@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -7,10 +9,23 @@ use crate::{Account, AccountId, ProviderHealth, ProviderId, UsageSnapshot};
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ApiRequest {
     GetUsage,
-    Refresh { providers: Option<Vec<ProviderId>> },
+    Refresh {
+        providers: Option<Vec<ProviderId>>,
+    },
     GetProviderHealth,
     GetAccounts,
     GetConfig,
+    UpdateConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        poll_interval_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        providers: Option<BTreeMap<String, ProviderToggle>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub struct ProviderToggle {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -69,6 +84,8 @@ pub struct ConfigResponse {
     pub socket_path: String,
     pub db_path: String,
     pub enabled_providers: Vec<ProviderId>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderToggle>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

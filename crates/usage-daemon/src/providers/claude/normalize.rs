@@ -34,6 +34,7 @@ pub(super) fn normalize_usage(
     })?;
 
     let mut windows = utilization_windows(response.utilization.as_ref());
+    windows.extend(recursive_utilization_windows(payload));
     if let Some(extra_usage) = response.extra_usage.as_ref().and_then(extra_usage_window) {
         windows.push(extra_usage);
     }
@@ -201,7 +202,7 @@ fn utilization_windows(
         .filter_map(|(name, entry)| match entry {
             ClaudeUtilizationEntry::Percent(percent) => percent.value().map(|value| {
                 percent_window(PercentWindowSpec {
-                    name,
+                    name: name.to_string(),
                     label: None,
                     percent_used: value,
                     reset_at: None,
@@ -209,7 +210,7 @@ fn utilization_windows(
             }),
             ClaudeUtilizationEntry::Window(window) => window.percent_used().map(|value| {
                 percent_window(PercentWindowSpec {
-                    name,
+                    name: name.to_string(),
                     label: window.label(),
                     percent_used: value,
                     reset_at: window.reset_at(),
@@ -219,26 +220,139 @@ fn utilization_windows(
         .collect()
 }
 
-struct PercentWindowSpec<'a> {
-    name: &'a str,
+fn recursive_utilization_windows(payload: &Value) -> Vec<UsageWindow> {
+    let mut windows = Vec::new();
+    let mut path = Vec::new();
+    collect_recursive_utilization_windows(payload, &mut path, &mut windows);
+    windows
+}
+
+fn collect_recursive_utilization_windows(
+    value: &Value,
+    path: &mut Vec<String>,
+    windows: &mut Vec<UsageWindow>,
+) {
+    if let Some(window) = path_window(path, value) {
+        windows.push(window);
+        return;
+    }
+
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if key == "extra_usage" {
+                    continue;
+                }
+                if key == "utilization" {
+                    if !path.is_empty() {
+                        collect_nested_utilization_windows(path, child, windows);
+                    }
+                    continue;
+                }
+
+                path.push(key.clone());
+                collect_recursive_utilization_windows(child, path, windows);
+                path.pop();
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                path.push(index.to_string());
+                collect_recursive_utilization_windows(child, path, windows);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_nested_utilization_windows(
+    parent_path: &[String],
+    value: &Value,
+    windows: &mut Vec<UsageWindow>,
+) {
+    let Some(utilization) = value.as_object() else {
+        return;
+    };
+
+    for (name, entry) in utilization {
+        let mut path = parent_path.to_vec();
+        path.push(name.clone());
+        if let Ok(entry) = serde_json::from_value::<ClaudeUtilizationEntry>(entry.clone()) {
+            if let Some(window) = utilization_entry_window(&path, entry) {
+                windows.push(window);
+            }
+        }
+    }
+}
+
+fn path_window(path: &[String], value: &Value) -> Option<UsageWindow> {
+    if path.is_empty() {
+        return None;
+    }
+
+    let entry = serde_json::from_value::<ClaudeUtilizationEntry>(value.clone()).ok()?;
+    utilization_entry_window(path, entry)
+}
+
+fn utilization_entry_window(path: &[String], entry: ClaudeUtilizationEntry) -> Option<UsageWindow> {
+    let name = path.join("_");
+    let label = path.last().map(humanize_window_label);
+
+    match entry {
+        ClaudeUtilizationEntry::Percent(percent) => {
+            if !looks_like_usage_window_name(path.last()?) {
+                return None;
+            }
+            percent.value().map(|value| {
+                percent_window(PercentWindowSpec {
+                    name,
+                    label,
+                    percent_used: value,
+                    reset_at: None,
+                })
+            })
+        }
+        ClaudeUtilizationEntry::Window(window) => window.percent_used().map(|value| {
+            percent_window(PercentWindowSpec {
+                name,
+                label: window.label().or(label),
+                percent_used: value,
+                reset_at: window.reset_at(),
+            })
+        }),
+    }
+}
+
+fn looks_like_usage_window_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("hour")
+        || name.contains("day")
+        || name.contains("week")
+        || name.contains("month")
+        || name.contains("session")
+}
+
+struct PercentWindowSpec {
+    name: String,
     label: Option<String>,
     percent_used: f64,
     reset_at: Option<DateTime<Utc>>,
 }
 
-fn percent_window(spec: PercentWindowSpec<'_>) -> UsageWindow {
+fn percent_window(spec: PercentWindowSpec) -> UsageWindow {
     let percent_used = spec.percent_used.clamp(0.0, MAX_PERCENT);
     let percent_remaining = MAX_PERCENT - percent_used;
 
     UsageWindow {
         window_id: format!(
             "claude_usage_utilization_{}",
-            stable_window_fragment(spec.name)
+            stable_window_fragment(&spec.name)
         ),
         label: spec
             .label
-            .unwrap_or_else(|| humanize_window_label(spec.name)),
-        kind: usage_kind_from_name(spec.name),
+            .unwrap_or_else(|| humanize_window_label(&spec.name)),
+        kind: usage_kind_from_name(&spec.name),
         used: Some(UsageAmount {
             value: percent_used,
             unit: UsageUnit::Percent,
@@ -443,6 +557,76 @@ mod tests {
         assert!(matches!(daily.kind, UsageWindowKind::Daily));
         assert_eq!(daily.percent_used, Some(9.25));
         assert_eq!(daily.remaining.as_ref().unwrap().value, 90.75);
+    }
+
+    #[test]
+    fn normalizes_top_level_usage_windows() {
+        let snapshot = normalize_usage(
+            &json!({
+                "five_hour": {
+                    "utilization": 42.5,
+                    "resets_at": "2026-06-12T08:00:00Z",
+                    "rate_limit_type": "five hour"
+                },
+                "seven_day_sonnet": {
+                    "usedPercent": "17.5",
+                    "resetDate": "2026-06-18T22:09:34Z"
+                },
+                "seven_day_opus": 5,
+                "tangelo": 8
+            }),
+            &test_credentials(),
+        )
+        .unwrap()
+        .into_snapshot(AccountId::new("joey"));
+
+        assert_eq!(snapshot.windows.len(), 3);
+
+        let five_hour = find_window(&snapshot.windows, "claude_usage_utilization_five_hour");
+        assert!(matches!(five_hour.kind, UsageWindowKind::Session));
+        assert_eq!(five_hour.label, "Claude five hour");
+        assert_eq!(five_hour.percent_used, Some(42.5));
+
+        let sonnet = find_window(
+            &snapshot.windows,
+            "claude_usage_utilization_seven_day_sonnet",
+        );
+        assert!(matches!(sonnet.kind, UsageWindowKind::Daily));
+        assert_eq!(sonnet.label, "Claude seven day sonnet");
+        assert_eq!(sonnet.percent_used, Some(17.5));
+
+        let opus = find_window(&snapshot.windows, "claude_usage_utilization_seven_day_opus");
+        assert_eq!(opus.percent_used, Some(5.0));
+    }
+
+    #[test]
+    fn recursively_normalizes_nested_usage_windows() {
+        let snapshot = normalize_usage(
+            &json!({
+                "limits": {
+                    "utilization": {
+                        "five_hour": 25
+                    },
+                    "weekly": {
+                        "percent_used": 70
+                    }
+                }
+            }),
+            &test_credentials(),
+        )
+        .unwrap()
+        .into_snapshot(AccountId::new("joey"));
+
+        let five_hour = find_window(
+            &snapshot.windows,
+            "claude_usage_utilization_limits_five_hour",
+        );
+        assert_eq!(five_hour.label, "Claude five hour");
+        assert_eq!(five_hour.percent_used, Some(25.0));
+
+        let weekly = find_window(&snapshot.windows, "claude_usage_utilization_limits_weekly");
+        assert_eq!(weekly.label, "Claude weekly");
+        assert_eq!(weekly.percent_used, Some(70.0));
     }
 
     #[test]

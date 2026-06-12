@@ -56,26 +56,32 @@ cargo run -p usage-daemon
 
 The daemon starts in the foreground, creates missing local files, opens a Unix socket, runs an initial refresh, and then refreshes enabled providers on the configured polling interval. By default it uses:
 
-- `./config.json`
-- `./usage.sqlite3`
-- `./usage.sock`
+- `~/.usagetracker/config.json`
+- `~/.usagetracker/usage.sqlite3`
+- `~/.usagetracker/usage.sock`
+
+The Swift menu bar app uses the same daemon socket by default and stores UI-only preferences under:
+
+- `~/.usagetracker/ui/config.json`
+
+The menu bar app's Settings page can change the polling interval and enable/disable providers while the daemon is running; the daemon applies these immediately and persists them back to `config.json` through its `update_config` API.
 
 Daemon options can be passed as flags:
 
 ```sh
 cargo run -p usage-daemon -- \
-  --config ./config.json \
-  --db-path ./usage.sqlite3 \
-  --socket-path ./usage.sock \
+  --config ~/.usagetracker/config.json \
+  --db-path ~/.usagetracker/usage.sqlite3 \
+  --socket-path ~/.usagetracker/usage.sock \
   --log-level info
 ```
 
 The same settings can be supplied with environment variables:
 
 ```sh
-USAGE_TRACKER_CONFIG=./config.json \
-USAGE_TRACKER_DB=./usage.sqlite3 \
-USAGE_TRACKER_SOCKET=./usage.sock \
+USAGE_TRACKER_CONFIG=~/.usagetracker/config.json \
+USAGE_TRACKER_DB=~/.usagetracker/usage.sqlite3 \
+USAGE_TRACKER_SOCKET=~/.usagetracker/usage.sock \
 USAGE_TRACKER_LOG_LEVEL=info \
 USAGE_TRACKER_POLL_INTERVAL_SECONDS=300 \
 cargo run -p usage-daemon
@@ -120,16 +126,16 @@ cargo run -p usage-cli -- accounts
 cargo run -p usage-cli -- config
 ```
 
-If the daemon is listening on a non-default socket, point the CLI at it:
+The CLI also defaults to `~/.usagetracker/usage.sock`. If the daemon is listening on a non-default socket, point the CLI at it:
 
 ```sh
-cargo run -p usage-cli -- --socket-path ./usage.sock status
+cargo run -p usage-cli -- --socket-path ~/.usagetracker/usage.sock status
 ```
 
 or:
 
 ```sh
-USAGE_TRACKER_SOCKET=./usage.sock cargo run -p usage-cli -- status
+USAGE_TRACKER_SOCKET=~/.usagetracker/usage.sock cargo run -p usage-cli -- status
 ```
 
 After installing or wrapping the CLI as `usage`, the commands are the same without the `cargo run` prefix:

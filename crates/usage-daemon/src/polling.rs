@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use usage_core::{AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus};
 
@@ -16,7 +16,7 @@ use crate::{
 
 pub struct RefreshCoordinator {
     storage: Storage,
-    providers: Vec<Arc<dyn ProviderCollector>>,
+    providers: RwLock<Vec<Arc<dyn ProviderCollector>>>,
     refresh_lock: Mutex<()>,
 }
 
@@ -24,25 +24,30 @@ impl RefreshCoordinator {
     pub fn new(storage: Storage, providers: Vec<Arc<dyn ProviderCollector>>) -> Self {
         Self {
             storage,
-            providers,
+            providers: RwLock::new(providers),
             refresh_lock: Mutex::new(()),
         }
     }
 
+    pub async fn set_providers(&self, providers: Vec<Arc<dyn ProviderCollector>>) {
+        *self.providers.write().await = providers;
+    }
+
     pub async fn refresh(&self, filter: Option<&[ProviderId]>) -> RefreshReport {
         let _guard = self.refresh_lock.lock().await;
+        let providers = self.providers.read().await.clone();
         let started_at = Utc::now();
         let filter_values = filter
             .map(|ids| ids.iter().map(ProviderId::as_str).collect::<Vec<_>>())
             .unwrap_or_default();
         info!(
             provider_filter = ?filter_values,
-            provider_count = self.providers.len(),
+            provider_count = providers.len(),
             "refresh started"
         );
 
         let mut provider_results = Vec::new();
-        for provider in &self.providers {
+        for provider in &providers {
             let provider_id = provider.provider_id();
             if !should_refresh_provider(&provider_id, filter) {
                 debug!(

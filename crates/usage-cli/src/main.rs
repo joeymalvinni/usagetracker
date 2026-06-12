@@ -6,13 +6,13 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-use usage_core::{ApiRequest, ProviderId};
+use usage_core::{default_socket_path, ApiRequest, ProviderId};
 
 #[derive(Debug, Parser)]
 #[command(name = "usage")]
 struct Args {
-    #[arg(long, env = "USAGE_TRACKER_SOCKET", default_value = "./usage.sock")]
-    socket_path: PathBuf,
+    #[arg(long, env = "USAGE_TRACKER_SOCKET")]
+    socket_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -48,7 +48,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Config => ApiRequest::GetConfig,
     };
 
-    let response = send_request(&args.socket_path, &request).await?;
+    let socket_path = args
+        .socket_path
+        .or_else(default_socket_path)
+        .context("failed to resolve ~/.usagetracker/usage.sock")?;
+    let response = send_request(&socket_path, &request).await?;
     println!("{response}");
     Ok(())
 }
