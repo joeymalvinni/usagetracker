@@ -2,7 +2,7 @@
   "poll_interval_seconds": 300,
   "providers": {
     "claude": {
-      "enabled": false
+      "enabled": true
     },
     "codex": {
       "enabled": true
