@@ -8,7 +8,7 @@ use crate::{
     config::Config,
     health,
     polling::RefreshCoordinator,
-    providers::{codex::CodexCollector, ProviderCollector, ProviderError, ProviderErrorKind},
+    providers::{claude::ClaudeCollector, codex::CodexCollector, ProviderCollector},
     server::SocketServer,
     storage::Storage,
 };
@@ -32,18 +32,12 @@ impl Daemon {
             storage.upsert_health(&health::disabled(ProviderId::new("codex")))?;
         }
 
-        if !config.provider_enabled("claude") {
-            storage.upsert_health(&health::disabled(ProviderId::new("claude")))?;
+        if config.provider_enabled("claude") {
+            providers.push(Arc::new(ClaudeCollector::new(
+                config.debug_capture_raw_payloads,
+            )?));
         } else {
-            let unsupported = ProviderError::new(
-                ProviderErrorKind::Unsupported,
-                "Claude provider is not implemented in this Codex-only build",
-            );
-            storage.upsert_health(&health::from_provider_error(
-                ProviderId::new("claude"),
-                None,
-                &unsupported,
-            ))?;
+            storage.upsert_health(&health::disabled(ProviderId::new("claude")))?;
         }
 
         let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), providers));

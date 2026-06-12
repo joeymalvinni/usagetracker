@@ -98,7 +98,7 @@ The config file controls which providers are enabled:
 }
 ```
 
-Codex collection reads credentials from `~/.codex/auth.json`. Claude is present in config, but is not implemented in this build.
+Codex collection reads credentials from `~/.codex/auth.json`. Claude collection reads Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects live quota usage from Anthropic's OAuth usage API.
 
 With the daemon running, use the CLI from another terminal:
 

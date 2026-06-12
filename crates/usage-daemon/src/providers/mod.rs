@@ -3,6 +3,7 @@ use std::{future::Future, pin::Pin};
 use thiserror::Error;
 use usage_core::{ProviderId, UsageSnapshot};
 
+pub mod claude;
 pub mod codex;
 
 #[derive(Clone, Debug)]
@@ -41,6 +42,7 @@ pub enum ProviderErrorKind {
     Network,
     Parse,
     ProviderUnavailable,
+    #[allow(dead_code)]
     Unsupported,
 }
 
