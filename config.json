@@ -1,0 +1,12 @@
+{
+  "poll_interval_seconds": 300,
+  "providers": {
+    "claude": {
+      "enabled": false
+    },
+    "codex": {
+      "enabled": true
+    }
+  },
+  "debug_capture_raw_payloads": false
+}
