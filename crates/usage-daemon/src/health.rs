@@ -63,8 +63,8 @@ fn status_for_kind(kind: ProviderErrorKind) -> ProviderHealthStatus {
         }
         ProviderErrorKind::RateLimited => ProviderHealthStatus::RateLimited,
         ProviderErrorKind::Parse => ProviderHealthStatus::ParseError,
-        ProviderErrorKind::Network
-        | ProviderErrorKind::ProviderUnavailable
-        | ProviderErrorKind::Unsupported => ProviderHealthStatus::ProviderError,
+        ProviderErrorKind::Network | ProviderErrorKind::ProviderUnavailable => {
+            ProviderHealthStatus::ProviderError
+        }
     }
 }

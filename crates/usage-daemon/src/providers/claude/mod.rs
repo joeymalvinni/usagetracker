@@ -1,0 +1,103 @@
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use usage_core::ProviderId;
+
+use crate::providers::{
+    DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
+    ProviderErrorKind, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+};
+
+mod client;
+mod credentials;
+mod normalize;
+
+use client::ClaudeApiClient;
+use credentials::{load_credentials, ClaudeCredentials};
+use normalize::normalize_usage;
+
+pub const PROVIDER_ID: &str = "claude";
+const CLAUDE_CREDENTIALS_FILE: &str = ".claude/.credentials.json";
+const CLAUDE_COLLECTION_MODE: &str = "oauth_usage_api";
+
+#[derive(Clone)]
+pub struct ClaudeCollector {
+    keychain_account: String,
+    credentials_file_path: PathBuf,
+    api: ClaudeApiClient,
+    capture_raw_payloads: bool,
+}
+
+impl ClaudeCollector {
+    pub fn new(capture_raw_payloads: bool) -> anyhow::Result<Self> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Claude data"))?;
+        Ok(Self {
+            keychain_account: std::env::var("USER").unwrap_or_else(|_| "default".to_string()),
+            credentials_file_path: home.join(CLAUDE_CREDENTIALS_FILE),
+            api: ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?,
+            capture_raw_payloads,
+        })
+    }
+
+    async fn load_credentials(&self) -> Result<ClaudeCredentials, ProviderError> {
+        load_credentials(
+            self.keychain_account.clone(),
+            self.credentials_file_path.clone(),
+        )
+        .await
+    }
+
+    async fn load_with_auto_refresh(&self) -> Result<ClaudeCredentials, ProviderError> {
+        let credentials = self.load_credentials().await?;
+        if credentials.is_expired() {
+            self.api.refresh_credentials(credentials).await
+        } else {
+            Ok(credentials)
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderCollector for ClaudeCollector {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::new(PROVIDER_ID)
+    }
+
+    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        let credentials = self.load_credentials().await?;
+        Ok(vec![DiscoveredAccount {
+            external_account_id: credentials.account_id(),
+            display_name: Some(credentials.display_name()),
+        }])
+    }
+
+    async fn collect_usage(
+        &self,
+        account: &DiscoveredAccount,
+    ) -> Result<ProviderCollectionResult, ProviderError> {
+        let mut credentials = self.load_with_auto_refresh().await?;
+        if credentials.account_id() != account.external_account_id {
+            return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Claude account changed since discovery",
+            ));
+        }
+
+        let payload = match self.api.fetch_usage(&credentials).await {
+            Err(err) if err.kind() == ProviderErrorKind::Unauthorized => {
+                credentials = self.api.refresh_credentials(credentials).await?;
+                self.api.fetch_usage(&credentials).await?
+            }
+            result => result?,
+        };
+        let usage = normalize_usage(&payload, &credentials)?;
+
+        Ok(ProviderCollectionResult {
+            usage,
+            collection_mode: CLAUDE_COLLECTION_MODE.to_string(),
+            raw_payload: self.capture_raw_payloads.then_some(payload),
+            warnings: Vec::new(),
+        })
+    }
+}

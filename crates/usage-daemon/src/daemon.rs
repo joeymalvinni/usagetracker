@@ -8,7 +8,11 @@ use crate::{
     config::Config,
     health,
     polling::RefreshCoordinator,
-    providers::{claude::ClaudeCollector, codex::CodexCollector, ProviderCollector},
+    providers::{
+        claude::{ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID},
+        codex::{CodexCollector, PROVIDER_ID as CODEX_PROVIDER_ID},
+        ProviderCollector,
+    },
     server::SocketServer,
     storage::Storage,
 };
@@ -19,25 +23,35 @@ pub struct Daemon {
     refresh: Arc<RefreshCoordinator>,
 }
 
+struct ProviderRegistration {
+    id: &'static str,
+    build: fn(&Config) -> anyhow::Result<Arc<dyn ProviderCollector>>,
+}
+
+const PROVIDER_REGISTRY: &[ProviderRegistration] = &[
+    ProviderRegistration {
+        id: CODEX_PROVIDER_ID,
+        build: build_codex_provider,
+    },
+    ProviderRegistration {
+        id: CLAUDE_PROVIDER_ID,
+        build: build_claude_provider,
+    },
+];
+
 impl Daemon {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let storage = Storage::open(&config.paths.db)?;
         let mut providers: Vec<Arc<dyn ProviderCollector>> = Vec::new();
 
-        if config.provider_enabled("codex") {
-            providers.push(Arc::new(CodexCollector::new(
-                config.debug_capture_raw_payloads,
-            )?));
-        } else {
-            storage.upsert_health(&health::disabled(ProviderId::new("codex")))?;
-        }
-
-        if config.provider_enabled("claude") {
-            providers.push(Arc::new(ClaudeCollector::new(
-                config.debug_capture_raw_payloads,
-            )?));
-        } else {
-            storage.upsert_health(&health::disabled(ProviderId::new("claude")))?;
+        for registration in PROVIDER_REGISTRY {
+            if config.provider_enabled(registration.id) {
+                providers.push((registration.build)(&config)?);
+            } else {
+                storage
+                    .upsert_health(&health::disabled(ProviderId::new(registration.id)))
+                    .await?;
+            }
         }
 
         let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), providers));
@@ -79,6 +93,18 @@ impl Daemon {
         }
         Ok(())
     }
+}
+
+fn build_codex_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
+    Ok(Arc::new(CodexCollector::new(
+        config.debug_capture_raw_payloads,
+    )?))
+}
+
+fn build_claude_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
+    Ok(Arc::new(ClaudeCollector::new(
+        config.debug_capture_raw_payloads,
+    )?))
 }
 
 fn spawn_polling_loop(

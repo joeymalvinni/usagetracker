@@ -4,8 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use usage_core::{ConfigResponse, ProviderId};
+
+const POLL_INTERVAL_ENV: &str = "USAGE_TRACKER_POLL_INTERVAL_SECONDS";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -51,10 +54,7 @@ impl Config {
         let socket_path = socket_override.unwrap_or_else(|| PathBuf::from("./usage.sock"));
 
         let file_config = read_or_create_config(&config_path)?;
-        let poll_interval_seconds = std::env::var("USAGE_TRACKER_POLL_INTERVAL_SECONDS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(file_config.poll_interval_seconds);
+        let poll_interval_seconds = poll_interval_seconds(file_config.poll_interval_seconds)?;
 
         Ok(Self {
             poll_interval_seconds,
@@ -92,6 +92,25 @@ impl Config {
             enabled_providers: self.enabled_provider_ids(),
         }
     }
+}
+
+fn poll_interval_seconds(file_value: u64) -> anyhow::Result<u64> {
+    let value = match std::env::var(POLL_INTERVAL_ENV) {
+        Ok(value) => parse_poll_interval_env(&value)?,
+        Err(std::env::VarError::NotPresent) => file_value,
+        Err(err) => bail!("failed to read {POLL_INTERVAL_ENV}: {err}"),
+    };
+
+    if value == 0 {
+        bail!("poll interval must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn parse_poll_interval_env(value: &str) -> anyhow::Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("{POLL_INTERVAL_ENV} must be an integer number of seconds"))
 }
 
 impl Default for FileConfig {
@@ -137,5 +156,17 @@ mod tests {
         let config = FileConfig::default();
         assert!(config.providers["codex"].enabled);
         assert!(!config.providers["claude"].enabled);
+    }
+
+    #[test]
+    fn rejects_zero_poll_interval() {
+        let err = poll_interval_seconds(0).unwrap_err();
+        assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn rejects_malformed_poll_interval_env_value() {
+        let err = parse_poll_interval_env("soon").unwrap_err();
+        assert!(err.to_string().contains("must be an integer"));
     }
 }

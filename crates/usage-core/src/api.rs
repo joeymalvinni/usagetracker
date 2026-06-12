@@ -42,10 +42,24 @@ pub enum ApiResponse {
 pub struct ProviderRefreshResult {
     pub provider_id: ProviderId,
     pub account_id: Option<AccountId>,
-    pub status: String,
+    pub status: ProviderRefreshStatus,
     pub collection_mode: Option<String>,
     pub collected_at: Option<DateTime<Utc>>,
     pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRefreshStatus {
+    Ok,
+    CredentialsMissing,
+    CredentialsInvalid,
+    Unauthorized,
+    RateLimited,
+    Network,
+    Parse,
+    ProviderUnavailable,
+    StorageError,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

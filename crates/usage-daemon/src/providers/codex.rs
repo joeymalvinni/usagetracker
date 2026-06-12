@@ -1,20 +1,20 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
+use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use usage_core::{
-    AccountId, ProviderId, UsageAmount, UsageSnapshot, UsageUnit, UsageWindow, UsageWindowKind,
-};
+use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 
 use crate::providers::{
     DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-    ProviderErrorKind,
+    ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
 };
 
-const CODEX_PROVIDER_ID: &str = "codex";
+pub const PROVIDER_ID: &str = "codex";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const MAX_PERCENT: f64 = 100.0;
 
 #[derive(Clone)]
 pub struct CodexCollector {
@@ -28,8 +28,8 @@ impl CodexCollector {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Codex auth"))?;
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .user_agent("codex-cli")
             .build()?;
         Ok(Self {
@@ -56,10 +56,10 @@ impl CodexCollector {
                 }
             })?;
 
-        let auth: CodexAuth = serde_json::from_str(&contents).map_err(|_| {
+        let auth: CodexAuth = serde_json::from_str(&contents).map_err(|err| {
             ProviderError::new(
                 ProviderErrorKind::CredentialsInvalid,
-                "Codex auth file is not valid JSON",
+                format!("Codex auth file is not valid JSON: {err}"),
             )
         })?;
 
@@ -84,95 +84,80 @@ impl CodexCollector {
     }
 }
 
+#[async_trait]
 impl ProviderCollector for CodexCollector {
     fn provider_id(&self) -> ProviderId {
-        ProviderId::new(CODEX_PROVIDER_ID)
+        ProviderId::new(PROVIDER_ID)
     }
 
-    fn discover_accounts<'a>(
-        &'a self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Vec<DiscoveredAccount>, ProviderError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let credentials = self.load_credentials().await?;
-            Ok(vec![DiscoveredAccount {
-                external_account_id: credentials.account_id,
-                display_name: Some("Codex".to_string()),
-            }])
-        })
+    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        let credentials = self.load_credentials().await?;
+        Ok(vec![DiscoveredAccount {
+            external_account_id: credentials.account_id,
+            display_name: Some("Codex".to_string()),
+        }])
     }
 
-    fn collect_usage<'a>(
-        &'a self,
-        account: &'a DiscoveredAccount,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ProviderCollectionResult, ProviderError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let credentials = self.load_credentials().await?;
-            if credentials.account_id != account.external_account_id {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::CredentialsInvalid,
-                    "Codex account changed since discovery",
-                ));
-            }
+    async fn collect_usage(
+        &self,
+        account: &DiscoveredAccount,
+    ) -> Result<ProviderCollectionResult, ProviderError> {
+        let credentials = self.load_credentials().await?;
+        if credentials.account_id != account.external_account_id {
+            return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Codex account changed since discovery",
+            ));
+        }
 
-            let response = self
-                .client
-                .get(CODEX_USAGE_URL)
-                .bearer_auth(&credentials.access_token)
-                .header("ChatGPT-Account-Id", &credentials.account_id)
-                .header("Accept", "application/json")
-                .send()
-                .await
-                .map_err(|_| {
-                    ProviderError::new(ProviderErrorKind::Network, "Codex usage request failed")
-                })?;
-
-            let status = response.status();
-            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::Unauthorized,
-                    "Codex credentials were rejected",
-                ));
-            }
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::RateLimited,
-                    "Codex usage endpoint is rate limited",
-                ));
-            }
-            if !status.is_success() {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::ProviderUnavailable,
-                    format!("Codex usage endpoint returned HTTP {}", status.as_u16()),
-                ));
-            }
-
-            let payload: Value = response.json().await.map_err(|_| {
-                ProviderError::new(ProviderErrorKind::Parse, "Codex usage JSON was invalid")
+        let response = self
+            .client
+            .get(CODEX_USAGE_URL)
+            .bearer_auth(&credentials.access_token)
+            .header("ChatGPT-Account-Id", &credentials.account_id)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|err| {
+                ProviderError::new(
+                    ProviderErrorKind::Network,
+                    format!("Codex usage request failed: {err}"),
+                )
             })?;
-            let snapshot = normalize_usage(
-                &payload,
-                AccountId::new(account.external_account_id.clone()),
-                account.display_name.as_deref(),
-            )?;
 
-            Ok(ProviderCollectionResult {
-                snapshot,
-                collection_mode: "wham_usage_api".to_string(),
-                raw_payload: self.capture_raw_payloads.then_some(payload),
-                warnings: Vec::new(),
-            })
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unauthorized,
+                "Codex credentials were rejected",
+            ));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ProviderError::new(
+                ProviderErrorKind::RateLimited,
+                "Codex usage endpoint is rate limited",
+            ));
+        }
+        if !status.is_success() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("Codex usage endpoint returned HTTP {}", status.as_u16()),
+            ));
+        }
+
+        let payload: Value = response.json().await.map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                format!("Codex usage JSON was invalid: {err}"),
+            )
+        })?;
+        let usage = normalize_usage(&payload, account.display_name.as_deref())?;
+
+        Ok(ProviderCollectionResult {
+            usage,
+            collection_mode: "wham_usage_api".to_string(),
+            raw_payload: self.capture_raw_payloads.then_some(payload),
+            warnings: Vec::new(),
         })
     }
 }
@@ -196,9 +181,8 @@ struct CodexCredentials {
 
 fn normalize_usage(
     payload: &Value,
-    account_id: AccountId,
     display_name: Option<&str>,
-) -> Result<UsageSnapshot, ProviderError> {
+) -> Result<ProviderUsage, ProviderError> {
     let object = payload.as_object().ok_or_else(|| {
         ProviderError::new(
             ProviderErrorKind::Parse,
@@ -206,21 +190,24 @@ fn normalize_usage(
         )
     })?;
 
-    let mut windows = Vec::new();
-    collect_codex_rate_limit_windows(&mut windows, "codex", "Codex", object.get("rate_limit"));
-    collect_codex_rate_limit_windows(
-        &mut windows,
-        "codex_code_review",
-        "Codex code review",
-        object.get("code_review_rate_limit"),
-    );
-    collect_additional_rate_limit_windows(&mut windows, object.get("additional_rate_limits"));
-    collect_codex_credits_window(&mut windows, object.get("credits"));
+    let mut windows = collect_codex_rate_limit_windows(RateLimitGroupSpec {
+        id_prefix: "codex",
+        label_prefix: "Codex",
+        rate_limit: object.get("rate_limit"),
+    });
+    windows.extend(collect_codex_rate_limit_windows(RateLimitGroupSpec {
+        id_prefix: "codex_code_review",
+        label_prefix: "Codex code review",
+        rate_limit: object.get("code_review_rate_limit"),
+    }));
+    windows.extend(collect_additional_rate_limit_windows(
+        object.get("additional_rate_limits"),
+    ));
+    windows.extend(collect_codex_credits_window(object.get("credits")));
 
     let top_level_keys = object.keys().cloned().collect::<Vec<_>>();
-    Ok(UsageSnapshot {
-        provider_id: ProviderId::new(CODEX_PROVIDER_ID),
-        account_id,
+    Ok(ProviderUsage {
+        provider_id: ProviderId::new(PROVIDER_ID),
         collected_at: Utc::now(),
         windows,
         metadata: json!({
@@ -241,63 +228,72 @@ fn normalize_usage(
     })
 }
 
-fn collect_codex_rate_limit_windows(
-    windows: &mut Vec<UsageWindow>,
-    id_prefix: &str,
-    label_prefix: &str,
-    rate_limit: Option<&Value>,
-) {
-    let Some(rate_limit) = rate_limit.and_then(Value::as_object) else {
-        return;
-    };
-
-    if let Some(window) = rate_limit_window(
-        &format!("{id_prefix}_session"),
-        &format!("{label_prefix} session"),
-        UsageWindowKind::Session,
-        rate_limit.get("primary_window"),
-    ) {
-        windows.push(window);
-    }
-
-    if let Some(window) = rate_limit_window(
-        &format!("{id_prefix}_weekly"),
-        &format!("{label_prefix} weekly"),
-        UsageWindowKind::Weekly,
-        rate_limit.get("secondary_window"),
-    ) {
-        windows.push(window);
-    }
+struct RateLimitGroupSpec<'a> {
+    id_prefix: &'a str,
+    label_prefix: &'a str,
+    rate_limit: Option<&'a Value>,
 }
 
-fn collect_additional_rate_limit_windows(windows: &mut Vec<UsageWindow>, value: Option<&Value>) {
+struct RateLimitWindowSpec<'a> {
+    window_id: String,
+    label: String,
+    kind: UsageWindowKind,
+    value: Option<&'a Value>,
+}
+
+fn collect_codex_rate_limit_windows(spec: RateLimitGroupSpec<'_>) -> Vec<UsageWindow> {
+    let Some(rate_limit) = spec.rate_limit.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    [
+        rate_limit_window(RateLimitWindowSpec {
+            window_id: format!("{}_session", spec.id_prefix),
+            label: format!("{} session", spec.label_prefix),
+            kind: UsageWindowKind::Session,
+            value: rate_limit.get("primary_window"),
+        }),
+        rate_limit_window(RateLimitWindowSpec {
+            window_id: format!("{}_weekly", spec.id_prefix),
+            label: format!("{} weekly", spec.label_prefix),
+            kind: UsageWindowKind::Weekly,
+            value: rate_limit.get("secondary_window"),
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn collect_additional_rate_limit_windows(value: Option<&Value>) -> Vec<UsageWindow> {
     let Some(rate_limits) = value.and_then(Value::as_array) else {
-        return;
+        return Vec::new();
     };
 
-    for (index, rate_limit) in rate_limits.iter().enumerate() {
-        let Some(rate_limit) = rate_limit.as_object() else {
-            continue;
-        };
-        let label = rate_limit
-            .get("limit_name")
-            .and_then(Value::as_str)
-            .or_else(|| rate_limit.get("metered_feature").and_then(Value::as_str))
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("Codex additional limit {}", index + 1));
-        collect_codex_rate_limit_windows(
-            windows,
-            &format!("codex_additional_{index}"),
-            &label,
-            rate_limit.get("rate_limit"),
-        );
-    }
+    rate_limits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, rate_limit)| {
+            let rate_limit = rate_limit.as_object()?;
+            let label = rate_limit
+                .get("limit_name")
+                .and_then(Value::as_str)
+                .or_else(|| rate_limit.get("metered_feature").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Codex additional limit {}", index + 1));
+            let id_prefix = format!("codex_additional_{index}");
+            Some(collect_codex_rate_limit_windows(RateLimitGroupSpec {
+                id_prefix: &id_prefix,
+                label_prefix: &label,
+                rate_limit: rate_limit.get("rate_limit"),
+            }))
+        })
+        .flatten()
+        .collect()
 }
 
-fn collect_codex_credits_window(windows: &mut Vec<UsageWindow>, credits: Option<&Value>) {
-    let Some(credits) = credits.and_then(Value::as_object) else {
-        return;
-    };
+fn collect_codex_credits_window(credits: Option<&Value>) -> Option<UsageWindow> {
+    let credits = credits.and_then(Value::as_object)?;
 
     let balance = credits.get("balance").and_then(number_from_json_value);
     let unlimited = credits
@@ -305,7 +301,7 @@ fn collect_codex_credits_window(windows: &mut Vec<UsageWindow>, credits: Option<
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if balance.is_none() && !unlimited {
-        return;
+        return None;
     }
 
     let remaining = if unlimited { None } else { balance };
@@ -314,7 +310,7 @@ fn collect_codex_credits_window(windows: &mut Vec<UsageWindow>, credits: Option<
         metadata_label.push_str(" (unlimited)");
     }
 
-    windows.push(UsageWindow {
+    Some(UsageWindow {
         window_id: "codex_credits".to_string(),
         label: metadata_label,
         kind: UsageWindowKind::Credits,
@@ -327,21 +323,16 @@ fn collect_codex_credits_window(windows: &mut Vec<UsageWindow>, credits: Option<
         percent_used: None,
         percent_remaining: None,
         reset_at: None,
-    });
+    })
 }
 
-fn rate_limit_window(
-    window_id: &str,
-    label: &str,
-    kind: UsageWindowKind,
-    value: Option<&Value>,
-) -> Option<UsageWindow> {
-    let object = value?.as_object()?;
+fn rate_limit_window(spec: RateLimitWindowSpec<'_>) -> Option<UsageWindow> {
+    let object = spec.value?.as_object()?;
     let percent_used = object
         .get("used_percent")
         .and_then(number_from_json_value)
-        .map(|value| value.clamp(0.0, 100.0));
-    let percent_remaining = percent_used.map(|value| 100.0 - value);
+        .map(|value| value.clamp(0.0, MAX_PERCENT));
+    let percent_remaining = percent_used.map(|value| MAX_PERCENT - value);
     let reset_at = object
         .get("reset_at")
         .and_then(unix_timestamp_from_json_value)
@@ -358,9 +349,9 @@ fn rate_limit_window(
     }
 
     Some(UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind,
+        window_id: spec.window_id,
+        label: spec.label,
+        kind: spec.kind,
         used: None,
         limit: None,
         remaining: None,
@@ -386,6 +377,7 @@ fn unix_timestamp_from_json_value(value: &Value) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use usage_core::AccountId;
 
     #[test]
     fn normalizes_codex_rate_limits() {
@@ -441,7 +433,9 @@ mod tests {
             }
         });
 
-        let snapshot = normalize_usage(&payload, AccountId::new("acct"), Some("Codex")).unwrap();
+        let snapshot = normalize_usage(&payload, Some("Codex"))
+            .unwrap()
+            .into_snapshot(AccountId::new("acct"));
         assert_eq!(snapshot.windows.len(), 5);
 
         let session = find_window(&snapshot.windows, "codex_session");
@@ -478,7 +472,7 @@ mod tests {
 
     #[test]
     fn rejects_non_object_payloads() {
-        let err = normalize_usage(&json!([1, 2, 3]), AccountId::new("acct"), None).unwrap_err();
+        let err = normalize_usage(&json!([1, 2, 3]), None).unwrap_err();
         assert_eq!(err.kind(), ProviderErrorKind::Parse);
     }
 
