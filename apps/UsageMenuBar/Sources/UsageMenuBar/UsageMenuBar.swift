@@ -58,7 +58,7 @@ import SwiftUI
         effect.state = .active
         effect.blendingMode = .behindWindow
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 12
+        effect.layer?.cornerRadius = 18
         effect.layer?.masksToBounds = true
         let host = NSHostingView(rootView: Popover().environmentObject(state))
         host.frame = effect.bounds
@@ -820,7 +820,7 @@ struct Popover: View {
     var body: some View {
         HStack(spacing: 0) {
             Rail(selection: $selection)
-            Divider().opacity(0.45)
+            Divider().opacity(0.30)
             Group {
                 switch selection {
                 case .summary: Summary()
@@ -831,7 +831,7 @@ struct Popover: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: 460, height: 560)
-        .background(.regularMaterial)
+        .liquidGlassRoot()
     }
 }
 enum Selection: Hashable { case summary, provider(String), settings }
@@ -839,6 +839,7 @@ enum Selection: Hashable { case summary, provider(String), settings }
 struct Rail: View {
     @EnvironmentObject var state: AppState
     @Binding var selection: Selection
+
     var body: some View {
         VStack(spacing: 10) {
             rail(.summary, "Summary") { Image(systemName: "gauge") }
@@ -848,11 +849,15 @@ struct Rail: View {
             Spacer()
             rail(.settings, "Settings") { Image(systemName: "gearshape") }
         }
-        .padding(.vertical, 14).frame(width: 58).background(.thinMaterial)
+        .padding(.vertical, 14).frame(width: 58).liquidGlassRail()
     }
     private func rail(_ s: Selection, _ tip: String, @ViewBuilder icon: () -> some View) -> some View {
-        Button { selection = s } label: { icon().frame(width: 32, height: 32).background(selection == s ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: RoundedRectangle(cornerRadius: 8)) }
-            .buttonStyle(.plain).help(tip)
+        Button { selection = s } label: {
+            icon()
+                .frame(width: 32, height: 32)
+                .liquidGlassSelection(active: selection == s)
+        }
+        .buttonStyle(.plain).help(tip)
     }
 }
 
@@ -878,7 +883,7 @@ struct Header: View {
             VStack(alignment: .leading, spacing: 2) { Text(title).font(.title3.bold()); Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
             Spacer()
             Button { Task { await state.refreshAll() } } label: { Image(systemName: state.refreshing ? "arrow.triangle.2.circlepath.circle" : "arrow.clockwise").frame(width: 28, height: 28) }
-                .buttonStyle(.borderless).help("Refresh")
+                .liquidGlassIconButton().help("Refresh")
         }
     }
 }
@@ -1187,7 +1192,71 @@ struct ProviderSettingsRow: View {
 struct EmptyState: View { let text: String; var body: some View { Text(text).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity) } }
 
 extension View {
+    @ViewBuilder
+    func liquidGlassRoot() -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(
+                .regular.tint(.white.opacity(0.08)),
+                in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+            )
+        } else {
+            background(.regularMaterial)
+        }
+    }
+
+    @ViewBuilder
+    func liquidGlassRail() -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(
+                .regular.tint(.white.opacity(0.05)),
+                in: UnevenRoundedRectangle(
+                    topLeadingRadius: 18,
+                    bottomLeadingRadius: 18,
+                    bottomTrailingRadius: 0,
+                    topTrailingRadius: 0,
+                    style: .continuous
+                )
+            )
+        } else {
+            background(.thinMaterial)
+        }
+    }
+
+    @ViewBuilder
+    func liquidGlassSelection(active: Bool) -> some View {
+        if active {
+            background(AnyShapeStyle(.quaternary), in: RoundedRectangle(cornerRadius: 8))
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder
+    func liquidGlassIconButton() -> some View {
+        buttonStyle(.borderless)
+    }
+
     func glass(secondary: Bool = false) -> some View {
-        padding(10).background(secondary ? AnyShapeStyle(.thinMaterial) : AnyShapeStyle(.ultraThinMaterial), in: RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.10)))
+        padding(10).liquidGlassCard(secondary: secondary)
+    }
+
+    @ViewBuilder
+    private func liquidGlassCard(secondary: Bool) -> some View {
+        if #available(macOS 26.0, *) {
+            glassEffect(
+                .regular.tint(secondary ? .white.opacity(0.04) : .white.opacity(0.075)),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(.white.opacity(secondary ? 0.08 : 0.12), lineWidth: 0.75)
+            }
+        } else {
+            background(
+                secondary ? AnyShapeStyle(.thinMaterial) : AnyShapeStyle(.ultraThinMaterial),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.10)))
+        }
     }
 }
