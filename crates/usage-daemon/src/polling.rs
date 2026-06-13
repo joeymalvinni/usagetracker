@@ -203,6 +203,17 @@ impl RefreshCoordinator {
                 "failed to store provider health"
             );
         }
+        if let Err(err) = self
+            .storage
+            .delete_provider_level_health(&provider_id)
+            .await
+        {
+            warn!(
+                provider_id = provider_id.as_str(),
+                error = %err,
+                "failed to clear provider-level health"
+            );
+        }
 
         info!(
             provider_id = provider_id.as_str(),
@@ -291,5 +302,109 @@ fn refresh_status_for_provider_error(kind: ProviderErrorKind) -> ProviderRefresh
         ProviderErrorKind::Network => ProviderRefreshStatus::Network,
         ProviderErrorKind::Parse => ProviderRefreshStatus::Parse,
         ProviderErrorKind::ProviderUnavailable => ProviderRefreshStatus::ProviderUnavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+    use usage_core::{
+        ProviderHealth, ProviderHealthStatus, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+    };
+    use uuid::Uuid;
+
+    use crate::providers::{ProviderCollectionResult, ProviderUsage};
+
+    struct FakeProvider;
+
+    #[async_trait]
+    impl ProviderCollector for FakeProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("claude")
+        }
+
+        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+            Ok(vec![DiscoveredAccount {
+                external_account_id: "external-account".to_string(),
+                display_name: Some("Claude".to_string()),
+            }])
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<ProviderCollectionResult, ProviderError> {
+            Ok(ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new("claude"),
+                    collected_at: Utc::now(),
+                    windows: vec![UsageWindow {
+                        window_id: "claude_usage".to_string(),
+                        label: "Claude usage".to_string(),
+                        kind: UsageWindowKind::Daily,
+                        used: Some(UsageAmount {
+                            value: 25.0,
+                            unit: UsageUnit::Percent,
+                        }),
+                        limit: Some(UsageAmount {
+                            value: 100.0,
+                            unit: UsageUnit::Percent,
+                        }),
+                        remaining: Some(UsageAmount {
+                            value: 75.0,
+                            unit: UsageUnit::Percent,
+                        }),
+                        percent_used: Some(25.0),
+                        percent_remaining: Some(75.0),
+                        reset_at: None,
+                    }],
+                    metadata: json!({}),
+                },
+                collection_mode: "live".to_string(),
+                raw_payload: None,
+                warnings: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_clears_stale_provider_level_health() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        storage
+            .upsert_health(&ProviderHealth {
+                provider_id: provider_id.clone(),
+                account_id: None,
+                status: ProviderHealthStatus::CredentialsMissing,
+                collection_mode: None,
+                last_success_at: None,
+                last_failure_at: Some(Utc::now()),
+                last_error_code: Some("credentials_missing".to_string()),
+                last_error_message: Some("missing".to_string()),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let coordinator = RefreshCoordinator::new(storage.clone(), vec![Arc::new(FakeProvider)]);
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(report.provider_results.len(), 1);
+        assert_eq!(report.provider_results[0].status, ProviderRefreshStatus::Ok);
+        let health = storage.provider_health().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].provider_id, provider_id);
+        assert!(health[0].account_id.is_some());
+        assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+    }
+
+    fn test_storage() -> Storage {
+        let path = std::env::temp_dir().join(format!("usage-polling-{}.sqlite3", Uuid::new_v4()));
+        let storage = Storage::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        storage
     }
 }

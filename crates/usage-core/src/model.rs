@@ -59,6 +59,7 @@ pub enum UsageUnit {
     Tokens,
     Requests,
     Credits,
+    Usd,
     Percent,
     Unknown,
 }

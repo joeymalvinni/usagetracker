@@ -9,10 +9,12 @@ use crate::providers::{
 };
 
 mod client;
+mod cost;
 mod credentials;
 mod normalize;
 
 use client::ClaudeApiClient;
+use cost::{merge_local_cost_report, scan_claude_local_costs};
 use credentials::{load_credentials, ClaudeCredentials};
 use normalize::normalize_usage;
 
@@ -91,13 +93,19 @@ impl ProviderCollector for ClaudeCollector {
             }
             result => result?,
         };
-        let usage = normalize_usage(&payload, &credentials)?;
+        let mut usage = normalize_usage(&payload, &credentials)?;
+        let mut warnings = Vec::new();
+        match tokio::task::spawn_blocking(scan_claude_local_costs).await {
+            Ok(Ok(report)) => merge_local_cost_report(&mut usage, report),
+            Ok(Err(err)) => warnings.push(format!("Claude local cost scan failed: {err}")),
+            Err(err) => warnings.push(format!("Claude local cost scan task failed: {err}")),
+        }
 
         Ok(ProviderCollectionResult {
             usage,
             collection_mode: CLAUDE_COLLECTION_MODE.to_string(),
             raw_payload: self.capture_raw_payloads.then_some(payload),
-            warnings: Vec::new(),
+            warnings,
         })
     }
 }

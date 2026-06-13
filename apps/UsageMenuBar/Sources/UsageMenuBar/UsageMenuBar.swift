@@ -417,8 +417,8 @@ enum UsageWindowKind: Equatable, Decodable {
         switch s { case "session": .session; case "daily": .daily; case "weekly": .weekly; case "monthly": .monthly; case "credits": .credits; case "tokens": .tokens; default: .other(s) }
     }
 }
-enum UsageUnit: Equatable, Decodable { case tokens, requests, credits, percent, unknown, other(String)
-    init(from decoder: Decoder) throws { switch try decoder.singleValueContainer().decode(String.self) { case "tokens": self = .tokens; case "requests": self = .requests; case "credits": self = .credits; case "percent": self = .percent; case "unknown": self = .unknown; case let s: self = .other(s) } }
+enum UsageUnit: Equatable, Decodable { case tokens, requests, credits, usd, percent, unknown, other(String)
+    init(from decoder: Decoder) throws { switch try decoder.singleValueContainer().decode(String.self) { case "tokens": self = .tokens; case "requests": self = .requests; case "credits": self = .credits; case "usd": self = .usd; case "percent": self = .percent; case "unknown": self = .unknown; case let s: self = .other(s) } }
 }
 enum ProviderHealthStatus: Equatable, Decodable { case ok, credentialsMissing, authFailed, rateLimited, providerError, parseError, backingOff, disabled, other(String)
     init(from decoder: Decoder) throws { switch try decoder.singleValueContainer().decode(String.self) { case "ok": self = .ok; case "credentials_missing": self = .credentialsMissing; case "auth_failed": self = .authFailed; case "rate_limited": self = .rateLimited; case "provider_error": self = .providerError; case "parse_error": self = .parseError; case "backing_off": self = .backingOff; case "disabled": self = .disabled; case let s: self = .other(s) } }
@@ -494,7 +494,7 @@ struct MetricEngine {
     }
     private func model(_ id: String) -> ProviderVM {
         let latest = snapshots.filter { $0.providerId == id }.max { $0.collectedAt < $1.collectedAt }
-        let h = health.first { $0.providerId == id }
+        let h = selectedHealth(providerId: id, accountId: latest?.accountId)
         let account = accounts.first { $0.id == latest?.accountId || $0.id == h?.accountId }
         let windows = (latest?.windows ?? []).filter { $0.kind != .credits }.map(window)
         let credits = (latest?.windows ?? []).filter { $0.kind == .credits }.map(window)
@@ -511,6 +511,13 @@ struct MetricEngine {
             visibleInMenu: visible(id),
             enabled: enabled
         )
+    }
+    private func selectedHealth(providerId: String, accountId: String?) -> ProviderHealth? {
+        let providerHealth = health.filter { $0.providerId == providerId }
+        if let accountId, let accountHealth = providerHealth.first(where: { $0.accountId == accountId }) {
+            return accountHealth
+        }
+        return providerHealth.max { $0.updatedAt < $1.updatedAt }
     }
     private func window(_ w: UsageWindow) -> WindowVM {
         let percent = w.percentRemaining ?? computedPercent(w)
@@ -534,7 +541,11 @@ struct MetricEngine {
         return max(0, min(100, 100 - used.value / limit.value * 100))
     }
     private func same(_ a: UsageUnit, _ b: UsageUnit) -> Bool { String(describing: a) == String(describing: b) }
-    private func amount(_ a: UsageAmount?) -> String { a.map { "\(Int($0.value.rounded())) \($0.unit.label)" } ?? "No data" }
+    private func amount(_ a: UsageAmount?) -> String {
+        guard let a else { return "No data" }
+        if a.unit == .usd { return a.value.formatted(.currency(code: "USD")) }
+        return "\(Int(a.value.rounded())) \(a.unit.label)"
+    }
     private func pretty(_ id: String) -> String { id == "codex" ? "Codex" : id == "claude" ? "Claude" : id.capitalized }
     private func short(_ id: String) -> String { id == "codex" ? "Cdx" : id == "claude" ? "Clde" : String(pretty(id).prefix(4)) }
     private func symbol(_ id: String) -> String { id == "codex" ? "terminal" : id == "claude" ? "sparkles" : "chart.bar" }
@@ -542,7 +553,7 @@ struct MetricEngine {
     private func time(_ d: Date) -> String { d.formatted(date: .omitted, time: .shortened) }
     private func relative(_ d: Date) -> String { d.formatted(.relative(presentation: .numeric)) }
 }
-extension UsageUnit { var label: String { switch self { case .tokens: "tokens"; case .requests: "requests"; case .credits: "credits"; case .percent: "%"; case .unknown: "units"; case .other(let s): s } } }
+extension UsageUnit { var label: String { switch self { case .tokens: "tokens"; case .requests: "requests"; case .credits: "credits"; case .usd: "USD"; case .percent: "%"; case .unknown: "units"; case .other(let s): s } } }
 extension String { var camelSplit: String { replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression).lowercased() } }
 
 enum ProviderBrand {

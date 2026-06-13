@@ -166,6 +166,21 @@ impl Storage {
         .await
     }
 
+    pub async fn delete_provider_level_health(
+        &self,
+        provider_id: &ProviderId,
+    ) -> anyhow::Result<()> {
+        let provider_id = provider_id.clone();
+        self.with_connection(move |conn| {
+            conn.execute(
+                "DELETE FROM provider_health WHERE provider_id = ?1 AND account_id = ''",
+                params![provider_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn latest_usage(&self) -> anyhow::Result<Vec<UsageSnapshot>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -387,6 +402,52 @@ mod tests {
         assert_eq!(health.len(), 1);
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
         assert_eq!(health[0].collection_mode.as_deref(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn deletes_provider_level_health_without_touching_account_health() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account_id = AccountId::new("account-id");
+
+        storage
+            .upsert_health(&ProviderHealth {
+                provider_id: provider_id.clone(),
+                account_id: None,
+                status: ProviderHealthStatus::CredentialsMissing,
+                collection_mode: None,
+                last_success_at: None,
+                last_failure_at: Some(Utc::now()),
+                last_error_code: Some("credentials_missing".to_string()),
+                last_error_message: Some("missing".to_string()),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        storage
+            .upsert_health(&ProviderHealth {
+                provider_id: provider_id.clone(),
+                account_id: Some(account_id.clone()),
+                status: ProviderHealthStatus::Ok,
+                collection_mode: Some("live".to_string()),
+                last_success_at: Some(Utc::now()),
+                last_failure_at: None,
+                last_error_code: None,
+                last_error_message: None,
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        storage
+            .delete_provider_level_health(&provider_id)
+            .await
+            .unwrap();
+
+        let health = storage.provider_health().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].account_id.as_ref(), Some(&account_id));
+        assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
     }
 
     fn test_storage() -> Storage {
