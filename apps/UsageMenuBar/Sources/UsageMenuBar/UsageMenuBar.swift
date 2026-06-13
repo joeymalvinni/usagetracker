@@ -1196,9 +1196,39 @@ extension View {
     func liquidGlassRoot() -> some View {
         if #available(macOS 26.0, *) {
             glassEffect(
-                .regular.tint(.white.opacity(0.08)),
+                .regular.tint(.white.opacity(0.20)),
                 in: RoundedRectangle(cornerRadius: 18, style: .continuous)
             )
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                .white.opacity(0.65),
+                                .white.opacity(0.26),
+                                .white.opacity(0.08),
+                                .black.opacity(0.14),
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1.1
+                    )
+            }
+            .overlay(alignment: .top) {
+                Capsule()
+                    .fill(.white.opacity(0.34))
+                    .frame(height: 1)
+                    .padding(.horizontal, 28)
+                    .padding(.top, 1)
+            }
+            .overlay(alignment: .leading) {
+                Capsule()
+                    .fill(.white.opacity(0.20))
+                    .frame(width: 1)
+                    .padding(.vertical, 28)
+                    .padding(.leading, 1)
+            }
         } else {
             background(.regularMaterial)
         }
