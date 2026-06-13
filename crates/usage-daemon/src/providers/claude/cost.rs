@@ -69,6 +69,7 @@ pub(super) fn merge_local_cost_report(usage: &mut ProviderUsage, report: ClaudeC
         "total_cost_usd": report.total_cost_usd,
         "total_tokens": report.total_tokens,
         "unpriced_tokens": report.unpriced_tokens,
+        "by_day": daily_cost_rows(&report.by_day),
         "by_model": report.by_model,
     });
 }
@@ -119,7 +120,21 @@ pub(super) struct ClaudeCostReport {
     total_cost_usd: f64,
     total_tokens: u64,
     unpriced_tokens: u64,
+    by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     by_model: BTreeMap<String, ClaudeModelCostSummary>,
+}
+
+#[derive(Debug, Default)]
+struct DailyCostSummary {
+    cost_usd: f64,
+    tokens: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DailyCostRow {
+    date: String,
+    cost_usd: f64,
+    tokens: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -283,6 +298,11 @@ fn add_claude_usage_row(
         if let Some(cost) = cost {
             report.lookback_cost_usd += cost;
         }
+        let day = report.by_day.entry(date).or_default();
+        day.tokens = day.tokens.saturating_add(tokens);
+        if let Some(cost) = cost {
+            day.cost_usd += cost;
+        }
     }
 
     let summary = report
@@ -303,6 +323,17 @@ fn add_claude_usage_row(
     if let Some(cost) = cost {
         summary.cost_usd += cost;
     }
+}
+
+fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) -> Vec<DailyCostRow> {
+    by_day
+        .iter()
+        .map(|(date, summary)| DailyCostRow {
+            date: date.to_string(),
+            cost_usd: summary.cost_usd,
+            tokens: summary.tokens,
+        })
+        .collect()
 }
 
 fn claude_usage_row(event: &Value) -> Option<ClaudeUsageRow> {

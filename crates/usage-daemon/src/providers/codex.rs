@@ -301,6 +301,7 @@ impl CodexUsageCostExt for ProviderUsage {
             "total_cost_usd": report.total_cost_usd,
             "total_tokens": report.total_tokens,
             "unpriced_tokens": report.unpriced_tokens,
+            "by_day": daily_cost_rows(&report.by_day),
             "by_model": report.by_model,
         });
     }
@@ -352,7 +353,21 @@ struct CodexCostReport {
     total_cost_usd: f64,
     total_tokens: u64,
     unpriced_tokens: u64,
+    by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     by_model: BTreeMap<String, CodexModelCostSummary>,
+}
+
+#[derive(Debug, Default)]
+struct DailyCostSummary {
+    cost_usd: f64,
+    tokens: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DailyCostRow {
+    date: String,
+    cost_usd: f64,
+    tokens: u64,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -516,6 +531,11 @@ fn scan_codex_session_file(
             if let Some(cost) = cost {
                 report.lookback_cost_usd += cost;
             }
+            let day = report.by_day.entry(date).or_default();
+            day.tokens = day.tokens.saturating_add(tokens);
+            if let Some(cost) = cost {
+                day.cost_usd += cost;
+            }
         }
 
         let summary = report
@@ -531,6 +551,17 @@ fn scan_codex_session_file(
     }
 
     Ok(())
+}
+
+fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) -> Vec<DailyCostRow> {
+    by_day
+        .iter()
+        .map(|(date, summary)| DailyCostRow {
+            date: date.to_string(),
+            cost_usd: summary.cost_usd,
+            tokens: summary.tokens,
+        })
+        .collect()
 }
 
 trait CodexTotalsAdd {

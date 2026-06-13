@@ -27,7 +27,7 @@ import SwiftUI
         item.button?.action = #selector(toggle)
 
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 540, height: 560)
+        popover.contentSize = NSSize(width: 460, height: 560)
         popover.contentViewController = NSHostingController(rootView: Popover().environmentObject(state))
 
         state.$menuTitle.receive(on: RunLoop.main).sink { [weak self] title in self?.item.button?.attributedTitle = title }.store(in: &bag)
@@ -48,7 +48,7 @@ import SwiftUI
     // inspected/screenshotted without clicking the status item.
     private var debugWindow: NSWindow?
     private func showDebugWindow() {
-        let size = NSSize(width: 540, height: 560)
+        let size = NSSize(width: 460, height: 560)
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
@@ -85,6 +85,7 @@ import SwiftUI
     @Published var pendingProviders = Set<String>()
     @Published var pendingInterval = false
     @Published var providers = [ProviderVM]()
+    @Published var cost = CostDashboardVM.empty
     @Published var menuTitle = NSAttributedString(string: "Usage")
     @Published var menuPreview = ""
     @Published var ui = UIConfig.load() {
@@ -161,7 +162,9 @@ import SwiftUI
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
     private func build() {
-        providers = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, ui: ui, visible: uiVisible).providers
+        let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, ui: ui, visible: uiVisible)
+        providers = engine.providers
+        cost = engine.costDashboard
         let (title, preview) = menuContent()
         menuTitle = title
         menuPreview = preview
@@ -438,6 +441,23 @@ enum JSONValue: Decodable, Equatable {
         else if let v = try? c.decode([JSONValue].self) { self = .array(v) }
         else { self = .object(try c.decode([String: JSONValue].self)) }
     }
+    var object: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
+    var array: [JSONValue]? { if case .array(let value) = self { value } else { nil } }
+    var string: String? { if case .string(let value) = self { value } else { nil } }
+    var double: Double? {
+        switch self {
+        case .number(let value): value
+        case .string(let value): Double(value)
+        default: nil
+        }
+    }
+    var uint64: UInt64? {
+        switch self {
+        case .number(let value): value >= 0 ? UInt64(value.rounded()) : nil
+        case .string(let value): UInt64(value)
+        default: nil
+        }
+    }
 }
 
 extension JSONDecoder {
@@ -455,6 +475,7 @@ extension JSONDecoder {
 enum DateFormats {
     static let fractional: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
     static let whole: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
+    static let dayKey: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"; return f }()
 }
 
 struct ProviderVM: Identifiable, Equatable {
@@ -468,6 +489,34 @@ struct ProviderVM: Identifiable, Equatable {
     let enabled: Bool
 }
 struct WindowVM: Identifiable, Equatable { let id, label, value, reset: String; let percent: Double?; let status: DisplayStatus }
+struct CostDashboardVM: Equatable {
+    static let empty = CostDashboardVM(days: [], providers: [])
+    let days: [CostDayVM]
+    let providers: [CostProviderVM]
+
+    var hasData: Bool { days.contains { $0.totalCost > 0 || $0.totalTokens > 0 } }
+    var todayCost: Double { days.last?.totalCost ?? 0 }
+    var todayTokens: UInt64 { days.last?.totalTokens ?? 0 }
+    var cost30d: Double { days.reduce(0) { $0 + $1.totalCost } }
+    var tokens30d: UInt64 { days.reduce(0) { $0.saturatingAdd($1.totalTokens) } }
+}
+struct CostProviderVM: Identifiable, Equatable { let id, name, symbol: String }
+struct CostDayVM: Identifiable, Equatable {
+    let id: String
+    let date: Date
+    let providers: [CostProviderDayVM]
+
+    var totalCost: Double { providers.reduce(0) { $0 + $1.cost } }
+    var totalTokens: UInt64 { providers.reduce(0) { $0.saturatingAdd($1.tokens) } }
+}
+struct CostProviderDayVM: Identifiable, Equatable {
+    var id: String { providerId }
+    let providerId, providerName, symbol: String
+    let date: Date
+    let dateKey: String
+    let cost: Double
+    let tokens: UInt64
+}
 enum DisplayStatus { case normal, warning, critical, stale, error, disabled, offline
     var color: Color { switch self { case .normal: .primary; case .warning: .orange; case .critical, .error, .offline: .red; case .stale, .disabled: .secondary } }
     var menuColor: NSColor? { switch self { case .warning: .systemOrange; case .critical, .error: .systemRed; default: nil } }
@@ -485,6 +534,60 @@ struct MetricEngine {
         var ids = Set((config?.enabledProviders ?? []) + health.map(\.providerId) + snapshots.map(\.providerId))
         if let config { ids.formUnion(config.providers.keys) }
         return ordered(Array(ids)).map(model)
+    }
+    var costDashboard: CostDashboardVM {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let dayStarts = (0..<30).compactMap { offset in
+            calendar.date(byAdding: .day, value: offset - 29, to: today)
+        }
+        let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
+        let knownProviders = ordered(Array(Set(snapshots.map(\.providerId) + ["codex", "claude"])))
+        var providerRows = [String: [String: (cost: Double, tokens: UInt64)]]()
+        var activeProviderIds = Set<String>()
+
+        for snapshot in snapshots {
+            let providerId = snapshot.providerId
+            guard let cost = snapshot.metadata.object?["\(providerId)_cost"]?.object else { continue }
+            let rows = cost["by_day"]?.array ?? synthesizedTodayRow(from: cost, todayKey: dayKeys.last)
+            for rowValue in rows {
+                guard let row = rowValue.object,
+                      let dateKey = row["date"]?.string,
+                      dayKeys.contains(dateKey)
+                else { continue }
+                let rowCost = row["cost_usd"]?.double ?? 0
+                let rowTokens = row["tokens"]?.uint64 ?? 0
+                if rowCost <= 0 && rowTokens == 0 { continue }
+                let existing = providerRows[providerId]?[dateKey] ?? (0, 0)
+                providerRows[providerId, default: [:]][dateKey] = (
+                    existing.cost + rowCost,
+                    existing.tokens.saturatingAdd(rowTokens)
+                )
+                activeProviderIds.insert(providerId)
+            }
+        }
+
+        let providerIds = knownProviders.filter { activeProviderIds.contains($0) }
+        let providers = providerIds.map { CostProviderVM(id: $0, name: pretty($0), symbol: symbol($0)) }
+        let days = zip(dayStarts, dayKeys).map { date, key in
+            CostDayVM(
+                id: key,
+                date: date,
+                providers: providerIds.map { providerId in
+                    let value = providerRows[providerId]?[key] ?? (0, 0)
+                    return CostProviderDayVM(
+                        providerId: providerId,
+                        providerName: pretty(providerId),
+                        symbol: symbol(providerId),
+                        date: date,
+                        dateKey: key,
+                        cost: value.cost,
+                        tokens: value.tokens
+                    )
+                }
+            )
+        }
+        return CostDashboardVM(days: days, providers: providers)
     }
     private func ordered(_ ids: [String]) -> [String] {
         let preferred = ui.providerOrder + ["codex", "claude"]
@@ -546,6 +649,17 @@ struct MetricEngine {
         if a.unit == .usd { return a.value.formatted(.currency(code: "USD")) }
         return "\(Int(a.value.rounded())) \(a.unit.label)"
     }
+    private func synthesizedTodayRow(from cost: [String: JSONValue], todayKey: String?) -> [JSONValue] {
+        guard let todayKey,
+              let tokens = cost["today_tokens"]?.uint64,
+              tokens > 0
+        else { return [] }
+        return [.object([
+            "date": .string(todayKey),
+            "cost_usd": .number(cost["today_cost_usd"]?.double ?? 0),
+            "tokens": .number(Double(tokens)),
+        ])]
+    }
     private func pretty(_ id: String) -> String { id == "codex" ? "Codex" : id == "claude" ? "Claude" : id.capitalized }
     private func short(_ id: String) -> String { id == "codex" ? "Cdx" : id == "claude" ? "Clde" : String(pretty(id).prefix(4)) }
     private func symbol(_ id: String) -> String { id == "codex" ? "terminal" : id == "claude" ? "sparkles" : "chart.bar" }
@@ -555,6 +669,33 @@ struct MetricEngine {
 }
 extension UsageUnit { var label: String { switch self { case .tokens: "tokens"; case .requests: "requests"; case .credits: "credits"; case .usd: "USD"; case .percent: "%"; case .unknown: "units"; case .other(let s): s } } }
 extension String { var camelSplit: String { replacingOccurrences(of: "([a-z])([A-Z])", with: "$1 $2", options: .regularExpression).lowercased() } }
+extension UInt64 {
+    func saturatingAdd(_ other: UInt64) -> UInt64 {
+        let result = addingReportingOverflow(other)
+        return result.overflow ? UInt64.max : result.partialValue
+    }
+}
+
+func providerColor(_ id: String) -> Color {
+    switch id {
+    case "codex": .green
+    case "claude": .orange
+    default: .blue
+    }
+}
+
+func formatUsd(_ value: Double) -> String {
+    if value > 0 && value < 0.01 { return "<$0.01" }
+    return value.formatted(.currency(code: "USD"))
+}
+
+func formatTokens(_ value: UInt64) -> String {
+    Double(value).formatted(.number.notation(.compactName).precision(.fractionLength(0...1)))
+}
+
+func shortDate(_ date: Date) -> String {
+    date.formatted(.dateTime.month(.abbreviated).day())
+}
 
 enum ProviderBrand {
     @MainActor private static var cache = [String: NSImage?]()
@@ -619,7 +760,7 @@ struct Popover: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 540, height: 560)
+        .frame(width: 460, height: 560)
         .background(.regularMaterial)
     }
 }
@@ -652,6 +793,7 @@ struct Summary: View {
             Header(title: "Usage", subtitle: state.daemon == .offline ? (state.message ?? "daemon offline") : "daemon healthy")
             ScrollView { LazyVStack(spacing: 10) {
                 if state.providers.isEmpty { EmptyState(text: state.daemon == .offline ? "Daemon unavailable" : "No providers enabled") }
+                CostDashboard(dashboard: state.cost)
                 ForEach(state.providers) { ProviderRow(provider: $0) }
             }.padding(.bottom, 10) }
         }.padding(18)
@@ -668,6 +810,137 @@ struct Header: View {
             Button { Task { await state.refreshAll() } } label: { Image(systemName: state.refreshing ? "arrow.triangle.2.circlepath.circle" : "arrow.clockwise").frame(width: 28, height: 28) }
                 .buttonStyle(.borderless).help("Refresh")
         }
+    }
+}
+
+enum CostRange: Int, CaseIterable {
+    case seven = 7, thirty = 30
+    var label: String { self == .seven ? "7d" : "30d" }
+}
+
+struct CostDashboard: View {
+    let dashboard: CostDashboardVM
+    @State private var range: CostRange = .seven
+    @State private var hover: CostProviderDayVM?
+
+    private var days: [CostDayVM] { Array(dashboard.days.suffix(range.rawValue)) }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Activity").font(.headline)
+                        Text(hover.map(hoverText) ?? activitySubtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    Spacer()
+                    Picker("", selection: $range) {
+                        ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }.pickerStyle(.segmented).labelsHidden().frame(width: 86)
+                }
+                CostActivityChart(days: days, hover: $hover)
+                    .frame(height: 152)
+                HStack(spacing: 10) {
+                    ForEach(dashboard.providers) { provider in
+                        HStack(spacing: 5) {
+                            Circle().fill(providerColor(provider.id)).frame(width: 7, height: 7)
+                            Text(provider.name).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                }
+            }.glass()
+
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
+                CostKPI(title: "Today cost", value: formatUsd(dashboard.todayCost))
+                CostKPI(title: "30d cost", value: formatUsd(dashboard.cost30d))
+                CostKPI(title: "Today tokens", value: formatTokens(dashboard.todayTokens))
+                CostKPI(title: "30d tokens", value: formatTokens(dashboard.tokens30d))
+            }
+        }
+    }
+
+    private var activitySubtitle: String {
+        if dashboard.hasData { "\(range.label) spend" }
+        else { "No cost data yet" }
+    }
+    private func hoverText(_ value: CostProviderDayVM) -> String {
+        "\(value.providerName) · \(shortDate(value.date)): \(formatUsd(value.cost)) · \(formatTokens(value.tokens))"
+    }
+}
+
+struct CostActivityChart: View {
+    let days: [CostDayVM]
+    @Binding var hover: CostProviderDayVM?
+
+    private var maxValue: Double {
+        max(1, days.map(total).max() ?? 1)
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            HStack(alignment: .bottom, spacing: days.count > 7 ? 3 : 8) {
+                ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
+                    VStack(spacing: 5) {
+                        ZStack(alignment: .bottom) {
+                            RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.45))
+                            VStack(spacing: 1) {
+                                Spacer(minLength: 0)
+                                ForEach(day.providers.reversed().filter { value($0) > 0 }) { provider in
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(providerColor(provider.providerId).gradient)
+                                        .frame(height: segmentHeight(provider, maxHeight: geo.size.height - 22))
+                                        .onHover { inside in hover = inside ? provider : (hover == provider ? nil : hover) }
+                                        .help("\(provider.providerName) \(shortDate(provider.date)): \(formatUsd(provider.cost))")
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+
+                        Text(label(for: day.date, index: index))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .frame(height: 14)
+                    }
+                }
+            }
+            .onHover { inside in if !inside { hover = nil } }
+        }
+    }
+
+    private func value(_ provider: CostProviderDayVM) -> Double {
+        provider.cost
+    }
+    private func total(_ day: CostDayVM) -> Double {
+        day.providers.reduce(0) { $0 + value($1) }
+    }
+    private func segmentHeight(_ provider: CostProviderDayVM, maxHeight: CGFloat) -> CGFloat {
+        let scaled = maxHeight * CGFloat(value(provider) / maxValue)
+        return max(4, scaled)
+    }
+    private func label(for date: Date, index: Int) -> String {
+        if days.count <= 7 {
+            return date.formatted(.dateTime.weekday(.narrow))
+        }
+        if index == 0 || index == days.count - 1 || index % 5 == 0 {
+            return date.formatted(.dateTime.day())
+        }
+        return ""
+    }
+}
+
+struct CostKPI: View {
+    let title, value: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.system(.subheadline, design: .rounded).weight(.semibold)).monospacedDigit().lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 2)
+        .padding(.vertical, 1)
     }
 }
 
