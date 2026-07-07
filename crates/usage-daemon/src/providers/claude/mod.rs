@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 use usage_core::ProviderId;
 
 use crate::providers::{
@@ -22,10 +23,10 @@ pub const PROVIDER_ID: &str = "claude";
 const CLAUDE_CREDENTIALS_FILE: &str = ".claude/.credentials.json";
 const CLAUDE_COLLECTION_MODE: &str = "oauth_usage_api";
 
-#[derive(Clone)]
 pub struct ClaudeCollector {
     keychain_account: String,
     credentials_file_path: PathBuf,
+    credentials_cache: Mutex<Option<ClaudeCredentials>>,
     api: ClaudeApiClient,
     capture_raw_payloads: bool,
 }
@@ -37,23 +38,40 @@ impl ClaudeCollector {
         Ok(Self {
             keychain_account: std::env::var("USER").unwrap_or_else(|_| "default".to_string()),
             credentials_file_path: home.join(CLAUDE_CREDENTIALS_FILE),
+            credentials_cache: Mutex::new(None),
             api: ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?,
             capture_raw_payloads,
         })
     }
 
     async fn load_credentials(&self) -> Result<ClaudeCredentials, ProviderError> {
-        load_credentials(
+        if let Some(credentials) = self.credentials_cache.lock().await.clone() {
+            return Ok(credentials);
+        }
+
+        let credentials = load_credentials(
             self.keychain_account.clone(),
             self.credentials_file_path.clone(),
         )
-        .await
+        .await?;
+
+        *self.credentials_cache.lock().await = Some(credentials.clone());
+        Ok(credentials)
+    }
+
+    async fn refresh_credentials(
+        &self,
+        credentials: ClaudeCredentials,
+    ) -> Result<ClaudeCredentials, ProviderError> {
+        let refreshed = self.api.refresh_credentials(credentials).await?;
+        *self.credentials_cache.lock().await = Some(refreshed.clone());
+        Ok(refreshed)
     }
 
     async fn load_with_auto_refresh(&self) -> Result<ClaudeCredentials, ProviderError> {
         let credentials = self.load_credentials().await?;
         if credentials.is_expired() {
-            self.api.refresh_credentials(credentials).await
+            self.refresh_credentials(credentials).await
         } else {
             Ok(credentials)
         }
@@ -88,7 +106,7 @@ impl ProviderCollector for ClaudeCollector {
 
         let payload = match self.api.fetch_usage(&credentials).await {
             Err(err) if err.kind() == ProviderErrorKind::Unauthorized => {
-                credentials = self.api.refresh_credentials(credentials).await?;
+                credentials = self.refresh_credentials(credentials).await?;
                 self.api.fetch_usage(&credentials).await?
             }
             result => result?,
