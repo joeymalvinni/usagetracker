@@ -92,7 +92,23 @@ import SwiftUI
         didSet { ui.save(); build() }
     }
 
-    private var socketPath = ProcessInfo.processInfo.environment["USAGE_TRACKER_SOCKET"] ?? UIPaths.socket.path
+    private var socketPath: String {
+        didSet {
+            if socketPath != oldValue { client = DaemonClient(socketPath: socketPath) }
+        }
+    }
+    private var client: DaemonClient
+
+    init() {
+        let socketPath = AppState.defaultSocketPath()
+        self.socketPath = socketPath
+        self.client = DaemonClient(socketPath: socketPath)
+    }
+
+    init(socketPath: String) {
+        self.socketPath = socketPath
+        self.client = DaemonClient(socketPath: socketPath)
+    }
 
     func bootstrap() async { await load(all: true) }
     func refreshForPopoverOpen() async { await load(all: false) }
@@ -142,11 +158,20 @@ import SwiftUI
         ui.providerOrder = order
     }
 
-    private var client: DaemonClient { DaemonClient(socketPath: socketPath) }
+    private static func defaultSocketPath() -> String {
+        ProcessInfo.processInfo.environment["USAGE_TRACKER_SOCKET"] ?? UIPaths.socket.path
+    }
+    private func path(from config: ConfigResponse? = nil) -> String {
+        config?.socketPath ?? socketPath
+    }
+    private func updateSocketPath(from config: ConfigResponse?) {
+        socketPath = path(from: config)
+    }
     private func uiVisible(_ id: String) -> Bool { ui.hiddenProviders.contains(id) == false }
     private func load(all: Bool) async {
         do {
-            config = try await client.config(); socketPath = config?.socketPath ?? socketPath
+            config = try await client.config()
+            updateSocketPath(from: config)
             if all { accounts = try await client.accounts() }
             async let h = client.health()
             async let u = client.usage()
@@ -178,7 +203,7 @@ import SwiftUI
             if index > 0 { title.append(NSAttributedString(string: "  ")); preview += "  " }
             let value: String
             if let percent = provider.percent {
-                let displayed = ui.menuMetric == .used ? 100 - percent : percent
+                let displayed = max(0, min(100, ui.menuMetric == .used ? 100 - percent : percent))
                 value = "\(Int(displayed.rounded()))%"
             } else {
                 value = provider.primary
@@ -259,27 +284,25 @@ struct DaemonClient {
     }
 
     private func send(_ request: DaemonRequest, _ seconds: Double) async throws -> DaemonResponse {
-        try await withThrowingTaskGroup(of: DaemonResponse.self) { group in
-            group.addTask {
-                let line = try String(decoding: encoder.encode(request) + [10], as: UTF8.self)
-                let response = try Socket.line(path: socketPath, request: line)
-                let decoded = try decoder.decode(DaemonResponse.self, from: Data(response.utf8))
-                if case let .error(error) = decoded { throw DaemonError.api(error.message) }
-                return decoded
-            }
-            group.addTask { try await Task.sleep(for: .seconds(seconds)); throw DaemonError.timeout }
-            let value = try await group.next()!
-            group.cancelAll()
-            return value
-        }
+        try Task.checkCancellation()
+        let line = try String(decoding: encoder.encode(request) + [10], as: UTF8.self)
+        let response = try Socket.line(path: socketPath, request: line, timeout: seconds)
+        try Task.checkCancellation()
+        let decoded = try decoder.decode(DaemonResponse.self, from: Data(response.utf8))
+        if case let .error(error) = decoded { throw DaemonError.api(error.message) }
+        return decoded
     }
 }
 
 enum Socket {
-    static func line(path: String, request: String) throws -> String {
+    static func line(path: String, request: String, timeout: Double) throws -> String {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.transport(errno) }
         defer { close(fd) }
+        let deadline = Date().addingTimeInterval(timeout)
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else { throw DaemonError.transport(errno) }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -287,23 +310,59 @@ enum Socket {
         withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
         let len = socklen_t(MemoryLayout<sa_family_t>.size + bytes.count)
         let connected = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) } }
-        guard connected == 0 else { throw DaemonError.transport(errno) }
+        if connected != 0 {
+            let code = errno
+            guard code == EINPROGRESS || code == EWOULDBLOCK else { throw DaemonError.transport(code) }
+            try wait(fd: fd, events: Int16(POLLOUT), deadline: deadline)
+            var error = Int32(0)
+            var length = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 else { throw DaemonError.transport(errno) }
+            guard error == 0 else { throw DaemonError.transport(error) }
+        }
 
         var out = Array(request.utf8)
         while !out.isEmpty {
             let sent = out.withUnsafeBytes { write(fd, $0.baseAddress!, out.count) }
-            guard sent > 0 else { throw DaemonError.transport(errno) }
-            out.removeFirst(sent)
+            if sent > 0 {
+                out.removeFirst(sent)
+            } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                try wait(fd: fd, events: Int16(POLLOUT), deadline: deadline)
+            } else if errno != EINTR {
+                throw DaemonError.transport(errno)
+            }
         }
 
         var data = [UInt8](), buf = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = read(fd, &buf, buf.count)
-            guard n > 0 else { throw DaemonError.closed }
-            if let i = buf[..<n].firstIndex(of: 10) { data += buf[..<i]; break }
-            data += buf[..<n]
+            if n > 0 {
+                if let i = buf[..<n].firstIndex(of: 10) { data += buf[..<i]; break }
+                data += buf[..<n]
+            } else if n == 0 {
+                throw DaemonError.closed
+            } else if errno == EAGAIN || errno == EWOULDBLOCK {
+                try wait(fd: fd, events: Int16(POLLIN), deadline: deadline)
+            } else if errno != EINTR {
+                throw DaemonError.transport(errno)
+            }
         }
         return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func wait(fd: Int32, events: Int16, deadline: Date) throws {
+        while true {
+            var pollFd = pollfd(fd: fd, events: events, revents: 0)
+            let result = poll(&pollFd, 1, remainingMilliseconds(until: deadline))
+            if result > 0 { return }
+            if result == 0 { throw DaemonError.timeout }
+            if errno != EINTR { throw DaemonError.transport(errno) }
+        }
+    }
+
+    private static func remainingMilliseconds(until deadline: Date) -> Int32 {
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { return 0 }
+        return min(Int32.max, max(1, Int32((remaining * 1000).rounded(.up))))
     }
 }
 
@@ -623,7 +682,7 @@ struct MetricEngine {
         return providerHealth.max { $0.updatedAt < $1.updatedAt }
     }
     private func window(_ w: UsageWindow) -> WindowVM {
-        let percent = w.percentRemaining ?? computedPercent(w)
+        let percent = (w.percentRemaining ?? computedPercent(w)).map { max(0, min(100, $0)) }
         let status: DisplayStatus = percent.map { $0 < 10 ? .critical : ($0 < 25 ? .warning : .normal) } ?? .normal
         return WindowVM(id: w.id, label: w.label, value: percent.map { "\(Int($0.rounded()))% left" } ?? amount(w.remaining ?? w.used), reset: w.resetAt.map { "resets \(time($0))" } ?? "", percent: percent, status: status)
     }
@@ -890,7 +949,7 @@ struct CostActivityChart: View {
                                     RoundedRectangle(cornerRadius: 3)
                                         .fill(providerColor(provider.providerId).gradient)
                                         .frame(height: segmentHeight(provider, maxHeight: geo.size.height - 22))
-                                        .onHover { inside in hover = inside ? provider : (hover == provider ? nil : hover) }
+                                        .onHover { inside in if inside { hover = provider } }
                                         .help("\(provider.providerName) \(shortDate(provider.date)): \(formatUsd(provider.cost))")
                                 }
                             }
