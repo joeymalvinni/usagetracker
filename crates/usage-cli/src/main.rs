@@ -8,7 +8,10 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-use usage_core::{default_socket_path, ApiRequest, ApiResponse, ProviderId};
+use usage_core::{
+    default_socket_path, Account, ApiRequest, ApiResponse, ConfigResponse, ProviderHealth,
+    ProviderId, UsageSnapshot,
+};
 
 mod render;
 
@@ -41,14 +44,20 @@ enum ColorChoice {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Summary of systems operations.
     Status,
+    /// Consumption dashboard.
     Usage,
+    /// Refresh providers.
     Refresh {
         #[arg(long = "provider")]
         providers: Vec<String>,
     },
+    /// Daemon and provider health.
     Health,
+    /// Identity mapping.
     Accounts,
+    /// Daemon config.
     Config,
 }
 
@@ -56,18 +65,17 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let command = args.command.unwrap_or(Command::Usage);
-    let usage_command = matches!(command, Command::Status | Command::Usage);
-    let request = match command {
-        Command::Status | Command::Usage => ApiRequest::GetUsage,
+    let request = match &command {
+        Command::Status | Command::Usage | Command::Health => ApiRequest::GetUsage,
         Command::Refresh { providers } => ApiRequest::Refresh {
             providers: (!providers.is_empty()).then(|| {
                 providers
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(ProviderId::new)
                     .collect::<Vec<_>>()
             }),
         },
-        Command::Health => ApiRequest::GetProviderHealth,
         Command::Accounts => ApiRequest::GetAccounts,
         Command::Config => ApiRequest::GetConfig,
     };
@@ -76,36 +84,122 @@ async fn main() -> anyhow::Result<()> {
         .socket_path
         .or_else(default_socket_path)
         .context("failed to resolve ~/.usagetracker/usage.sock")?;
+    if matches!(command, Command::Status | Command::Health) {
+        let snapshots = fetch_usage(&socket_path).await?;
+        let accounts = fetch_accounts(&socket_path).await?;
+        let health = fetch_health(&socket_path).await?;
+        let config = fetch_config(&socket_path).await?;
+        let status = render::StatusView::from_parts(
+            socket_path.display().to_string(),
+            &snapshots,
+            &accounts,
+            &health,
+            &config,
+        );
+        if args.style == OutputStyle::Json {
+            println!("{}", serde_json::to_string(&status)?);
+        } else {
+            println!(
+                "{}",
+                render::render_status(&status, args.style, color_enabled(args.color))
+            );
+        }
+        return Ok(());
+    }
+
     let response = send_request(&socket_path, &request).await?;
-    if usage_command && args.style != OutputStyle::Json {
-        let accounts = match send_request(&socket_path, &ApiRequest::GetAccounts).await? {
-            ApiResponse::Accounts { accounts } => accounts,
-            ApiResponse::Error { error } => {
-                bail!("daemon returned {}: {}", error.code, error.message);
-            }
-            other => bail!("daemon returned unexpected accounts response: {other:?}"),
-        };
-        match response {
-            ApiResponse::Usage { snapshots } => {
+    if args.style == OutputStyle::Json {
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        let color = color_enabled(args.color);
+        match (command, response) {
+            (Command::Usage, ApiResponse::Usage { snapshots }) => {
+                let accounts = fetch_accounts(&socket_path).await?;
                 println!(
                     "{}",
-                    render::render_usage(
-                        &snapshots,
+                    render::render_usage(&snapshots, &accounts, args.style, color)
+                );
+            }
+            (Command::Accounts, ApiResponse::Accounts { accounts }) => {
+                let snapshots = fetch_usage(&socket_path).await?;
+                println!(
+                    "{}",
+                    render::render_accounts(&accounts, &snapshots, args.style, color)
+                );
+            }
+            (Command::Config, ApiResponse::Config { config }) => {
+                println!("{}", render::render_config(&config, args.style, color));
+            }
+            (
+                Command::Refresh { .. },
+                ApiResponse::Refresh {
+                    started_at,
+                    finished_at,
+                    provider_results,
+                },
+            ) => {
+                let accounts = fetch_accounts(&socket_path).await?;
+                let snapshots = fetch_usage(&socket_path).await?;
+                println!(
+                    "{}",
+                    render::render_refresh(
+                        started_at,
+                        finished_at,
+                        &provider_results,
                         &accounts,
+                        &snapshots,
                         args.style,
-                        color_enabled(args.color)
+                        color
                     )
                 );
             }
-            ApiResponse::Error { error } => {
+            (_, ApiResponse::Error { error }) => {
                 bail!("daemon returned {}: {}", error.code, error.message);
             }
-            other => bail!("daemon returned unexpected usage response: {other:?}"),
+            (_, other) => bail!("daemon returned unexpected response: {other:?}"),
         }
-    } else {
-        println!("{}", serde_json::to_string(&response)?);
     }
     Ok(())
+}
+
+async fn fetch_accounts(socket_path: &PathBuf) -> anyhow::Result<Vec<Account>> {
+    match send_request(socket_path, &ApiRequest::GetAccounts).await? {
+        ApiResponse::Accounts { accounts } => Ok(accounts),
+        ApiResponse::Error { error } => {
+            bail!("daemon returned {}: {}", error.code, error.message);
+        }
+        other => bail!("daemon returned unexpected accounts response: {other:?}"),
+    }
+}
+
+async fn fetch_usage(socket_path: &PathBuf) -> anyhow::Result<Vec<UsageSnapshot>> {
+    match send_request(socket_path, &ApiRequest::GetUsage).await? {
+        ApiResponse::Usage { snapshots } => Ok(snapshots),
+        ApiResponse::Error { error } => {
+            bail!("daemon returned {}: {}", error.code, error.message);
+        }
+        other => bail!("daemon returned unexpected usage response: {other:?}"),
+    }
+}
+
+async fn fetch_health(socket_path: &PathBuf) -> anyhow::Result<Vec<ProviderHealth>> {
+    match send_request(socket_path, &ApiRequest::GetProviderHealth).await? {
+        ApiResponse::ProviderHealth { health } => Ok(health),
+        ApiResponse::Error { error } => {
+            bail!("daemon returned {}: {}", error.code, error.message);
+        }
+        other => bail!("daemon returned unexpected health response: {other:?}"),
+    }
+}
+
+async fn fetch_config(socket_path: &PathBuf) -> anyhow::Result<ConfigResponse> {
+    match send_request(socket_path, &ApiRequest::GetConfig).await? {
+        ApiResponse::Config { config } => Ok(config),
+        ApiResponse::Error { error } => {
+            bail!("daemon returned {}: {}", error.code, error.message);
+        }
+        other => bail!("daemon returned unexpected config response: {other:?}"),
+    }
 }
 
 fn color_enabled(choice: ColorChoice) -> bool {

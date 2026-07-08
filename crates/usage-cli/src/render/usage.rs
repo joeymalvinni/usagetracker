@@ -5,7 +5,16 @@ use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
 use serde_json::Value;
 use usage_core::{Account, UsageAmount, UsageSnapshot, UsageUnit, UsageWindow, UsageWindowKind};
 
-use crate::OutputStyle;
+use crate::{
+    render::{
+        labels::{identity_labels, metadata_str, plan_label},
+        style::{
+            collapse_spaces, format_collection_mode, format_provider_name, truncate, visible_len,
+            Theme,
+        },
+    },
+    OutputStyle,
+};
 
 const DASHBOARD_WIDTH: usize = 62;
 const BAR_WIDTH: usize = 12;
@@ -22,79 +31,6 @@ pub fn render_usage(
         OutputStyle::Dashboard => render_dashboard(&dashboard, theme),
         OutputStyle::Compact => render_compact(&dashboard, theme),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Theme {
-    color: bool,
-}
-
-impl Theme {
-    fn new(color: bool) -> Self {
-        Self { color }
-    }
-
-    fn paint(self, code: &str, value: &str) -> String {
-        if self.color {
-            format!("\x1b[{code}m{value}\x1b[0m")
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn border(self, value: &str) -> String {
-        self.paint("2;37", value)
-    }
-
-    fn title(self, value: &str) -> String {
-        self.paint("1;97", value)
-    }
-
-    fn label(self, value: &str) -> String {
-        self.paint("2;37", value)
-    }
-
-    fn value(self, value: &str) -> String {
-        self.paint("1;37", value)
-    }
-
-    fn muted(self, value: &str) -> String {
-        self.paint("2;37", value)
-    }
-
-    fn accent(self, value: &str) -> String {
-        self.paint("36", value)
-    }
-
-    fn good(self, value: &str) -> String {
-        self.paint("32", value)
-    }
-
-    fn warn(self, value: &str) -> String {
-        self.paint("33", value)
-    }
-
-    fn danger(self, value: &str) -> String {
-        self.paint("31", value)
-    }
-
-    fn quota(self, percent_remaining: f64, value: &str) -> String {
-        if percent_remaining >= 50.0 {
-            self.good(value)
-        } else if percent_remaining >= 20.0 {
-            self.warn(value)
-        } else {
-            self.danger(value)
-        }
-    }
-
-    fn pace(self, status: &str) -> String {
-        match status {
-            "over" => self.warn(status),
-            "under" | "on track" => self.good(status),
-            _ => self.value(status),
-        }
     }
 }
 
@@ -127,7 +63,7 @@ struct ProviderPanel {
     pace: Option<PaceLine>,
     forecast: Option<String>,
     credits: Option<String>,
-    account: Option<String>,
+    identity: Option<String>,
 }
 
 #[derive(Debug)]
@@ -192,14 +128,15 @@ impl ProviderPanel {
             }
         });
 
+        let labels = identity_labels(account, Some(snapshot));
         Self {
-            title: provider_title(snapshot),
+            title: provider_title(snapshot, labels.plan.as_deref()),
             session: session_window.map(|window| window_line("Session", window)),
             weekly: weekly_window.map(|window| window_line("Weekly", window)),
             pace,
             forecast,
             credits: credits_line(snapshot),
-            account: account_label(snapshot, account),
+            identity: labels.identity,
         }
     }
 }
@@ -267,17 +204,17 @@ fn render_compact(dashboard: &Dashboard, theme: Theme) -> String {
         if let Some(credits) = &provider.credits {
             parts.push(format!("credits {}", collapse_spaces(credits)));
         }
-        let account = provider
-            .account
+        let identity = provider
+            .identity
             .as_ref()
-            .map(|account| format!(" · {account}"))
+            .map(|identity| format!(" · {identity}"))
             .unwrap_or_default();
         let _ = writeln!(
             output,
             "{}: {}{}",
             theme.title(&provider.title),
             parts.join(", "),
-            account
+            identity
         );
     }
 
@@ -360,11 +297,11 @@ fn provider_lines(provider: &ProviderPanel, theme: Theme) -> Vec<String> {
             credits_text(credits, theme)
         ));
     }
-    if let Some(account) = &provider.account {
+    if let Some(identity) = &provider.identity {
         lines.push(format!(
             "{} {}",
-            pad_right(theme.label("Account"), 8),
-            theme.muted(account)
+            pad_right(theme.label("Identity"), 8),
+            theme.muted(identity)
         ));
     }
     lines
@@ -575,12 +512,8 @@ fn role_matches(window: &UsageWindow, role: WindowRole) -> bool {
     }
 }
 
-fn provider_title(snapshot: &UsageSnapshot) -> String {
-    let provider = match snapshot.provider_id.as_str() {
-        "codex" => "Codex".to_string(),
-        "claude" => "Claude".to_string(),
-        value => title_case(value),
-    };
+fn provider_title(snapshot: &UsageSnapshot, fallback_plan: Option<&str>) -> String {
+    let provider = format_provider_name(snapshot.provider_id.as_str());
     let mut parts = vec![provider];
     if let Some(mode) = metadata_str(&snapshot.metadata, "collection_mode") {
         parts.push(collection_mode_label(snapshot.provider_id.as_str(), mode));
@@ -589,46 +522,14 @@ fn provider_title(snapshot: &UsageSnapshot) -> String {
         .or_else(|| metadata_str(&snapshot.metadata, "subscription_type"))
     {
         parts.push(plan_label(plan));
+    } else if let Some(plan) = fallback_plan {
+        parts.push(plan.to_string());
     }
     parts.join(" · ")
 }
 
 fn collection_mode_label(provider_id: &str, mode: &str) -> String {
-    match (provider_id, mode) {
-        ("codex", "wham_usage_api") => "openai-web".to_string(),
-        ("claude", "claude_cli_usage") => "terminal".to_string(),
-        ("claude", "oauth_usage_api") => "web".to_string(),
-        _ => mode.replace('_', "-"),
-    }
-}
-
-fn plan_label(plan: &str) -> String {
-    match plan {
-        "prolite" => "Pro Lite".to_string(),
-        "plus" => "Plus".to_string(),
-        "pro" => "Pro".to_string(),
-        "team" => "Team".to_string(),
-        "max" => "Max".to_string(),
-        value => title_case(&value.replace(['_', '-'], " ")),
-    }
-}
-
-fn account_label(snapshot: &UsageSnapshot, account: Option<&Account>) -> Option<String> {
-    metadata_str(&snapshot.metadata, "email")
-        .or_else(|| metadata_str(&snapshot.metadata, "account_email"))
-        .or_else(|| metadata_str(&snapshot.metadata, "keychain_account"))
-        .or_else(|| metadata_str(&snapshot.metadata, "account_display_name"))
-        .map(str::to_string)
-        .or_else(|| {
-            account
-                .and_then(|account| account.display_name.clone())
-                .or_else(|| {
-                    account
-                        .map(|account| account.external_account_id.clone())
-                        .filter(|value| !looks_like_uuid(value))
-                })
-        })
-        .filter(|value| !is_provider_placeholder(snapshot, value))
+    format_collection_mode(provider_id, mode)
 }
 
 fn aggregate_daily_tokens(snapshots: &[UsageSnapshot]) -> BTreeMap<NaiveDate, u64> {
@@ -878,13 +779,6 @@ fn format_amount(amount: &UsageAmount) -> String {
     }
 }
 
-fn metadata_str<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
-    metadata
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-}
-
 fn u64_field(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(u64_value)
 }
@@ -896,89 +790,10 @@ fn u64_value(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str()?.parse().ok())
 }
 
-fn title_case(value: &str) -> String {
-    value
-        .split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn looks_like_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value
-            .chars()
-            .all(|char| char.is_ascii_hexdigit() || char == '-')
-}
-
-fn is_provider_placeholder(snapshot: &UsageSnapshot, value: &str) -> bool {
-    value.eq_ignore_ascii_case(snapshot.provider_id.as_str())
-}
-
-fn collapse_spaces(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    if visible_len(value) <= max_chars {
-        return value.to_string();
-    }
-    strip_ansi(value)
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
-
-fn visible_len(value: &str) -> usize {
-    let mut len = 0;
-    let mut chars = value.chars().peekable();
-    while let Some(char) = chars.next() {
-        if char == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-            }
-            for char in chars.by_ref() {
-                if ('@'..='~').contains(&char) {
-                    break;
-                }
-            }
-        } else {
-            len += 1;
-        }
-    }
-    len
-}
-
-fn strip_ansi(value: &str) -> String {
-    let mut stripped = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(char) = chars.next() {
-        if char == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-            }
-            for char in chars.by_ref() {
-                if ('@'..='~').contains(&char) {
-                    break;
-                }
-            }
-        } else {
-            stripped.push(char);
-        }
-    }
-    stripped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::style::strip_ansi;
     use chrono::TimeZone;
     use serde_json::json;
     use usage_core::{AccountId, ProviderId};
@@ -992,7 +807,7 @@ mod tests {
         assert!(rendered.contains("Overview"));
         assert!(rendered.contains("Activity · last 7 days"));
         assert!(rendered.contains("Codex · openai-web · Pro Lite"));
-        assert!(rendered.contains("Account  user@example.com"));
+        assert!(rendered.contains("Identity user@example.com"));
         assert!(!rendered.contains("\x1b["));
     }
 

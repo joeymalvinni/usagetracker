@@ -1612,6 +1612,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "serde",
  "serde_json",
  "tokio",
  "usage-core",
