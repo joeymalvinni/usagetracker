@@ -14,12 +14,87 @@ pub fn render_usage(
     snapshots: &[UsageSnapshot],
     accounts: &[Account],
     style: OutputStyle,
+    color: bool,
 ) -> String {
     let dashboard = Dashboard::from_snapshots(snapshots, accounts);
+    let theme = Theme::new(color);
     match style {
-        OutputStyle::Dashboard => render_dashboard(&dashboard),
-        OutputStyle::Compact => render_compact(&dashboard),
+        OutputStyle::Dashboard => render_dashboard(&dashboard, theme),
+        OutputStyle::Compact => render_compact(&dashboard, theme),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Theme {
+    color: bool,
+}
+
+impl Theme {
+    fn new(color: bool) -> Self {
+        Self { color }
+    }
+
+    fn paint(self, code: &str, value: &str) -> String {
+        if self.color {
+            format!("\x1b[{code}m{value}\x1b[0m")
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn border(self, value: &str) -> String {
+        self.paint("2;37", value)
+    }
+
+    fn title(self, value: &str) -> String {
+        self.paint("1;97", value)
+    }
+
+    fn label(self, value: &str) -> String {
+        self.paint("2;37", value)
+    }
+
+    fn value(self, value: &str) -> String {
+        self.paint("1;37", value)
+    }
+
+    fn muted(self, value: &str) -> String {
+        self.paint("2;37", value)
+    }
+
+    fn accent(self, value: &str) -> String {
+        self.paint("36", value)
+    }
+
+    fn good(self, value: &str) -> String {
+        self.paint("32", value)
+    }
+
+    fn warn(self, value: &str) -> String {
+        self.paint("33", value)
+    }
+
+    fn danger(self, value: &str) -> String {
+        self.paint("31", value)
+    }
+
+    fn quota(self, percent_remaining: f64, value: &str) -> String {
+        if percent_remaining >= 50.0 {
+            self.good(value)
+        } else if percent_remaining >= 20.0 {
+            self.warn(value)
+        } else {
+            self.danger(value)
+        }
+    }
+
+    fn pace(self, status: &str) -> String {
+        match status {
+            "over" => self.warn(status),
+            "under" | "on track" => self.good(status),
+            _ => self.value(status),
+        }
     }
 }
 
@@ -129,33 +204,40 @@ impl ProviderPanel {
     }
 }
 
-fn render_dashboard(dashboard: &Dashboard) -> String {
+fn render_dashboard(dashboard: &Dashboard, theme: Theme) -> String {
     let mut output = String::new();
     push_box(
         &mut output,
         "Overview",
-        &overview_lines(&dashboard.overview),
+        &overview_lines(&dashboard.overview, theme),
+        theme,
     );
     output.push('\n');
     push_box(
         &mut output,
         "Activity · last 7 days",
-        &activity_lines(&dashboard.activity),
+        &activity_lines(&dashboard.activity, theme),
+        theme,
     );
     for provider in &dashboard.providers {
         output.push('\n');
-        push_box(&mut output, &provider.title, &provider_lines(provider));
+        push_box(
+            &mut output,
+            &provider.title,
+            &provider_lines(provider, theme),
+            theme,
+        );
     }
     output.trim_end().to_string()
 }
 
-fn render_compact(dashboard: &Dashboard) -> String {
+fn render_compact(dashboard: &Dashboard, theme: Theme) -> String {
     let mut output = String::new();
     let _ = writeln!(
         output,
         "Tokens {} total · {} peak · streak {}d current / {}d longest",
-        format_tokens(dashboard.overview.lifetime_tokens),
-        format_tokens(dashboard.overview.peak_tokens),
+        theme.value(&format_tokens(dashboard.overview.lifetime_tokens)),
+        theme.value(&format_tokens(dashboard.overview.peak_tokens)),
         dashboard.overview.current_streak_days,
         dashboard.overview.longest_streak_days
     );
@@ -163,10 +245,16 @@ fn render_compact(dashboard: &Dashboard) -> String {
     let activity = dashboard
         .activity
         .iter()
-        .map(|day| format!("{} {}", day.date.format("%a"), format_tokens(day.tokens)))
+        .map(|day| {
+            format!(
+                "{} {}",
+                theme.muted(&day.date.format("%a").to_string()),
+                theme.value(&format_tokens(day.tokens))
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    let _ = writeln!(output, "Activity {activity}");
+    let _ = writeln!(output, "{} {activity}", theme.label("Activity"));
 
     for provider in &dashboard.providers {
         let mut parts = Vec::new();
@@ -187,7 +275,7 @@ fn render_compact(dashboard: &Dashboard) -> String {
         let _ = writeln!(
             output,
             "{}: {}{}",
-            provider.title,
+            theme.title(&provider.title),
             parts.join(", "),
             account
         );
@@ -196,31 +284,31 @@ fn render_compact(dashboard: &Dashboard) -> String {
     output.trim_end().to_string()
 }
 
-fn overview_lines(overview: &Overview) -> Vec<String> {
+fn overview_lines(overview: &Overview, theme: Theme) -> Vec<String> {
     vec![
         format!(
-            "{:<16} {:<10} {:<14} {}",
-            "Lifetime tokens",
-            format_tokens(overview.lifetime_tokens),
-            "Peak tokens",
-            format_tokens(overview.peak_tokens)
+            "{} {} {} {}",
+            pad_right(theme.label("Lifetime tokens"), 16),
+            pad_right(theme.value(&format_tokens(overview.lifetime_tokens)), 10),
+            pad_right(theme.label("Peak tokens"), 14),
+            theme.value(&format_tokens(overview.peak_tokens))
         ),
         format!(
-            "{:<16} {:<10} {:<14} {}",
-            "Longest task",
-            "n/a",
-            "Current streak",
-            format_days(overview.current_streak_days)
+            "{} {} {} {}",
+            pad_right(theme.label("Longest task"), 16),
+            pad_right(theme.muted("n/a"), 10),
+            pad_right(theme.label("Current streak"), 14),
+            theme.value(&format_days(overview.current_streak_days))
         ),
         format!(
-            "{:<16} {}",
-            "Longest streak",
-            format_days(overview.longest_streak_days)
+            "{} {}",
+            pad_right(theme.label("Longest streak"), 16),
+            theme.value(&format_days(overview.longest_streak_days))
         ),
     ]
 }
 
-fn activity_lines(activity: &[ActivityDay]) -> Vec<String> {
+fn activity_lines(activity: &[ActivityDay], theme: Theme) -> Vec<String> {
     let peak = activity
         .iter()
         .map(|day| day.tokens)
@@ -230,72 +318,94 @@ fn activity_lines(activity: &[ActivityDay]) -> Vec<String> {
         .iter()
         .map(|day| {
             format!(
-                "{:<3} {:>7}  {}",
-                day.date.format("%a"),
-                format_tokens(day.tokens),
-                token_bar(day.tokens, peak, BAR_WIDTH)
+                "{} {}  {}",
+                pad_right(theme.label(&day.date.format("%a").to_string()), 3),
+                pad_left(theme.value(&format_tokens(day.tokens)), 7),
+                token_bar(day.tokens, peak, BAR_WIDTH, theme)
             )
         })
         .collect()
 }
 
-fn provider_lines(provider: &ProviderPanel) -> Vec<String> {
+fn provider_lines(provider: &ProviderPanel, theme: Theme) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(session) = &provider.session {
-        lines.push(window_row(session));
+        lines.push(window_row(session, theme));
     }
     if let Some(weekly) = &provider.weekly {
-        lines.push(window_row(weekly));
+        lines.push(window_row(weekly, theme));
     }
     if let Some(pace) = &provider.pace {
         lines.push(format!(
-            "{:<8} {:<10} {:>3}% used vs {:>3}% expected",
-            "Pace",
-            pace.status,
-            pace.percent_used.round() as u64,
-            pace.percent_expected.round() as u64
+            "{} {} {} {} {} {}",
+            pad_right(theme.label("Pace"), 8),
+            pad_right(theme.pace(pace.status), 10),
+            pad_left(theme.value(&format!("{:.0}%", pace.percent_used)), 4),
+            theme.muted("used vs"),
+            pad_left(theme.value(&format!("{:.0}%", pace.percent_expected)), 4),
+            theme.muted("expected")
         ));
     }
     if let Some(forecast) = &provider.forecast {
-        lines.push(format!("{:<8} {forecast}", "Forecast"));
+        lines.push(format!(
+            "{} {}",
+            pad_right(theme.label("Forecast"), 8),
+            forecast_text(forecast, theme)
+        ));
     }
     if let Some(credits) = &provider.credits {
-        lines.push(format!("{:<8} {credits}", "Credits"));
+        lines.push(format!(
+            "{} {}",
+            pad_right(theme.label("Credits"), 8),
+            credits_text(credits, theme)
+        ));
     }
     if let Some(account) = &provider.account {
-        lines.push(format!("{:<8} {account}", "Account"));
+        lines.push(format!(
+            "{} {}",
+            pad_right(theme.label("Account"), 8),
+            theme.muted(account)
+        ));
     }
     lines
 }
 
-fn push_box(output: &mut String, title: &str, lines: &[String]) {
-    push_top_border(output, title);
+fn push_box(output: &mut String, title: &str, lines: &[String], theme: Theme) {
+    push_top_border(output, title, theme);
     for line in lines {
-        push_content_line(output, line);
+        push_content_line(output, line, theme);
     }
-    push_bottom_border(output);
+    push_bottom_border(output, theme);
 }
 
-fn push_top_border(output: &mut String, title: &str) {
-    let mut line = format!("┌─ {} ", truncate(title, DASHBOARD_WIDTH.saturating_sub(5)));
-    let fill = DASHBOARD_WIDTH.saturating_sub(visible_len(&line) + 1);
-    line.push_str(&"─".repeat(fill));
-    line.push('┐');
-    output.push_str(&line);
+fn push_top_border(output: &mut String, title: &str, theme: Theme) {
+    let title = truncate(title, DASHBOARD_WIDTH.saturating_sub(5));
+    let fill = DASHBOARD_WIDTH.saturating_sub(visible_len(&title) + 5);
+    output.push_str(&theme.border("┌─ "));
+    output.push_str(&theme.title(&title));
+    output.push_str(&theme.border(" "));
+    output.push_str(&theme.border(&"─".repeat(fill)));
+    output.push_str(&theme.border("┐"));
     output.push('\n');
 }
 
-fn push_content_line(output: &mut String, content: &str) {
+fn push_content_line(output: &mut String, content: &str, theme: Theme) {
     let inner_width = DASHBOARD_WIDTH - 4;
     let content = truncate(content, inner_width);
     let padding = inner_width.saturating_sub(visible_len(&content));
-    let _ = writeln!(output, "│ {content}{} │", " ".repeat(padding));
+    let _ = writeln!(
+        output,
+        "{} {content}{} {}",
+        theme.border("│"),
+        " ".repeat(padding),
+        theme.border("│")
+    );
 }
 
-fn push_bottom_border(output: &mut String) {
-    output.push('└');
-    output.push_str(&"─".repeat(DASHBOARD_WIDTH - 2));
-    output.push('┘');
+fn push_bottom_border(output: &mut String, theme: Theme) {
+    output.push_str(&theme.border("└"));
+    output.push_str(&theme.border(&"─".repeat(DASHBOARD_WIDTH - 2)));
+    output.push_str(&theme.border("┘"));
     output.push('\n');
 }
 
@@ -307,20 +417,31 @@ fn compact_window(window: &WindowLine) -> String {
     format!("{} {remaining} left", window.label.to_ascii_lowercase())
 }
 
-fn window_row(line: &WindowLine) -> String {
+fn window_row(line: &WindowLine, theme: Theme) -> String {
     let percent = line
         .percent_remaining
         .map(format_percent)
         .unwrap_or_else(|| "?".to_string());
+    let percent = line
+        .percent_remaining
+        .map(|value| theme.quota(value, &percent))
+        .unwrap_or_else(|| theme.muted(&percent));
     let bar = line
         .percent_remaining
-        .map(|value| percent_bar(value, BAR_WIDTH))
-        .unwrap_or_else(|| "░".repeat(BAR_WIDTH));
+        .map(|value| percent_bar(value, BAR_WIDTH, theme))
+        .unwrap_or_else(|| theme.muted(&"░".repeat(BAR_WIDTH)));
     let reset = line
         .reset_at
         .map(reset_label)
         .unwrap_or_else(|| "reset unknown".to_string());
-    format!("{:<8} {:>4} left  {}  {}", line.label, percent, bar, reset)
+    format!(
+        "{} {} {}  {}  {}",
+        pad_right(theme.label(line.label), 8),
+        pad_left(percent, 4),
+        theme.muted("left"),
+        bar,
+        theme.muted(&reset)
+    )
 }
 
 fn window_line(label: &'static str, window: &UsageWindow) -> WindowLine {
@@ -652,18 +773,62 @@ fn reset_label(reset_at: DateTime<Utc>) -> String {
     format!("resets {}", reset_at.with_timezone(&Local).format("%b %-d"))
 }
 
-fn token_bar(tokens: u64, peak: u64, width: usize) -> String {
+fn token_bar(tokens: u64, peak: u64, width: usize, theme: Theme) -> String {
     if peak == 0 {
-        return "░".repeat(width);
+        return theme.muted(&"░".repeat(width));
     }
     let filled = ((tokens as f64 / peak as f64) * width as f64).round() as usize;
     let filled = filled.clamp((tokens > 0) as usize, width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    bar_segments(filled, width, |value| theme.accent(value), theme)
 }
 
-fn percent_bar(percent: f64, width: usize) -> String {
+fn percent_bar(percent: f64, width: usize, theme: Theme) -> String {
     let filled = ((percent.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    bar_segments(filled, width, |value| theme.quota(percent, value), theme)
+}
+
+fn bar_segments(
+    filled: usize,
+    width: usize,
+    filled_style: impl FnOnce(&str) -> String,
+    theme: Theme,
+) -> String {
+    let empty = width.saturating_sub(filled);
+    format!(
+        "{}{}",
+        filled_style(&"█".repeat(filled)),
+        theme.muted(&"░".repeat(empty))
+    )
+}
+
+fn forecast_text(forecast: &str, theme: Theme) -> String {
+    if forecast.contains("exhausted") {
+        theme.danger(forecast)
+    } else if forecast.contains("tight") {
+        theme.warn(forecast)
+    } else {
+        theme.good(forecast)
+    }
+}
+
+fn credits_text(credits: &str, theme: Theme) -> String {
+    if credits.contains("empty") {
+        theme.danger(credits)
+    } else if credits.contains("available") {
+        theme.good(credits)
+    } else {
+        theme.value(credits)
+    }
+}
+
+fn pad_right(value: String, width: usize) -> String {
+    let padding = width.saturating_sub(visible_len(&value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn pad_left(value: String, width: usize) -> String {
+    let padding = width.saturating_sub(visible_len(&value));
+    format!("{}{value}", " ".repeat(padding))
 }
 
 fn format_tokens(tokens: u64) -> String {
@@ -764,7 +929,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
     if visible_len(value) <= max_chars {
         return value.to_string();
     }
-    value
+    strip_ansi(value)
         .chars()
         .take(max_chars.saturating_sub(1))
         .collect::<String>()
@@ -772,7 +937,43 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn visible_len(value: &str) -> usize {
-    value.chars().count()
+    let mut len = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(char) = chars.next() {
+        if char == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+            }
+            for char in chars.by_ref() {
+                if ('@'..='~').contains(&char) {
+                    break;
+                }
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+fn strip_ansi(value: &str) -> String {
+    let mut stripped = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(char) = chars.next() {
+        if char == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+            }
+            for char in chars.by_ref() {
+                if ('@'..='~').contains(&char) {
+                    break;
+                }
+            }
+        } else {
+            stripped.push(char);
+        }
+    }
+    stripped
 }
 
 #[cfg(test)]
@@ -784,6 +985,41 @@ mod tests {
 
     #[test]
     fn renders_dashboard_sections() {
+        let (snapshot, account) = sample_dashboard();
+
+        let rendered = render_usage(&[snapshot], &[account], OutputStyle::Dashboard, false);
+
+        assert!(rendered.contains("Overview"));
+        assert!(rendered.contains("Activity · last 7 days"));
+        assert!(rendered.contains("Codex · openai-web · Pro Lite"));
+        assert!(rendered.contains("Account  user@example.com"));
+        assert!(!rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn colored_dashboard_keeps_box_widths() {
+        let (mut snapshot, account) = sample_dashboard();
+        snapshot.windows[0].percent_used = Some(92.0);
+        snapshot.windows[0].percent_remaining = Some(8.0);
+
+        let rendered = render_usage(&[snapshot], &[account], OutputStyle::Dashboard, true);
+
+        assert!(rendered.contains("\x1b["));
+        assert!(strip_ansi(&rendered).contains("Codex · openai-web · Pro Lite"));
+        for line in rendered.lines().filter(|line| !line.is_empty()) {
+            assert_eq!(visible_len(line), DASHBOARD_WIDTH);
+        }
+    }
+
+    #[test]
+    fn labels_claude_cli_collection_as_terminal() {
+        assert_eq!(
+            collection_mode_label("claude", "claude_cli_usage"),
+            "terminal"
+        );
+    }
+
+    fn sample_dashboard() -> (UsageSnapshot, Account) {
         let account_id = AccountId::new("account");
         let snapshot = UsageSnapshot {
             provider_id: ProviderId::new("codex"),
@@ -835,19 +1071,6 @@ mod tests {
             updated_at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
         };
 
-        let rendered = render_usage(&[snapshot], &[account], OutputStyle::Dashboard);
-
-        assert!(rendered.contains("Overview"));
-        assert!(rendered.contains("Activity · last 7 days"));
-        assert!(rendered.contains("Codex · openai-web · Pro Lite"));
-        assert!(rendered.contains("Account  user@example.com"));
-    }
-
-    #[test]
-    fn labels_claude_cli_collection_as_terminal() {
-        assert_eq!(
-            collection_mode_label("claude", "claude_cli_usage"),
-            "terminal"
-        );
+        (snapshot, account)
     }
 }

@@ -117,6 +117,7 @@ CLI commands:
 ```sh
 cargo run -p usage-cli -- status
 cargo run -p usage-cli -- usage
+cargo run -p usage-cli -- --color always
 cargo run -p usage-cli -- --style compact
 cargo run -p usage-cli -- --style json
 cargo run -p usage-cli -- refresh
@@ -127,6 +128,7 @@ cargo run -p usage-cli -- config
 ```
 
 Usage/status output supports `--style dashboard`, `--style compact`, and `--style json`.
+Color defaults to `--color auto`, can be forced with `--color always`, disabled with `--color never`, and respects `NO_COLOR`.
 Other commands continue to return daemon API JSON.
 
 The CLI also defaults to `~/.usagetracker/usage.sock`. If the daemon is listening on a non-default socket, point the CLI at it:

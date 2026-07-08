@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::{env, io};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
+use io::IsTerminal;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -17,6 +19,8 @@ struct Args {
     socket_path: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputStyle::Dashboard)]
     style: OutputStyle,
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -26,6 +30,13 @@ enum OutputStyle {
     Dashboard,
     Compact,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ColorChoice {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,7 +89,12 @@ async fn main() -> anyhow::Result<()> {
             ApiResponse::Usage { snapshots } => {
                 println!(
                     "{}",
-                    render::render_usage(&snapshots, &accounts, args.style)
+                    render::render_usage(
+                        &snapshots,
+                        &accounts,
+                        args.style,
+                        color_enabled(args.color)
+                    )
                 );
             }
             ApiResponse::Error { error } => {
@@ -90,6 +106,14 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&response)?);
     }
     Ok(())
+}
+
+fn color_enabled(choice: ColorChoice) -> bool {
+    match choice {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
+    }
 }
 
 async fn send_request(socket_path: &PathBuf, request: &ApiRequest) -> anyhow::Result<ApiResponse> {
