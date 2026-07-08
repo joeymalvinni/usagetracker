@@ -1,20 +1,31 @@
 use std::path::PathBuf;
 
-use anyhow::Context;
-use clap::{Parser, Subcommand};
+use anyhow::{bail, Context};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
-use usage_core::{default_socket_path, ApiRequest, ProviderId};
+use usage_core::{default_socket_path, ApiRequest, ApiResponse, ProviderId};
+
+mod render;
 
 #[derive(Debug, Parser)]
 #[command(name = "usage")]
 struct Args {
     #[arg(long, env = "USAGE_TRACKER_SOCKET")]
     socket_path: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = OutputStyle::Dashboard)]
+    style: OutputStyle,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputStyle {
+    Dashboard,
+    Compact,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -33,7 +44,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let request = match args.command.unwrap_or(Command::Usage) {
+    let command = args.command.unwrap_or(Command::Usage);
+    let usage_command = matches!(command, Command::Status | Command::Usage);
+    let request = match command {
         Command::Status | Command::Usage => ApiRequest::GetUsage,
         Command::Refresh { providers } => ApiRequest::Refresh {
             providers: (!providers.is_empty()).then(|| {
@@ -53,11 +66,33 @@ async fn main() -> anyhow::Result<()> {
         .or_else(default_socket_path)
         .context("failed to resolve ~/.usagetracker/usage.sock")?;
     let response = send_request(&socket_path, &request).await?;
-    println!("{response}");
+    if usage_command && args.style != OutputStyle::Json {
+        let accounts = match send_request(&socket_path, &ApiRequest::GetAccounts).await? {
+            ApiResponse::Accounts { accounts } => accounts,
+            ApiResponse::Error { error } => {
+                bail!("daemon returned {}: {}", error.code, error.message);
+            }
+            other => bail!("daemon returned unexpected accounts response: {other:?}"),
+        };
+        match response {
+            ApiResponse::Usage { snapshots } => {
+                println!(
+                    "{}",
+                    render::render_usage(&snapshots, &accounts, args.style)
+                );
+            }
+            ApiResponse::Error { error } => {
+                bail!("daemon returned {}: {}", error.code, error.message);
+            }
+            other => bail!("daemon returned unexpected usage response: {other:?}"),
+        }
+    } else {
+        println!("{}", serde_json::to_string(&response)?);
+    }
     Ok(())
 }
 
-async fn send_request(socket_path: &PathBuf, request: &ApiRequest) -> anyhow::Result<String> {
+async fn send_request(socket_path: &PathBuf, request: &ApiRequest) -> anyhow::Result<ApiResponse> {
     let stream = UnixStream::connect(socket_path).await.with_context(|| {
         format!(
             "failed to connect to daemon socket {}",
@@ -71,8 +106,9 @@ async fn send_request(socket_path: &PathBuf, request: &ApiRequest) -> anyhow::Re
     writer.flush().await?;
 
     let mut lines = BufReader::new(reader).lines();
-    lines
+    let response = lines
         .next_line()
         .await?
-        .context("daemon closed connection without a response")
+        .context("daemon closed connection without a response")?;
+    serde_json::from_str(&response).context("daemon returned invalid response JSON")
 }

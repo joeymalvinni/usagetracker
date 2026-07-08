@@ -224,6 +224,7 @@ fn normalize_usage(
         windows,
         metadata: json!({
             "account_display_name": display_name,
+            "email": object.get("email").and_then(Value::as_str),
             "collection_mode": "wham_usage_api",
             "credits_has_credits": object.get("credits").and_then(|value| value.get("has_credits")).and_then(Value::as_bool),
             "credits_overage_limit_reached": object.get("credits").and_then(|value| value.get("overage_limit_reached")).and_then(Value::as_bool),
@@ -953,6 +954,7 @@ mod tests {
         assert!(credits.limit.is_none());
 
         assert_eq!(snapshot.metadata["plan_type"], "prolite");
+        assert_eq!(snapshot.metadata["email"], "user@example.com");
         assert_eq!(snapshot.metadata["credits_has_credits"], false);
         assert_eq!(
             snapshot.metadata["rate_limit_reset_credits_available_count"],

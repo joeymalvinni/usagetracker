@@ -112,19 +112,24 @@ With the daemon running, use the CLI from another terminal:
 cargo run -p usage-cli --
 ```
 
-That default command is the same as `usage` / `status` and returns the latest stored usage snapshot.
+That default command is the same as `usage` / `status` and renders the latest stored usage dashboard.
 
 CLI commands:
 
 ```sh
 cargo run -p usage-cli -- status
 cargo run -p usage-cli -- usage
+cargo run -p usage-cli -- --style compact
+cargo run -p usage-cli -- --style json
 cargo run -p usage-cli -- refresh
 cargo run -p usage-cli -- refresh --provider codex
 cargo run -p usage-cli -- health
 cargo run -p usage-cli -- accounts
 cargo run -p usage-cli -- config
 ```
+
+Usage/status output supports `--style dashboard`, `--style compact`, and `--style json`.
+Other commands continue to return daemon API JSON.
 
 The CLI also defaults to `~/.usagetracker/usage.sock`. If the daemon is listening on a non-default socket, point the CLI at it:
 
