@@ -102,7 +102,7 @@ The config file controls which providers are enabled:
 }
 ```
 
-Codex collection reads credentials from `~/.codex/auth.json`. Claude collection reads Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects live quota usage from Anthropic's OAuth usage API.
+Codex collection reads credentials from `~/.codex/auth.json`. Claude collection defaults to the local Claude Code terminal usage command, `claude -p /usage --output-format json --no-session-persistence`. If that command fails, Claude collection falls back to Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects quota usage from Anthropic's OAuth usage API.
 
 With the daemon running, use the CLI from another terminal:
 

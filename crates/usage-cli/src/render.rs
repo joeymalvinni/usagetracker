@@ -475,6 +475,7 @@ fn provider_title(snapshot: &UsageSnapshot) -> String {
 fn collection_mode_label(provider_id: &str, mode: &str) -> String {
     match (provider_id, mode) {
         ("codex", "wham_usage_api") => "openai-web".to_string(),
+        ("claude", "claude_cli_usage") => "terminal".to_string(),
         ("claude", "oauth_usage_api") => "web".to_string(),
         _ => mode.replace('_', "-"),
     }
@@ -840,5 +841,13 @@ mod tests {
         assert!(rendered.contains("Activity · last 7 days"));
         assert!(rendered.contains("Codex · openai-web · Pro Lite"));
         assert!(rendered.contains("Account  user@example.com"));
+    }
+
+    #[test]
+    fn labels_claude_cli_collection_as_terminal() {
+        assert_eq!(
+            collection_mode_label("claude", "claude_cli_usage"),
+            "terminal"
+        );
     }
 }

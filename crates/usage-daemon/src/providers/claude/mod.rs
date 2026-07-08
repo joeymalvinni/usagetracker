@@ -102,6 +102,17 @@ impl ClaudeCollector {
         let usage = normalize_usage(&payload, &credentials)?;
         Ok((usage, payload))
     }
+
+    async fn collect_usage_with_cli(&self) -> Result<cli::ClaudeCliUsage, ProviderError> {
+        tokio::task::spawn_blocking(collect_usage_from_cli)
+            .await
+            .map_err(|err| {
+                ProviderError::new(
+                    ProviderErrorKind::ProviderUnavailable,
+                    format!("Claude CLI usage task failed: {err}"),
+                )
+            })?
+    }
 }
 
 #[async_trait]
@@ -143,47 +154,36 @@ impl ProviderCollector for ClaudeCollector {
         }
 
         let mut warnings = Vec::new();
-        let (mut usage, collection_mode, raw_payload) =
-            match self.collect_usage_with_api(account).await {
-                Ok((usage, payload)) => (
-                    usage,
-                    CLAUDE_COLLECTION_MODE.to_string(),
-                    self.capture_raw_payloads.then_some(payload),
-                ),
-                Err(api_err) => {
-                    let fallback = tokio::task::spawn_blocking(collect_usage_from_cli)
-                        .await
-                        .map_err(|err| {
-                            ProviderError::new(
-                                ProviderErrorKind::ProviderUnavailable,
-                                format!("Claude CLI usage fallback task failed: {err}"),
-                            )
-                        })?;
-                    match fallback {
-                        Ok(cli_usage) => {
-                            warnings.push(format!(
-                                "Claude OAuth usage API failed; used CLI fallback: {}",
-                                api_err.short_message()
-                            ));
-                            (
-                                cli_usage.usage,
-                                CLAUDE_CLI_COLLECTION_MODE.to_string(),
-                                self.capture_raw_payloads.then_some(cli_usage.raw_output),
-                            )
-                        }
-                        Err(cli_err) => {
-                            return Err(ProviderError::new(
-                                api_err.kind(),
-                                format!(
-                                    "Claude OAuth usage API failed ({}); CLI fallback failed ({})",
-                                    api_err.short_message(),
-                                    cli_err.short_message()
-                                ),
-                            ));
-                        }
-                    }
+        let (mut usage, collection_mode, raw_payload) = match self.collect_usage_with_cli().await {
+            Ok(cli_usage) => (
+                cli_usage.usage,
+                CLAUDE_CLI_COLLECTION_MODE.to_string(),
+                self.capture_raw_payloads.then_some(cli_usage.raw_output),
+            ),
+            Err(cli_err) => match self.collect_usage_with_api(account).await {
+                Ok((usage, payload)) => {
+                    warnings.push(format!(
+                        "Claude CLI usage failed; used OAuth usage API fallback: {}",
+                        cli_err.short_message()
+                    ));
+                    (
+                        usage,
+                        CLAUDE_COLLECTION_MODE.to_string(),
+                        self.capture_raw_payloads.then_some(payload),
+                    )
                 }
-            };
+                Err(api_err) => {
+                    return Err(ProviderError::new(
+                        cli_err.kind(),
+                        format!(
+                            "Claude CLI usage failed ({}); OAuth usage API fallback failed ({})",
+                            cli_err.short_message(),
+                            api_err.short_message()
+                        ),
+                    ));
+                }
+            },
+        };
 
         match tokio::task::spawn_blocking(scan_claude_local_costs).await {
             Ok(Ok(report)) => merge_local_cost_report(&mut usage, report),
