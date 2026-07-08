@@ -6,14 +6,16 @@ use usage_core::ProviderId;
 
 use crate::providers::{
     DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-    ProviderErrorKind, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+    ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
 };
 
+mod cli;
 mod client;
 mod cost;
 mod credentials;
 mod normalize;
 
+use cli::collect_usage_from_cli;
 use client::ClaudeApiClient;
 use cost::{merge_local_cost_report, scan_claude_local_costs};
 use credentials::{load_credentials, ClaudeCredentials};
@@ -22,6 +24,7 @@ use normalize::normalize_usage;
 pub const PROVIDER_ID: &str = "claude";
 const CLAUDE_CREDENTIALS_FILE: &str = ".claude/.credentials.json";
 const CLAUDE_COLLECTION_MODE: &str = "oauth_usage_api";
+const CLAUDE_CLI_COLLECTION_MODE: &str = "claude_cli_usage";
 
 pub struct ClaudeCollector {
     keychain_account: String,
@@ -76,26 +79,11 @@ impl ClaudeCollector {
             Ok(credentials)
         }
     }
-}
 
-#[async_trait]
-impl ProviderCollector for ClaudeCollector {
-    fn provider_id(&self) -> ProviderId {
-        ProviderId::new(PROVIDER_ID)
-    }
-
-    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
-        let credentials = self.load_credentials().await?;
-        Ok(vec![DiscoveredAccount {
-            external_account_id: credentials.account_id(),
-            display_name: Some(credentials.display_name()),
-        }])
-    }
-
-    async fn collect_usage(
+    async fn collect_usage_with_api(
         &self,
         account: &DiscoveredAccount,
-    ) -> Result<ProviderCollectionResult, ProviderError> {
+    ) -> Result<(ProviderUsage, serde_json::Value), ProviderError> {
         let mut credentials = self.load_with_auto_refresh().await?;
         if credentials.account_id() != account.external_account_id {
             return Err(ProviderError::new(
@@ -111,8 +99,92 @@ impl ProviderCollector for ClaudeCollector {
             }
             result => result?,
         };
-        let mut usage = normalize_usage(&payload, &credentials)?;
+        let usage = normalize_usage(&payload, &credentials)?;
+        Ok((usage, payload))
+    }
+}
+
+#[async_trait]
+impl ProviderCollector for ClaudeCollector {
+    fn provider_id(&self) -> ProviderId {
+        ProviderId::new(PROVIDER_ID)
+    }
+
+    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        match self.load_credentials().await {
+            Ok(credentials) => Ok(vec![DiscoveredAccount {
+                external_account_id: credentials.account_id(),
+                display_name: Some(credentials.display_name()),
+            }]),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ProviderErrorKind::CredentialsMissing | ProviderErrorKind::CredentialsInvalid
+                ) =>
+            {
+                Ok(vec![DiscoveredAccount {
+                    external_account_id: self.keychain_account.clone(),
+                    display_name: Some("Claude".to_string()),
+                }])
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn collect_usage(
+        &self,
+        account: &DiscoveredAccount,
+    ) -> Result<ProviderCollectionResult, ProviderError> {
+        if account.external_account_id != self.keychain_account {
+            return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Claude account changed since discovery",
+            ));
+        }
+
         let mut warnings = Vec::new();
+        let (mut usage, collection_mode, raw_payload) =
+            match self.collect_usage_with_api(account).await {
+                Ok((usage, payload)) => (
+                    usage,
+                    CLAUDE_COLLECTION_MODE.to_string(),
+                    self.capture_raw_payloads.then_some(payload),
+                ),
+                Err(api_err) => {
+                    let fallback = tokio::task::spawn_blocking(collect_usage_from_cli)
+                        .await
+                        .map_err(|err| {
+                            ProviderError::new(
+                                ProviderErrorKind::ProviderUnavailable,
+                                format!("Claude CLI usage fallback task failed: {err}"),
+                            )
+                        })?;
+                    match fallback {
+                        Ok(cli_usage) => {
+                            warnings.push(format!(
+                                "Claude OAuth usage API failed; used CLI fallback: {}",
+                                api_err.short_message()
+                            ));
+                            (
+                                cli_usage.usage,
+                                CLAUDE_CLI_COLLECTION_MODE.to_string(),
+                                self.capture_raw_payloads.then_some(cli_usage.raw_output),
+                            )
+                        }
+                        Err(cli_err) => {
+                            return Err(ProviderError::new(
+                                api_err.kind(),
+                                format!(
+                                    "Claude OAuth usage API failed ({}); CLI fallback failed ({})",
+                                    api_err.short_message(),
+                                    cli_err.short_message()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            };
+
         match tokio::task::spawn_blocking(scan_claude_local_costs).await {
             Ok(Ok(report)) => merge_local_cost_report(&mut usage, report),
             Ok(Err(err)) => warnings.push(format!("Claude local cost scan failed: {err}")),
@@ -121,8 +193,8 @@ impl ProviderCollector for ClaudeCollector {
 
         Ok(ProviderCollectionResult {
             usage,
-            collection_mode: CLAUDE_COLLECTION_MODE.to_string(),
-            raw_payload: self.capture_raw_payloads.then_some(payload),
+            collection_mode,
+            raw_payload,
             warnings,
         })
     }

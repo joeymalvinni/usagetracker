@@ -15,6 +15,7 @@ version = "0.1.0"
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
@@ -27,3 +28,4 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+wait-timeout = "0.2"

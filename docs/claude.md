@@ -1,6 +1,6 @@
 # Claude Collection Logic
 
-Claude support lives in `crates/usage-daemon/src/providers/claude.rs`. It is disabled by default and only runs when `providers.claude.enabled` is true in `config.json`.
+Claude support lives in `crates/usage-daemon/src/providers/claude/`. It is disabled by default and only runs when `providers.claude.enabled` is true in `config.json`.
 
 ## Credentials
 
@@ -142,6 +142,46 @@ top_level_keys
 
 Raw provider payloads are only stored when `debug_capture_raw_payloads` is enabled.
 
+## Claude CLI Fallback
+
+If the OAuth usage path fails during collection, the daemon tries a bounded Claude Code CLI fallback. It runs:
+
+```text
+claude -p /usage --output-format json --no-session-persistence
+```
+
+The subprocess removes proxy environment variables so a daemon-level proxy or connectivity problem does not automatically break the local Claude Code usage lookup. The command must exit successfully and return JSON with a string `result` field.
+
+The fallback parses usage windows from the print-mode `/usage` result. It recognizes single-line output such as:
+
+```text
+Current session: 20% used · resets Jul 7 at 9:39pm (America/Los_Angeles)
+Current week (all models): 25% used · resets Jul 7 at 6pm (America/Los_Angeles)
+Current week (Fable): 17% used
+```
+
+It also accepts the multiline usage shape from the interactive screen:
+
+```text
+Current session
+20% used
+Resets 9:40pm (America/Los_Angeles)
+```
+
+Parsed windows are stored as percent windows with stable ids like `claude_cli_usage_current_session`. Reset text is converted to UTC when it uses Claude Code's current formats, including `9:40pm (America/Los_Angeles)` and `Jul 7 at 6pm (America/Los_Angeles)`.
+
+Successful fallback snapshots use:
+
+```text
+collection_mode: claude_cli_usage
+command: claude -p /usage --output-format json --no-session-persistence
+reset_text_by_window
+```
+
+The collector adds a warning noting that the OAuth API failed and the CLI fallback was used. If `debug_capture_raw_payloads` is enabled, the raw Claude print-mode JSON is stored.
+
+Account discovery also falls back to a generic Claude account using the current `USER` account name when OAuth credentials are missing or invalid. This lets collection reach the CLI fallback on machines where Claude Code itself is logged in but the daemon cannot read or parse the OAuth credential store.
+
 ## Failure Cases
 
 Missing Keychain credentials and a missing fallback file are reported as missing credentials.
@@ -151,3 +191,5 @@ Keychain access errors, invalid JSON, missing OAuth data, blank tokens, and fail
 Refresh and usage request transport failures are network errors. HTTP 401 or 403 means unauthorized, HTTP 429 means rate limited, and other non-success statuses mean the provider is unavailable.
 
 Usage responses that are not valid JSON, are not objects, or contain no usable windows are parse errors.
+
+The CLI fallback is provider-unavailable when the `claude` command cannot be spawned, exits unsuccessfully, or times out. CLI output that is invalid JSON or contains no recognizable `/usage` windows is a parse error. If both OAuth collection and the CLI fallback fail, the reported error includes both failure messages.
