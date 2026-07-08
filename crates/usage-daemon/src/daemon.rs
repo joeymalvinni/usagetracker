@@ -6,7 +6,7 @@ use usage_core::{ConfigResponse, ProviderId, ProviderToggle};
 
 use crate::{
     config::Config,
-    health,
+    health, local_logs,
     polling::RefreshCoordinator,
     providers::{
         claude::{ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID},
@@ -75,12 +75,14 @@ impl Daemon {
         );
 
         let poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
+        let local_log_task = local_logs::spawn_change_log_loop(self.runtime.refresh.clone());
 
         tokio::signal::ctrl_c().await?;
         info!("shutdown signal received");
 
         server_task.abort();
         poll_task.abort();
+        local_log_task.abort();
         if let Err(err) = std::fs::remove_file(&socket_path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(error = %err, "failed to remove socket file");

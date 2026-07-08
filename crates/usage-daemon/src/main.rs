@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod health;
+mod local_logs;
 mod polling;
 mod providers;
 mod server;
