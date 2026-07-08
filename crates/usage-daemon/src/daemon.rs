@@ -124,10 +124,12 @@ impl DaemonRuntime {
         }
 
         let mut config = self.config.write().await;
-        config.apply_update(poll_interval_seconds, providers.as_ref())?;
-        config.persist()?;
+        let mut updated_config = config.clone();
+        updated_config.apply_update(poll_interval_seconds, providers.as_ref())?;
 
-        let collectors = build_providers(&config, &self.storage).await?;
+        let collectors = build_providers(&updated_config, &self.storage).await?;
+        updated_config.persist()?;
+        *config = updated_config;
         self.refresh.set_providers(collectors).await;
         let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
 

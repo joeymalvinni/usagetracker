@@ -121,7 +121,7 @@ import SwiftUI
     }
     func refreshAll() async {
         refreshing = true; defer { refreshing = false }
-        do { _ = try await client.refresh(nil); await load(all: false) } catch { fail(error) }
+        do { _ = try await client.refresh(nil); await load(all: true) } catch { fail(error) }
     }
     func visible(_ id: String) -> Bool { uiVisible(id) }
     func setVisible(_ id: String, _ on: Bool) {
@@ -135,7 +135,7 @@ import SwiftUI
             actionError = nil
             build()
             if enabled { _ = try? await client.refresh([id]) }
-            await load(all: false)
+            await load(all: true)
         } catch {
             actionError = describe(error)
         }
@@ -147,6 +147,7 @@ import SwiftUI
             config = try await client.updateConfig(pollIntervalSeconds: seconds, providers: nil)
             actionError = nil
             build()
+            await load(all: true)
         } catch {
             actionError = describe(error)
         }
@@ -176,8 +177,14 @@ import SwiftUI
             async let h = client.health()
             async let u = client.usage()
             health = try await h; snapshots = try await u
+            if !all && hasUnknownAccountReferences() { accounts = try await client.accounts() }
             daemon = .online; message = nil; build()
         } catch { fail(error); build() }
+    }
+    private func hasUnknownAccountReferences() -> Bool {
+        let known = Set(accounts.map(\.id))
+        let referenced = Set(snapshots.map(\.accountId) + health.compactMap(\.accountId))
+        return referenced.contains { !known.contains($0) }
     }
     private func fail(_ error: Error) {
         daemon = .offline
@@ -306,7 +313,10 @@ enum Socket {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8.prefix(MemoryLayout.size(ofValue: addr.sun_path) - 1)) + [0]
+        let pathBytes = Array(path.utf8)
+        let maxPathBytes = MemoryLayout.size(ofValue: addr.sun_path) - 1
+        guard pathBytes.count <= maxPathBytes else { throw DaemonError.pathTooLong(path, maxPathBytes) }
+        let bytes = pathBytes + [0]
         withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
         let len = socklen_t(MemoryLayout<sa_family_t>.size + bytes.count)
         let connected = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) } }
@@ -367,7 +377,7 @@ enum Socket {
 }
 
 enum DaemonError: LocalizedError {
-    case api(String), badResponse, closed, timeout, transport(Int32)
+    case api(String), badResponse, closed, timeout, transport(Int32), pathTooLong(String, Int)
     var errorDescription: String? {
         switch self {
         case .api(let s): s
@@ -375,6 +385,7 @@ enum DaemonError: LocalizedError {
         case .closed: "Daemon closed the connection"
         case .timeout: "Daemon request timed out"
         case .transport(let code): String(cString: strerror(code))
+        case .pathTooLong(let path, let maxBytes): "Unix socket path is too long (\(path.utf8.count) bytes, max \(maxBytes)): \(path)"
         }
     }
 }
