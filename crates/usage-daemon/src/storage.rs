@@ -128,6 +128,26 @@ impl Storage {
         .await
     }
 
+    pub async fn update_account_display_name(
+        &self,
+        account_id: &AccountId,
+        display_name: &str,
+    ) -> anyhow::Result<()> {
+        let account_id = account_id.clone();
+        let display_name = display_name.trim().to_string();
+        self.with_connection(move |conn| {
+            if display_name.is_empty() {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE accounts SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
+                params![display_name, Utc::now().to_rfc3339(), account_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn upsert_health(&self, health: &ProviderHealth) -> anyhow::Result<()> {
         let health = health.clone();
         self.with_connection(move |conn| {

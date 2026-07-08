@@ -214,6 +214,20 @@ impl RefreshCoordinator {
                 "failed to clear provider-level health"
             );
         }
+        if let Some(display_name) = result.account_display_name.as_deref() {
+            if let Err(err) = self
+                .storage
+                .update_account_display_name(&account_id, display_name)
+                .await
+            {
+                warn!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account_id.as_str(),
+                    error = %err,
+                    "failed to update account display name"
+                );
+            }
+        }
 
         info!(
             provider_id = provider_id.as_str(),
@@ -364,6 +378,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 collection_mode: "live".to_string(),
+                account_display_name: None,
                 raw_payload: None,
                 warnings: vec![],
             })
