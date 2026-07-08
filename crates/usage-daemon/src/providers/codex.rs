@@ -100,7 +100,7 @@ impl ProviderCollector for CodexCollector {
         let credentials = self.load_credentials().await?;
         Ok(vec![DiscoveredAccount {
             external_account_id: credentials.account_id,
-            display_name: Some("Codex".to_string()),
+            display_name: None,
         }])
     }
 
@@ -157,7 +157,13 @@ impl ProviderCollector for CodexCollector {
                 format!("Codex usage JSON was invalid: {err}"),
             )
         })?;
-        let mut usage = normalize_usage(&payload, account.display_name.as_deref())?;
+        let account_display_name = payload
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let mut usage = normalize_usage(&payload, account_display_name.as_deref())?;
         let mut warnings = Vec::new();
         match tokio::task::spawn_blocking(scan_codex_local_costs).await {
             Ok(Ok(report)) => usage.merge_cost_report(report),
@@ -168,6 +174,7 @@ impl ProviderCollector for CodexCollector {
         Ok(ProviderCollectionResult {
             usage,
             collection_mode: "wham_usage_api".to_string(),
+            account_display_name,
             raw_payload: self.capture_raw_payloads.then_some(payload),
             warnings,
         })

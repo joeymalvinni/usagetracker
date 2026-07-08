@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::Mutex;
 use usage_core::ProviderId;
 
@@ -125,7 +126,7 @@ impl ProviderCollector for ClaudeCollector {
         match self.load_credentials().await {
             Ok(credentials) => Ok(vec![DiscoveredAccount {
                 external_account_id: credentials.account_id(),
-                display_name: Some(credentials.display_name()),
+                display_name: None,
             }]),
             Err(err)
                 if matches!(
@@ -135,7 +136,7 @@ impl ProviderCollector for ClaudeCollector {
             {
                 Ok(vec![DiscoveredAccount {
                     external_account_id: self.keychain_account.clone(),
-                    display_name: Some("Claude".to_string()),
+                    display_name: None,
                 }])
             }
             Err(err) => Err(err),
@@ -191,9 +192,23 @@ impl ProviderCollector for ClaudeCollector {
             Err(err) => warnings.push(format!("Claude local cost scan task failed: {err}")),
         }
 
+        usage.metadata["credential_profile"] = json!(account.external_account_id);
+        if usage
+            .metadata
+            .get("subscription_type")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            if let Ok(credentials) = self.load_credentials().await {
+                usage.metadata["subscription_type"] = json!(credentials.subscription_type);
+                usage.metadata["rate_limit_tier"] = json!(credentials.rate_limit_tier);
+            }
+        }
+
         Ok(ProviderCollectionResult {
             usage,
             collection_mode,
+            account_display_name: None,
             raw_payload,
             warnings,
         })

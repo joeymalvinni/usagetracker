@@ -21,6 +21,7 @@ pub struct DiscoveredAccount {
 pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
     pub collection_mode: String,
+    pub account_display_name: Option<String>,
     pub raw_payload: Option<serde_json::Value>,
     pub warnings: Vec<String>,
 }
