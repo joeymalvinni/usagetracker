@@ -29,6 +29,7 @@ enum DaemonState { case unknown, online, offline }
         }
     }
     private var client: DaemonClient
+    private let daemonSupervisor = DaemonSupervisor()
 
     init() {
         let socketPath = AppState.defaultSocketPath()
@@ -107,6 +108,9 @@ enum DaemonState { case unknown, online, offline }
     }
     private func uiVisible(_ id: String) -> Bool { ui.hiddenProviders.contains(id) == false }
     private func load(all: Bool) async {
+        await load(all: all, allowDaemonStart: true)
+    }
+    private func load(all: Bool, allowDaemonStart: Bool) async {
         do {
             config = try await client.config()
             updateSocketPath(from: config)
@@ -116,7 +120,13 @@ enum DaemonState { case unknown, online, offline }
             health = try await h; snapshots = try await u
             if !all && hasUnknownAccountReferences() { accounts = try await client.accounts() }
             daemon = .online; message = nil; build()
-        } catch { fail(error); build() }
+        } catch {
+            if allowDaemonStart, await daemonSupervisor.ensureRunning(socketPath: socketPath) {
+                await load(all: all, allowDaemonStart: false)
+            } else {
+                fail(error); build()
+            }
+        }
     }
     private func hasUnknownAccountReferences() -> Bool {
         let known = Set(accounts.map(\.id))
