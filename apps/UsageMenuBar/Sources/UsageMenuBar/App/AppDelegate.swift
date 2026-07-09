@@ -233,10 +233,24 @@ import SwiftUI
 
     private func menuIcon(_ image: NSImage?) -> NSImage? {
         guard let image else { return nil }
-        let copy = image.copy() as? NSImage ?? image
-        copy.size = menuIconSize
-        copy.isTemplate = image.isTemplate
-        return copy
+        let sourceSize = image.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return image }
+
+        let scale = min(menuIconSize.width / sourceSize.width, menuIconSize.height / sourceSize.height)
+        let drawSize = NSSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
+        let drawRect = NSRect(
+            x: (menuIconSize.width - drawSize.width) / 2,
+            y: (menuIconSize.height - drawSize.height) / 2,
+            width: drawSize.width,
+            height: drawSize.height
+        )
+
+        let icon = NSImage(size: menuIconSize)
+        icon.lockFocus()
+        image.draw(in: drawRect, from: .zero, operation: .sourceOver, fraction: 1)
+        icon.unlockFocus()
+        icon.isTemplate = image.isTemplate
+        return icon
     }
 
     @objc private func openSummaryFromMenu() {
