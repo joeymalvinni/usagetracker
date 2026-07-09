@@ -6,7 +6,7 @@ struct Summary: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg - 2) {
-            Header(title: "Usage", subtitleStyle: state.daemon == .offline ? .offline : .online)
+            Header(title: "UsageTracker", subtitleStyle: state.daemon == .offline ? .offline : .custom(""))
             ScrollView {
                 LazyVStack(spacing: Theme.Spacing.xs + 2) {
                     if state.providers.isEmpty {

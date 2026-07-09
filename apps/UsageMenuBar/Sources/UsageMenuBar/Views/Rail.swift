@@ -42,12 +42,6 @@ struct Rail: View {
             VStack(spacing: 2) {
                 icon()
                     .frame(width: 28, height: 28)
-                    .background(
-                        selection == s
-                        ? AnyShapeStyle(.quaternary)
-                        : AnyShapeStyle(.clear),
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.sm)
-                    )
                 Text(label)
                     .font(Theme.Typography.micro)
                     .foregroundStyle(selection == s ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
@@ -58,25 +52,27 @@ struct Rail: View {
         }
         .buttonStyle(.plain)
         .help(label)
-        .hoverBackground()
+        .railBackground(isSelected: selection == s)
     }
 }
 
 private extension View {
-    /// Subtle hover background for rail rows.
-    func hoverBackground() -> some View {
-        modifier(HoverBackgroundModifier())
+    /// Subtle hover and selection background for rail rows.
+    func railBackground(isSelected: Bool) -> some View {
+        modifier(RailBackgroundModifier(isSelected: isSelected))
     }
 }
 
-private struct HoverBackgroundModifier: ViewModifier {
+private struct RailBackgroundModifier: ViewModifier {
+    let isSelected: Bool
     @State private var hovered = false
     func body(content: Content) -> some View {
         content
             .background(
                 RoundedRectangle(cornerRadius: Theme.Radius.sm)
-                    .fill(.quaternary.opacity(hovered ? 0.5 : 0))
+                    .fill(.quaternary.opacity(isSelected || hovered ? 0.5 : 0))
                     .animation(.easeOut(duration: 0.15), value: hovered)
+                    .animation(.easeOut(duration: 0.15), value: isSelected)
             )
             .onHover { hovered = $0 }
     }
