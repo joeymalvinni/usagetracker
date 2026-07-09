@@ -105,6 +105,7 @@ pub(crate) fn format_provider_name(provider_id: &str) -> String {
 pub(crate) fn format_collection_mode(provider_id: &str, mode: &str) -> String {
     match (provider_id, mode) {
         ("codex", "wham_usage_api") => "openai-web".to_string(),
+        ("codex", "codex_app_server_rate_limits") => "app-server".to_string(),
         ("claude", "claude_cli_usage") => "terminal".to_string(),
         ("claude", "oauth_usage_api") => "web".to_string(),
         ("opencode_go", "opencode_go_web_console") => "web".to_string(),

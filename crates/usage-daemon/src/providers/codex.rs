@@ -1,8 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -10,7 +14,9 @@ use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tracing::{debug, info, warn};
 use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use wait_timeout::ChildExt;
 
 use crate::providers::{
     DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
@@ -21,12 +27,15 @@ pub const PROVIDER_ID: &str = "codex";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_PERCENT: f64 = 100.0;
 const COST_LOOKBACK_DAYS: u64 = 30;
+const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
+const CODEX_COST_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct CodexCollector {
     auth_path: PathBuf,
     client: reqwest::Client,
     capture_raw_payloads: bool,
+    cost_cache: Arc<Mutex<Option<CodexCostCache>>>,
 }
 
 impl CodexCollector {
@@ -42,6 +51,7 @@ impl CodexCollector {
             auth_path: home.join(".codex/auth.json"),
             client,
             capture_raw_payloads,
+            cost_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -88,6 +98,92 @@ impl CodexCollector {
             account_id: tokens.account_id,
         })
     }
+
+    async fn collect_usage_from_wham(
+        &self,
+        credentials: &CodexCredentials,
+    ) -> Result<CodexCollectedUsage, ProviderError> {
+        let started = Instant::now();
+        debug!("codex wham usage request started");
+        let response = self
+            .client
+            .get(CODEX_USAGE_URL)
+            .bearer_auth(&credentials.access_token)
+            .header("ChatGPT-Account-Id", &credentials.account_id)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|err| {
+                ProviderError::new(
+                    ProviderErrorKind::Network,
+                    format!("Codex usage request failed: {err}"),
+                )
+            })?;
+
+        let status = response.status();
+        debug!(
+            status = status.as_u16(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "codex wham usage response received"
+        );
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unauthorized,
+                "Codex credentials were rejected",
+            ));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ProviderError::new(
+                ProviderErrorKind::RateLimited,
+                "Codex usage endpoint is rate limited",
+            ));
+        }
+        if !status.is_success() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("Codex usage endpoint returned HTTP {}", status.as_u16()),
+            ));
+        }
+
+        let payload: Value = response.json().await.map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                format!("Codex usage JSON was invalid: {err}"),
+            )
+        })?;
+        let reset_credits = payload.get("rate_limit_reset_credits");
+        debug!(
+            top_level_keys = ?payload
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>()),
+            reset_credits_available = reset_credits
+                .and_then(|value| value.get("available_count"))
+                .and_then(number_from_json_value),
+            reset_credits_has_expiry = reset_credits
+                .and_then(|value| value.as_object())
+                .is_some_and(|object| {
+                    object.contains_key("next_expires_at")
+                        || object.contains_key("expires_at")
+                        || object.contains_key("credits")
+                }),
+            "codex wham usage payload parsed"
+        );
+        let account_display_name = payload
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let usage = normalize_usage(&payload, account_display_name.as_deref())?;
+
+        Ok(CodexCollectedUsage {
+            usage,
+            collection_mode: "wham_usage_api".to_string(),
+            account_display_name,
+            raw_payload: payload,
+            warnings: Vec::new(),
+        })
+    }
 }
 
 #[async_trait]
@@ -116,69 +212,107 @@ impl ProviderCollector for CodexCollector {
             ));
         }
 
-        let response = self
-            .client
-            .get(CODEX_USAGE_URL)
-            .bearer_auth(&credentials.access_token)
-            .header("ChatGPT-Account-Id", &credentials.account_id)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|err| {
-                ProviderError::new(
-                    ProviderErrorKind::Network,
-                    format!("Codex usage request failed: {err}"),
-                )
-            })?;
-
-        let status = response.status();
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(ProviderError::new(
-                ProviderErrorKind::Unauthorized,
-                "Codex credentials were rejected",
-            ));
-        }
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ProviderError::new(
-                ProviderErrorKind::RateLimited,
-                "Codex usage endpoint is rate limited",
-            ));
-        }
-        if !status.is_success() {
-            return Err(ProviderError::new(
-                ProviderErrorKind::ProviderUnavailable,
-                format!("Codex usage endpoint returned HTTP {}", status.as_u16()),
-            ));
-        }
-
-        let payload: Value = response.json().await.map_err(|err| {
-            ProviderError::new(
-                ProviderErrorKind::Parse,
-                format!("Codex usage JSON was invalid: {err}"),
-            )
-        })?;
-        let account_display_name = payload
-            .get("email")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let mut usage = normalize_usage(&payload, account_display_name.as_deref())?;
-        let mut warnings = Vec::new();
-        match tokio::task::spawn_blocking(scan_codex_local_costs).await {
-            Ok(Ok(report)) => usage.merge_cost_report(report),
-            Ok(Err(err)) => warnings.push(format!("Codex local cost scan failed: {err}")),
-            Err(err) => warnings.push(format!("Codex local cost scan task failed: {err}")),
+        let app_server_started = Instant::now();
+        info!("codex app-server usage collection started");
+        let mut collected = match tokio::task::spawn_blocking(collect_usage_from_app_server).await {
+            Ok(Ok(collected)) => {
+                info!(
+                    elapsed_ms = app_server_started.elapsed().as_millis(),
+                    windows = collected.usage.windows.len(),
+                    reset_credits_available =
+                        reset_credits_available_count(&collected.usage.metadata),
+                    reset_credits_next_expires_at =
+                        reset_credits_next_expires_at(&collected.usage.metadata),
+                    "codex app-server usage collection completed"
+                );
+                collected
+            }
+            Ok(Err(app_server_err)) => {
+                warn!(
+                    elapsed_ms = app_server_started.elapsed().as_millis(),
+                    error = %app_server_err,
+                    "codex app-server usage failed; falling back to wham"
+                );
+                let mut fallback = self.collect_usage_from_wham(&credentials).await?;
+                fallback.warnings.push(format!(
+                    "Codex app-server usage failed; used legacy wham usage API fallback: {}",
+                    app_server_err.short_message()
+                ));
+                fallback
+            }
+            Err(err) => {
+                warn!(
+                    elapsed_ms = app_server_started.elapsed().as_millis(),
+                    error = %err,
+                    "codex app-server usage task failed; falling back to wham"
+                );
+                let mut fallback = self.collect_usage_from_wham(&credentials).await?;
+                fallback.warnings.push(format!(
+                    "Codex app-server usage task failed; used legacy wham usage API fallback: {err}"
+                ));
+                fallback
+            }
+        };
+        let cost_cache = self.cost_cache.clone();
+        let cost_started = Instant::now();
+        debug!("codex local cost scan started");
+        match tokio::task::spawn_blocking(move || scan_codex_local_costs_cached(cost_cache)).await {
+            Ok(Ok(scan)) => {
+                info!(
+                    elapsed_ms = cost_started.elapsed().as_millis(),
+                    cache_status = scan.cache_status.as_str(),
+                    files_scanned = scan.report.files_scanned,
+                    token_count_events = scan.report.token_count_events,
+                    today_tokens = scan.report.today_tokens,
+                    lookback_tokens = scan.report.lookback_tokens,
+                    "codex local cost scan completed"
+                );
+                collected.usage.merge_cost_report(scan.report)
+            }
+            Ok(Err(err)) => collected
+                .warnings
+                .push(format!("Codex local cost scan failed: {err}")),
+            Err(err) => collected
+                .warnings
+                .push(format!("Codex local cost scan task failed: {err}")),
         }
 
         Ok(ProviderCollectionResult {
-            usage,
-            collection_mode: "wham_usage_api".to_string(),
-            account_display_name,
-            raw_payload: self.capture_raw_payloads.then_some(payload),
-            warnings,
+            usage: collected.usage,
+            collection_mode: collected.collection_mode,
+            account_display_name: collected.account_display_name,
+            raw_payload: self.capture_raw_payloads.then_some(collected.raw_payload),
+            warnings: collected.warnings,
         })
     }
+}
+
+#[derive(Debug)]
+struct CodexCollectedUsage {
+    usage: ProviderUsage,
+    collection_mode: String,
+    account_display_name: Option<String>,
+    raw_payload: Value,
+    warnings: Vec<String>,
+}
+
+fn reset_credits_available_count(metadata: &Value) -> Option<f64> {
+    metadata
+        .get("rate_limit_reset_credits")
+        .and_then(|value| value.get("available_count"))
+        .and_then(number_from_json_value)
+        .or_else(|| {
+            metadata
+                .get("rate_limit_reset_credits_available_count")
+                .and_then(number_from_json_value)
+        })
+}
+
+fn reset_credits_next_expires_at(metadata: &Value) -> Option<f64> {
+    metadata
+        .get("rate_limit_reset_credits")
+        .and_then(|value| value.get("next_expires_at"))
+        .and_then(number_from_json_value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +377,278 @@ fn normalize_usage(
                 .and_then(|value| value.get("available_count"))
                 .and_then(number_from_json_value),
             "spend_control_reached": object.get("spend_control").and_then(|value| value.get("reached")).and_then(Value::as_bool),
+            "top_level_keys": top_level_keys,
+        }),
+    })
+}
+
+fn collect_usage_from_app_server() -> Result<CodexCollectedUsage, ProviderError> {
+    let payload = run_codex_app_server_rate_limits().map_err(|err| {
+        ProviderError::new(
+            ProviderErrorKind::ProviderUnavailable,
+            format!("Codex app-server rate limit request failed: {err}"),
+        )
+    })?;
+    let account_display_name = payload
+        .get("account_read")
+        .and_then(|value| value.get("account"))
+        .and_then(|value| value.get("email"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let usage = normalize_app_server_usage(&payload, account_display_name.as_deref())?;
+
+    Ok(CodexCollectedUsage {
+        usage,
+        collection_mode: "codex_app_server_rate_limits".to_string(),
+        account_display_name,
+        raw_payload: payload,
+        warnings: Vec::new(),
+    })
+}
+
+fn run_codex_app_server_rate_limits() -> anyhow::Result<Value> {
+    let started = Instant::now();
+    debug!("codex app-server process starting");
+    let mut child = Command::new("codex")
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open codex app-server stderr"))?;
+
+    let (line_tx, line_rx) = mpsc::channel::<std::io::Result<String>>();
+    let _stdout_thread = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let stop = line.is_err();
+            if line_tx.send(line).is_err() || stop {
+                break;
+            }
+        }
+    });
+
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+    let _stderr_thread = thread::spawn(move || {
+        let mut contents = String::new();
+        let _ = stderr.read_to_string(&mut contents);
+        let _ = stderr_tx.send(contents);
+    });
+
+    write_json_rpc(
+        &mut stdin,
+        &json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "usagetracker",
+                    "title": "usagetracker",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+    )?;
+    write_json_rpc(
+        &mut stdin,
+        &json!({ "method": "initialized", "params": {} }),
+    )?;
+    write_json_rpc(
+        &mut stdin,
+        &json!({
+            "method": "account/read",
+            "id": 2,
+            "params": { "refreshToken": false }
+        }),
+    )?;
+    write_json_rpc(
+        &mut stdin,
+        &json!({ "method": "account/rateLimits/read", "id": 3 }),
+    )?;
+
+    let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
+    let mut account_read: Option<Value> = None;
+    let mut rate_limits_read: Option<Value> = None;
+
+    while account_read.is_none() || rate_limits_read.is_none() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let line = match line_rx.recv_timeout(remaining) {
+            Ok(line) => line?,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("codex app-server stdout closed before expected responses");
+            }
+        };
+
+        let message: Value = serde_json::from_str(&line)?;
+        debug!(
+            id = message.get("id").and_then(|value| value.as_i64()),
+            has_error = message.get("error").is_some(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "codex app-server message received"
+        );
+        match message.get("id").and_then(Value::as_i64) {
+            Some(2) => account_read = Some(json_rpc_result(message, "account/read")?),
+            Some(3) => {
+                rate_limits_read = Some(json_rpc_result(message, "account/rateLimits/read")?)
+            }
+            _ => {}
+        }
+    }
+
+    drop(stdin);
+    let _ = child.kill();
+    match child.wait_timeout(Duration::from_secs(2))? {
+        Some(status) => {
+            debug!(
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                "codex app-server process exited"
+            );
+        }
+        None => {
+            warn!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "codex app-server process did not exit after kill timeout"
+            );
+        }
+    }
+    let stderr = stderr_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap_or_default();
+
+    let account_read = account_read.ok_or_else(|| {
+        warn!(
+            elapsed_ms = started.elapsed().as_millis(),
+            stderr = stderr.trim(),
+            "codex app-server account/read timed out"
+        );
+        anyhow::anyhow!(
+            "codex app-server account/read timed out after {:?}; stderr: {}",
+            CODEX_APP_SERVER_TIMEOUT,
+            stderr.trim()
+        )
+    })?;
+    let rate_limits_read = rate_limits_read.ok_or_else(|| {
+        warn!(
+            elapsed_ms = started.elapsed().as_millis(),
+            stderr = stderr.trim(),
+            "codex app-server account/rateLimits/read timed out"
+        );
+        anyhow::anyhow!(
+            "codex app-server account/rateLimits/read timed out after {:?}; stderr: {}",
+            CODEX_APP_SERVER_TIMEOUT,
+            stderr.trim()
+        )
+    })?;
+
+    debug!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "codex app-server process completed"
+    );
+
+    Ok(json!({
+        "account_read": account_read,
+        "rate_limits_read": rate_limits_read,
+    }))
+}
+
+fn write_json_rpc(stdin: &mut impl Write, message: &Value) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut *stdin, message)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn json_rpc_result(message: Value, method: &str) -> anyhow::Result<Value> {
+    if let Some(error) = message.get("error") {
+        anyhow::bail!("{method} returned error: {error}");
+    }
+    message
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{method} response missing result"))
+}
+
+fn normalize_app_server_usage(
+    payload: &Value,
+    display_name: Option<&str>,
+) -> Result<ProviderUsage, ProviderError> {
+    let rate_limits_read = payload
+        .get("rate_limits_read")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                "Codex app-server rate limits response was not a JSON object",
+            )
+        })?;
+    let account = payload
+        .get("account_read")
+        .and_then(|value| value.get("account"));
+    let main_rate_limit = rate_limits_read
+        .get("rateLimitsByLimitId")
+        .and_then(|value| value.get("codex"))
+        .or_else(|| rate_limits_read.get("rateLimits"));
+
+    let mut windows = collect_app_server_rate_limit_windows(AppServerRateLimitGroupSpec {
+        id_prefix: "codex",
+        label_prefix: "Codex",
+        rate_limit: main_rate_limit,
+    });
+    windows.extend(collect_app_server_additional_rate_limit_windows(
+        rate_limits_read.get("rateLimitsByLimitId"),
+    ));
+    windows.extend(collect_app_server_credits_window(
+        main_rate_limit.and_then(|value| value.get("credits")),
+    ));
+
+    let reset_credits = rate_limits_read.get("rateLimitResetCredits");
+    let top_level_keys = rate_limits_read.keys().cloned().collect::<Vec<_>>();
+    Ok(ProviderUsage {
+        provider_id: ProviderId::new(PROVIDER_ID),
+        collected_at: Utc::now(),
+        windows,
+        metadata: json!({
+            "account_display_name": display_name,
+            "email": account.and_then(|value| value.get("email")).and_then(Value::as_str),
+            "collection_mode": "codex_app_server_rate_limits",
+            "credits_has_credits": main_rate_limit
+                .and_then(|value| value.get("credits"))
+                .and_then(|value| value.get("hasCredits"))
+                .and_then(Value::as_bool),
+            "credits_overage_limit_reached": Value::Null,
+            "credits_unlimited": main_rate_limit
+                .and_then(|value| value.get("credits"))
+                .and_then(|value| value.get("unlimited"))
+                .and_then(Value::as_bool),
+            "plan_type": account
+                .and_then(|value| value.get("planType"))
+                .and_then(Value::as_str)
+                .or_else(|| main_rate_limit.and_then(|value| value.get("planType")).and_then(Value::as_str)),
+            "rate_limit_reached_type": main_rate_limit
+                .and_then(|value| value.get("rateLimitReachedType"))
+                .and_then(Value::as_str),
+            "rate_limit_reset_credits_available_count": reset_credits
+                .and_then(|value| value.get("availableCount"))
+                .and_then(number_from_json_value),
+            "rate_limit_reset_credits": app_server_reset_credits_metadata(reset_credits),
+            "spend_control_reached": Value::Null,
             "top_level_keys": top_level_keys,
         }),
     })
@@ -349,7 +755,44 @@ fn token_window(window_id: &str, label: &str, tokens: u64, kind: UsageWindowKind
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug)]
+struct CodexCostCache {
+    fingerprint: CodexSessionFingerprint,
+    report: CodexCostReport,
+    scanned_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexCostCacheStatus {
+    Hit,
+    Throttled,
+    Refreshed,
+}
+
+impl CodexCostCacheStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Throttled => "throttled",
+            Self::Refreshed => "refreshed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodexCostScan {
+    report: CodexCostReport,
+    cache_status: CodexCostCacheStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CodexSessionFingerprint {
+    files: usize,
+    total_size: u64,
+    latest_modified_ns: u128,
+}
+
+#[derive(Clone, Debug, Default)]
 struct CodexCostReport {
     session_roots: Vec<String>,
     files_scanned: usize,
@@ -365,7 +808,7 @@ struct CodexCostReport {
     by_model: BTreeMap<String, CodexModelCostSummary>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct DailyCostSummary {
     cost_usd: f64,
     tokens: u64,
@@ -378,7 +821,7 @@ struct DailyCostRow {
     tokens: u64,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 struct CodexModelCostSummary {
     input_tokens: u64,
     cached_input_tokens: u64,
@@ -409,8 +852,45 @@ impl CodexTokenTotals {
     }
 }
 
-fn scan_codex_local_costs() -> anyhow::Result<CodexCostReport> {
+fn scan_codex_local_costs_cached(
+    cache: Arc<Mutex<Option<CodexCostCache>>>,
+) -> anyhow::Result<CodexCostScan> {
     let roots = codex_session_roots()?;
+    let fingerprint = codex_session_fingerprint(&roots)?;
+    if let Some(cached) = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Codex cost cache mutex poisoned"))?
+        .as_ref()
+    {
+        if cached.fingerprint == fingerprint {
+            return Ok(CodexCostScan {
+                report: cached.report.clone(),
+                cache_status: CodexCostCacheStatus::Hit,
+            });
+        }
+        if cached.scanned_at.elapsed() < CODEX_COST_SCAN_MIN_INTERVAL {
+            return Ok(CodexCostScan {
+                report: cached.report.clone(),
+                cache_status: CodexCostCacheStatus::Throttled,
+            });
+        }
+    }
+
+    let report = scan_codex_local_costs_from_roots(roots)?;
+    *cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Codex cost cache mutex poisoned"))? = Some(CodexCostCache {
+        fingerprint,
+        report: report.clone(),
+        scanned_at: Instant::now(),
+    });
+    Ok(CodexCostScan {
+        report,
+        cache_status: CodexCostCacheStatus::Refreshed,
+    })
+}
+
+fn scan_codex_local_costs_from_roots(roots: Vec<PathBuf>) -> anyhow::Result<CodexCostReport> {
     let today = Local::now().date_naive();
     let lookback_start = today
         .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
@@ -431,6 +911,26 @@ fn scan_codex_local_costs() -> anyhow::Result<CodexCostReport> {
     }
 
     Ok(report)
+}
+
+fn codex_session_fingerprint(roots: &[PathBuf]) -> anyhow::Result<CodexSessionFingerprint> {
+    let mut fingerprint = CodexSessionFingerprint::default();
+    for root in roots {
+        collect_codex_session_files(root, &mut |path| {
+            let metadata = std::fs::metadata(path)?;
+            fingerprint.files += 1;
+            fingerprint.total_size = fingerprint.total_size.saturating_add(metadata.len());
+            let modified_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            fingerprint.latest_modified_ns = fingerprint.latest_modified_ns.max(modified_ns);
+            Ok(())
+        })?;
+    }
+    Ok(fingerprint)
 }
 
 fn codex_session_roots() -> anyhow::Result<Vec<PathBuf>> {
@@ -739,6 +1239,19 @@ struct RateLimitWindowSpec<'a> {
     value: Option<&'a Value>,
 }
 
+struct AppServerRateLimitGroupSpec<'a> {
+    id_prefix: &'a str,
+    label_prefix: &'a str,
+    rate_limit: Option<&'a Value>,
+}
+
+struct AppServerRateLimitWindowSpec<'a> {
+    window_id: String,
+    label: String,
+    kind: UsageWindowKind,
+    value: Option<&'a Value>,
+}
+
 fn collect_codex_rate_limit_windows(spec: RateLimitGroupSpec<'_>) -> Vec<UsageWindow> {
     let Some(rate_limit) = spec.rate_limit.and_then(Value::as_object) else {
         return Vec::new();
@@ -756,6 +1269,32 @@ fn collect_codex_rate_limit_windows(spec: RateLimitGroupSpec<'_>) -> Vec<UsageWi
             label: format!("{} weekly", spec.label_prefix),
             kind: UsageWindowKind::Weekly,
             value: rate_limit.get("secondary_window"),
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn collect_app_server_rate_limit_windows(
+    spec: AppServerRateLimitGroupSpec<'_>,
+) -> Vec<UsageWindow> {
+    let Some(rate_limit) = spec.rate_limit.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    [
+        app_server_rate_limit_window(AppServerRateLimitWindowSpec {
+            window_id: format!("{}_session", spec.id_prefix),
+            label: format!("{} session", spec.label_prefix),
+            kind: UsageWindowKind::Session,
+            value: rate_limit.get("primary"),
+        }),
+        app_server_rate_limit_window(AppServerRateLimitWindowSpec {
+            window_id: format!("{}_weekly", spec.id_prefix),
+            label: format!("{} weekly", spec.label_prefix),
+            kind: UsageWindowKind::Weekly,
+            value: rate_limit.get("secondary"),
         }),
     ]
     .into_iter()
@@ -790,7 +1329,67 @@ fn collect_additional_rate_limit_windows(value: Option<&Value>) -> Vec<UsageWind
         .collect()
 }
 
+fn collect_app_server_additional_rate_limit_windows(value: Option<&Value>) -> Vec<UsageWindow> {
+    let Some(rate_limits) = value.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    rate_limits
+        .iter()
+        .filter(|(limit_id, _)| limit_id.as_str() != "codex")
+        .enumerate()
+        .flat_map(|(index, (limit_id, rate_limit))| {
+            let label = rate_limit
+                .get("limitName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(limit_id);
+            let id_prefix = format!("codex_additional_{index}");
+            collect_app_server_rate_limit_windows(AppServerRateLimitGroupSpec {
+                id_prefix: &id_prefix,
+                label_prefix: label,
+                rate_limit: Some(rate_limit),
+            })
+        })
+        .collect()
+}
+
 fn collect_codex_credits_window(credits: Option<&Value>) -> Option<UsageWindow> {
+    let credits = credits.and_then(Value::as_object)?;
+
+    let balance = credits.get("balance").and_then(number_from_json_value);
+    let unlimited = credits
+        .get("unlimited")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if balance.is_none() && !unlimited {
+        return None;
+    }
+
+    let remaining = if unlimited { None } else { balance };
+    let mut metadata_label = "Codex credits".to_string();
+    if unlimited {
+        metadata_label.push_str(" (unlimited)");
+    }
+
+    Some(UsageWindow {
+        window_id: "codex_credits".to_string(),
+        label: metadata_label,
+        kind: UsageWindowKind::Credits,
+        used: None,
+        limit: None,
+        remaining: remaining.map(|value| UsageAmount {
+            value,
+            unit: UsageUnit::Credits,
+        }),
+        percent_used: None,
+        percent_remaining: None,
+        reset_at: None,
+    })
+}
+
+fn collect_app_server_credits_window(credits: Option<&Value>) -> Option<UsageWindow> {
     let credits = credits.and_then(Value::as_object)?;
 
     let balance = credits.get("balance").and_then(number_from_json_value);
@@ -857,6 +1456,92 @@ fn rate_limit_window(spec: RateLimitWindowSpec<'_>) -> Option<UsageWindow> {
         percent_remaining,
         reset_at,
     })
+}
+
+fn app_server_rate_limit_window(spec: AppServerRateLimitWindowSpec<'_>) -> Option<UsageWindow> {
+    let object = spec.value?.as_object()?;
+    let percent_used = object
+        .get("usedPercent")
+        .and_then(number_from_json_value)
+        .map(|value| value.clamp(0.0, MAX_PERCENT));
+    let percent_remaining = percent_used.map(|value| MAX_PERCENT - value);
+    let reset_at = object
+        .get("resetsAt")
+        .and_then(unix_timestamp_from_json_value);
+
+    if percent_used.is_none() && reset_at.is_none() {
+        return None;
+    }
+
+    Some(UsageWindow {
+        window_id: spec.window_id,
+        label: spec.label,
+        kind: spec.kind,
+        used: None,
+        limit: None,
+        remaining: None,
+        percent_used,
+        percent_remaining,
+        reset_at,
+    })
+}
+
+fn app_server_reset_credits_metadata(reset_credits: Option<&Value>) -> Value {
+    let Some(reset_credits) = reset_credits.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+
+    let credits = reset_credits
+        .get("credits")
+        .and_then(Value::as_array)
+        .map(|credits| {
+            credits
+                .iter()
+                .filter_map(app_server_reset_credit_metadata)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let next_expires_at = credits
+        .iter()
+        .filter(|credit| {
+            credit
+                .get("status")
+                .and_then(Value::as_str)
+                .is_none_or(|status| status == "available")
+        })
+        .filter_map(|credit| credit.get("expires_at").and_then(number_from_json_value))
+        .min_by(|left, right| left.total_cmp(right));
+    let next_expires_at_iso = next_expires_at.and_then(unix_seconds_iso);
+
+    json!({
+        "available_count": reset_credits
+            .get("availableCount")
+            .and_then(number_from_json_value),
+        "credits": credits,
+        "next_expires_at": next_expires_at,
+        "next_expires_at_iso": next_expires_at_iso,
+    })
+}
+
+fn app_server_reset_credit_metadata(credit: &Value) -> Option<Value> {
+    let credit = credit.as_object()?;
+    let granted_at = credit.get("grantedAt").and_then(number_from_json_value);
+    let expires_at = credit.get("expiresAt").and_then(number_from_json_value);
+    Some(json!({
+        "id": credit.get("id").and_then(Value::as_str),
+        "status": credit.get("status").and_then(Value::as_str),
+        "reset_type": credit.get("resetType").and_then(Value::as_str),
+        "granted_at": granted_at,
+        "granted_at_iso": granted_at.and_then(unix_seconds_iso),
+        "expires_at": expires_at,
+        "expires_at_iso": expires_at.and_then(unix_seconds_iso),
+        "title": credit.get("title").and_then(Value::as_str),
+        "description": credit.get("description").and_then(Value::as_str),
+    }))
+}
+
+fn unix_seconds_iso(seconds: f64) -> Option<String> {
+    DateTime::from_timestamp(seconds.round() as i64, 0).map(|time| time.to_rfc3339())
 }
 
 fn number_from_json_value(value: &Value) -> Option<f64> {
@@ -967,6 +1652,156 @@ mod tests {
             snapshot.metadata["rate_limit_reset_credits_available_count"],
             1.0
         );
+    }
+
+    #[test]
+    fn normalizes_app_server_rate_limits_with_reset_credit_expiry() {
+        let payload = json!({
+            "account_read": {
+                "account": {
+                    "type": "chatgpt",
+                    "email": "user@example.com",
+                    "planType": "prolite"
+                },
+                "requiresOpenaiAuth": true
+            },
+            "rate_limits_read": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": null,
+                    "primary": {
+                        "usedPercent": 7,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1783626874
+                    },
+                    "secondary": {
+                        "usedPercent": 39,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1784040385
+                    },
+                    "credits": {
+                        "hasCredits": false,
+                        "unlimited": false,
+                        "balance": "0"
+                    },
+                    "planType": "prolite",
+                    "rateLimitReachedType": null
+                },
+                "rateLimitsByLimitId": {
+                    "codex_bengalfox": {
+                        "limitId": "codex_bengalfox",
+                        "limitName": "GPT-5.3-Codex-Spark",
+                        "primary": {
+                            "usedPercent": 0,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1783627252
+                        },
+                        "secondary": {
+                            "usedPercent": 0,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1784214052
+                        },
+                        "credits": null,
+                        "planType": "prolite",
+                        "rateLimitReachedType": null
+                    },
+                    "codex": {
+                        "limitId": "codex",
+                        "limitName": null,
+                        "primary": {
+                            "usedPercent": 7,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1783626874
+                        },
+                        "secondary": {
+                            "usedPercent": 39,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1784040385
+                        },
+                        "credits": {
+                            "hasCredits": false,
+                            "unlimited": false,
+                            "balance": "0"
+                        },
+                        "planType": "prolite",
+                        "rateLimitReachedType": null
+                    }
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 4,
+                    "credits": [
+                        {
+                            "id": "RateLimitResetCredit_old",
+                            "resetType": "codexRateLimits",
+                            "status": "available",
+                            "grantedAt": 1781230493,
+                            "expiresAt": 1783822493,
+                            "title": "Full reset (Weekly + 5 hr)",
+                            "description": "Thanks for using Codex!"
+                        },
+                        {
+                            "id": "RateLimitResetCredit_new",
+                            "resetType": "codexRateLimits",
+                            "status": "available",
+                            "grantedAt": 1781743124,
+                            "expiresAt": 1784335124,
+                            "title": "Full reset (Weekly + 5 hr)",
+                            "description": "Thanks for using Codex!"
+                        }
+                    ]
+                }
+            }
+        });
+
+        let snapshot = normalize_app_server_usage(&payload, Some("Codex"))
+            .unwrap()
+            .into_snapshot(AccountId::new("acct"));
+        assert_eq!(snapshot.windows.len(), 5);
+
+        let session = find_window(&snapshot.windows, "codex_session");
+        assert_eq!(session.percent_used, Some(7.0));
+        assert_eq!(session.percent_remaining, Some(93.0));
+        assert_eq!(session.reset_at.unwrap().timestamp(), 1783626874);
+
+        let weekly = find_window(&snapshot.windows, "codex_weekly");
+        assert_eq!(weekly.percent_used, Some(39.0));
+        assert_eq!(weekly.reset_at.unwrap().timestamp(), 1784040385);
+
+        let additional_session = find_window(&snapshot.windows, "codex_additional_0_session");
+        assert_eq!(additional_session.label, "GPT-5.3-Codex-Spark session");
+
+        let credits = find_window(&snapshot.windows, "codex_credits");
+        assert_eq!(credits.remaining.as_ref().unwrap().value, 0.0);
+
+        assert_eq!(
+            snapshot.metadata["collection_mode"],
+            "codex_app_server_rate_limits"
+        );
+        assert_eq!(
+            snapshot.metadata["rate_limit_reset_credits_available_count"],
+            4.0
+        );
+        assert_eq!(
+            snapshot.metadata["rate_limit_reset_credits"]["next_expires_at"],
+            1783822493.0
+        );
+        assert_eq!(
+            snapshot.metadata["rate_limit_reset_credits"]["next_expires_at_iso"],
+            "2026-07-12T02:14:53+00:00"
+        );
+        assert_eq!(
+            snapshot.metadata["rate_limit_reset_credits"]["credits"][0]["expires_at"],
+            1783822493.0
+        );
+        assert_eq!(
+            snapshot.metadata["rate_limit_reset_credits"]["credits"][0]["expires_at_iso"],
+            "2026-07-12T02:14:53+00:00"
+        );
+        assert_eq!(
+            snapshot.metadata["rate_limit_reset_credits"]["credits"][0]["id"],
+            "RateLimitResetCredit_old"
+        );
+        assert_eq!(snapshot.metadata["plan_type"], "prolite");
     }
 
     #[test]

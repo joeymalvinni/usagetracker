@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    os::unix::net::UnixStream as StdUnixStream,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -256,6 +257,25 @@ fn prepare_socket_path(socket_path: &Path) -> anyhow::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
+
+    if socket_path.exists() {
+        match StdUnixStream::connect(socket_path) {
+            Ok(_) => {
+                anyhow::bail!(
+                    "daemon socket {} is already accepting connections; refusing to replace a live daemon socket",
+                    socket_path.display()
+                );
+            }
+            Err(err) => {
+                info!(
+                    socket = %socket_path.display(),
+                    error = %err,
+                    "removing stale daemon socket"
+                );
+            }
+        }
+    }
+
     match std::fs::remove_file(socket_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),

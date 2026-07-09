@@ -1,10 +1,10 @@
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Instant};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use usage_core::{Account, ApiRequest, ApiResponse, ProviderHealth, UsageSnapshot};
 
 use crate::daemon::DaemonRuntime;
@@ -46,8 +46,14 @@ impl SocketServer {
             let response = match serde_json::from_str::<ApiRequest>(&line) {
                 Ok(request) => {
                     info!(request = ?request, "daemon request received");
+                    let started = Instant::now();
                     let response = self.handle_request(request).await;
-                    debug!(response = ?response, "daemon response completed");
+                    info!(
+                        response = response_summary(&response),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "daemon request completed"
+                    );
+                    trace!(response = ?response, "daemon response body");
                     response
                 }
                 Err(err) => {
@@ -151,6 +157,17 @@ fn is_supported_provider(provider_id: &str) -> bool {
 fn storage_error(err: anyhow::Error) -> ApiResponse {
     warn!(error = %err, "storage request failed");
     ApiResponse::error("storage_error", err.to_string())
+}
+
+fn response_summary(response: &ApiResponse) -> &'static str {
+    match response {
+        ApiResponse::Usage { .. } => "usage",
+        ApiResponse::Refresh { .. } => "refresh",
+        ApiResponse::ProviderHealth { .. } => "provider_health",
+        ApiResponse::Accounts { .. } => "accounts",
+        ApiResponse::Config { .. } => "config",
+        ApiResponse::Error { .. } => "error",
+    }
 }
 
 #[cfg(test)]

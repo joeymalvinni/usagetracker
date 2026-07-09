@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
@@ -43,7 +43,9 @@ impl RefreshCoordinator {
     }
 
     pub async fn refresh(&self, filter: Option<&[ProviderId]>) -> RefreshReport {
+        let lock_started = Instant::now();
         let _guard = self.refresh_lock.lock().await;
+        let lock_wait_ms = lock_started.elapsed().as_millis();
         let providers = self.providers.read().await.clone();
         let started_at = Utc::now();
         let filter_values = filter
@@ -52,6 +54,7 @@ impl RefreshCoordinator {
         info!(
             provider_filter = ?filter_values,
             provider_count = providers.len(),
+            lock_wait_ms,
             "refresh started"
         );
 
@@ -91,6 +94,7 @@ impl RefreshCoordinator {
             provider_id = provider_id.as_str(),
             "discovering provider accounts"
         );
+        let discovery_started = Instant::now();
 
         let accounts = match provider.discover_accounts().await {
             Ok(accounts) => accounts,
@@ -100,6 +104,7 @@ impl RefreshCoordinator {
         info!(
             provider_id = provider_id.as_str(),
             account_count = accounts.len(),
+            elapsed_ms = discovery_started.elapsed().as_millis(),
             "provider account discovery completed"
         );
 
@@ -148,10 +153,29 @@ impl RefreshCoordinator {
             account_id = account.id.as_str(),
             "collecting provider usage"
         );
+        let collect_started = Instant::now();
 
         match provider.collect_usage(&discovered).await {
-            Ok(result) => self.store_success(provider_id, account.id, result).await,
+            Ok(result) => {
+                info!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account.id.as_str(),
+                    collection_mode = result.collection_mode.as_str(),
+                    elapsed_ms = collect_started.elapsed().as_millis(),
+                    warnings = result.warnings.len(),
+                    "provider usage collection completed"
+                );
+                self.store_success(provider_id, account.id, result).await
+            }
             Err(err) => {
+                warn!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account.id.as_str(),
+                    elapsed_ms = collect_started.elapsed().as_millis(),
+                    error_code = err.kind().as_str(),
+                    error = %err,
+                    "provider usage collection failed"
+                );
                 self.record_failure(provider_id, Some(account.id), err)
                     .await
             }
@@ -182,6 +206,7 @@ impl RefreshCoordinator {
             );
         }
 
+        let store_started = Instant::now();
         if let Err(err) = self
             .storage
             .insert_snapshot(&snapshot, result.raw_payload.as_ref())
@@ -238,10 +263,21 @@ impl RefreshCoordinator {
             }
         }
 
+        for warning in &result.warnings {
+            warn!(
+                provider_id = provider_id.as_str(),
+                account_id = account_id.as_str(),
+                warning = %warning,
+                "provider refresh warning"
+            );
+        }
+
         info!(
             provider_id = provider_id.as_str(),
             account_id = account_id.as_str(),
             windows = snapshot.windows.len(),
+            collection_mode = result.collection_mode.as_str(),
+            elapsed_ms = store_started.elapsed().as_millis(),
             "provider usage stored"
         );
         ProviderRefreshResult {

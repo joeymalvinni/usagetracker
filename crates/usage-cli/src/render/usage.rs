@@ -64,6 +64,7 @@ struct ProviderPanel {
     pace: Option<PaceLine>,
     forecast: Option<String>,
     credits: Option<String>,
+    reset_credits: Option<String>,
     identity: Option<String>,
 }
 
@@ -139,6 +140,7 @@ impl ProviderPanel {
             pace,
             forecast,
             credits: credits_line(snapshot),
+            reset_credits: reset_credits_line(snapshot),
             identity: labels.identity,
         }
     }
@@ -210,6 +212,9 @@ fn render_compact(dashboard: &Dashboard, theme: Theme) -> String {
         if let Some(credits) = &provider.credits {
             parts.push(format!("credits {}", collapse_spaces(credits)));
         }
+        if let Some(reset_credits) = &provider.reset_credits {
+            parts.push(format!("resets {}", collapse_spaces(reset_credits)));
+        }
         let identity = provider
             .identity
             .as_ref()
@@ -280,6 +285,13 @@ fn provider_lines(provider: &ProviderPanel, theme: Theme) -> Vec<String> {
     }
     if let Some(monthly) = &provider.monthly {
         lines.push(window_row(monthly, theme));
+    }
+    if let Some(reset_credits) = &provider.reset_credits {
+        lines.push(format!(
+            "{} {}",
+            pad_right(theme.label("Resets"), 8),
+            theme.good(reset_credits)
+        ));
     }
     if let Some(pace) = &provider.pace {
         lines.push(format!(
@@ -428,6 +440,37 @@ fn credits_line(snapshot: &UsageSnapshot) -> Option<String> {
     } else {
         None
     }
+}
+
+fn reset_credits_line(snapshot: &UsageSnapshot) -> Option<String> {
+    let metadata = snapshot.metadata.get("rate_limit_reset_credits")?;
+    let available = metadata
+        .get("available_count")
+        .and_then(f64_value)
+        .or_else(|| {
+            snapshot
+                .metadata
+                .get("rate_limit_reset_credits_available_count")
+                .and_then(f64_value)
+        })?;
+    if available <= 0.0 {
+        return None;
+    }
+
+    let count = available.round() as u64;
+    let next_expires_at = metadata
+        .get("next_expires_at")
+        .and_then(f64_value)
+        .and_then(|seconds| DateTime::from_timestamp(seconds.round() as i64, 0));
+    let suffix = next_expires_at
+        .map(reset_credit_expiry_label)
+        .unwrap_or_else(|| "expiry unknown".to_string());
+
+    Some(format!(
+        "{} available  {}",
+        pluralize(count, "reset", "resets"),
+        suffix
+    ))
 }
 
 fn pace_line(window: &UsageWindow) -> Option<PaceLine> {
@@ -690,6 +733,24 @@ fn reset_label(reset_at: DateTime<Utc>) -> String {
     format!("resets {}", reset_at.with_timezone(&Local).format("%b %-d"))
 }
 
+fn reset_credit_expiry_label(expires_at: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    if expires_at <= now {
+        return "expired".to_string();
+    }
+
+    let local = expires_at.with_timezone(&Local);
+    format!("expires {}", local.format("%a, %b %-d at %-I:%M %p"))
+}
+
+fn pluralize(count: u64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
 fn token_bar(tokens: u64, peak: u64, width: usize, theme: Theme) -> String {
     if peak == 0 {
         return theme.muted(&"░".repeat(width));
@@ -806,6 +867,10 @@ fn u64_value(value: &Value) -> Option<u64> {
         .or_else(|| value.as_str()?.parse().ok())
 }
 
+fn f64_value(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +889,8 @@ mod tests {
         assert!(rendered.contains("Activity · last 7 days"));
         assert!(rendered.contains("Codex · openai-web · Pro Lite"));
         assert!(rendered.contains("Monthly"));
+        assert!(rendered.contains("Resets"));
+        assert!(rendered.contains("2 resets available"));
         assert!(rendered.contains("Identity user@example.com"));
         assert!(!rendered.contains("\x1b["));
     }
@@ -896,6 +963,11 @@ mod tests {
                 "collection_mode": "wham_usage_api",
                 "plan_type": "prolite",
                 "email": "user@example.com",
+                "rate_limit_reset_credits_available_count": 2,
+                "rate_limit_reset_credits": {
+                    "available_count": 2,
+                    "next_expires_at": (Utc::now() + TimeDelta::days(2)).timestamp()
+                },
                 "codex_cost": {
                     "total_tokens": 1_250_000_000_u64,
                     "by_day": [
