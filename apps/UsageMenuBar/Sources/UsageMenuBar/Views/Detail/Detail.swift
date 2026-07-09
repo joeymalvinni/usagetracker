@@ -209,13 +209,13 @@ private struct ProviderSection<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.xs + 2) {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             Text(title)
                 .font(Theme.Typography.caption.bold())
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, Theme.Spacing.xl)
-                .padding(.bottom, Theme.Spacing.xs)
+                .padding(.top, Theme.Spacing.sm)
+                .padding(.bottom, 2)
             content
         }
     }
