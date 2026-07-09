@@ -46,7 +46,7 @@ struct Settings: View {
     private var providerList: some View {
         VStack(spacing: 0) {
             List {
-                ForEach(state.providers) { p in
+                ForEach(state.settingsProviders) { p in
                     ProviderSettingsRow(provider: p)
                         .listRowSeparator(.hidden)
                         .listRowBackground(Color.clear)
@@ -58,7 +58,7 @@ struct Settings: View {
             .scrollContentBackground(.hidden)
             .scrollDisabled(true)
             .environment(\.defaultMinListRowHeight, 44)
-            .frame(height: CGFloat(state.providers.count) * 50)
+            .frame(height: CGFloat(state.settingsProviders.count) * 50)
             Text("Drag to reorder. Order applies to the summary.")
                 .font(Theme.Typography.micro)
                 .foregroundStyle(.tertiary)

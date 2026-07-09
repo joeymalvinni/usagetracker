@@ -115,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
         match (command, response) {
             (Command::Usage, ApiResponse::Usage { snapshots }) => {
                 let accounts = fetch_accounts(&socket_path).await?;
+                let config = fetch_config(&socket_path).await?;
+                let snapshots = default_visible_snapshots(snapshots, &config);
+                let accounts = default_visible_accounts(accounts, &config);
                 println!(
                     "{}",
                     render::render_usage(&snapshots, &accounts, args.style, color)
@@ -208,6 +211,37 @@ fn color_enabled(choice: ColorChoice) -> bool {
         ColorChoice::Never => false,
         ColorChoice::Auto => env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal(),
     }
+}
+
+fn default_visible_snapshots(
+    snapshots: Vec<UsageSnapshot>,
+    config: &ConfigResponse,
+) -> Vec<UsageSnapshot> {
+    snapshots
+        .into_iter()
+        .filter(|snapshot| default_visible_provider(snapshot.provider_id.as_str(), config))
+        .collect()
+}
+
+fn default_visible_accounts(accounts: Vec<Account>, config: &ConfigResponse) -> Vec<Account> {
+    accounts
+        .into_iter()
+        .filter(|account| default_visible_provider(account.provider_id.as_str(), config))
+        .collect()
+}
+
+fn default_visible_provider(provider_id: &str, config: &ConfigResponse) -> bool {
+    if config
+        .providers
+        .get(provider_id)
+        .is_some_and(|provider| provider.enabled)
+    {
+        return true;
+    }
+    config
+        .enabled_providers
+        .iter()
+        .any(|id| id.as_str() == provider_id)
 }
 
 async fn send_request(socket_path: &PathBuf, request: &ApiRequest) -> anyhow::Result<ApiResponse> {

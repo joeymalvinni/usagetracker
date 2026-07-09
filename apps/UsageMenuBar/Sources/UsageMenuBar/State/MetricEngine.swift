@@ -10,10 +10,11 @@ struct MetricEngine {
     let visible: (String) -> Bool
 
     var providers: [ProviderVM] {
-        var ids = Set((config?.enabledProviders ?? []).filter(isSupportedProvider) + health.map(\.providerId).filter(isSupportedProvider) + snapshots.map(\.providerId).filter(isSupportedProvider))
-        ids.formUnion(accounts.map(\.providerId).filter(isSupportedProvider))
-        if let config { ids.formUnion(config.providers.keys.filter(isSupportedProvider)) }
-        return ordered(Array(ids.filter(isVisibleProvider))).map(model)
+        ordered(Array(providerIds().filter(isDefaultVisibleProvider))).map(model)
+    }
+
+    var settingsProviders: [ProviderVM] {
+        ordered(Array(providerIds(includeKnownProviders: true))).map(model)
     }
 
     var costDashboard: CostDashboardVM {
@@ -71,8 +72,18 @@ struct MetricEngine {
         return CostDashboardVM(days: days, providers: providers)
     }
 
+    private var knownProviderIds: [String] { ["codex", "claude", "opencode_go"] }
+
+    private func providerIds(includeKnownProviders: Bool = false) -> Set<String> {
+        var ids = Set((config?.enabledProviders ?? []).filter(isSupportedProvider) + health.map(\.providerId).filter(isSupportedProvider) + snapshots.map(\.providerId).filter(isSupportedProvider))
+        ids.formUnion(accounts.map(\.providerId).filter(isSupportedProvider))
+        if let config { ids.formUnion(config.providers.keys.filter(isSupportedProvider)) }
+        if includeKnownProviders { ids.formUnion(knownProviderIds) }
+        return ids
+    }
+
     private func ordered(_ ids: [String]) -> [String] {
-        let preferred = ui.providerOrder.filter(isSupportedProvider) + ["codex", "claude", "opencode_go"]
+        let preferred = ui.providerOrder.filter(isSupportedProvider) + knownProviderIds
         var seen = Set<String>()
         let supported = ids.filter(isSupportedProvider)
         let ranked = preferred.filter { supported.contains($0) && seen.insert($0).inserted }
@@ -81,19 +92,23 @@ struct MetricEngine {
 
     private func isSupportedProvider(_ id: String) -> Bool { id != "opencode" }
 
-    private func isVisibleProvider(_ id: String) -> Bool {
-        hasProviderData(id) || isConnectedProvider(id)
+    private func isDefaultVisibleProvider(_ id: String) -> Bool {
+        guard isEnabledProvider(id) else { return false }
+        if hasProviderData(id) { return true }
+        return !isUnavailableProvider(id)
     }
 
     private func hasProviderData(_ id: String) -> Bool {
         snapshots.contains { $0.providerId == id } || accounts.contains { $0.providerId == id }
     }
 
-    private func isConnectedProvider(_ id: String) -> Bool {
-        if config?.providers[id]?.enabled == true || config?.enabledProviders.contains(id) == true {
-            return true
-        }
-        return health.contains { $0.providerId == id && $0.status != .disabled }
+    private func isEnabledProvider(_ id: String) -> Bool {
+        if let enabled = config?.providers[id]?.enabled { return enabled }
+        return config?.enabledProviders.contains(id) == true
+    }
+
+    private func isUnavailableProvider(_ id: String) -> Bool {
+        health.contains { $0.providerId == id && $0.lastErrorCode == "provider_unavailable" }
     }
 
     private func model(_ id: String) -> ProviderVM {
@@ -105,7 +120,7 @@ struct MetricEngine {
         let windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: id) }
         let credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: id) }
         let primary = windows.compactMap(\.percent).min()
-        let enabled = config?.providers[id]?.enabled ?? (config?.enabledProviders.contains(id) ?? (h?.status != .disabled))
+        let enabled = isEnabledProvider(id)
         let status = status(id: id, percent: primary, latest: latest, health: h, enabled: enabled)
         let (sparkline, sparklineTotal) = dailyTokens(providerId: id)
         let secondary = secondaryMetric(sparklineTotal: sparklineTotal, windows: windows)

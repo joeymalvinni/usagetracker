@@ -15,6 +15,7 @@ enum DaemonState { case unknown, online, offline }
     @Published var pendingProviders = Set<String>()
     @Published var pendingInterval = false
     @Published var providers = [ProviderVM]()
+    @Published var settingsProviders = [ProviderVM]()
     @Published var cost = CostDashboardVM.empty
     @Published var menuPreview = "Usage"
     @Published var menuStatus = DisplayStatus.stale
@@ -92,7 +93,7 @@ enum DaemonState { case unknown, online, offline }
     }
 
     func moveProviders(from source: IndexSet, to destination: Int) {
-        var order = providers.map(\.id)
+        var order = settingsProviders.map(\.id)
         order.move(fromOffsets: source, toOffset: destination)
         ui.providerOrder = order
     }
@@ -143,6 +144,7 @@ enum DaemonState { case unknown, online, offline }
     private func build() {
         let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, ui: ui, visible: uiVisible)
         providers = engine.providers
+        settingsProviders = engine.settingsProviders
         cost = engine.costDashboard
         let (preview, status, bars) = menuContent()
         menuPreview = preview

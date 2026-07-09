@@ -273,8 +273,9 @@ fn provider_ids(
     provider_ids
         .into_iter()
         .filter(|provider_id| {
-            has_provider_data(provider_id, snapshots, accounts)
-                || is_connected_provider(provider_id, config, health)
+            is_enabled_provider(provider_id, config)
+                && (has_provider_data(provider_id, snapshots, accounts)
+                    || !is_unavailable_without_data(provider_id, health))
         })
         .collect()
 }
@@ -288,19 +289,23 @@ fn has_provider_data(provider_id: &str, snapshots: &[UsageSnapshot], accounts: &
             .any(|account| account.provider_id.as_str() == provider_id)
 }
 
-fn is_connected_provider(
-    provider_id: &str,
-    config: &ConfigResponse,
-    health: &[ProviderHealth],
-) -> bool {
+fn is_enabled_provider(provider_id: &str, config: &ConfigResponse) -> bool {
     config
         .providers
         .get(provider_id)
         .is_some_and(|provider| provider.enabled)
-        || health.iter().any(|row| {
-            row.provider_id.as_str() == provider_id
-                && !matches!(row.status, ProviderHealthStatus::Disabled)
-        })
+        || config
+            .enabled_providers
+            .iter()
+            .any(|id| id.as_str() == provider_id)
+}
+
+fn is_unavailable_without_data(provider_id: &str, health: &[ProviderHealth]) -> bool {
+    health.iter().any(|row| {
+        row.provider_id.as_str() == provider_id
+            && matches!(row.status, ProviderHealthStatus::ProviderError)
+            && row.last_error_code.as_deref() == Some("provider_unavailable")
+    })
 }
 
 fn latest_snapshots_by_provider(snapshots: &[UsageSnapshot]) -> HashMap<String, &UsageSnapshot> {
@@ -406,6 +411,81 @@ mod tests {
 
         assert!(!rendered.contains(r#""provider_id":"codex""#));
         assert!(rendered.contains(r#""provider_id":"claude""#));
+    }
+
+    #[test]
+    fn hides_disabled_providers_with_data() {
+        let account_id = AccountId::new("account");
+        let account = Account {
+            id: account_id.clone(),
+            provider_id: ProviderId::new("codex"),
+            external_account_id: "joey".to_string(),
+            display_name: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let snapshot = UsageSnapshot {
+            provider_id: ProviderId::new("codex"),
+            account_id,
+            collected_at: Utc::now(),
+            windows: Vec::<UsageWindow>::new(),
+            metadata: json!({}),
+        };
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("codex".to_string(), ProviderToggle { enabled: false });
+
+        let status = StatusView::from_parts(
+            "/tmp/usage.sock".to_string(),
+            &[snapshot],
+            &[account],
+            &[],
+            &ConfigResponse {
+                poll_interval_seconds: 60,
+                config_path: "/tmp/config.json".to_string(),
+                socket_path: "/tmp/usage.sock".to_string(),
+                db_path: "/tmp/usage.sqlite3".to_string(),
+                enabled_providers: vec![],
+                providers,
+            },
+        );
+        let rendered = serde_json::to_string(&status).unwrap();
+
+        assert!(!rendered.contains(r#""provider_id":"codex""#));
+    }
+
+    #[test]
+    fn hides_unavailable_enabled_providers_without_data() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("codex".to_string(), ProviderToggle { enabled: true });
+        let health = ProviderHealth {
+            provider_id: ProviderId::new("codex"),
+            account_id: None,
+            status: ProviderHealthStatus::ProviderError,
+            collection_mode: None,
+            last_success_at: None,
+            last_failure_at: Some(Utc::now()),
+            last_error_code: Some("provider_unavailable".to_string()),
+            last_error_message: Some("Codex data directory not found".to_string()),
+            updated_at: Utc::now(),
+        };
+
+        let status = StatusView::from_parts(
+            "/tmp/usage.sock".to_string(),
+            &[],
+            &[],
+            &[health],
+            &ConfigResponse {
+                poll_interval_seconds: 60,
+                config_path: "/tmp/config.json".to_string(),
+                socket_path: "/tmp/usage.sock".to_string(),
+                db_path: "/tmp/usage.sqlite3".to_string(),
+                enabled_providers: vec![ProviderId::new("codex")],
+                providers,
+            },
+        );
+        let rendered = serde_json::to_string(&status).unwrap();
+
+        assert!(!rendered.contains(r#""provider_id":"codex""#));
     }
 
     fn sample_status(collected_at: DateTime<Utc>) -> StatusView {
