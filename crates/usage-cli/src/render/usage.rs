@@ -60,6 +60,7 @@ struct ProviderPanel {
     title: String,
     session: Option<WindowLine>,
     weekly: Option<WindowLine>,
+    monthly: Option<WindowLine>,
     pace: Option<PaceLine>,
     forecast: Option<String>,
     credits: Option<String>,
@@ -116,6 +117,7 @@ impl ProviderPanel {
     fn from_snapshot(snapshot: &UsageSnapshot, account: Option<&Account>) -> Self {
         let session_window = select_window(snapshot, WindowRole::Session);
         let weekly_window = select_window(snapshot, WindowRole::Weekly);
+        let monthly_window = select_window(snapshot, WindowRole::Monthly);
         let pace_window = weekly_window.or(session_window);
         let pace = pace_window.and_then(pace_line);
         let forecast = pace.as_ref().map(|pace| {
@@ -133,6 +135,7 @@ impl ProviderPanel {
             title: provider_title(snapshot, labels.plan.as_deref()),
             session: session_window.map(|window| window_line("Session", window)),
             weekly: weekly_window.map(|window| window_line("Weekly", window)),
+            monthly: monthly_window.map(|window| window_line("Monthly", window)),
             pace,
             forecast,
             credits: credits_line(snapshot),
@@ -200,6 +203,9 @@ fn render_compact(dashboard: &Dashboard, theme: Theme) -> String {
         }
         if let Some(weekly) = &provider.weekly {
             parts.push(compact_window(weekly));
+        }
+        if let Some(monthly) = &provider.monthly {
+            parts.push(compact_window(monthly));
         }
         if let Some(credits) = &provider.credits {
             parts.push(format!("credits {}", collapse_spaces(credits)));
@@ -271,6 +277,9 @@ fn provider_lines(provider: &ProviderPanel, theme: Theme) -> Vec<String> {
     }
     if let Some(weekly) = &provider.weekly {
         lines.push(window_row(weekly, theme));
+    }
+    if let Some(monthly) = &provider.monthly {
+        lines.push(window_row(monthly, theme));
     }
     if let Some(pace) = &provider.pace {
         lines.push(format!(
@@ -474,6 +483,7 @@ fn expected_window_duration(window: &UsageWindow) -> Option<TimeDelta> {
 enum WindowRole {
     Session,
     Weekly,
+    Monthly,
 }
 
 fn select_window(snapshot: &UsageSnapshot, role: WindowRole) -> Option<&UsageWindow> {
@@ -508,6 +518,12 @@ fn role_matches(window: &UsageWindow, role: WindowRole) -> bool {
                 || name.contains("weekly")
                 || name.contains("seven_day")
                 || name.contains("seven day")
+        }
+        WindowRole::Monthly => {
+            matches!(window.kind, UsageWindowKind::Monthly)
+                || name.contains("monthly")
+                || name.contains("30d")
+                || name.contains("30 days")
         }
     }
 }
@@ -807,6 +823,7 @@ mod tests {
         assert!(rendered.contains("Overview"));
         assert!(rendered.contains("Activity · last 7 days"));
         assert!(rendered.contains("Codex · openai-web · Pro Lite"));
+        assert!(rendered.contains("Monthly"));
         assert!(rendered.contains("Identity user@example.com"));
         assert!(!rendered.contains("\x1b["));
     }
@@ -862,6 +879,17 @@ mod tests {
                     percent_used: Some(40.0),
                     percent_remaining: Some(60.0),
                     reset_at: Some(Utc::now() + TimeDelta::days(3)),
+                },
+                UsageWindow {
+                    window_id: "codex_monthly".to_string(),
+                    label: "Codex monthly".to_string(),
+                    kind: UsageWindowKind::Monthly,
+                    used: None,
+                    limit: None,
+                    remaining: None,
+                    percent_used: Some(50.0),
+                    percent_remaining: Some(50.0),
+                    reset_at: Some(Utc::now() + TimeDelta::days(20)),
                 },
             ],
             metadata: json!({
