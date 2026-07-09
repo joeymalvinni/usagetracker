@@ -33,6 +33,15 @@ impl RefreshCoordinator {
         *self.providers.write().await = providers;
     }
 
+    pub async fn provider_ids(&self) -> Vec<ProviderId> {
+        self.providers
+            .read()
+            .await
+            .iter()
+            .map(|provider| provider.provider_id())
+            .collect()
+    }
+
     pub async fn refresh(&self, filter: Option<&[ProviderId]>) -> RefreshReport {
         let _guard = self.refresh_lock.lock().await;
         let providers = self.providers.read().await.clone();

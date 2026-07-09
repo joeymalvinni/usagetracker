@@ -11,8 +11,9 @@ struct MetricEngine {
 
     var providers: [ProviderVM] {
         var ids = Set((config?.enabledProviders ?? []).filter(isSupportedProvider) + health.map(\.providerId).filter(isSupportedProvider) + snapshots.map(\.providerId).filter(isSupportedProvider))
+        ids.formUnion(accounts.map(\.providerId).filter(isSupportedProvider))
         if let config { ids.formUnion(config.providers.keys.filter(isSupportedProvider)) }
-        return ordered(Array(ids)).map(model)
+        return ordered(Array(ids.filter(isVisibleProvider))).map(model)
     }
 
     var costDashboard: CostDashboardVM {
@@ -79,6 +80,21 @@ struct MetricEngine {
     }
 
     private func isSupportedProvider(_ id: String) -> Bool { id != "opencode" }
+
+    private func isVisibleProvider(_ id: String) -> Bool {
+        hasProviderData(id) || isConnectedProvider(id)
+    }
+
+    private func hasProviderData(_ id: String) -> Bool {
+        snapshots.contains { $0.providerId == id } || accounts.contains { $0.providerId == id }
+    }
+
+    private func isConnectedProvider(_ id: String) -> Bool {
+        if config?.providers[id]?.enabled == true || config?.enabledProviders.contains(id) == true {
+            return true
+        }
+        return health.contains { $0.providerId == id && $0.status != .disabled }
+    }
 
     private func model(_ id: String) -> ProviderVM {
         let latest = snapshots.filter { $0.providerId == id }.max { $0.collectedAt < $1.collectedAt }

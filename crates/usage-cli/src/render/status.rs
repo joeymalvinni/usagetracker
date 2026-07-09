@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
-use usage_core::{Account, ConfigResponse, ProviderHealth, UsageSnapshot};
+use usage_core::{Account, ConfigResponse, ProviderHealth, ProviderHealthStatus, UsageSnapshot};
 
 use crate::{
     render::{
@@ -60,7 +60,7 @@ impl StatusView {
             .iter()
             .map(|row| (row.provider_id.as_str().to_string(), row))
             .collect::<HashMap<_, _>>();
-        let provider_ids = provider_ids(config, health, snapshots);
+        let provider_ids = provider_ids(config, health, snapshots, accounts);
         let freshness_window = TimeDelta::seconds((config.poll_interval_seconds * 2) as i64);
 
         let providers = provider_ids
@@ -251,6 +251,7 @@ fn provider_ids(
     config: &ConfigResponse,
     health: &[ProviderHealth],
     snapshots: &[UsageSnapshot],
+    accounts: &[Account],
 ) -> Vec<String> {
     let mut provider_ids = BTreeSet::new();
     provider_ids.extend(config.providers.keys().cloned());
@@ -264,7 +265,42 @@ fn provider_ids(
             .iter()
             .map(|snapshot| snapshot.provider_id.as_str().to_string()),
     );
-    provider_ids.into_iter().collect()
+    provider_ids.extend(
+        accounts
+            .iter()
+            .map(|account| account.provider_id.as_str().to_string()),
+    );
+    provider_ids
+        .into_iter()
+        .filter(|provider_id| {
+            has_provider_data(provider_id, snapshots, accounts)
+                || is_connected_provider(provider_id, config, health)
+        })
+        .collect()
+}
+
+fn has_provider_data(provider_id: &str, snapshots: &[UsageSnapshot], accounts: &[Account]) -> bool {
+    snapshots
+        .iter()
+        .any(|snapshot| snapshot.provider_id.as_str() == provider_id)
+        || accounts
+            .iter()
+            .any(|account| account.provider_id.as_str() == provider_id)
+}
+
+fn is_connected_provider(
+    provider_id: &str,
+    config: &ConfigResponse,
+    health: &[ProviderHealth],
+) -> bool {
+    config
+        .providers
+        .get(provider_id)
+        .is_some_and(|provider| provider.enabled)
+        || health.iter().any(|row| {
+            row.provider_id.as_str() == provider_id
+                && !matches!(row.status, ProviderHealthStatus::Disabled)
+        })
 }
 
 fn latest_snapshots_by_provider(snapshots: &[UsageSnapshot]) -> HashMap<String, &UsageSnapshot> {
@@ -333,6 +369,43 @@ mod tests {
 
         assert!(rendered.contains(r#""type":"status""#));
         assert!(rendered.contains(r#""usage":"fresh""#));
+    }
+
+    #[test]
+    fn hides_disabled_providers_without_data() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("codex".to_string(), ProviderToggle { enabled: false });
+        providers.insert("claude".to_string(), ProviderToggle { enabled: true });
+        let health = ProviderHealth {
+            provider_id: ProviderId::new("codex"),
+            account_id: None,
+            status: ProviderHealthStatus::Disabled,
+            collection_mode: None,
+            last_success_at: None,
+            last_failure_at: None,
+            last_error_code: None,
+            last_error_message: None,
+            updated_at: Utc::now(),
+        };
+
+        let status = StatusView::from_parts(
+            "/tmp/usage.sock".to_string(),
+            &[],
+            &[],
+            &[health],
+            &ConfigResponse {
+                poll_interval_seconds: 60,
+                config_path: "/tmp/config.json".to_string(),
+                socket_path: "/tmp/usage.sock".to_string(),
+                db_path: "/tmp/usage.sqlite3".to_string(),
+                enabled_providers: vec![ProviderId::new("claude")],
+                providers,
+            },
+        );
+        let rendered = serde_json::to_string(&status).unwrap();
+
+        assert!(!rendered.contains(r#""provider_id":"codex""#));
+        assert!(rendered.contains(r#""provider_id":"claude""#));
     }
 
     fn sample_status(collected_at: DateTime<Utc>) -> StatusView {

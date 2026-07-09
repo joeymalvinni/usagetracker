@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
@@ -113,8 +118,31 @@ impl DaemonRuntime {
         (runtime, poll_interval_rx)
     }
 
-    pub async fn config_response(&self) -> ConfigResponse {
-        self.config.read().await.response()
+    pub async fn config_response(&self) -> anyhow::Result<ConfigResponse> {
+        let visible_providers = self.visible_provider_ids().await?;
+        Ok(self
+            .config
+            .read()
+            .await
+            .response_with_visible_providers(Some(&visible_providers)))
+    }
+
+    pub async fn visible_provider_ids(&self) -> anyhow::Result<BTreeSet<String>> {
+        let mut providers = self
+            .storage
+            .provider_data_ids()
+            .await?
+            .into_iter()
+            .map(|id| id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        providers.extend(
+            self.refresh
+                .provider_ids()
+                .await
+                .into_iter()
+                .map(|id| id.as_str().to_string()),
+        );
+        Ok(providers)
     }
 
     pub async fn update_config(
@@ -140,12 +168,15 @@ impl DaemonRuntime {
         self.refresh.set_providers(collectors).await;
         let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
 
+        let poll_interval_seconds = config.poll_interval_seconds;
+        let enabled_providers = config.enabled_provider_ids();
         info!(
-            poll_interval_seconds = config.poll_interval_seconds,
-            enabled_providers = ?config.enabled_provider_ids(),
+            poll_interval_seconds,
+            enabled_providers = ?enabled_providers,
             "daemon config updated"
         );
-        Ok(config.response())
+        drop(config);
+        self.config_response().await
     }
 }
 

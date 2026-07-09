@@ -250,6 +250,22 @@ impl Storage {
         .await
     }
 
+    pub async fn provider_data_ids(&self) -> anyhow::Result<Vec<ProviderId>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT provider_id FROM accounts
+                 UNION
+                 SELECT provider_id FROM usage_snapshots
+                 ORDER BY provider_id",
+            )?;
+            let provider_ids = stmt
+                .query_map([], |row| Ok(ProviderId::new(row.get::<_, String>(0)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(provider_ids)
+        })
+        .await
+    }
+
     async fn with_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
@@ -468,6 +484,48 @@ mod tests {
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].account_id.as_ref(), Some(&account_id));
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn returns_provider_ids_with_account_or_snapshot_data() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("codex");
+        let account = storage
+            .upsert_account(&provider_id, "external-account", Some("Codex"))
+            .await
+            .unwrap();
+
+        storage
+            .upsert_health(&ProviderHealth {
+                provider_id: ProviderId::new("claude"),
+                account_id: None,
+                status: ProviderHealthStatus::Disabled,
+                collection_mode: None,
+                last_success_at: None,
+                last_failure_at: None,
+                last_error_code: None,
+                last_error_message: None,
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        storage
+            .insert_snapshot(
+                &UsageSnapshot {
+                    provider_id: provider_id.clone(),
+                    account_id: account.id,
+                    collected_at: Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({}),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let providers = storage.provider_data_ids().await.unwrap();
+        assert_eq!(providers, vec![provider_id]);
     }
 
     fn test_storage() -> Storage {

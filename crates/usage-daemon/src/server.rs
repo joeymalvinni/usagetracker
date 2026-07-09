@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -80,20 +80,26 @@ impl SocketServer {
                     provider_results: report.provider_results,
                 }
             }
-            ApiRequest::GetProviderHealth => match self.runtime.storage.provider_health().await {
-                Ok(health) => ApiResponse::ProviderHealth {
-                    health: supported_provider_health(health),
-                },
-                Err(err) => storage_error(err),
-            },
+            ApiRequest::GetProviderHealth => {
+                match (
+                    self.runtime.storage.provider_health().await,
+                    self.runtime.visible_provider_ids().await,
+                ) {
+                    (Ok(health), Ok(visible_providers)) => ApiResponse::ProviderHealth {
+                        health: visible_supported_provider_health(health, &visible_providers),
+                    },
+                    (Err(err), _) | (_, Err(err)) => storage_error(err),
+                }
+            }
             ApiRequest::GetAccounts => match self.runtime.storage.accounts().await {
                 Ok(accounts) => ApiResponse::Accounts {
                     accounts: supported_accounts(accounts),
                 },
                 Err(err) => storage_error(err),
             },
-            ApiRequest::GetConfig => ApiResponse::Config {
-                config: self.runtime.config_response().await,
+            ApiRequest::GetConfig => match self.runtime.config_response().await {
+                Ok(config) => ApiResponse::Config { config },
+                Err(err) => storage_error(err),
             },
             ApiRequest::UpdateConfig {
                 poll_interval_seconds,
@@ -120,10 +126,14 @@ fn supported_usage_snapshots(snapshots: Vec<UsageSnapshot>) -> Vec<UsageSnapshot
         .collect()
 }
 
-fn supported_provider_health(health: Vec<ProviderHealth>) -> Vec<ProviderHealth> {
+fn visible_supported_provider_health(
+    health: Vec<ProviderHealth>,
+    visible_providers: &BTreeSet<String>,
+) -> Vec<ProviderHealth> {
     health
         .into_iter()
         .filter(|row| is_supported_provider(row.provider_id.as_str()))
+        .filter(|row| visible_providers.contains(row.provider_id.as_str()))
         .collect()
 }
 
@@ -256,7 +266,7 @@ mod tests {
             ApiResponse::Config { config } => {
                 assert_eq!(config.poll_interval_seconds, 120);
                 assert_eq!(config.enabled_providers, Vec::<ProviderId>::new());
-                assert!(!config.providers["codex"].enabled);
+                assert!(!config.providers.contains_key("codex"));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -269,6 +279,95 @@ mod tests {
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);
         let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn serves_disabled_provider_when_database_has_data() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "codex".to_string(),
+            crate::config::ProviderConfig {
+                enabled: false,
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
+        let env = test_env(providers);
+        env.runtime
+            .storage
+            .upsert_account(&ProviderId::new("codex"), "external-account", None)
+            .await
+            .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+
+        wait_for_socket(&env.socket_path).await;
+        let response = request_line(&env.socket_path, r#"{"method":"get_config"}"#).await;
+
+        match response {
+            ApiResponse::Config { config } => {
+                assert_eq!(config.enabled_providers, Vec::<ProviderId>::new());
+                assert!(!config.providers["codex"].enabled);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[test]
+    fn filters_health_to_visible_supported_providers() {
+        let mut visible = BTreeSet::new();
+        visible.insert("codex".to_string());
+        let now = chrono::Utc::now();
+
+        let filtered = visible_supported_provider_health(
+            vec![
+                ProviderHealth {
+                    provider_id: ProviderId::new("codex"),
+                    account_id: None,
+                    status: usage_core::ProviderHealthStatus::Disabled,
+                    collection_mode: None,
+                    last_success_at: None,
+                    last_failure_at: None,
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at: now,
+                },
+                ProviderHealth {
+                    provider_id: ProviderId::new("claude"),
+                    account_id: None,
+                    status: usage_core::ProviderHealthStatus::Disabled,
+                    collection_mode: None,
+                    last_success_at: None,
+                    last_failure_at: None,
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at: now,
+                },
+                ProviderHealth {
+                    provider_id: ProviderId::new("opencode"),
+                    account_id: None,
+                    status: usage_core::ProviderHealthStatus::Ok,
+                    collection_mode: None,
+                    last_success_at: None,
+                    last_failure_at: None,
+                    last_error_code: None,
+                    last_error_message: None,
+                    updated_at: now,
+                },
+            ],
+            &visible,
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].provider_id, ProviderId::new("codex"));
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -92,17 +92,25 @@ impl Config {
             .collect()
     }
 
-    pub fn response(&self) -> ConfigResponse {
+    pub fn response_with_visible_providers(
+        &self,
+        visible_providers: Option<&BTreeSet<String>>,
+    ) -> ConfigResponse {
         ConfigResponse {
             poll_interval_seconds: self.poll_interval_seconds,
             config_path: self.paths.config.display().to_string(),
             socket_path: self.paths.socket.display().to_string(),
             db_path: self.paths.db.display().to_string(),
-            enabled_providers: self.enabled_provider_ids(),
+            enabled_providers: self
+                .enabled_provider_ids()
+                .into_iter()
+                .filter(|id| provider_visible(id.as_str(), visible_providers))
+                .collect(),
             providers: self
                 .providers
                 .iter()
                 .filter(|(id, _)| is_supported_provider(id))
+                .filter(|(id, _)| provider_visible(id, visible_providers))
                 .map(|(id, provider)| {
                     (
                         id.clone(),
@@ -159,6 +167,10 @@ impl Config {
             .with_context(|| format!("failed to write {}", self.paths.config.display()))?;
         Ok(())
     }
+}
+
+fn provider_visible(provider_id: &str, visible_providers: Option<&BTreeSet<String>>) -> bool {
+    visible_providers.is_none_or(|ids| ids.contains(provider_id))
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
