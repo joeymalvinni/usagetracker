@@ -97,6 +97,7 @@ pub(crate) fn format_provider_name(provider_id: &str) -> String {
     match provider_id {
         "codex" => "Codex".to_string(),
         "claude" => "Claude".to_string(),
+        "opencode_go" => "OpenCode Go".to_string(),
         value => title_case(&value.replace(['_', '-'], " ")),
     }
 }
@@ -106,6 +107,8 @@ pub(crate) fn format_collection_mode(provider_id: &str, mode: &str) -> String {
         ("codex", "wham_usage_api") => "openai-web".to_string(),
         ("claude", "claude_cli_usage") => "terminal".to_string(),
         ("claude", "oauth_usage_api") => "web".to_string(),
+        ("opencode_go", "opencode_go_web_console") => "web".to_string(),
+        ("opencode_go", "opencode_go_local_sqlite") => "local".to_string(),
         _ => mode.replace('_', "-"),
     }
 }

@@ -39,11 +39,15 @@ pub struct FileConfig {
     pub debug_capture_raw_payloads: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub cookie_header: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 impl Config {
@@ -82,6 +86,7 @@ impl Config {
     pub fn enabled_provider_ids(&self) -> Vec<ProviderId> {
         self.providers
             .iter()
+            .filter(|(id, _)| is_supported_provider(id))
             .filter(|(_, config)| config.enabled)
             .map(|(id, _)| ProviderId::new(id.clone()))
             .collect()
@@ -97,6 +102,7 @@ impl Config {
             providers: self
                 .providers
                 .iter()
+                .filter(|(id, _)| is_supported_provider(id))
                 .map(|(id, provider)| {
                     (
                         id.clone(),
@@ -124,7 +130,11 @@ impl Config {
             for (id, toggle) in providers {
                 self.providers
                     .entry(id.clone())
-                    .or_insert(ProviderConfig { enabled: false })
+                    .or_insert(ProviderConfig {
+                        enabled: false,
+                        cookie_header: None,
+                        workspace_id: None,
+                    })
                     .enabled = toggle.enabled;
             }
         }
@@ -149,6 +159,10 @@ impl Config {
             .with_context(|| format!("failed to write {}", self.paths.config.display()))?;
         Ok(())
     }
+}
+
+fn is_supported_provider(provider_id: &str) -> bool {
+    provider_id != "opencode"
 }
 
 fn default_paths() -> anyhow::Result<Paths> {
@@ -181,8 +195,30 @@ fn parse_poll_interval_env(value: &str) -> anyhow::Result<u64> {
 impl Default for FileConfig {
     fn default() -> Self {
         let mut providers = BTreeMap::new();
-        providers.insert("codex".to_string(), ProviderConfig { enabled: true });
-        providers.insert("claude".to_string(), ProviderConfig { enabled: false });
+        providers.insert(
+            "codex".to_string(),
+            ProviderConfig {
+                enabled: true,
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
+        providers.insert(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: false,
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
+        providers.insert(
+            "opencode_go".to_string(),
+            ProviderConfig {
+                enabled: false,
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
         Self {
             poll_interval_seconds: default_poll_interval_seconds(),
             providers,

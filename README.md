@@ -96,6 +96,9 @@ The config file controls which providers are enabled:
     },
     "claude": {
       "enabled": false
+    },
+    "opencode_go": {
+      "enabled": false
     }
   },
   "debug_capture_raw_payloads": false
@@ -103,6 +106,37 @@ The config file controls which providers are enabled:
 ```
 
 Codex collection reads credentials from `~/.codex/auth.json`. Claude collection defaults to the local Claude Code terminal usage command, `claude -p /usage --output-format json --no-session-persistence`. If that command fails, Claude collection falls back to Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects quota usage from Anthropic's OAuth usage API.
+
+OpenCode Go collection is disabled by default. `opencode_go` tries authenticated web console usage first, then falls back to the local OpenCode SQLite database at `~/.local/share/opencode/opencode.db` when web collection is unavailable. Zen balance is fetched as optional best-effort enrichment.
+
+OpenCode web collection resolves cookies automatically:
+
+1. Use a manually supplied cookie header from config, environment, or file.
+2. Use the cached cookie header from the macOS Keychain.
+3. Import `auth` and `__Host-auth` cookies from supported browser stores and cache the filtered header in Keychain.
+
+The browser importer scans supported browser cookie stores for `opencode.ai` and `app.opencode.ai`. `opencode_go` checks Chrome, Dia, Firefox, Brave, Edge, Arc, Chromium, and Vivaldi.
+
+Manual cookies are optional overrides:
+
+```json
+"opencode_go": {
+  "enabled": true,
+  "cookie_header": "auth=...; __Host-auth=...",
+  "workspace_id": "wrk_..."
+}
+```
+
+Environment variables:
+
+```sh
+USAGE_TRACKER_OPENCODE_GO_COOKIE='auth=...; __Host-auth=...'
+USAGE_TRACKER_OPENCODE_GO_WORKSPACE_ID='wrk_...'
+```
+
+Cookie files:
+
+- `~/.usagetracker/opencode_go.cookie`
 
 With the daemon running, use the CLI from another terminal:
 

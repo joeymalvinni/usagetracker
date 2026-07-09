@@ -11,6 +11,7 @@ use crate::{
     providers::{
         claude::{ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID},
         codex::{CodexCollector, PROVIDER_ID as CODEX_PROVIDER_ID},
+        opencode::{OpenCodeCollector, OPENCODE_GO_PROVIDER_ID},
         ProviderCollector,
     },
     server::SocketServer,
@@ -42,6 +43,10 @@ const PROVIDER_REGISTRY: &[ProviderRegistration] = &[
     ProviderRegistration {
         id: CLAUDE_PROVIDER_ID,
         build: build_claude_provider,
+    },
+    ProviderRegistration {
+        id: OPENCODE_GO_PROVIDER_ID,
+        build: build_opencode_go_provider,
     },
 ];
 
@@ -169,6 +174,17 @@ fn build_codex_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderColle
 
 fn build_claude_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
     Ok(Arc::new(ClaudeCollector::new(
+        config.debug_capture_raw_payloads,
+    )?))
+}
+
+fn build_opencode_go_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
+    Ok(Arc::new(OpenCodeCollector::new(
+        config
+            .providers
+            .get(OPENCODE_GO_PROVIDER_ID)
+            .cloned()
+            .unwrap_or_default(),
         config.debug_capture_raw_payloads,
     )?))
 }

@@ -7,6 +7,7 @@ use usage_core::{ProviderId, UsageSnapshot, UsageWindow};
 
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
 pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);

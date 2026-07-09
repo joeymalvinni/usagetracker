@@ -6,7 +6,9 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+aes.workspace = true
 async-trait.workspace = true
+cbc.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 clap.workspace = true
@@ -14,9 +16,12 @@ dirs.workspace = true
 keyring.workspace = true
 notify.workspace = true
 reqwest.workspace = true
+regex.workspace = true
+pbkdf2.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

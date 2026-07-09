@@ -5,7 +5,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tracing::{debug, info, warn};
-use usage_core::{ApiRequest, ApiResponse};
+use usage_core::{Account, ApiRequest, ApiResponse, ProviderHealth, UsageSnapshot};
 
 use crate::daemon::DaemonRuntime;
 
@@ -67,7 +67,9 @@ impl SocketServer {
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
         match request {
             ApiRequest::GetUsage => match self.runtime.storage.latest_usage().await {
-                Ok(snapshots) => ApiResponse::Usage { snapshots },
+                Ok(snapshots) => ApiResponse::Usage {
+                    snapshots: supported_usage_snapshots(snapshots),
+                },
                 Err(err) => storage_error(err),
             },
             ApiRequest::Refresh { providers } => {
@@ -79,11 +81,15 @@ impl SocketServer {
                 }
             }
             ApiRequest::GetProviderHealth => match self.runtime.storage.provider_health().await {
-                Ok(health) => ApiResponse::ProviderHealth { health },
+                Ok(health) => ApiResponse::ProviderHealth {
+                    health: supported_provider_health(health),
+                },
                 Err(err) => storage_error(err),
             },
             ApiRequest::GetAccounts => match self.runtime.storage.accounts().await {
-                Ok(accounts) => ApiResponse::Accounts { accounts },
+                Ok(accounts) => ApiResponse::Accounts {
+                    accounts: supported_accounts(accounts),
+                },
                 Err(err) => storage_error(err),
             },
             ApiRequest::GetConfig => ApiResponse::Config {
@@ -105,6 +111,31 @@ impl SocketServer {
             },
         }
     }
+}
+
+fn supported_usage_snapshots(snapshots: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
+    snapshots
+        .into_iter()
+        .filter(|snapshot| is_supported_provider(snapshot.provider_id.as_str()))
+        .collect()
+}
+
+fn supported_provider_health(health: Vec<ProviderHealth>) -> Vec<ProviderHealth> {
+    health
+        .into_iter()
+        .filter(|row| is_supported_provider(row.provider_id.as_str()))
+        .collect()
+}
+
+fn supported_accounts(accounts: Vec<Account>) -> Vec<Account> {
+    accounts
+        .into_iter()
+        .filter(|account| is_supported_provider(account.provider_id.as_str()))
+        .collect()
+}
+
+fn is_supported_provider(provider_id: &str) -> bool {
+    provider_id != "opencode"
 }
 
 fn storage_error(err: anyhow::Error) -> ApiResponse {
@@ -199,7 +230,11 @@ mod tests {
         let mut providers = BTreeMap::new();
         providers.insert(
             "codex".to_string(),
-            crate::config::ProviderConfig { enabled: true },
+            crate::config::ProviderConfig {
+                enabled: true,
+                cookie_header: None,
+                workspace_id: None,
+            },
         );
         let env = test_env(providers);
         let config_path = env.root.join("config.json");
