@@ -2,13 +2,11 @@ import SwiftUI
 
 struct Popover: View {
     @EnvironmentObject var state: AppState
-    @State private var selection: Selection = {
-        switch ProcessInfo.processInfo.environment["USAGE_DEBUG_PAGE"] {
-        case "settings": .settings
-        case let page? where page.hasPrefix("provider:"): .provider(String(page.dropFirst("provider:".count)))
-        default: .summary
-        }
-    }()
+    @State private var selection: Selection
+
+    init(initialSelection: Selection? = nil) {
+        _selection = State(initialValue: initialSelection ?? Self.debugSelection())
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -59,6 +57,14 @@ struct Popover: View {
         entries.append(contentsOf: state.providers.map { RailEntry(selection: .provider($0.id)) })
         entries.append(.init(selection: .settings))
         return entries
+    }
+
+    private static func debugSelection() -> Selection {
+        switch ProcessInfo.processInfo.environment["USAGE_DEBUG_PAGE"] {
+        case "settings": .settings
+        case let page? where page.hasPrefix("provider:"): .provider(String(page.dropFirst("provider:".count)))
+        default: .summary
+        }
     }
 }
 
