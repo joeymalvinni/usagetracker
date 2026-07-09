@@ -7,7 +7,6 @@ struct ProviderRow: View {
     var body: some View {
         Button(action: onSelect) {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                // Primary line — identity + hero number + trend + chevron.
                 HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
                     Label {
                         Text(provider.name)
@@ -26,9 +25,6 @@ struct ProviderRow: View {
                         .foregroundStyle(.tertiary)
                 }
 
-                // Secondary line — absolute stat on the left; a labeled status
-                // chip on the right, shown only when something needs attention.
-                // Healthy providers stay quiet.
                 HStack(spacing: Theme.Spacing.xs) {
                     Text(provider.secondary)
                         .font(Theme.Typography.caption)
@@ -40,18 +36,24 @@ struct ProviderRow: View {
                     }
                 }
 
-                // One inline window row + an "N windows" note when more exist.
-                // The detail page already enumerates every window, so the summary
-                // only needs to telegraph the most-used window at a glance.
-                if let primaryWindow = provider.windows.first {
+                if let primaryWindow = limitWindows.first {
                     VStack(spacing: 0) {
                         WindowRow(window: primaryWindow, compact: true)
-                        if provider.windows.count > 1 {
-                            Text("\(provider.windows.count) windows")
-                                .font(Theme.Typography.micro)
-                                .foregroundStyle(.tertiary)
-                                .frame(maxWidth: .infinity, alignment: .trailing)
-                                .padding(.top, Theme.Spacing.xs)
+                        if limitWindows.count > 1 || resetWindow != nil {
+                            HStack(spacing: Theme.Spacing.xs) {
+                                if let resetText {
+                                    Text(resetText)
+                                        .fontWeight(.medium)
+                                }
+                                Spacer(minLength: Theme.Spacing.sm)
+                                if limitWindows.count > 1 {
+                                    Text(limitCountText)
+                                }
+                            }
+                            .font(Theme.Typography.micro)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .padding(.top, Theme.Spacing.xs)
                         }
                     }
                 }
@@ -63,10 +65,28 @@ struct ProviderRow: View {
         .buttonStyle(.plain)
         .help("Open \(provider.name)")
     }
+
+    private var resetWindow: WindowVM? {
+        guard provider.id == "codex" else { return nil }
+        return provider.windows.first { $0.id == "\(provider.id)_rate_limit_resets" }
+    }
+
+    private var limitWindows: [WindowVM] {
+        provider.windows.filter { $0.id != "\(provider.id)_rate_limit_resets" }
+    }
+
+    private var resetText: String? {
+        guard let resetWindow else { return nil }
+        let value = resetWindow.value.replacingOccurrences(of: " available", with: "")
+        let noun = value == "1" ? "reset" : "resets"
+        return "\(value) \(noun) available · \(resetWindow.reset)"
+    }
+
+    private var limitCountText: String {
+        "\(limitWindows.count) limits"
+    }
 }
 
-/// Labeled status indicator — replaces the old unexplained colored dot.
-/// Says what is wrong in words, tinted by severity.
 struct StatusChip: View {
     let status: DisplayStatus
     var healthText: String = ""
@@ -87,8 +107,6 @@ struct StatusChip: View {
     }
 }
 
-/// Mini inline sparkline used in rows. Monochrome — trend shape is the
-/// signal; color stays reserved for status.
 struct Sparkline: View {
     let values: [Double]
 

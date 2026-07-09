@@ -13,9 +13,14 @@ struct Detail: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                         ProviderActivityCard(provider: p, dashboard: state.cost)
-                        if !p.windows.isEmpty {
+                        if !limitWindows(p).isEmpty {
                             ProviderSection(title: "Limits") {
-                                ForEach(p.windows) { WindowRow(window: $0) }
+                                ForEach(limitWindows(p)) { WindowRow(window: $0) }
+                            }
+                        }
+                        if p.id == "codex", !p.resetCredits.isEmpty {
+                            ProviderSection(title: "Resets") {
+                                ResetCreditDisclosure(provider: p)
                             }
                         }
                         if !p.spend.isEmpty {
@@ -38,6 +43,68 @@ struct Detail: View {
         }
         .padding(Theme.Spacing.lg)
         .transition(.opacity.combined(with: .move(edge: .trailing)))
+    }
+
+    private func limitWindows(_ provider: ProviderVM) -> [WindowVM] {
+        provider.windows.filter { $0.id != "\(provider.id)_rate_limit_resets" }
+    }
+}
+
+private struct ResetCreditDisclosure: View {
+    let provider: ProviderVM
+    @State private var expanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                ForEach(provider.resetCredits) { credit in
+                    HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(credit.title)
+                                .lineLimit(1)
+                            Text(credit.status.capitalized)
+                                .font(Theme.Typography.micro)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer(minLength: Theme.Spacing.sm)
+                        Text(credit.expiresText)
+                            .monospacedDigit()
+                            .foregroundStyle(credit.expiresAt.map { $0 <= Date() } == true ? .red : .secondary)
+                            .lineLimit(1)
+                    }
+                    .font(Theme.Typography.caption)
+                }
+            }
+            .padding(.top, Theme.Spacing.xs)
+        } label: {
+            HStack(spacing: Theme.Spacing.sm) {
+                Label {
+                    Text(summaryText)
+                } icon: {
+                    Image(systemName: "clock.arrow.circlepath")
+                }
+                .lineLimit(1)
+                Spacer(minLength: Theme.Spacing.sm)
+                Text("\(provider.resetCredits.count)")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .font(Theme.Typography.caption.weight(.medium))
+        }
+        .buttonStyle(.plain)
+        .surfaceInset()
+        .help(summaryText)
+    }
+
+    private var summaryText: String {
+        guard let resetWindow else { return "\(provider.resetCredits.count) resets available" }
+        let value = resetWindow.value.replacingOccurrences(of: " available", with: "")
+        let noun = value == "1" ? "reset" : "resets"
+        return "\(value) \(noun) available · \(resetWindow.reset)"
+    }
+
+    private var resetWindow: WindowVM? {
+        provider.windows.first { $0.id == "\(provider.id)_rate_limit_resets" }
     }
 }
 

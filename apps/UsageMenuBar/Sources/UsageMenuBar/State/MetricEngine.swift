@@ -117,8 +117,12 @@ struct MetricEngine {
         let account = accounts.first { $0.id == latest?.accountId || $0.id == h?.accountId }
         let snapshotWindows = latest?.windows ?? []
         let spend = snapshotWindows.filter(isSpendWindow).map { window($0, providerId: id) }
-        let windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: id) }
+        var windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: id) }
+        if let latest, let resetCredits = resetCreditWindow(latest, providerId: id) {
+            windows.append(resetCredits)
+        }
         let credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: id) }
+        let resetCredits = latest.map(resetCreditDetails) ?? []
         let primary = windows.compactMap(\.percent).min()
         let enabled = isEnabledProvider(id)
         let status = status(id: id, percent: primary, latest: latest, health: h, enabled: enabled)
@@ -129,6 +133,7 @@ struct MetricEngine {
             primary: primary.map { "\(Int($0.rounded()))%" } ?? windows.first?.value ?? "No data",
             detail: latest.map { "updated \(relative($0.collectedAt))" } ?? "waiting for data",
             percent: primary, status: status, spend: spend, windows: windows, credits: credits,
+            resetCredits: resetCredits,
             account: account?.displayName ?? account?.externalAccountId,
             healthText: h.map { $0.status.friendly } ?? "unknown",
             visibleInMenu: visible(id),
@@ -136,6 +141,67 @@ struct MetricEngine {
             secondary: secondary,
             sparkline: sparkline
         )
+    }
+
+    private func resetCreditWindow(_ snapshot: UsageSnapshot, providerId: String) -> WindowVM? {
+        guard let root = snapshot.metadata.object else { return nil }
+        let metadata = root["rate_limit_reset_credits"]?.object
+        let available = metadata?["available_count"]?.double ?? root["rate_limit_reset_credits_available_count"]?.double
+        guard let available, available > 0 else { return nil }
+
+        let count = Int(available.rounded())
+        let expiresAt = metadata?["next_expires_at"]?.double.map { Date(timeIntervalSince1970: $0) }
+        let reset = expiresAt.map { "expires \(expiryTime($0))" } ?? "expiry unknown"
+        let status: DisplayStatus
+        if let expiresAt, expiresAt <= Date() {
+            status = .critical
+        } else if let expiresAt, expiresAt.timeIntervalSinceNow < 24 * 60 * 60 {
+            status = .warning
+        } else {
+            status = .normal
+        }
+
+        return WindowVM(
+            id: "\(providerId)_rate_limit_resets",
+            label: "Codex resets",
+            value: "\(count) available",
+            reset: reset,
+            providerId: providerId,
+            providerName: pretty(providerId),
+            absolute: nil,
+            percent: nil,
+            status: status
+        )
+    }
+
+    private func resetCreditDetails(_ snapshot: UsageSnapshot) -> [ResetCreditVM] {
+        guard snapshot.providerId == "codex",
+              let root = snapshot.metadata.object,
+              let credits = root["rate_limit_reset_credits"]?.object?["credits"]?.array
+        else { return [] }
+
+        return credits.enumerated().compactMap { index, value in
+            guard let credit = value.object else { return nil }
+            let expiresAt = credit["expires_at"]?.double.map { Date(timeIntervalSince1970: $0) }
+            let status = credit["status"]?.string ?? "unknown"
+            let title = credit["title"]?.string ?? credit["reset_type"]?.string ?? "Reset credit"
+            let id = credit["id"]?.string ?? "\(snapshot.id):reset_credit:\(index)"
+            return ResetCreditVM(
+                id: id,
+                title: title,
+                status: status,
+                expiresAt: expiresAt,
+                expiresText: expiresAt.map(expiryTime) ?? "expiry unknown"
+            )
+        }
+        .sorted {
+            switch ($0.expiresAt, $1.expiresAt) {
+            case let (left?, right?): return left < right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return $0.title < $1.title
+            }
+        }
     }
 
     private func selectedHealth(providerId: String, accountId: String?) -> ProviderHealth? {
@@ -264,6 +330,9 @@ struct MetricEngine {
         return "chart.bar"
     }
     private func time(_ d: Date) -> String { d.formatted(date: .omitted, time: .shortened) }
+    private func expiryTime(_ d: Date) -> String {
+        DateFormats.expiry.string(from: d)
+    }
     private func relative(_ d: Date) -> String { DateFormats.relative.localizedString(for: d, relativeTo: Date()) }
 }
 

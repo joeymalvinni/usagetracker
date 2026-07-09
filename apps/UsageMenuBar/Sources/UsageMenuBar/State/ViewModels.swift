@@ -58,6 +58,7 @@ struct ProviderVM: Identifiable, Equatable {
     let percent: Double?
     let status: DisplayStatus
     let spend, windows, credits: [WindowVM]
+    let resetCredits: [ResetCreditVM]
     let account: String?
     let healthText: String
     let visibleInMenu: Bool
@@ -80,6 +81,14 @@ struct WindowVM: Identifiable, Equatable {
     let absolute: String?
     let percent: Double?
     let status: DisplayStatus
+}
+
+struct ResetCreditVM: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let status: String
+    let expiresAt: Date?
+    let expiresText: String
 }
 
 struct CostDashboardVM: Equatable {
