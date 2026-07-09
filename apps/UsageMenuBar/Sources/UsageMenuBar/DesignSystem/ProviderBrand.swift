@@ -62,6 +62,9 @@ enum ProviderBrand {
     }
 
     static func palette(_ id: String) -> ProviderPalette {
-        palettes[id] ?? fallbackPalette
+        // Detail dashboards key chart series by `provider:account` so multiple
+        // accounts remain distinct. Colors belong to the provider, however.
+        let providerId = String(id.split(separator: ":", maxSplits: 1).first ?? Substring(id))
+        return palettes[providerId] ?? fallbackPalette
     }
 }

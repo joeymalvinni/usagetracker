@@ -406,7 +406,13 @@ private struct ProviderActivityCard: View {
                 }
             }
 
-            CostActivityChart(days: days, metric: metric, hover: $hover)
+            CostActivityChart(
+                days: days,
+                metric: metric,
+                hover: $hover,
+                providerColor: Theme.chartColor(provider.providerId),
+                onSelectProvider: nil
+            )
                 .frame(height: 126)
                 .opacity(hasData ? 1 : 0.55)
 

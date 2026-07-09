@@ -6,6 +6,7 @@ struct CostActivityChart: View {
     let days: [CostDayVM]
     let metric: CostMetric
     @Binding var hover: CostProviderDayVM?
+    var providerColor: Color?
     var onSelectProvider: ((String) -> Void)?
 
     private var maxValue: Double {
@@ -59,7 +60,7 @@ struct CostActivityChart: View {
                 let visible = value(provider) > 0
                 if visible {
                     RoundedRectangle(cornerRadius: index == 0 ? 4 : 1)
-                        .fill(Theme.chartColor(provider.providerId))
+                        .fill(providerColor ?? Theme.chartColor(provider.providerId))
                         .frame(height: segmentHeight(provider, maxHeight: maxHeight))
                         .contentShape(Rectangle())
                         .onTapGesture {

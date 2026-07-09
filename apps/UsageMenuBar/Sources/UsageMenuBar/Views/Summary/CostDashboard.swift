@@ -39,7 +39,13 @@ struct CostDashboard: View {
                 .labelsHidden()
                 .frame(width: 110)
             }
-            CostActivityChart(days: days, metric: metric, hover: $hover, onSelectProvider: onSelectProvider)
+            CostActivityChart(
+                days: days,
+                metric: metric,
+                hover: $hover,
+                providerColor: nil,
+                onSelectProvider: onSelectProvider
+            )
                 .frame(height: 120)
             // Single KPI strip driven by the active metric — no longer showing
             // cost and tokens simultaneously (the old 4-grid duplicated the
