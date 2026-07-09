@@ -4,6 +4,8 @@ struct Header: View {
     @EnvironmentObject var state: AppState
     let title: String
     var subtitleStyle: HeaderSubtitleStyle = .custom("")
+    var showsRefresh = true
+    var refreshAction: (() -> Void)?
 
     var body: some View {
         HStack(spacing: Theme.Spacing.md) {
@@ -12,8 +14,14 @@ struct Header: View {
                 statusPill
             }
             Spacer()
-            RefreshRing(refreshing: state.refreshing) {
-                Task { await state.refreshAll() }
+            if showsRefresh {
+                RefreshRing(refreshing: state.refreshing) {
+                    if let refreshAction {
+                        refreshAction()
+                    } else {
+                        Task { await state.refreshAll() }
+                    }
+                }
             }
         }
     }
@@ -24,10 +32,12 @@ struct Header: View {
         case .online: StatusPill(online: true)
         case .offline: StatusPill(online: false, detail: state.message)
         case .custom(let text):
-            Text(text)
-                .font(Theme.Typography.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            if !text.isEmpty {
+                Text(text)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
     }
 }
@@ -67,9 +77,9 @@ struct RefreshRing: View {
     var body: some View {
         Button(action: action) {
             ZStack {
-                Circle()
-                    .stroke(.tertiary.opacity(0.4), lineWidth: 2)
                 if refreshing {
+                    Circle()
+                        .stroke(.tertiary.opacity(0.4), lineWidth: 2)
                     Circle()
                         .trim(from: 0, to: 0.7)
                         .stroke(.primary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
