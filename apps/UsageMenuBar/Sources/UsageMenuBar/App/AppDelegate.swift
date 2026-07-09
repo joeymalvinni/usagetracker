@@ -19,7 +19,7 @@ import SwiftUI
     private var bag = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configureStatusButton()
 
         popover.behavior = .transient
@@ -27,7 +27,10 @@ import SwiftUI
         popover.contentViewController = GlassPopoverHostingController(rootView: Popover().environmentObject(state))
 
         state.$menuPreview.receive(on: RunLoop.main).sink { [weak self] preview in self?.item.button?.toolTip = preview.isEmpty ? "Usage" : preview }.store(in: &bag)
-        state.$menuStatus.receive(on: RunLoop.main).sink { [weak self] status in self?.updateMenuIcon(for: status) }.store(in: &bag)
+        Publishers.CombineLatest(state.$menuStatus, state.$menuBars)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] status, bars in self?.updateMenuIcon(for: status, bars: bars) }
+            .store(in: &bag)
         Task { await state.bootstrap(); await state.pollLoop() }
 
         if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] == "1" { showDebugWindow() }
@@ -40,48 +43,14 @@ import SwiftUI
         item.button?.toolTip = "Usage"
         item.button?.title = ""
         item.button?.attributedTitle = NSAttributedString(string: "")
-        updateMenuIcon(for: .stale)
+        updateMenuIcon(for: .stale, bars: [])
     }
 
-    private func updateMenuIcon(for status: DisplayStatus) {
+    private func updateMenuIcon(for status: DisplayStatus, bars: [MenuBarProviderVM]) {
         guard let button = item.button else { return }
-        button.image = menuImage(for: status)
-        button.contentTintColor = menuTint(for: status)
-    }
-
-    private func menuImage(for status: DisplayStatus) -> NSImage? {
-        let symbols: [String]
-        switch status {
-        case .offline, .error:
-            symbols = ["exclamationmark.triangle.fill"]
-        case .critical:
-            symbols = ["gauge.with.dots.needle.0percent", "gauge"]
-        case .warning:
-            symbols = ["gauge.with.dots.needle.33percent", "gauge"]
-        case .normal:
-            symbols = ["gauge.with.dots.needle.67percent", "gauge"]
-        case .stale, .disabled:
-            symbols = ["gauge.with.dots.needle.50percent", "gauge"]
-        }
-
-        let image = symbols.compactMap {
-            NSImage(systemSymbolName: $0, accessibilityDescription: "Usage")
-        }.first
-        image?.isTemplate = true
-        return image
-    }
-
-    private func menuTint(for status: DisplayStatus) -> NSColor? {
-        switch status {
-        case .normal:
-            nil
-        case .warning:
-            .systemOrange
-        case .critical, .error, .offline:
-            .systemRed
-        case .stale, .disabled:
-            .secondaryLabelColor
-        }
+        item.length = MenuBarProgressIcon.statusItemLength(for: bars)
+        button.image = MenuBarProgressIcon.image(for: bars, status: status)
+        button.contentTintColor = nil
     }
 
     @objc private func toggle() {

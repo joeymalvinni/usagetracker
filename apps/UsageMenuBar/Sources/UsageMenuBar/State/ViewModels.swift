@@ -57,13 +57,21 @@ struct ProviderVM: Identifiable, Equatable {
     let id, name, short, symbol, primary, detail: String
     let percent: Double?
     let status: DisplayStatus
-    let windows, credits: [WindowVM]
+    let spend, windows, credits: [WindowVM]
     let account: String?
     let healthText: String
     let visibleInMenu: Bool
     let enabled: Bool
     let secondary: String
     let sparkline: [Double]
+}
+
+struct MenuBarProviderVM: Identifiable, Equatable {
+    var id: String { providerId }
+    let providerId: String
+    let short: String
+    let percent: Double?
+    let status: DisplayStatus
 }
 
 struct WindowVM: Identifiable, Equatable {

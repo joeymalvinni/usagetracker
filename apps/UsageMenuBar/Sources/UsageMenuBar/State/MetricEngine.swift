@@ -81,8 +81,10 @@ struct MetricEngine {
         let latest = snapshots.filter { $0.providerId == id }.max { $0.collectedAt < $1.collectedAt }
         let h = selectedHealth(providerId: id, accountId: latest?.accountId)
         let account = accounts.first { $0.id == latest?.accountId || $0.id == h?.accountId }
-        let windows = (latest?.windows ?? []).filter { $0.kind != .credits }.map { window($0, providerId: id) }
-        let credits = (latest?.windows ?? []).filter { $0.kind == .credits }.map { window($0, providerId: id) }
+        let snapshotWindows = latest?.windows ?? []
+        let spend = snapshotWindows.filter(isSpendWindow).map { window($0, providerId: id) }
+        let windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: id) }
+        let credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: id) }
         let primary = windows.compactMap(\.percent).min()
         let enabled = config?.providers[id]?.enabled ?? (config?.enabledProviders.contains(id) ?? (h?.status != .disabled))
         let status = status(id: id, percent: primary, latest: latest, health: h, enabled: enabled)
@@ -92,7 +94,7 @@ struct MetricEngine {
             id: id, name: pretty(id), short: short(id), symbol: symbol(id),
             primary: primary.map { "\(Int($0.rounded()))%" } ?? windows.first?.value ?? "No data",
             detail: latest.map { "updated \(relative($0.collectedAt))" } ?? "waiting for data",
-            percent: primary, status: status, windows: windows, credits: credits,
+            percent: primary, status: status, spend: spend, windows: windows, credits: credits,
             account: account?.displayName ?? account?.externalAccountId,
             healthText: h.map { $0.status.friendly } ?? "unknown",
             visibleInMenu: visible(id),
@@ -124,6 +126,11 @@ struct MetricEngine {
             percent: percent,
             status: status
         )
+    }
+
+    private func isSpendWindow(_ w: UsageWindow) -> Bool {
+        guard w.limit == nil, w.percentRemaining == nil, let used = w.used else { return false }
+        return used.unit == .usd || used.unit == .tokens
     }
 
     private func absoluteText(_ w: UsageWindow) -> String? {
@@ -158,7 +165,8 @@ struct MetricEngine {
     private func amount(_ a: UsageAmount?) -> String {
         guard let a else { return "No data" }
         if a.unit == .usd { return a.value.formatted(.currency(code: "USD")) }
-        return "\(Int(a.value.rounded())) \(a.unit.label)"
+        if a.unit == .tokens { return "\(compact(a.value)) tokens" }
+        return "\(compact(a.value)) \(a.unit.label)"
     }
 
     private func dailyTokens(providerId: String) -> (sparkline: [Double], total: UInt64) {

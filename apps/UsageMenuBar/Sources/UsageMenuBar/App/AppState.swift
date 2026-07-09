@@ -18,6 +18,7 @@ enum DaemonState { case unknown, online, offline }
     @Published var cost = CostDashboardVM.empty
     @Published var menuPreview = "Usage"
     @Published var menuStatus = DisplayStatus.stale
+    @Published var menuBars = [MenuBarProviderVM]()
     @Published var ui = UIConfig.load() {
         didSet { ui.save(); build() }
     }
@@ -54,6 +55,10 @@ enum DaemonState { case unknown, online, offline }
     func refreshAll() async {
         refreshing = true; defer { refreshing = false }
         do { _ = try await client.refresh(nil); await load(all: true) } catch { fail(error) }
+    }
+    func refreshProvider(_ id: String) async {
+        refreshing = true; defer { refreshing = false }
+        do { _ = try await client.refresh([id]); await load(all: true) } catch { fail(error) }
     }
     func visible(_ id: String) -> Bool { uiVisible(id) }
     func setVisible(_ id: String, _ on: Bool) {
@@ -129,28 +134,34 @@ enum DaemonState { case unknown, online, offline }
         let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, ui: ui, visible: uiVisible)
         providers = engine.providers
         cost = engine.costDashboard
-        let (preview, status) = menuContent()
+        let (preview, status, bars) = menuContent()
         menuPreview = preview
         menuStatus = status
+        menuBars = bars
     }
-    private func menuContent() -> (String, DisplayStatus) {
-        guard daemon != .offline else { return ("Usage offline", .offline) }
+    private func menuContent() -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
+        guard daemon != .offline else { return ("Usage offline", .offline, []) }
         var preview = ""
-        let shown = Array(providers.filter { $0.enabled && $0.visibleInMenu }.prefix(max(0, ui.maxMenuProviders)))
+        let eligible = providers.filter { $0.enabled && $0.visibleInMenu }
+        let shown = Array(eligible.prefix(max(0, ui.maxMenuProviders)))
         for (index, provider) in shown.enumerated() {
             if index > 0 { preview += "  " }
             let value: String
             if let percent = provider.percent {
-                let displayed = max(0, min(100, ui.menuMetric == .used ? 100 - percent : percent))
-                value = "\(Int(displayed.rounded()))%"
+                let displayedValue = max(0, min(100, ui.menuMetric == .used ? 100 - percent : percent))
+                value = "\(Int(displayedValue.rounded()))%"
             } else {
                 value = provider.primary
             }
             let text = ui.showProviderLabels ? "\(provider.short) \(value)" : value
             preview += text
         }
-        if preview.isEmpty { return ("Usage", .stale) }
-        return (preview, menuStatus(for: shown))
+        let bars = eligible.prefix(2).map { provider in
+            let displayed = provider.percent.map { max(0, min(100, ui.menuMetric == .used ? 100 - $0 : $0)) }
+            return MenuBarProviderVM(providerId: provider.id, short: provider.short, percent: displayed, status: provider.status)
+        }
+        if preview.isEmpty { return ("Usage", .stale, []) }
+        return (preview, menuStatus(for: shown), bars)
     }
 
     private func menuStatus(for providers: [ProviderVM]) -> DisplayStatus {
