@@ -12,6 +12,8 @@ enum CostMetric: String, CaseIterable, Hashable {
 
 struct CostDashboard: View {
     let dashboard: CostDashboardVM
+    var onSelectProvider: ((String) -> Void)?
+
     @State private var range: CostRange = .seven
     @State private var metric: CostMetric = .cost
     @State private var hover: CostProviderDayVM?
@@ -36,7 +38,7 @@ struct CostDashboard: View {
                 .labelsHidden()
                 .frame(width: 110)
             }
-            CostActivityChart(days: days, metric: metric, hover: $hover)
+            CostActivityChart(days: days, metric: metric, hover: $hover, onSelectProvider: onSelectProvider)
                 .frame(height: 120)
             // Single KPI strip driven by the active metric — no longer showing
             // cost and tokens simultaneously (the old 4-grid duplicated the

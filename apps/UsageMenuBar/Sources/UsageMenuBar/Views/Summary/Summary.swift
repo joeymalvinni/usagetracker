@@ -16,7 +16,9 @@ struct Summary: View {
                             isError: state.daemon == .offline
                         )
                     }
-                    CostDashboard(dashboard: state.cost)
+                    CostDashboard(dashboard: state.cost) { providerId in
+                        selection = .provider(providerId)
+                    }
                     ForEach(state.providers) { p in
                         ProviderRow(provider: p) {
                             selection = .provider(p.id)

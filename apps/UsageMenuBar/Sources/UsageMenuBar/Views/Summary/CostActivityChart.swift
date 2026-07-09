@@ -6,6 +6,7 @@ struct CostActivityChart: View {
     let days: [CostDayVM]
     let metric: CostMetric
     @Binding var hover: CostProviderDayVM?
+    var onSelectProvider: ((String) -> Void)?
 
     private var maxValue: Double {
         max(1, days.map(total).max() ?? 1)
@@ -60,6 +61,10 @@ struct CostActivityChart: View {
                     RoundedRectangle(cornerRadius: index == 0 ? 4 : 1)
                         .fill(Theme.chartColor(provider.providerId))
                         .frame(height: segmentHeight(provider, maxHeight: maxHeight))
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            onSelectProvider?(provider.providerId)
+                        }
                         .onHover { inside in if inside { hover = provider } }
                         .help("\(provider.providerName) \(shortDate(provider.date)): \(metric == .cost ? formatUsd(provider.cost) : formatTokens(provider.tokens))")
                 }
