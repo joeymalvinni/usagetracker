@@ -10,8 +10,8 @@ struct MetricEngine {
     let visible: (String) -> Bool
 
     var providers: [ProviderVM] {
-        var ids = Set((config?.enabledProviders ?? []) + health.map(\.providerId) + snapshots.map(\.providerId))
-        if let config { ids.formUnion(config.providers.keys) }
+        var ids = Set((config?.enabledProviders ?? []).filter(isSupportedProvider) + health.map(\.providerId).filter(isSupportedProvider) + snapshots.map(\.providerId).filter(isSupportedProvider))
+        if let config { ids.formUnion(config.providers.keys.filter(isSupportedProvider)) }
         return ordered(Array(ids)).map(model)
     }
 
@@ -22,7 +22,7 @@ struct MetricEngine {
             calendar.date(byAdding: .day, value: offset - 29, to: today)
         }
         let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
-        let knownProviders = ordered(Array(Set(snapshots.map(\.providerId) + ["codex", "claude"])))
+        let knownProviders = ordered(Array(Set(snapshots.map(\.providerId).filter(isSupportedProvider) + ["codex", "claude", "opencode_go"])))
         var providerRows = [String: [String: (cost: Double, tokens: UInt64)]]()
         var activeProviderIds = Set<String>()
 
@@ -71,11 +71,14 @@ struct MetricEngine {
     }
 
     private func ordered(_ ids: [String]) -> [String] {
-        let preferred = ui.providerOrder + ["codex", "claude"]
+        let preferred = ui.providerOrder.filter(isSupportedProvider) + ["codex", "claude", "opencode_go"]
         var seen = Set<String>()
-        let ranked = preferred.filter { ids.contains($0) && seen.insert($0).inserted }
-        return ranked + ids.filter { !ranked.contains($0) }.sorted()
+        let supported = ids.filter(isSupportedProvider)
+        let ranked = preferred.filter { supported.contains($0) && seen.insert($0).inserted }
+        return ranked + supported.filter { !ranked.contains($0) }.sorted()
     }
+
+    private func isSupportedProvider(_ id: String) -> Bool { id != "opencode" }
 
     private func model(_ id: String) -> ProviderVM {
         let latest = snapshots.filter { $0.providerId == id }.max { $0.collectedAt < $1.collectedAt }
@@ -209,9 +212,26 @@ struct MetricEngine {
         ])]
     }
 
-    private func pretty(_ id: String) -> String { id == "codex" ? "Codex" : id == "claude" ? "Claude" : id.capitalized }
-    private func short(_ id: String) -> String { id == "codex" ? "Cdx" : id == "claude" ? "Clde" : String(pretty(id).prefix(4)) }
-    private func symbol(_ id: String) -> String { id == "codex" ? "terminal" : id == "claude" ? "sparkles" : "chart.bar" }
+    private func pretty(_ id: String) -> String {
+        if id == "codex" { return "Codex" }
+        if id == "claude" { return "Claude" }
+        if id == "opencode_go" { return "OpenCode Go" }
+        return id.capitalized
+    }
+
+    private func short(_ id: String) -> String {
+        if id == "codex" { return "Cdx" }
+        if id == "claude" { return "Clde" }
+        if id == "opencode_go" { return "Go" }
+        return String(pretty(id).prefix(4))
+    }
+
+    private func symbol(_ id: String) -> String {
+        if id == "codex" { return "terminal" }
+        if id == "claude" { return "sparkles" }
+        if id == "opencode_go" { return "bolt.horizontal" }
+        return "chart.bar"
+    }
     private func time(_ d: Date) -> String { d.formatted(date: .omitted, time: .shortened) }
     private func relative(_ d: Date) -> String { DateFormats.relative.localizedString(for: d, relativeTo: Date()) }
 }

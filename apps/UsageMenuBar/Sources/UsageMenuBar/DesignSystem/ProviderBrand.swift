@@ -35,6 +35,11 @@ enum ProviderBrand {
             progressStart: Color(red: 0.38, green: 0.76, blue: 0.74),
             progressEnd: Color(red: 0.20, green: 0.47, blue: 0.50)
         ),
+        "opencode_go": ProviderPalette(
+            chart: Color(red: 0.18, green: 0.21, blue: 0.25),
+            progressStart: Color(red: 0.42, green: 0.47, blue: 0.55),
+            progressEnd: Color(red: 0.08, green: 0.10, blue: 0.13)
+        ),
     ]
 
     @MainActor static func image(_ id: String) -> NSImage? {
@@ -42,6 +47,7 @@ enum ProviderBrand {
         let name: String? = switch id {
         case "codex": "chatgpt"
         case "claude": "claude"
+        case "opencode_go": "opencode"
         default: nil
         }
         var image: NSImage?
