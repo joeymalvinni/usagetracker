@@ -75,6 +75,6 @@ enum MenuBarProgressIcon {
         case .stale, .disabled, .normal:
             nil
         }
-        return MenuBarProviderVM(providerId: "usage", short: "", percent: percent, status: status)
+        return MenuBarProviderVM(id: "usage", providerId: "usage", short: "", percent: percent, status: status)
     }
 }

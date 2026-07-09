@@ -8,15 +8,12 @@ struct Rail: View {
         VStack(spacing: Theme.Spacing.xs) {
             rail(.summary, "Summary") { Image(systemName: "gauge") }
             ForEach(state.providers) { p in
-                rail(.provider(p.id), p.name) {
-                    ProviderIcon(id: p.id, symbol: p.symbol)
+                rail(.provider(p.id, accountId: nil), p.name) {
+                    ProviderIcon(id: p.providerId, symbol: p.symbol)
                         .frame(width: 18, height: 18)
                 }
                 .overlay(alignment: .topTrailing) {
-                    // Attention badge: only rendered when the provider needs
-                    // attention, tinted by severity. Healthy providers show
-                    // nothing — color always means "look here".
-                    if p.status.needsAttention {
+                    if railShowsDot(p) {
                         Circle()
                             .fill(p.status.tint)
                             .frame(width: 7, height: 7)
@@ -31,10 +28,15 @@ struct Rail: View {
         }
         .padding(.vertical, Theme.Spacing.lg)
         .frame(width: 68)
-        // Flat sidebar tint — the popover shell already carries translucency;
-        // stacking a second material here reads as clutter.
         .background(Color.primary.opacity(0.04))
         .animation(.spring(duration: 0.3), value: state.providers.map(\.id))
+    }
+
+    // Actionable alerts (warning/critical/error) only show a dot until the user has viewed
+    // the account; non-actionable states (stale/disabled) always show their gray dot.
+    private func railShowsDot(_ p: ProviderVM) -> Bool {
+        if p.status.isAlert { return p.hasUnseenAlert }
+        return p.status.needsAttention
     }
 
     private func rail(_ s: Selection, _ label: String, @ViewBuilder icon: () -> some View) -> some View {
@@ -44,7 +46,7 @@ struct Rail: View {
                     .frame(width: 28, height: 28)
                 Text(label)
                     .font(Theme.Typography.micro)
-                    .foregroundStyle(selection == s ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+                    .foregroundStyle(selection.matchesProvider(s) ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                     .lineLimit(1)
             }
             .frame(width: 60)
@@ -52,12 +54,21 @@ struct Rail: View {
         }
         .buttonStyle(.plain)
         .help(label)
-        .railBackground(isSelected: selection == s)
+        .railBackground(isSelected: selection.matchesProvider(s))
+    }
+}
+
+private extension Selection {
+    func matchesProvider(_ other: Selection) -> Bool {
+        switch (self, other) {
+        case (.summary, .summary), (.settings, .settings): true
+        case (.provider(let a, _), .provider(let b, _)): a == b
+        default: false
+        }
     }
 }
 
 private extension View {
-    /// Subtle hover and selection background for rail rows.
     func railBackground(isSelected: Bool) -> some View {
         modifier(RailBackgroundModifier(isSelected: isSelected))
     }

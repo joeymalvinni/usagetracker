@@ -14,7 +14,7 @@ struct ProviderRefreshResult: Decodable, Equatable {
 }
 
 enum ProviderRefreshStatus: Equatable, Decodable {
-    case ok, credentialsMissing, credentialsInvalid, unauthorized, rateLimited, network, parse, providerUnavailable, storageError, other(String)
+    case ok, credentialsMissing, credentialsInvalid, unauthorized, rateLimited, network, parse, providerUnavailable, storageError, disabled, other(String)
     init(from decoder: Decoder) throws {
         switch try decoder.singleValueContainer().decode(String.self) {
         case "ok": self = .ok
@@ -26,6 +26,7 @@ enum ProviderRefreshStatus: Equatable, Decodable {
         case "parse": self = .parse
         case "provider_unavailable": self = .providerUnavailable
         case "storage_error": self = .storageError
+        case "disabled": self = .disabled
         case let s: self = .other(s)
         }
     }

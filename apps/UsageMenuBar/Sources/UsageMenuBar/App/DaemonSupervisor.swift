@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final class DaemonSupervisor {
@@ -35,6 +36,24 @@ final class DaemonSupervisor {
         return false
     }
 
+    func restart(socketPath: String) async -> Bool {
+        if let process, process.isRunning {
+            process.terminate()
+        } else {
+            for pid in daemonPIDs(listeningOn: socketPath) {
+                Darwin.kill(pid, SIGTERM)
+            }
+        }
+
+        for _ in 0..<30 {
+            if !Socket.canConnect(path: socketPath, timeout: 0.2) { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        didAttemptStart = false
+        process = nil
+        return await ensureRunning(socketPath: socketPath)
+    }
+
     private func findDaemonExecutable() -> URL? {
         let env = ProcessInfo.processInfo.environment
         let fm = FileManager.default
@@ -48,6 +67,47 @@ final class DaemonSupervisor {
             if fm.isExecutableFile(atPath: candidate.path) { return candidate }
         }
         return nil
+    }
+
+    private func daemonPIDs(listeningOn socketPath: String) -> [pid_t] {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-t", "--", socketPath]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return []
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(decoding: data, as: UTF8.self)
+        return text
+            .split(whereSeparator: \.isNewline)
+            .compactMap { pid_t($0) }
+            .filter(isUsageDaemon)
+    }
+
+    private func isUsageDaemon(_ pid: pid_t) -> Bool {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-p", String(pid), "-o", "comm="]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return false
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let command = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return URL(fileURLWithPath: command).lastPathComponent == "usage-daemon"
     }
 
     private func candidateRoots() -> [URL] {

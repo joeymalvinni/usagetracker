@@ -131,7 +131,7 @@ import SwiftUI
                 let item = NSMenuItem(title: providerMenuTitle(provider), action: #selector(openProviderFromMenu(_:)), keyEquivalent: "")
                 item.target = self
                 item.representedObject = provider.id
-                item.image = menuIcon(ProviderBrand.image(provider.id) ?? symbolImage(provider.symbol))
+                item.image = menuIcon(ProviderBrand.image(provider.providerId) ?? symbolImage(provider.symbol))
                 item.toolTip = provider.detail
                 menu.addItem(item)
             }
@@ -263,7 +263,7 @@ import SwiftUI
 
     @objc private func openProviderFromMenu(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        showPopover(selection: .provider(id))
+        showPopover(selection: .provider(id, accountId: nil))
     }
 
     @objc private func refreshFromMenu() {

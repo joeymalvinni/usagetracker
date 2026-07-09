@@ -19,6 +19,11 @@ struct UIConfig: Codable, Equatable {
     var showProviderLabels = true
     var maxMenuProviders = 2
     var colorByStatus = true
+    var onboardingCompleted = false
+    /// Alert signatures the user has seen (viewed the account). Clears the rail/chip dot.
+    var seenAlerts = Set<String>()
+    /// Alert signatures whose banner the user has dismissed.
+    var dismissedAlerts = Set<String>()
 
     init() {}
 
@@ -30,6 +35,10 @@ struct UIConfig: Codable, Equatable {
         showProviderLabels = try c.decodeIfPresent(Bool.self, forKey: .showProviderLabels) ?? true
         maxMenuProviders = try c.decodeIfPresent(Int.self, forKey: .maxMenuProviders) ?? 2
         colorByStatus = try c.decodeIfPresent(Bool.self, forKey: .colorByStatus) ?? true
+        // Existing beta users should not be interrupted; newly created configs keep false.
+        onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
+        seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
+        dismissedAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedAlerts) ?? []
     }
 
     static func load() -> Self {
@@ -37,6 +46,13 @@ struct UIConfig: Codable, Equatable {
               let config = try? JSONDecoder().decode(Self.self, from: data)
         else { let config = Self(); config.save(); return config }
         return config
+    }
+
+    func pruningAlertAcknowledgements(to live: Set<String>) -> Self {
+        var pruned = self
+        pruned.seenAlerts.formIntersection(live)
+        pruned.dismissedAlerts.formIntersection(live)
+        return pruned
     }
 
     func save() {

@@ -11,9 +11,13 @@ enum DaemonState { case unknown, online, offline }
     @Published var snapshots = [UsageSnapshot]()
     @Published var refreshing = false
     @Published var message: String?
+    @Published var actionMessage: String?
     @Published var actionError: String?
     @Published var pendingProviders = Set<String>()
+    @Published var pendingAccountProviders = Set<String>()
+    @Published var pendingAccounts = Set<String>()
     @Published var pendingInterval = false
+    @Published var providerSetups = [String: ProviderSetupResponse]()
     @Published var providers = [ProviderVM]()
     @Published var settingsProviders = [ProviderVM]()
     @Published var cost = CostDashboardVM.empty
@@ -56,11 +60,23 @@ enum DaemonState { case unknown, online, offline }
     }
     func refreshAll() async {
         refreshing = true; defer { refreshing = false }
-        do { _ = try await client.refresh(nil); await load(all: true) } catch { fail(error) }
+        do {
+            let report = try await client.refresh(nil)
+            applyRefreshOutcome(report)
+            await load(all: true)
+        } catch {
+            actionError = describe(error)
+        }
     }
     func refreshProvider(_ id: String) async {
         refreshing = true; defer { refreshing = false }
-        do { _ = try await client.refresh([id]); await load(all: true) } catch { fail(error) }
+        do {
+            let report = try await client.refresh([id])
+            applyRefreshOutcome(report)
+            await load(all: true)
+        } catch {
+            actionError = describe(error)
+        }
     }
     func visible(_ id: String) -> Bool { uiVisible(id) }
     func setVisible(_ id: String, _ on: Bool) {
@@ -73,7 +89,7 @@ enum DaemonState { case unknown, online, offline }
             config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: enabled])
             actionError = nil
             build()
-            if enabled { _ = try? await client.refresh([id]) }
+            if enabled { applyRefreshOutcome(try await client.refresh([id])) }
             await load(all: true)
         } catch {
             actionError = describe(error)
@@ -90,6 +106,208 @@ enum DaemonState { case unknown, online, offline }
         } catch {
             actionError = describe(error)
         }
+    }
+
+    func addCodexAccount() async {
+        pendingAccountProviders.insert("codex")
+        defer { pendingAccountProviders.remove("codex") }
+        do {
+            let response = try await client.addProviderAccount(providerId: "codex", displayName: nil)
+            actionError = nil
+            actionMessage = "Finish signing in to Codex in your browser. This account will appear automatically."
+            await waitForCodexAccount(profileId: response.profileId)
+        } catch {
+            actionMessage = nil
+            actionError = describe(error)
+        }
+    }
+
+    func setAccountHidden(_ id: String, _ hidden: Bool) async {
+        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
+        do {
+            _ = try await client.updateAccount(accountId: id, hidden: hidden)
+            actionError = nil
+            await load(all: true)
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func setAccountCollectionEnabled(_ id: String, _ enabled: Bool) async {
+        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
+        do {
+            _ = try await client.updateAccount(accountId: id, hidden: enabled ? false : nil, collectionEnabled: enabled)
+            actionError = nil
+            if enabled, let providerId = accounts.first(where: { $0.id == id })?.providerId {
+                applyRefreshOutcome(try await client.refresh([providerId]))
+            }
+            await load(all: true)
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func removeAccount(_ id: String) async {
+        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
+        do {
+            _ = try await client.removeAccount(accountId: id)
+            actionError = nil
+            actionMessage = "Account removed. Usage history was kept."
+            await load(all: true)
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func deleteAccount(_ id: String) async {
+        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
+        do {
+            try await deleteAccountFromDaemon(id)
+        } catch {
+            let message = describe(error)
+            if isMissingAccount(message) {
+                actionError = nil
+                actionMessage = "Account was already deleted."
+                await load(all: true)
+            } else {
+                actionError = message
+                await load(all: true)
+            }
+            return
+        }
+        actionError = nil
+        actionMessage = "Account and usage history deleted."
+        await load(all: true)
+    }
+
+    func deleteAllAccounts() async {
+        let ids = accounts.map(\.id)
+        guard !ids.isEmpty else { return }
+        pendingAccounts.formUnion(ids)
+        defer { pendingAccounts.subtract(ids) }
+
+        var failures = [String]()
+        for id in ids {
+            do {
+                try await deleteAccountFromDaemon(id)
+            } catch {
+                let message = describe(error)
+                if !isMissingAccount(message) { failures.append(message) }
+            }
+        }
+        await load(all: true)
+        if failures.isEmpty {
+            actionError = nil
+            actionMessage = "All accounts and usage history deleted."
+        } else {
+            actionMessage = nil
+            actionError = "Some accounts could not be deleted: \(failures.joined(separator: "; "))"
+        }
+    }
+
+    private func deleteAccountFromDaemon(_ id: String) async throws {
+        do {
+            try await client.deleteAccount(accountId: id)
+        } catch {
+            let message = describe(error)
+            guard message.contains("unknown variant `delete_account`"),
+                  await daemonSupervisor.restart(socketPath: socketPath) else {
+                throw error
+            }
+            try await client.deleteAccount(accountId: id)
+        }
+    }
+
+    private func isMissingAccount(_ message: String) -> Bool {
+        message.localizedCaseInsensitiveContains("unknown account")
+            || message.localizedCaseInsensitiveContains("account was not found")
+    }
+
+    func restoreAccount(_ id: String) async {
+        await setAccountCollectionEnabled(id, true)
+    }
+
+    func renameAccount(_ id: String, displayName: String) async {
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            actionError = "Enter a name for this account."
+            return
+        }
+        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
+        do {
+            _ = try await client.updateAccount(accountId: id, displayName: name)
+            actionError = nil
+            actionMessage = "Account renamed to \(name)."
+            await load(all: true)
+            if let providerId = accounts.first(where: { $0.id == id })?.providerId,
+               providerSetups[providerId] != nil {
+                await loadProviderSetup(providerId)
+            }
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func loadProviderSetup(_ providerId: String) async {
+        pendingAccountProviders.insert(providerId)
+        defer { pendingAccountProviders.remove(providerId) }
+        do {
+            providerSetups[providerId] = try await client.providerSetup(providerId: providerId)
+            actionError = nil
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func selectWorkspace(providerId: String, workspaceId: String) async {
+        pendingAccountProviders.insert(providerId)
+        defer { pendingAccountProviders.remove(providerId) }
+        do {
+            providerSetups[providerId] = try await client.updateProviderSetup(
+                providerId: providerId,
+                workspaceId: workspaceId
+            )
+            actionError = nil
+            actionMessage = "OpenCode workspace selected."
+            applyRefreshOutcome(try await client.refresh([providerId]))
+            await load(all: true)
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func repairProvider(_ providerId: String, accountId: String? = nil) async {
+        pendingAccountProviders.insert(providerId)
+        defer { pendingAccountProviders.remove(providerId) }
+        let startedAt = Date()
+        do {
+            let response = try await client.repairProvider(providerId: providerId, accountId: accountId)
+            actionError = nil
+            actionMessage = response.message
+            if providerId == "codex" || providerId == "claude" {
+                await waitForProviderRepair(
+                    providerId: providerId,
+                    accountId: accountId,
+                    startedAt: startedAt
+                )
+            }
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func completeOnboarding() {
+        ui.onboardingCompleted = true
+        actionError = nil
+        actionMessage = "Setup complete. Usage will update automatically."
+    }
+
+    func restartOnboarding() {
+        ui.onboardingCompleted = false
+    }
+
+    var lastSuccessfulRefresh: Date? {
+        health.compactMap(\.lastSuccessAt).max() ?? snapshots.map(\.collectedAt).max()
     }
 
     func moveProviders(from source: IndexSet, to destination: Int) {
@@ -134,12 +352,98 @@ enum DaemonState { case unknown, online, offline }
         let referenced = Set(snapshots.map(\.accountId) + health.compactMap(\.accountId))
         return referenced.contains { !known.contains($0) }
     }
+    private func waitForCodexAccount(profileId: String) async {
+        for _ in 0..<600 {
+            guard !Task.isCancelled else { return }
+            do {
+                let discovered = try await client.accounts()
+                if discovered.contains(where: { $0.providerId == "codex" && $0.profileId == profileId }) {
+                    accounts = discovered
+                    actionError = nil
+                    actionMessage = "Codex account connected."
+                    await load(all: true)
+                    return
+                }
+            } catch {
+                // Login is asynchronous; transient socket failures are retried below.
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        actionMessage = "Codex sign-in is still pending. You can retry from Settings."
+    }
+    private func waitForProviderRepair(providerId: String, accountId: String?, startedAt: Date) async {
+        for _ in 0..<600 {
+            guard !Task.isCancelled else { return }
+            do {
+                let latest = try await client.health()
+                let repaired = latest.first {
+                    $0.providerId == providerId
+                        && (accountId == nil || $0.accountId == accountId)
+                        && $0.updatedAt >= startedAt
+                        && $0.status != .credentialsMissing
+                        && $0.status != .authFailed
+                }
+                if repaired != nil {
+                    actionError = nil
+                    actionMessage = "\(providerName(providerId)) login connected."
+                    await load(all: true)
+                    return
+                }
+            } catch {
+                // Keep waiting while the browser login and daemon refresh complete.
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        actionMessage = "\(providerName(providerId)) sign-in is still pending. You can retry from Settings."
+    }
     private func fail(_ error: Error) {
         daemon = .offline
         message = describe(error)
     }
     private func describe(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+    private func applyRefreshOutcome(_ report: RefreshResponse) {
+        let failures = report.providerResults.filter {
+            switch $0.status {
+            case .ok, .disabled: false
+            default: true
+            }
+        }
+        if failures.isEmpty {
+            actionError = nil
+            actionMessage = "Usage refreshed successfully."
+        } else {
+            actionMessage = nil
+            actionError = failures.map { result in
+                let provider = providerName(result.providerId)
+                return "\(provider): \(result.message ?? refreshStatusText(result.status))"
+            }.joined(separator: "\n")
+        }
+    }
+
+    private func providerName(_ id: String) -> String {
+        switch id {
+        case "codex": "Codex"
+        case "claude": "Claude"
+        case "opencode_go": "OpenCode Go"
+        default: id
+        }
+    }
+
+    private func refreshStatusText(_ status: ProviderRefreshStatus) -> String {
+        switch status {
+        case .ok: "refreshed"
+        case .credentialsMissing: "sign-in required"
+        case .credentialsInvalid, .unauthorized: "credentials need repair"
+        case .rateLimited: "temporarily rate limited"
+        case .network: "network request failed"
+        case .parse: "provider response changed"
+        case .providerUnavailable: "provider unavailable"
+        case .storageError: "could not save usage"
+        case .disabled: "collection disabled"
+        case .other(let value): value.replacingOccurrences(of: "_", with: " ")
+        }
     }
     private func build() {
         let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, ui: ui, visible: uiVisible)
@@ -150,6 +454,39 @@ enum DaemonState { case unknown, online, offline }
         menuPreview = preview
         menuStatus = status
         menuBars = bars
+        pruneStaleAcknowledgements()
+    }
+
+    /// Drop acknowledgements whose exact alert signature is no longer active, so that a
+    /// resolved-then-recurring alert (e.g. a weekly limit that resets and fills again)
+    /// re-alerts, and an escalation (warning → critical) is treated as a new alert.
+    private func pruneStaleAcknowledgements() {
+        let live = Set(providers.flatMap { ($0.subAccounts ?? [$0]).compactMap(\.alertSignature) })
+        let pruned = ui.pruningAlertAcknowledgements(to: live)
+        guard pruned != ui else { return }
+        // UIConfig is a value type whose property observer rebuilds the view models.
+        // Assign the fully-pruned value once so a partial update cannot recursively
+        // re-enter this method before both acknowledgement sets have been updated.
+        ui = pruned
+    }
+
+    /// Mark an account's active alert as seen, clearing its rail/chip indicator.
+    func markAlertSeen(_ vm: ProviderVM) {
+        guard let sig = vm.alertSignature, !ui.seenAlerts.contains(sig) else { return }
+        ui.seenAlerts.insert(sig)
+    }
+
+    /// Dismiss the banner for an account's active alert (also marks it seen).
+    func dismissAlert(_ vm: ProviderVM) {
+        guard let sig = vm.alertSignature else { return }
+        ui.dismissedAlerts.insert(sig)
+        ui.seenAlerts.insert(sig)
+    }
+
+    /// Whether the banner for this account's active alert should be shown.
+    func showsAlertBanner(_ vm: ProviderVM) -> Bool {
+        guard let sig = vm.alertSignature else { return false }
+        return !ui.dismissedAlerts.contains(sig)
     }
     private func menuContent() -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
         guard daemon != .offline else { return ("Usage offline", .offline, []) }
@@ -170,7 +507,7 @@ enum DaemonState { case unknown, online, offline }
         }
         let bars = eligible.prefix(2).map { provider in
             let displayed = provider.percent.map { max(0, min(100, ui.menuMetric == .used ? 100 - $0 : $0)) }
-            return MenuBarProviderVM(providerId: provider.id, short: provider.short, percent: displayed, status: provider.status)
+            return MenuBarProviderVM(id: provider.id, providerId: provider.providerId, short: provider.short, percent: displayed, status: provider.status)
         }
         if preview.isEmpty { return ("Usage", .stale, []) }
         return (preview, menuStatus(for: shown), bars)

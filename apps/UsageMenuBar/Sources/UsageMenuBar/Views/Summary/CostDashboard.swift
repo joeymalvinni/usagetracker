@@ -15,7 +15,7 @@ struct CostDashboard: View {
     var onSelectProvider: ((String) -> Void)?
 
     @State private var range: CostRange = .seven
-    @State private var metric: CostMetric = .cost
+    @State private var metric: CostMetric = .tokens
     @State private var hover: CostProviderDayVM?
 
     private var days: [CostDayVM] { Array(dashboard.days.suffix(range.rawValue)) }
@@ -31,6 +31,7 @@ struct CostDashboard: View {
                         .lineLimit(1)
                 }
                 Spacer()
+                DataQualityLabel(dashboard: dashboard, metric: metric)
                 Picker("", selection: $metric) {
                     ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
@@ -62,7 +63,7 @@ struct CostDashboard: View {
     }
 
     private var activitySubtitle: String {
-        if dashboard.hasData { "\(range.label) \(metric == .cost ? "spend" : "tokens")" }
+        if dashboard.hasData { "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated spend" : (metric == .cost ? "spend" : "tokens"))" }
         else { "No activity yet" }
     }
     private func hoverText(_ value: CostProviderDayVM) -> String {
@@ -71,5 +72,32 @@ struct CostDashboard: View {
         } else {
             return "\(value.providerName) · \(shortDate(value.date)): \(formatTokens(value.tokens))"
         }
+    }
+}
+
+struct DataQualityLabel: View {
+    let dashboard: CostDashboardVM
+    let metric: CostMetric
+
+    var body: some View {
+        if metric == .cost && (dashboard.isEstimated || dashboard.isPartial) {
+            Label(label, systemImage: dashboard.isPartial ? "exclamationmark.circle" : "function")
+                .font(Theme.Typography.micro.weight(.medium))
+                .foregroundStyle(dashboard.isPartial ? .orange : .secondary)
+                .help(helpText)
+        }
+    }
+
+    private var label: String {
+        if dashboard.isEstimated && dashboard.isPartial { return "Est. · partial" }
+        return dashboard.isPartial ? "Partial" : "Estimate"
+    }
+
+    private var helpText: String {
+        let source = dashboard.sourceLabel.map { " Source: \($0)." } ?? ""
+        if dashboard.isPartial {
+            return "This total does not cover the complete selected period.\(source)"
+        }
+        return "Calculated from local usage at published API rates; it may not match your bill.\(source)"
     }
 }

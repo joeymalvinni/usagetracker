@@ -2,37 +2,85 @@ import SwiftUI
 
 struct Detail: View {
     @EnvironmentObject var state: AppState
-    let provider: ProviderVM?
+    let providerId: String
+    let initialAccountId: String?
+    @State private var selectedAccountId: String?
+
+    private var group: ProviderVM? {
+        state.providers.first { $0.id == providerId || $0.providerId == providerId }
+    }
+
+    private var accounts: [ProviderVM] {
+        group?.subAccounts ?? (group.map { [$0] } ?? [])
+    }
+
+    private var selectedAccount: ProviderVM? {
+        if let selectedAccountId, let account = accounts.first(where: { $0.accountId == selectedAccountId }) {
+            return account
+        }
+        return accounts.first
+    }
+
+    private var activeProvider: ProviderVM {
+        selectedAccount ?? group ?? ProviderVM(
+            id: providerId, providerId: providerId, accountId: nil,
+            name: providerId, short: "", symbol: "chart.bar",
+            primary: "No data", detail: "waiting for data",
+            percent: nil, status: .stale,
+            spend: [], windows: [], credits: [], resetCredits: [],
+            account: nil, healthText: "unknown",
+            visibleInMenu: false, enabled: false,
+            secondary: "no activity", sparkline: [],
+            costDashboard: .empty, subAccounts: nil
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg - 2) {
-            if let p = provider {
-                Header(title: p.name, subtitleStyle: .custom([p.account, p.detail, p.healthText].compactMap(\.self).joined(separator: " · "))) {
-                    Task { await state.refreshProvider(p.id) }
+            if let group {
+                Header(title: group.name, subtitleStyle: subtitleStyle) {
+                    Task { await state.refreshProvider(providerId) }
+                }
+                if state.showsAlertBanner(activeProvider) {
+                    AlertBanner(
+                        provider: activeProvider,
+                        actionLabel: activeProvider.repairRecommended ? "Repair login" : "Retry",
+                        onAction: {
+                            if activeProvider.repairRecommended {
+                                Task { await state.repairProvider(providerId, accountId: activeProvider.accountId) }
+                            } else {
+                                Task { await state.refreshProvider(providerId) }
+                            }
+                        },
+                        onDismiss: { state.dismissAlert(activeProvider) }
+                    )
+                }
+                if accounts.count > 1 {
+                    accountPicker
                 }
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-                        ProviderActivityCard(provider: p, dashboard: state.cost)
-                        if !limitWindows(p).isEmpty {
+                        ProviderActivityCard(provider: activeProvider, dashboard: activeProvider.costDashboard)
+                        if !limitWindows(activeProvider).isEmpty {
                             ProviderSection(title: "Limits") {
-                                ForEach(limitWindows(p)) { WindowRow(window: $0) }
+                                ForEach(limitWindows(activeProvider)) { WindowRow(window: $0) }
                             }
                         }
-                        if p.id == "codex", !p.resetCredits.isEmpty {
+                        if activeProvider.providerId == "codex", !activeProvider.resetCredits.isEmpty {
                             ProviderSection(title: "Resets") {
-                                ResetCreditDisclosure(provider: p)
+                                ResetCreditDisclosure(provider: activeProvider)
                             }
                         }
-                        if !p.spend.isEmpty {
-                            ProviderSection(title: "Spend") {
-                                ForEach(SpendLine.grouped(p.spend)) { line in
+                        if !activeProvider.spend.isEmpty {
+                            ProviderSection(title: activeProvider.isEstimate ? "Estimated spend" : "Spend") {
+                                ForEach(SpendLine.grouped(activeProvider.spend)) { line in
                                     SpendLineRow(line: line)
                                 }
                             }
                         }
-                        if !p.credits.isEmpty {
+                        if !activeProvider.credits.isEmpty {
                             ProviderSection(title: "Credits") {
-                                ForEach(p.credits) { WindowRow(window: $0) }
+                                ForEach(activeProvider.credits) { WindowRow(window: $0) }
                             }
                         }
                     }
@@ -43,10 +91,151 @@ struct Detail: View {
         }
         .padding(Theme.Spacing.lg)
         .transition(.opacity.combined(with: .move(edge: .trailing)))
+        .onAppear {
+            if selectedAccountId == nil {
+                selectedAccountId = initialAccountId ?? accounts.first?.accountId
+            }
+            state.markAlertSeen(activeProvider)
+        }
+        .onChange(of: initialAccountId) { _, newValue in
+            selectedAccountId = newValue ?? accounts.first?.accountId
+        }
+        .onChange(of: selectedAccountId) { _, _ in
+            state.markAlertSeen(activeProvider)
+        }
+    }
+
+    private var subtitleStyle: HeaderSubtitleStyle {
+        let success = activeProvider.lastSuccessAt.map { "success \(DateFormats.relative.localizedString(for: $0, relativeTo: Date()))" }
+        let parts = [selectedAccount?.account, success ?? activeProvider.detail, activeProvider.healthText].compactMap(\.self)
+        return .custom(parts.joined(separator: " · "))
+    }
+
+    @ViewBuilder
+    private var accountPicker: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Spacing.xs) {
+                ForEach(accounts, id: \.accountId) { account in
+                    Button {
+                        selectedAccountId = account.accountId
+                    } label: {
+                        HStack(spacing: Theme.Spacing.xs) {
+                            if account.hasUnseenAlert {
+                                Circle()
+                                    .fill(account.status.tint)
+                                    .frame(width: 6, height: 6)
+                            }
+                            Text(accountRowLabel(account))
+                        }
+                            .font(Theme.Typography.caption.weight(.medium))
+                            .lineLimit(1)
+                            .padding(.horizontal, Theme.Spacing.md)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+                                    .fill(selectedAccountId == account.accountId
+                                        ? Color.primary.opacity(0.10)
+                                        : Color.primary.opacity(0.04))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+                                    .stroke(selectedAccountId == account.accountId
+                                        ? Theme.chartColor(account.providerId).opacity(0.4)
+                                        : Color.clear, lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help(account.account ?? account.name)
+                }
+            }
+        }
+    }
+
+    private func accountRowLabel(_ account: ProviderVM) -> String {
+        if let displayName = account.account, !displayName.isEmpty {
+            return displayName
+        }
+        return account.name
+    }
+
+    private func providerAccount(_ id: String) -> ProviderVM? {
+        state.providers.first { $0.id == id || $0.providerId == id }
     }
 
     private func limitWindows(_ provider: ProviderVM) -> [WindowVM] {
-        provider.windows.filter { $0.id != "\(provider.id)_rate_limit_resets" }
+        provider.windows.filter { $0.id != "\(provider.providerId)_rate_limit_resets" }
+    }
+}
+
+private struct AlertBanner: View {
+    let provider: ProviderVM
+    let actionLabel: String
+    let onAction: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+            Image(systemName: provider.status == .critical ? "exclamationmark.triangle.fill" : "exclamationmark.circle.fill")
+                .foregroundStyle(provider.status.tint)
+                .font(Theme.Typography.caption)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(Theme.Typography.caption.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: Theme.Spacing.sm)
+            Button(actionLabel, action: onAction)
+                .controlSize(.small)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(Theme.Typography.micro.weight(.bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Dismiss")
+        }
+        .padding(Theme.Spacing.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(provider.status.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+                .stroke(provider.status.tint.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    private var worstWindow: WindowVM? {
+        provider.windows
+            .filter { $0.id != "\(provider.providerId)_rate_limit_resets" && $0.percent != nil }
+            .min { ($0.percent ?? 100) < ($1.percent ?? 100) }
+    }
+
+    private var title: String {
+        switch provider.status {
+        case .critical:
+            if (worstWindow?.percent ?? provider.percent ?? 100) <= 0 {
+                return "You've reached your usage limit"
+            }
+            return "You're almost out of your usage limit"
+        case .warning: return "You're running low on your usage limit"
+        default: return provider.healthText == "unknown" ? provider.status.label.capitalized : provider.healthText.capitalized
+        }
+    }
+
+    private var subtitle: String? {
+        if provider.status == .error, let error = provider.errorDetail, !error.isEmpty {
+            return error
+        }
+        if let window = worstWindow {
+            let reset = window.reset.isEmpty ? "" : " · \(window.reset)"
+            return "\(window.label): \(window.value)\(reset)"
+        }
+        return provider.status.isAlert && !provider.detail.isEmpty ? provider.detail : nil
     }
 }
 
@@ -104,7 +293,7 @@ private struct ResetCreditDisclosure: View {
     }
 
     private var resetWindow: WindowVM? {
-        provider.windows.first { $0.id == "\(provider.id)_rate_limit_resets" }
+        provider.windows.first { $0.id == "\(provider.providerId)_rate_limit_resets" }
     }
 }
 
@@ -175,13 +364,7 @@ private struct ProviderActivityCard: View {
     @State private var hover: CostProviderDayVM?
 
     private var days: [CostDayVM] {
-        dashboard.days.suffix(range.rawValue).map { day in
-            CostDayVM(
-                id: day.id,
-                date: day.date,
-                providers: day.providers.filter { $0.providerId == provider.id }
-            )
-        }
+        dashboard.days.suffix(range.rawValue)
     }
 
     private var providerDays: [CostProviderDayVM] {
@@ -194,27 +377,33 @@ private struct ProviderActivityCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            HStack(alignment: .top, spacing: Theme.Spacing.sm) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Activity").font(Theme.Typography.headline)
-                    Text(hover.map(hoverText) ?? activitySubtitle)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+            VStack(spacing: Theme.Spacing.xs) {
+                HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Activity").font(Theme.Typography.headline)
+                        Text(hover.map(hoverText) ?? activitySubtitle)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: Theme.Spacing.sm)
+                        DataQualityLabel(dashboard: dashboard, metric: metric)
                 }
-                Spacer(minLength: Theme.Spacing.sm)
-                Picker("", selection: $range) {
-                    ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                HStack(spacing: Theme.Spacing.xs) {
+                    Spacer()
+                    Picker("", selection: $range) {
+                        ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 82)
+                    Picker("", selection: $metric) {
+                        ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 110)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 82)
-                Picker("", selection: $metric) {
-                    ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 110)
             }
 
             CostActivityChart(days: days, metric: metric, hover: $hover)
@@ -236,7 +425,7 @@ private struct ProviderActivityCard: View {
 
     private var activitySubtitle: String {
         guard hasData else { return "No recent cost or token activity" }
-        return "\(range.label) \(metric == .cost ? "spend" : "tokens")"
+        return "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated spend" : (metric == .cost ? "spend" : "tokens"))"
     }
 
     private var todayValue: String {

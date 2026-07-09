@@ -3,8 +3,6 @@ import SwiftUI
 enum DisplayStatus {
     case normal, warning, critical, stale, error, disabled, offline
 
-    /// Semantic status color. Only surfaced when `needsAttention` (status
-    /// chip, rail badge, progress-bar fill) — color always means "look here".
     var tint: Color {
         switch self {
         case .normal: .green
@@ -15,11 +13,31 @@ enum DisplayStatus {
     }
     var menuColor: NSColor? { switch self { case .warning: .systemOrange; case .critical, .error: .systemRed; default: nil } }
 
-    /// Anything worth surfacing to the user. `.normal` stays quiet.
     var needsAttention: Bool {
         switch self {
         case .normal: false
         default: true
+        }
+    }
+
+    /// An actionable alert the user should acknowledge (as opposed to stale/disabled/off).
+    var isAlert: Bool {
+        switch self {
+        case .warning, .critical, .error, .offline: true
+        default: false
+        }
+    }
+
+    /// Stable identifier for the status level, used in alert signatures.
+    var code: String {
+        switch self {
+        case .normal: "normal"
+        case .warning: "warning"
+        case .critical: "critical"
+        case .stale: "stale"
+        case .error: "error"
+        case .disabled: "disabled"
+        case .offline: "offline"
         }
     }
 
@@ -37,7 +55,6 @@ enum DisplayStatus {
 }
 
 extension ProviderHealthStatus {
-    /// Friendly, human-readable phrase used in rows & detail views.
     var friendly: String {
         switch self {
         case .ok: "all good"
@@ -54,7 +71,9 @@ extension ProviderHealthStatus {
 }
 
 struct ProviderVM: Identifiable, Equatable {
-    let id, name, short, symbol, primary, detail: String
+    let id, providerId: String
+    let accountId: String?
+    let name, short, symbol, primary, detail: String
     let percent: Double?
     let status: DisplayStatus
     let spend, windows, credits: [WindowVM]
@@ -65,10 +84,22 @@ struct ProviderVM: Identifiable, Equatable {
     let enabled: Bool
     let secondary: String
     let sparkline: [Double]
+    let costDashboard: CostDashboardVM
+    let subAccounts: [ProviderVM]?
+    /// Non-nil when this provider/account is in an actionable alert state.
+    /// Format: "provider|account|statusCode". Acknowledgements key off this exact value.
+    var alertSignature: String? = nil
+    /// True when there is an active alert that the user has not yet viewed.
+    var hasUnseenAlert: Bool = false
+    var lastSuccessAt: Date? = nil
+    var errorDetail: String? = nil
+    var isEstimate: Bool = false
+    var isPartial: Bool = false
+    var repairRecommended: Bool = false
 }
 
 struct MenuBarProviderVM: Identifiable, Equatable {
-    var id: String { providerId }
+    let id: String
     let providerId: String
     let short: String
     let percent: Double?
@@ -95,6 +126,9 @@ struct CostDashboardVM: Equatable {
     static let empty = CostDashboardVM(days: [], providers: [])
     let days: [CostDayVM]
     let providers: [CostProviderVM]
+    var isEstimated: Bool = false
+    var isPartial: Bool = false
+    var sourceLabel: String? = nil
 
     var hasData: Bool { days.contains { $0.totalCost > 0 || $0.totalTokens > 0 } }
     var todayCost: Double { days.last?.totalCost ?? 0 }

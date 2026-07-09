@@ -13,6 +13,7 @@ enum JSONValue: Decodable, Equatable {
     var object: [String: JSONValue]? { if case .object(let value) = self { value } else { nil } }
     var array: [JSONValue]? { if case .array(let value) = self { value } else { nil } }
     var string: String? { if case .string(let value) = self { value } else { nil } }
+    var bool: Bool? { if case .bool(let value) = self { value } else { nil } }
     var double: Double? {
         switch self {
         case .number(let value): value

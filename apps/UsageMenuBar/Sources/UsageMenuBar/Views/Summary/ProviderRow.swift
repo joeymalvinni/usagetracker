@@ -11,7 +11,7 @@ struct ProviderRow: View {
                     Label {
                         Text(provider.name)
                     } icon: {
-                        ProviderIcon(id: provider.id, symbol: provider.symbol)
+                        ProviderIcon(id: provider.providerId, symbol: provider.symbol)
                     }
                     .font(Theme.Typography.headline)
                     Spacer()
@@ -32,7 +32,7 @@ struct ProviderRow: View {
                         .monospacedDigit()
                     Spacer()
                     if provider.status.needsAttention {
-                        StatusChip(status: provider.status, healthText: provider.healthText)
+                        StatusChip(status: provider.status, healthText: provider.healthText, percent: provider.percent)
                     }
                 }
 
@@ -63,16 +63,16 @@ struct ProviderRow: View {
             .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
         }
         .buttonStyle(.plain)
-        .help("Open \(provider.name)")
+        .help(provider.errorDetail ?? "Open \(provider.name)")
     }
 
     private var resetWindow: WindowVM? {
-        guard provider.id == "codex" else { return nil }
-        return provider.windows.first { $0.id == "\(provider.id)_rate_limit_resets" }
+        guard provider.providerId == "codex" else { return nil }
+        return provider.windows.first { $0.id == "\(provider.providerId)_rate_limit_resets" }
     }
 
     private var limitWindows: [WindowVM] {
-        provider.windows.filter { $0.id != "\(provider.id)_rate_limit_resets" }
+        provider.windows.filter { $0.id != "\(provider.providerId)_rate_limit_resets" }
     }
 
     private var resetText: String? {
@@ -90,8 +90,12 @@ struct ProviderRow: View {
 struct StatusChip: View {
     let status: DisplayStatus
     var healthText: String = ""
+    var percent: Double? = nil
 
     private var text: String {
+        if status == .critical, let percent, percent <= 0 {
+            return "limit reached"
+        }
         let generic = ["all good", "unknown", ""]
         return generic.contains(healthText) ? status.label : healthText
     }

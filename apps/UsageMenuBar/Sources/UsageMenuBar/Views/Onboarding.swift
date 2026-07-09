@@ -1,0 +1,204 @@
+import SwiftUI
+
+struct Onboarding: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
+            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                Text("Welcome to UsageTracker")
+                    .font(Theme.Typography.title)
+                Text("Choose the accounts you want to track. Usage stays on this Mac; credentials remain in provider files or Keychain.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let error = state.actionError {
+                SetupNotice(text: error, isError: true)
+            } else if let message = state.actionMessage {
+                SetupNotice(text: message, isError: false)
+            }
+
+            ScrollView {
+                VStack(spacing: Theme.Spacing.sm) {
+                    OnboardingProviderCard(providerId: "codex")
+                    OnboardingProviderCard(providerId: "claude")
+                    OnboardingProviderCard(providerId: "opencode_go")
+                }
+            }
+
+            HStack {
+                Label("Cost figures from local logs are estimates and are labeled in the dashboard.", systemImage: "info.circle")
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Finish setup") { state.completeOnboarding() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(state.daemon == .offline)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: Theme.Popover.width, height: Theme.Popover.height)
+    }
+}
+
+private struct OnboardingProviderCard: View {
+    @EnvironmentObject var state: AppState
+    let providerId: String
+
+    private var provider: ProviderVM? {
+        state.settingsProviders.first { $0.providerId == providerId }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            HStack {
+                ProviderIcon(id: providerId, symbol: symbol, size: 18)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name).font(Theme.Typography.headline)
+                    Text(description)
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("", isOn: enabledBinding)
+                    .labelsHidden()
+                    .disabled(state.daemon == .offline || state.pendingProviders.contains(providerId))
+            }
+            if provider?.enabled == true {
+                ProviderSetupControls(providerId: providerId, compact: true)
+            }
+        }
+        .surfaceCard()
+    }
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { provider?.enabled ?? false },
+            set: { enabled in Task { await state.setProviderEnabled(providerId, enabled) } }
+        )
+    }
+
+    private var name: String {
+        switch providerId { case "codex": "Codex"; case "claude": "Claude"; default: "OpenCode Go" }
+    }
+    private var symbol: String {
+        switch providerId { case "codex": "terminal"; case "claude": "sparkles"; default: "bolt.horizontal" }
+    }
+    private var description: String {
+        switch providerId {
+        case "codex": "Rate limits plus estimated local token activity"
+        case "claude": "Claude Code limits plus estimated local activity"
+        default: "Workspace usage, balance, and local fallback"
+        }
+    }
+}
+
+struct ProviderSetupControls: View {
+    @EnvironmentObject var state: AppState
+    let providerId: String
+    var compact = false
+
+    private var setup: ProviderSetupResponse? { state.providerSetups[providerId] }
+    private var busy: Bool { state.pendingAccountProviders.contains(providerId) }
+    private var accounts: [Account] { state.accounts.filter { $0.providerId == providerId } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            HStack(spacing: Theme.Spacing.sm) {
+                Button(repairLabel) {
+                    Task { await repair() }
+                }
+                .disabled(busy || state.daemon == .offline)
+
+                if providerId == "codex", !accounts.isEmpty {
+                    Button("Add another account") { Task { await state.addCodexAccount() } }
+                        .disabled(busy)
+                }
+                if providerId == "opencode_go" {
+                    Button(setup == nil ? "Discover workspaces" : "Discover again") {
+                        Task { await state.loadProviderSetup(providerId) }
+                    }
+                    .disabled(busy)
+                }
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
+            }
+            .controlSize(.small)
+
+            if providerId == "opencode_go", let setup {
+                if !setup.workspaceOptions.isEmpty {
+                    Picker("Workspace", selection: workspaceBinding(setup)) {
+                        ForEach(setup.workspaceOptions, id: \.self) { Text($0).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(busy)
+                } else if let error = setup.discoveryError {
+                    Text(error)
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Text(helpText)
+                .font(Theme.Typography.micro)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .task {
+            if state.providerSetups[providerId] == nil, providerId != "opencode_go" {
+                await state.loadProviderSetup(providerId)
+            }
+        }
+    }
+
+    private func repair() async {
+        if providerId == "codex", accounts.isEmpty {
+            await state.addCodexAccount()
+        } else {
+            await state.repairProvider(providerId, accountId: accounts.first?.id)
+        }
+    }
+
+    private func workspaceBinding(_ setup: ProviderSetupResponse) -> Binding<String> {
+        let fallback = setup.selectedWorkspaceId ?? setup.workspaceOptions.first ?? ""
+        return Binding(
+            get: { state.providerSetups[providerId]?.selectedWorkspaceId ?? fallback },
+            set: { workspace in Task { await state.selectWorkspace(providerId: providerId, workspaceId: workspace) } }
+        )
+    }
+
+    private var repairLabel: String {
+        switch providerId {
+        case "codex": accounts.isEmpty ? "Connect Codex" : "Repair login"
+        case "claude": accounts.isEmpty ? "Connect Claude" : "Repair Claude login"
+        default: "Open OpenCode login"
+        }
+    }
+
+    private var helpText: String {
+        switch providerId {
+        case "codex": "Each account uses an isolated Codex profile. Finish the browser sign-in; the account appears automatically."
+        case "claude": "Finish the browser sign-in; UsageTracker refreshes Claude automatically."
+        default: "Sign in at opencode.ai, then discover and choose the workspace to track."
+        }
+    }
+}
+
+struct SetupNotice: View {
+    let text: String
+    let isError: Bool
+
+    var body: some View {
+        Label(text, systemImage: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+            .font(Theme.Typography.caption)
+            .foregroundStyle(isError ? .red : .secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(Theme.Spacing.sm)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .surfaceInset()
+    }
+}
