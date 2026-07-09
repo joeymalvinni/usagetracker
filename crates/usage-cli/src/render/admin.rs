@@ -215,6 +215,7 @@ fn render_accounts_dashboard(
         "Provider",
         "Identity",
         "Kind",
+        "State",
         "Plan",
         "External ID",
         "Updated",
@@ -228,6 +229,7 @@ fn render_accounts_dashboard(
             format_provider_name(account.provider_id.as_str()),
             labels.identity.unwrap_or_else(|| "-".to_string()),
             labels.identity_kind.unwrap_or("-").to_string(),
+            account_state(account, theme),
             labels.plan.unwrap_or_else(|| "-".to_string()),
             account.external_account_id.clone(),
             format_local_time(Some(account.updated_at)),
@@ -259,6 +261,7 @@ fn render_accounts_compact(
             if let Some(plan) = labels.plan {
                 parts.push(format!("plan {plan}"));
             }
+            parts.push(format!("state {}", account_state_plain(account)));
             parts.push(format!("external {}", account.external_account_id));
             parts.push(format!(
                 "updated {}",
@@ -359,6 +362,24 @@ fn account_by_id(accounts: &[Account]) -> std::collections::HashMap<String, &Acc
         .iter()
         .map(|account| (account.id.as_str().to_string(), account))
         .collect()
+}
+
+fn account_state(account: &Account, theme: Theme) -> String {
+    match (account.hidden, account.collection_enabled) {
+        (true, false) => theme.muted("removed"),
+        (true, true) => theme.muted("hidden"),
+        (false, false) => theme.muted("disabled"),
+        (false, true) => theme.good("active"),
+    }
+}
+
+fn account_state_plain(account: &Account) -> &'static str {
+    match (account.hidden, account.collection_enabled) {
+        (true, false) => "removed",
+        (true, true) => "hidden",
+        (false, false) => "disabled",
+        (false, true) => "active",
+    }
 }
 
 fn json_name(value: &impl Serialize) -> String {
@@ -463,7 +484,10 @@ mod tests {
             id: AccountId::new("account"),
             provider_id: ProviderId::new("claude"),
             external_account_id: "joey".to_string(),
+            profile_id: None,
             display_name: Some("Claude team".to_string()),
+            hidden: false,
+            collection_enabled: true,
             created_at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 7, 8, 17, 18, 53).unwrap(),
         }

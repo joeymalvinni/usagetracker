@@ -8,9 +8,19 @@ pub struct Account {
     pub id: AccountId,
     pub provider_id: ProviderId,
     pub external_account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default = "default_collection_enabled")]
+    pub collection_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_collection_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

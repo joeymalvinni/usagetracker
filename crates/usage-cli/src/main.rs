@@ -227,6 +227,7 @@ fn default_visible_accounts(accounts: Vec<Account>, config: &ConfigResponse) -> 
     accounts
         .into_iter()
         .filter(|account| default_visible_provider(account.provider_id.as_str(), config))
+        .filter(|account| !account.hidden)
         .collect()
 }
 

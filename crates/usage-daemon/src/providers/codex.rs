@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -18,9 +18,13 @@ use tracing::{debug, info, warn};
 use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 use wait_timeout::ChildExt;
 
-use crate::providers::{
-    DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-    ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+use crate::{
+    config::{ProviderConfig, ProviderProfileConfig},
+    providers::{
+        DailyUsageBucket, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
+        ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
+    },
 };
 
 pub const PROVIDER_ID: &str = "codex";
@@ -32,14 +36,23 @@ const CODEX_COST_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct CodexCollector {
-    auth_path: PathBuf,
+    profiles: Vec<CodexProfile>,
+    local_codex_home: PathBuf,
     client: reqwest::Client,
     capture_raw_payloads: bool,
+}
+
+#[derive(Clone)]
+struct CodexProfile {
+    id: String,
+    display_name: Option<String>,
+    auth_path: PathBuf,
+    codex_home: PathBuf,
     cost_cache: Arc<Mutex<Option<CodexCostCache>>>,
 }
 
 impl CodexCollector {
-    pub fn new(capture_raw_payloads: bool) -> anyhow::Result<Self> {
+    pub fn new(config: ProviderConfig, capture_raw_payloads: bool) -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Codex auth"))?;
         let client = reqwest::Client::builder()
@@ -47,56 +60,77 @@ impl CodexCollector {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .user_agent("codex-cli")
             .build()?;
+        let local_codex_home = local_codex_home(&home);
+        let profiles = codex_profiles(config, &local_codex_home);
         Ok(Self {
-            auth_path: home.join(".codex/auth.json"),
+            profiles,
+            local_codex_home,
             client,
             capture_raw_payloads,
-            cost_cache: Arc::new(Mutex::new(None)),
         })
     }
 
-    async fn load_credentials(&self) -> Result<CodexCredentials, ProviderError> {
-        let contents = tokio::fs::read_to_string(&self.auth_path)
+    async fn load_credentials(
+        &self,
+        profile: &CodexProfile,
+    ) -> Result<CodexCredentials, ProviderError> {
+        let contents = tokio::fs::read_to_string(&profile.auth_path)
             .await
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     ProviderError::new(
                         ProviderErrorKind::CredentialsMissing,
-                        "~/.codex/auth.json is missing",
+                        format!("Codex auth file {} is missing", profile.auth_path.display()),
                     )
                 } else {
                     ProviderError::new(
                         ProviderErrorKind::CredentialsInvalid,
-                        "failed to read Codex auth file",
+                        format!(
+                            "failed to read Codex auth file {}",
+                            profile.auth_path.display()
+                        ),
                     )
                 }
             })?;
 
-        let auth: CodexAuth = serde_json::from_str(&contents).map_err(|err| {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                format!("Codex auth file is not valid JSON: {err}"),
-            )
-        })?;
+        codex_credentials_from_auth_json(&contents)
+    }
 
-        let tokens = auth.tokens.ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "Codex auth file is missing tokens",
-            )
-        })?;
-
-        if tokens.access_token.trim().is_empty() || tokens.account_id.trim().is_empty() {
-            return Err(ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "Codex auth file is missing token fields",
-            ));
+    async fn profile_for_account(
+        &self,
+        account: &DiscoveredAccount,
+    ) -> Result<(CodexProfile, CodexCredentials), ProviderError> {
+        if let Some(profile_id) = account.profile_id.as_deref() {
+            let profile = self
+                .profiles
+                .iter()
+                .find(|profile| profile.id == profile_id)
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::CredentialsInvalid,
+                        format!("Codex profile {profile_id} no longer exists"),
+                    )
+                })?;
+            let credentials = self.load_credentials(profile).await?;
+            if credentials.account_id != account.external_account_id {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    "Codex account changed since discovery",
+                ));
+            }
+            return Ok((profile.clone(), credentials));
         }
 
-        Ok(CodexCredentials {
-            access_token: tokens.access_token,
-            account_id: tokens.account_id,
-        })
+        for profile in &self.profiles {
+            let credentials = self.load_credentials(profile).await?;
+            if credentials.account_id == account.external_account_id {
+                return Ok((profile.clone(), credentials));
+            }
+        }
+        Err(ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex account changed since discovery",
+        ))
     }
 
     async fn collect_usage_from_wham(
@@ -178,12 +212,93 @@ impl CodexCollector {
 
         Ok(CodexCollectedUsage {
             usage,
+            daily_usage: Vec::new(),
+            account_activity_available: false,
             collection_mode: "wham_usage_api".to_string(),
             account_display_name,
             raw_payload: payload,
             warnings: Vec::new(),
         })
     }
+}
+
+fn local_codex_home(home: &Path) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(expand_home_path)
+        .unwrap_or_else(|| home.join(".codex"))
+}
+
+fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexProfile> {
+    let configured = if config.profiles.is_empty() {
+        vec![ProviderProfileConfig {
+            id: Some("default".to_string()),
+            codex_home: Some(local_codex_home.to_path_buf()),
+            ..ProviderProfileConfig::default()
+        }]
+    } else {
+        config.profiles
+    };
+
+    configured
+        .into_iter()
+        .enumerate()
+        .filter(|(_, profile)| profile.enabled && !profile.deleted)
+        .map(|(index, profile)| {
+            let id = profile_id(profile.id.as_deref(), index);
+            let codex_home = profile
+                .codex_home
+                .map(expand_home_path)
+                .unwrap_or_else(|| local_codex_home.to_path_buf());
+            let auth_path = profile
+                .auth_path
+                .map(expand_home_path)
+                .unwrap_or_else(|| codex_home.join("auth.json"));
+            CodexProfile {
+                id,
+                display_name: profile.display_name.or_else(|| {
+                    if index == 0 {
+                        None
+                    } else {
+                        Some(format!("Codex Account {}", index + 1))
+                    }
+                }),
+                auth_path,
+                codex_home,
+                cost_cache: Arc::new(Mutex::new(None)),
+            }
+        })
+        .collect()
+}
+
+fn profile_id(configured: Option<&str>, index: usize) -> String {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if index == 0 {
+                "default".to_string()
+            } else {
+                format!("profile-{}", index + 1)
+            }
+        })
+}
+
+fn expand_home_path(path: PathBuf) -> PathBuf {
+    let Some(value) = path.to_str() else {
+        return path;
+    };
+    if value == "~" {
+        return dirs::home_dir().unwrap_or(path);
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path
 }
 
 #[async_trait]
@@ -193,28 +308,76 @@ impl ProviderCollector for CodexCollector {
     }
 
     async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
-        let credentials = self.load_credentials().await?;
-        Ok(vec![DiscoveredAccount {
-            external_account_id: credentials.account_id,
-            display_name: None,
-        }])
+        if self.profiles.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsMissing,
+                "no enabled Codex profiles are configured",
+            ));
+        }
+
+        let mut accounts = Vec::new();
+        let mut failures = Vec::new();
+        for profile in &self.profiles {
+            match self.load_credentials(profile).await {
+                Ok(credentials) => accounts.push(DiscoveredAccount {
+                    external_account_id: credentials.account_id,
+                    display_name: profile
+                        .display_name
+                        .clone()
+                        .or(credentials.account_display_name),
+                    profile_id: Some(profile.id.clone()),
+                }),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ProviderErrorKind::CredentialsMissing
+                            | ProviderErrorKind::CredentialsInvalid
+                    ) =>
+                {
+                    warn!(
+                        profile_id = profile.id.as_str(),
+                        error_code = err.kind().as_str(),
+                        error = %err,
+                        "failed to discover Codex profile"
+                    );
+                    failures.push(err);
+                }
+                Err(err) => {
+                    failures.push(err);
+                }
+            }
+        }
+
+        if !accounts.is_empty() {
+            let mut seen = BTreeSet::new();
+            accounts.retain(|account| seen.insert(account.external_account_id.clone()));
+            return Ok(accounts);
+        }
+        Err(failures.into_iter().next().unwrap_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsMissing,
+                "no Codex accounts were discovered",
+            )
+        }))
     }
 
     async fn collect_usage(
         &self,
         account: &DiscoveredAccount,
     ) -> Result<ProviderCollectionResult, ProviderError> {
-        let credentials = self.load_credentials().await?;
-        if credentials.account_id != account.external_account_id {
-            return Err(ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "Codex account changed since discovery",
-            ));
-        }
+        let (profile, credentials) = self.profile_for_account(account).await?;
 
         let app_server_started = Instant::now();
-        info!("codex app-server usage collection started");
-        let mut collected = match tokio::task::spawn_blocking(collect_usage_from_app_server).await {
+        info!(
+            profile_id = profile.id.as_str(),
+            "codex app-server usage collection started"
+        );
+        let app_server_profile = profile.clone();
+        let mut collected = match tokio::task::spawn_blocking(move || {
+            collect_usage_from_app_server(&app_server_profile)
+        })
+        .await
+        {
             Ok(Ok(collected)) => {
                 info!(
                     elapsed_ms = app_server_started.elapsed().as_millis(),
@@ -253,10 +416,26 @@ impl ProviderCollector for CodexCollector {
                 fallback
             }
         };
-        let cost_cache = self.cost_cache.clone();
+        collected.usage.metadata["credential_profile"] = json!(profile.id.as_str());
+        if let Some(display_name) = profile.display_name.as_deref() {
+            collected.usage.metadata["profile_display_name"] = json!(display_name);
+        }
+
+        let cost_cache = profile.cost_cache.clone();
+        let local_account_id = codex_account_id_from_auth_file(&self.local_codex_home);
+        let cost_roots = codex_session_roots(
+            &profile.codex_home,
+            &self.local_codex_home,
+            local_account_id.as_deref(),
+            &credentials.account_id,
+        );
         let cost_started = Instant::now();
         debug!("codex local cost scan started");
-        match tokio::task::spawn_blocking(move || scan_codex_local_costs_cached(cost_cache)).await {
+        match tokio::task::spawn_blocking(move || {
+            scan_codex_local_costs_cached(cost_cache, cost_roots)
+        })
+        .await
+        {
             Ok(Ok(scan)) => {
                 info!(
                     elapsed_ms = cost_started.elapsed().as_millis(),
@@ -267,7 +446,9 @@ impl ProviderCollector for CodexCollector {
                     lookback_tokens = scan.report.lookback_tokens,
                     "codex local cost scan completed"
                 );
-                collected.usage.merge_cost_report(scan.report)
+                collected
+                    .usage
+                    .merge_cost_report(scan.report, !collected.account_activity_available)
             }
             Ok(Err(err)) => collected
                 .warnings
@@ -279,6 +460,7 @@ impl ProviderCollector for CodexCollector {
 
         Ok(ProviderCollectionResult {
             usage: collected.usage,
+            daily_usage: collected.daily_usage,
             collection_mode: collected.collection_mode,
             account_display_name: collected.account_display_name,
             raw_payload: self.capture_raw_payloads.then_some(collected.raw_payload),
@@ -290,6 +472,8 @@ impl ProviderCollector for CodexCollector {
 #[derive(Debug)]
 struct CodexCollectedUsage {
     usage: ProviderUsage,
+    daily_usage: Vec<DailyUsageBucket>,
+    account_activity_available: bool,
     collection_mode: String,
     account_display_name: Option<String>,
     raw_payload: Value,
@@ -324,12 +508,95 @@ struct CodexAuth {
 struct CodexTokens {
     access_token: String,
     account_id: String,
+    id_token: Option<String>,
 }
 
 #[derive(Debug)]
 struct CodexCredentials {
     access_token: String,
     account_id: String,
+    account_display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexIdTokenClaims {
+    email: Option<String>,
+    name: Option<String>,
+}
+
+fn codex_credentials_from_auth_json(contents: &str) -> Result<CodexCredentials, ProviderError> {
+    let auth: CodexAuth = serde_json::from_str(contents).map_err(|err| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            format!("Codex auth file is not valid JSON: {err}"),
+        )
+    })?;
+
+    let tokens = auth.tokens.ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex auth file is missing tokens",
+        )
+    })?;
+
+    if tokens.access_token.trim().is_empty() || tokens.account_id.trim().is_empty() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex auth file is missing token fields",
+        ));
+    }
+
+    let account_display_name = tokens
+        .id_token
+        .as_deref()
+        .and_then(codex_display_name_from_id_token);
+
+    Ok(CodexCredentials {
+        access_token: tokens.access_token,
+        account_id: tokens.account_id,
+        account_display_name,
+    })
+}
+
+fn codex_display_name_from_id_token(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let decoded = decode_base64url(payload)?;
+    let claims: CodexIdTokenClaims = serde_json::from_slice(&decoded).ok()?;
+    nonempty_string(claims.email).or_else(|| nonempty_string(claims.name))
+}
+
+fn decode_base64url(value: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity((value.len() * 3).div_ceil(4));
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+
+    for byte in value.bytes() {
+        let decoded = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+
+        buffer = (buffer << 6) | decoded;
+        bits += 6;
+
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+
+    Some(bytes)
+}
+
+fn nonempty_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_usage(
@@ -382,8 +649,10 @@ fn normalize_usage(
     })
 }
 
-fn collect_usage_from_app_server() -> Result<CodexCollectedUsage, ProviderError> {
-    let payload = run_codex_app_server_rate_limits().map_err(|err| {
+fn collect_usage_from_app_server(
+    profile: &CodexProfile,
+) -> Result<CodexCollectedUsage, ProviderError> {
+    let payload = run_codex_app_server_rate_limits(&profile.codex_home).map_err(|err| {
         ProviderError::new(
             ProviderErrorKind::ProviderUnavailable,
             format!("Codex app-server rate limit request failed: {err}"),
@@ -397,22 +666,55 @@ fn collect_usage_from_app_server() -> Result<CodexCollectedUsage, ProviderError>
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let usage = normalize_app_server_usage(&payload, account_display_name.as_deref())?;
+    let mut usage = normalize_app_server_usage(&payload, account_display_name.as_deref())?;
+    let mut warnings = Vec::new();
+    let (daily_usage, account_activity_available) = match payload
+        .get("account_usage_read")
+        .filter(|value| !value.is_null())
+    {
+        Some(value) => match normalize_account_token_usage(value) {
+            Ok(activity) => {
+                let daily_usage = activity.daily_usage.clone();
+                usage.merge_account_activity(activity);
+                (daily_usage, true)
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "Codex account activity could not be parsed; using local activity fallback: {}",
+                    err.short_message()
+                ));
+                (Vec::new(), false)
+            }
+        },
+        None => {
+            let detail = payload
+                .get("account_usage_error")
+                .and_then(Value::as_str)
+                .unwrap_or("account/usage/read returned no result");
+            warnings.push(format!(
+                "Codex account activity was unavailable; using local activity fallback: {detail}"
+            ));
+            (Vec::new(), false)
+        }
+    };
 
     Ok(CodexCollectedUsage {
         usage,
+        daily_usage,
+        account_activity_available,
         collection_mode: "codex_app_server_rate_limits".to_string(),
         account_display_name,
         raw_payload: payload,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
-fn run_codex_app_server_rate_limits() -> anyhow::Result<Value> {
+fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> {
     let started = Instant::now();
     debug!("codex app-server process starting");
     let mut child = Command::new("codex")
         .arg("app-server")
+        .env("CODEX_HOME", codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -478,12 +780,19 @@ fn run_codex_app_server_rate_limits() -> anyhow::Result<Value> {
         &mut stdin,
         &json!({ "method": "account/rateLimits/read", "id": 3 }),
     )?;
+    write_json_rpc(
+        &mut stdin,
+        &json!({ "method": "account/usage/read", "id": 4 }),
+    )?;
 
     let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
     let mut account_read: Option<Value> = None;
     let mut rate_limits_read: Option<Value> = None;
+    let mut account_usage_read: Option<Value> = None;
+    let mut account_usage_error: Option<String> = None;
+    let mut account_usage_complete = false;
 
-    while account_read.is_none() || rate_limits_read.is_none() {
+    while account_read.is_none() || rate_limits_read.is_none() || !account_usage_complete {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             break;
         };
@@ -506,6 +815,18 @@ fn run_codex_app_server_rate_limits() -> anyhow::Result<Value> {
             Some(2) => account_read = Some(json_rpc_result(message, "account/read")?),
             Some(3) => {
                 rate_limits_read = Some(json_rpc_result(message, "account/rateLimits/read")?)
+            }
+            Some(4) => {
+                account_usage_complete = true;
+                if let Some(error) = message.get("error") {
+                    account_usage_error = Some(error.to_string());
+                } else {
+                    account_usage_read = message.get("result").cloned();
+                    if account_usage_read.is_none() {
+                        account_usage_error =
+                            Some("account/usage/read response was missing result".to_string());
+                    }
+                }
             }
             _ => {}
         }
@@ -556,6 +877,12 @@ fn run_codex_app_server_rate_limits() -> anyhow::Result<Value> {
             stderr.trim()
         )
     })?;
+    if !account_usage_complete {
+        account_usage_error = Some(format!(
+            "account/usage/read timed out after {:?}",
+            CODEX_APP_SERVER_TIMEOUT
+        ));
+    }
 
     debug!(
         elapsed_ms = started.elapsed().as_millis(),
@@ -565,6 +892,8 @@ fn run_codex_app_server_rate_limits() -> anyhow::Result<Value> {
     Ok(json!({
         "account_read": account_read,
         "rate_limits_read": rate_limits_read,
+        "account_usage_read": account_usage_read,
+        "account_usage_error": account_usage_error,
     }))
 }
 
@@ -654,16 +983,190 @@ fn normalize_app_server_usage(
     })
 }
 
+#[derive(Clone, Debug)]
+struct CodexAccountActivity {
+    daily_usage: Vec<DailyUsageBucket>,
+    lifetime_tokens: Option<u64>,
+    peak_daily_tokens: Option<u64>,
+    longest_running_turn_sec: Option<u64>,
+    current_streak_days: Option<u64>,
+    longest_streak_days: Option<u64>,
+}
+
+fn normalize_account_token_usage(value: &Value) -> Result<CodexAccountActivity, ProviderError> {
+    let object = value.as_object().ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorKind::Parse,
+            "Codex account usage response was not an object",
+        )
+    })?;
+    let summary = object
+        .get("summary")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                "Codex account usage response was missing summary",
+            )
+        })?;
+
+    let mut by_date = BTreeMap::<NaiveDate, u64>::new();
+    if let Some(buckets) = object
+        .get("dailyUsageBuckets")
+        .filter(|value| !value.is_null())
+    {
+        let buckets = buckets.as_array().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                "Codex account usage daily buckets were not an array",
+            )
+        })?;
+        for bucket in buckets {
+            let bucket = bucket.as_object().ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::Parse,
+                    "Codex account usage contained a non-object daily bucket",
+                )
+            })?;
+            let date = bucket
+                .get("startDate")
+                .and_then(Value::as_str)
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::Parse,
+                        "Codex account usage daily bucket had an invalid startDate",
+                    )
+                })?;
+            let tokens = bucket
+                .get("tokens")
+                .and_then(u64_from_json_value)
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::Parse,
+                        "Codex account usage daily bucket had invalid tokens",
+                    )
+                })?;
+            let entry = by_date.entry(date).or_default();
+            *entry = entry.saturating_add(tokens);
+        }
+    }
+
+    Ok(CodexAccountActivity {
+        daily_usage: by_date
+            .into_iter()
+            .map(|(date, tokens)| DailyUsageBucket {
+                date,
+                tokens,
+                cost_usd: None,
+                source: "codex_account_usage".to_string(),
+            })
+            .collect(),
+        lifetime_tokens: summary.get("lifetimeTokens").and_then(u64_from_json_value),
+        peak_daily_tokens: summary.get("peakDailyTokens").and_then(u64_from_json_value),
+        longest_running_turn_sec: summary
+            .get("longestRunningTurnSec")
+            .and_then(u64_from_json_value),
+        current_streak_days: summary
+            .get("currentStreakDays")
+            .and_then(u64_from_json_value),
+        longest_streak_days: summary
+            .get("longestStreakDays")
+            .and_then(u64_from_json_value),
+    })
+}
+
+trait CodexAccountActivityExt {
+    fn merge_account_activity(&mut self, activity: CodexAccountActivity);
+}
+
+impl CodexAccountActivityExt for ProviderUsage {
+    fn merge_account_activity(&mut self, activity: CodexAccountActivity) {
+        let today = Local::now().date_naive();
+        let lookback_start = today
+            .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
+            .unwrap_or(today);
+        let today_tokens = activity
+            .daily_usage
+            .iter()
+            .find(|bucket| bucket.date == today)
+            .map(|bucket| bucket.tokens)
+            .unwrap_or(0);
+        let lookback_tokens = activity
+            .daily_usage
+            .iter()
+            .filter(|bucket| bucket.date >= lookback_start && bucket.date <= today)
+            .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
+        let bucket_sum = activity
+            .daily_usage
+            .iter()
+            .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
+        let lifetime_tokens = activity.lifetime_tokens.unwrap_or(bucket_sum);
+
+        if today_tokens > 0 {
+            self.windows.push(token_window(
+                "codex_tokens_today",
+                "Codex tokens today",
+                today_tokens,
+                UsageWindowKind::Daily,
+            ));
+        }
+        if lookback_tokens > 0 {
+            self.windows.push(token_window(
+                "codex_tokens_30d",
+                "Codex tokens 30 days",
+                lookback_tokens,
+                UsageWindowKind::Monthly,
+            ));
+        }
+        if lifetime_tokens > 0 {
+            self.windows.push(token_window(
+                "codex_tokens_lifetime",
+                "Codex lifetime tokens",
+                lifetime_tokens,
+                UsageWindowKind::Other("lifetime".to_string()),
+            ));
+        }
+
+        let by_day = activity
+            .daily_usage
+            .iter()
+            .map(|bucket| {
+                json!({
+                    "date": bucket.date.to_string(),
+                    "tokens": bucket.tokens,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.metadata["codex_activity"] = json!({
+            "source": "codex_account_usage",
+            "server_authoritative": true,
+            "daily_bucket_count": activity.daily_usage.len(),
+            "today_tokens": today_tokens,
+            "lookback_days": COST_LOOKBACK_DAYS,
+            "lookback_tokens": lookback_tokens,
+            "lifetime_tokens": lifetime_tokens,
+            "peak_daily_tokens": activity.peak_daily_tokens,
+            "longest_running_turn_sec": activity.longest_running_turn_sec,
+            "current_streak_days": activity.current_streak_days,
+            "longest_streak_days": activity.longest_streak_days,
+            "by_day": by_day,
+        });
+    }
+}
+
 trait CodexUsageCostExt {
-    fn merge_cost_report(&mut self, report: CodexCostReport);
+    fn merge_cost_report(&mut self, report: CodexCostReport, include_token_activity: bool);
 }
 
 impl CodexUsageCostExt for ProviderUsage {
-    fn merge_cost_report(&mut self, report: CodexCostReport) {
+    fn merge_cost_report(&mut self, report: CodexCostReport, include_token_activity: bool) {
         if report.total_tokens == 0 {
             self.metadata["codex_cost"] = json!({
                 "source": "local_session_logs",
                 "estimate": true,
+                "partial": true,
+                "complete_lookback": false,
                 "session_roots": report.session_roots,
                 "files_scanned": report.files_scanned,
                 "token_count_events": report.token_count_events,
@@ -678,12 +1181,14 @@ impl CodexUsageCostExt for ProviderUsage {
                 "Codex spend today",
                 report.today_cost_usd,
             ));
-            self.windows.push(token_window(
-                "codex_tokens_today",
-                "Codex tokens today",
-                report.today_tokens,
-                UsageWindowKind::Daily,
-            ));
+            if include_token_activity {
+                self.windows.push(token_window(
+                    "codex_tokens_today",
+                    "Codex tokens today",
+                    report.today_tokens,
+                    UsageWindowKind::Daily,
+                ));
+            }
         }
 
         if report.lookback_tokens > 0 {
@@ -692,18 +1197,22 @@ impl CodexUsageCostExt for ProviderUsage {
                 "Codex spend 30 days",
                 report.lookback_cost_usd,
             ));
-            self.windows.push(token_window(
-                "codex_tokens_30d",
-                "Codex tokens 30 days",
-                report.lookback_tokens,
-                UsageWindowKind::Monthly,
-            ));
+            if include_token_activity {
+                self.windows.push(token_window(
+                    "codex_tokens_30d",
+                    "Codex tokens 30 days",
+                    report.lookback_tokens,
+                    UsageWindowKind::Monthly,
+                ));
+            }
         }
 
         self.metadata["codex_cost"] = json!({
             "source": "local_session_logs",
             "estimate": true,
-            "hint": "Estimated from local Codex logs for the selected account.",
+            "partial": true,
+            "complete_lookback": false,
+            "hint": "Estimated from this device's local Codex logs; account-wide token activity is tracked separately.",
             "session_roots": report.session_roots,
             "files_scanned": report.files_scanned,
             "token_count_events": report.token_count_events,
@@ -838,9 +1347,7 @@ struct CodexTokenTotals {
 
 impl CodexTokenTotals {
     fn total(self) -> u64 {
-        self.input
-            .saturating_add(self.cached)
-            .saturating_add(self.output)
+        self.input.saturating_add(self.output)
     }
 
     fn saturating_delta(self, previous: Self) -> Self {
@@ -854,21 +1361,26 @@ impl CodexTokenTotals {
 
 fn scan_codex_local_costs_cached(
     cache: Arc<Mutex<Option<CodexCostCache>>>,
+    roots: Vec<PathBuf>,
 ) -> anyhow::Result<CodexCostScan> {
-    let roots = codex_session_roots()?;
     let fingerprint = codex_session_fingerprint(&roots)?;
+    let session_roots = roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
     if let Some(cached) = cache
         .lock()
         .map_err(|_| anyhow::anyhow!("Codex cost cache mutex poisoned"))?
         .as_ref()
     {
-        if cached.fingerprint == fingerprint {
+        let same_roots = cached.report.session_roots == session_roots;
+        if same_roots && cached.fingerprint == fingerprint {
             return Ok(CodexCostScan {
                 report: cached.report.clone(),
                 cache_status: CodexCostCacheStatus::Hit,
             });
         }
-        if cached.scanned_at.elapsed() < CODEX_COST_SCAN_MIN_INTERVAL {
+        if same_roots && cached.scanned_at.elapsed() < CODEX_COST_SCAN_MIN_INTERVAL {
             return Ok(CodexCostScan {
                 report: cached.report.clone(),
                 cache_status: CodexCostCacheStatus::Throttled,
@@ -933,14 +1445,25 @@ fn codex_session_fingerprint(roots: &[PathBuf]) -> anyhow::Result<CodexSessionFi
     Ok(fingerprint)
 }
 
-fn codex_session_roots() -> anyhow::Result<Vec<PathBuf>> {
-    let codex_home = match std::env::var("CODEX_HOME") {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
-        _ => dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Codex logs"))?
-            .join(".codex"),
-    };
-    Ok(vec![codex_home.join("sessions")])
+fn codex_account_id_from_auth_file(codex_home: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(codex_home.join("auth.json")).ok()?;
+    let auth: CodexAuth = serde_json::from_str(&contents).ok()?;
+    nonempty_string(Some(auth.tokens?.account_id))
+}
+
+fn codex_session_roots(
+    profile_home: &Path,
+    local_codex_home: &Path,
+    local_account_id: Option<&str>,
+    profile_account_id: &str,
+) -> Vec<PathBuf> {
+    let mut roots = vec![profile_home.join("sessions")];
+    if profile_home != local_codex_home && local_account_id == Some(profile_account_id) {
+        roots.push(local_codex_home.join("sessions"));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn collect_codex_session_files(
@@ -1563,6 +2086,168 @@ mod tests {
     use usage_core::AccountId;
 
     #[test]
+    fn adds_standard_codex_sessions_only_for_the_active_account() {
+        let profile_home = Path::new("/profiles/personal");
+        let local_home = Path::new("/home/.codex");
+
+        let matching = codex_session_roots(
+            profile_home,
+            local_home,
+            Some("personal-account"),
+            "personal-account",
+        );
+        assert_eq!(matching.len(), 2);
+        assert!(matching.contains(&profile_home.join("sessions")));
+        assert!(matching.contains(&local_home.join("sessions")));
+
+        let different = codex_session_roots(
+            Path::new("/profiles/work"),
+            local_home,
+            Some("personal-account"),
+            "work-account",
+        );
+        assert_eq!(different, vec![PathBuf::from("/profiles/work/sessions")]);
+    }
+
+    #[test]
+    fn does_not_duplicate_standard_codex_session_root() {
+        let local_home = Path::new("/home/.codex");
+        let roots = codex_session_roots(
+            local_home,
+            local_home,
+            Some("personal-account"),
+            "personal-account",
+        );
+
+        assert_eq!(roots, vec![local_home.join("sessions")]);
+    }
+
+    #[test]
+    fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() {
+        let today = Local::now().date_naive();
+        let yesterday = today.checked_sub_days(Days::new(1)).unwrap();
+        let activity = normalize_account_token_usage(&json!({
+            "summary": {
+                "lifetimeTokens": 300,
+                "peakDailyTokens": 200,
+                "longestRunningTurnSec": 90,
+                "currentStreakDays": 2,
+                "longestStreakDays": 4
+            },
+            "dailyUsageBuckets": [
+                {"startDate": yesterday.to_string(), "tokens": 200},
+                {"startDate": today.to_string(), "tokens": 100}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(activity.daily_usage.len(), 2);
+        assert_eq!(activity.daily_usage[0].date, yesterday);
+        assert_eq!(activity.daily_usage[1].tokens, 100);
+
+        let mut usage = ProviderUsage {
+            provider_id: ProviderId::new(PROVIDER_ID),
+            collected_at: Utc::now(),
+            windows: Vec::new(),
+            metadata: json!({}),
+        };
+        usage.merge_account_activity(activity);
+
+        let mut by_day = BTreeMap::new();
+        by_day.insert(
+            today,
+            DailyCostSummary {
+                cost_usd: 1.25,
+                tokens: 100,
+            },
+        );
+        usage.merge_cost_report(
+            CodexCostReport {
+                today_cost_usd: 1.25,
+                today_tokens: 100,
+                lookback_cost_usd: 1.25,
+                lookback_tokens: 100,
+                total_cost_usd: 1.25,
+                total_tokens: 100,
+                by_day,
+                ..Default::default()
+            },
+            false,
+        );
+
+        assert_eq!(usage.metadata["codex_activity"]["lifetime_tokens"], 300);
+        assert_eq!(usage.metadata["codex_activity"]["by_day"][1]["tokens"], 100);
+        assert_eq!(usage.metadata["codex_cost"]["partial"], true);
+        assert_eq!(
+            usage
+                .windows
+                .iter()
+                .filter(|window| window.window_id == "codex_tokens_today")
+                .count(),
+            1
+        );
+        assert!(usage
+            .windows
+            .iter()
+            .any(|window| window.window_id == "codex_estimated_spend_today"));
+    }
+
+    #[test]
+    fn reads_codex_identity_from_id_token_claims() {
+        let credentials = codex_credentials_from_auth_json(
+            r#"{
+                "tokens": {
+                    "access_token": "access",
+                    "account_id": "account-id",
+                    "id_token": "header.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJuYW1lIjoiRXhhbXBsZSBVc2VyIn0.signature"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(credentials.access_token, "access");
+        assert_eq!(credentials.account_id, "account-id");
+        assert_eq!(
+            credentials.account_display_name.as_deref(),
+            Some("user@example.com")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_codex_name_when_id_token_email_is_blank() {
+        let credentials = codex_credentials_from_auth_json(
+            r#"{
+                "tokens": {
+                    "access_token": "access",
+                    "account_id": "account-id",
+                    "id_token": "header.eyJlbWFpbCI6IiAgICIsIm5hbWUiOiJFeGFtcGxlIFVzZXIifQ.signature"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            credentials.account_display_name.as_deref(),
+            Some("Example User")
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_codex_id_token_identity_claims() {
+        let credentials = codex_credentials_from_auth_json(
+            r#"{
+                "tokens": {
+                    "access_token": "access",
+                    "account_id": "account-id",
+                    "id_token": "not-a-jwt"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(credentials.account_display_name, None);
+    }
+
+    #[test]
     fn normalizes_codex_rate_limits() {
         let payload = json!({
             "account_id": "external-account",
@@ -1873,6 +2558,17 @@ mod tests {
             "gpt-5.5"
         );
         assert!((cost - 0.0062).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn token_total_does_not_double_count_cached_input() {
+        let totals = CodexTokenTotals {
+            input: 1_000,
+            cached: 800,
+            output: 100,
+        };
+
+        assert_eq!(totals.total(), 1_100);
     }
 
     fn find_window<'a>(windows: &'a [UsageWindow], window_id: &str) -> &'a UsageWindow {

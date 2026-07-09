@@ -2,11 +2,17 @@ CREATE TABLE IF NOT EXISTS accounts (
   id TEXT PRIMARY KEY,
   provider_id TEXT NOT NULL,
   external_account_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL DEFAULT '',
   display_name TEXT,
+  hidden INTEGER NOT NULL DEFAULT 0,
+  collection_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE(provider_id, external_account_id)
+  UNIQUE(provider_id, profile_id)
 );
+
+CREATE INDEX IF NOT EXISTS accounts_provider_external_account
+ON accounts(provider_id, external_account_id);
 
 CREATE TABLE IF NOT EXISTS usage_snapshots (
   id TEXT PRIMARY KEY,
@@ -42,4 +48,3 @@ CREATE TABLE IF NOT EXISTS provider_health (
   updated_at TEXT NOT NULL,
   PRIMARY KEY(provider_id, account_id)
 );
-

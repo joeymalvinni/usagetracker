@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use thiserror::Error;
 use usage_core::{ProviderId, UsageSnapshot, UsageWindow};
 
@@ -16,15 +16,25 @@ pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct DiscoveredAccount {
     pub external_account_id: String,
     pub display_name: Option<String>,
+    pub profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
+    pub daily_usage: Vec<DailyUsageBucket>,
     pub collection_mode: String,
     pub account_display_name: Option<String>,
     pub raw_payload: Option<serde_json::Value>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DailyUsageBucket {
+    pub date: NaiveDate,
+    pub tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub source: String,
 }
 
 #[derive(Clone, Debug)]

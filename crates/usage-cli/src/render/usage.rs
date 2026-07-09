@@ -981,7 +981,10 @@ mod tests {
             id: account_id,
             provider_id: ProviderId::new("codex"),
             external_account_id: "external".to_string(),
+            profile_id: None,
             display_name: Some("Codex".to_string()),
+            hidden: false,
+            collection_enabled: true,
             created_at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
         };

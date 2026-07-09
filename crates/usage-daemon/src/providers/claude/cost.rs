@@ -173,8 +173,14 @@ impl ClaudeTokenTotals {
     }
 }
 
-pub(super) fn scan_claude_local_costs() -> anyhow::Result<ClaudeCostReport> {
-    let roots = claude_project_roots()?;
+pub(super) fn scan_claude_local_costs_from_roots(
+    configured_roots: Vec<PathBuf>,
+) -> anyhow::Result<ClaudeCostReport> {
+    let roots = if configured_roots.is_empty() {
+        claude_project_roots()?
+    } else {
+        configured_roots
+    };
     let today = Local::now().date_naive();
     let lookback_start = today
         .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))

@@ -21,6 +21,39 @@ pub enum ApiRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         providers: Option<BTreeMap<String, ProviderToggle>>,
     },
+    AddProviderAccount {
+        provider_id: ProviderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    UpdateAccount {
+        account_id: AccountId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hidden: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collection_enabled: Option<bool>,
+    },
+    RemoveAccount {
+        account_id: AccountId,
+    },
+    DeleteAccount {
+        account_id: AccountId,
+    },
+    GetProviderSetup {
+        provider_id: ProviderId,
+    },
+    UpdateProviderSetup {
+        provider_id: ProviderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+    },
+    RepairProvider {
+        provider_id: ProviderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<AccountId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -48,9 +81,54 @@ pub enum ApiResponse {
     Config {
         config: ConfigResponse,
     },
+    AddProviderAccount {
+        account: AddProviderAccountResponse,
+    },
+    Account {
+        account: Account,
+    },
+    AccountDeleted {
+        account_id: AccountId,
+    },
+    ProviderSetup {
+        setup: ProviderSetupResponse,
+    },
+    ProviderAction {
+        action: ProviderActionResponse,
+    },
     Error {
         error: ApiErrorResponse,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AddProviderAccountResponse {
+    pub provider_id: ProviderId,
+    pub profile_id: String,
+    pub display_name: Option<String>,
+    pub profile_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderSetupResponse {
+    pub provider_id: ProviderId,
+    pub profiles: Vec<ProviderProfileResponse>,
+    pub selected_workspace_id: Option<String>,
+    pub workspace_options: Vec<String>,
+    pub discovery_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderProfileResponse {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderActionResponse {
+    pub provider_id: ProviderId,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +153,7 @@ pub enum ProviderRefreshStatus {
     Parse,
     ProviderUnavailable,
     StorageError,
+    Disabled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

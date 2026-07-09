@@ -172,6 +172,7 @@ impl OpenCodeCollector {
 
         Ok(ProviderCollectionResult {
             usage,
+            daily_usage: Vec::new(),
             collection_mode: "opencode_go_web_console".to_string(),
             account_display_name: account_email.or_else(|| Some(workspace_id.clone())),
             raw_payload: self.capture_raw_payloads.then_some(json!({
@@ -482,6 +483,23 @@ impl OpenCodeCollector {
     fn has_manual_cookie_header(&self) -> bool {
         self.manual_cookie_header().is_some()
     }
+
+    pub(crate) async fn discover_workspace_options(&self) -> Result<Vec<String>, ProviderError> {
+        let cookie_header = self.resolve_cookie_header(true)?;
+        let body = self
+            .fetch_server_function(&cookie_header.value, WORKSPACES_SERVER_ID, None)
+            .await?;
+        let mut ids = workspace_ids_from_text(&body);
+        ids.sort();
+        ids.dedup();
+        if ids.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Parse,
+                "OpenCode workspace discovery returned no workspace ids",
+            ));
+        }
+        Ok(ids)
+    }
 }
 
 #[async_trait]
@@ -501,6 +519,7 @@ impl ProviderCollector for OpenCodeCollector {
             return Ok(vec![DiscoveredAccount {
                 external_account_id: workspace_id.to_string(),
                 display_name: Some(workspace_id.to_string()),
+                profile_id: None,
             }]);
         }
 
@@ -509,6 +528,7 @@ impl ProviderCollector for OpenCodeCollector {
                 return Ok(vec![DiscoveredAccount {
                     external_account_id: workspace_id.clone(),
                     display_name: Some(workspace_id),
+                    profile_id: None,
                 }]);
             }
         }
@@ -517,6 +537,7 @@ impl ProviderCollector for OpenCodeCollector {
             return Ok(vec![DiscoveredAccount {
                 external_account_id: "opencode_go_local".to_string(),
                 display_name: Some("OpenCode Go local".to_string()),
+                profile_id: None,
             }]);
         }
 
@@ -1389,6 +1410,7 @@ fn collect_go_local_usage() -> Result<ProviderCollectionResult, ProviderError> {
             windows,
             metadata,
         },
+        daily_usage: Vec::new(),
         collection_mode: "opencode_go_local_sqlite".to_string(),
         account_display_name: Some("OpenCode Go local".to_string()),
         raw_payload: None,
@@ -1671,6 +1693,10 @@ fn clear_cached_cookie_header(provider_id: &str) {
     if let Ok(entry) = Entry::new(COOKIE_CACHE_SERVICE, provider_id) {
         let _ = entry.delete_credential();
     }
+}
+
+pub(crate) fn clear_cached_cookie_cache() {
+    clear_cached_cookie_header(OPENCODE_GO_PROVIDER_ID);
 }
 
 fn import_browser_cookie_header(_provider_id: &str) -> Result<String, ProviderError> {

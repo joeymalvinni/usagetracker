@@ -5,9 +5,12 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tracing::{debug, info, trace, warn};
-use usage_core::{Account, ApiRequest, ApiResponse, ProviderHealth, UsageSnapshot};
+use usage_core::{
+    Account, ApiRequest, ApiResponse, ProviderHealth, UsageAmount, UsageSnapshot, UsageUnit,
+    UsageWindow, UsageWindowKind,
+};
 
-use crate::daemon::DaemonRuntime;
+use crate::{daemon::DaemonRuntime, storage::StoredDailyUsage};
 
 #[derive(Clone)]
 pub struct SocketServer {
@@ -72,12 +75,21 @@ impl SocketServer {
 
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
         match request {
-            ApiRequest::GetUsage => match self.runtime.storage.latest_usage().await {
-                Ok(snapshots) => ApiResponse::Usage {
-                    snapshots: supported_usage_snapshots(snapshots),
-                },
-                Err(err) => storage_error(err),
-            },
+            ApiRequest::GetUsage => {
+                match (
+                    self.runtime.storage.latest_usage().await,
+                    self.runtime.storage.accounts().await,
+                    self.runtime.storage.daily_usage_history().await,
+                ) {
+                    (Ok(mut snapshots), Ok(accounts), Ok(history)) => {
+                        merge_daily_usage_history(&mut snapshots, &history);
+                        ApiResponse::Usage {
+                            snapshots: supported_visible_usage_snapshots(snapshots, &accounts),
+                        }
+                    }
+                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => storage_error(err),
+                }
+            }
             ApiRequest::Refresh { providers } => {
                 let report = self.runtime.refresh.refresh(providers.as_deref()).await;
                 ApiResponse::Refresh {
@@ -89,12 +101,19 @@ impl SocketServer {
             ApiRequest::GetProviderHealth => {
                 match (
                     self.runtime.storage.provider_health().await,
+                    self.runtime.storage.accounts().await,
                     self.runtime.visible_provider_ids().await,
                 ) {
-                    (Ok(health), Ok(visible_providers)) => ApiResponse::ProviderHealth {
-                        health: visible_supported_provider_health(health, &visible_providers),
-                    },
-                    (Err(err), _) | (_, Err(err)) => storage_error(err),
+                    (Ok(health), Ok(accounts), Ok(visible_providers)) => {
+                        ApiResponse::ProviderHealth {
+                            health: visible_supported_provider_health(
+                                health,
+                                &accounts,
+                                &visible_providers,
+                            ),
+                        }
+                    }
+                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => storage_error(err),
                 }
             }
             ApiRequest::GetAccounts => match self.runtime.storage.accounts().await {
@@ -121,25 +140,251 @@ impl SocketServer {
                     ApiResponse::error("invalid_config", err.to_string())
                 }
             },
+            ApiRequest::AddProviderAccount {
+                provider_id,
+                display_name,
+            } => match self
+                .runtime
+                .add_provider_account(provider_id, display_name)
+                .await
+            {
+                Ok(account) => ApiResponse::AddProviderAccount { account },
+                Err(err) => {
+                    warn!(error = %err, "add provider account failed");
+                    ApiResponse::error("add_provider_account_failed", err.to_string())
+                }
+            },
+            ApiRequest::UpdateAccount {
+                account_id,
+                display_name,
+                hidden,
+                collection_enabled,
+            } => match self
+                .runtime
+                .update_account(account_id, display_name, hidden, collection_enabled)
+                .await
+            {
+                Ok(account) => ApiResponse::Account { account },
+                Err(err) => {
+                    warn!(error = %err, "account update failed");
+                    ApiResponse::error("account_update_failed", err.to_string())
+                }
+            },
+            ApiRequest::RemoveAccount { account_id } => {
+                match self.runtime.remove_account(account_id).await {
+                    Ok(account) => ApiResponse::Account { account },
+                    Err(err) => {
+                        warn!(error = %err, "account remove failed");
+                        ApiResponse::error("account_remove_failed", err.to_string())
+                    }
+                }
+            }
+            ApiRequest::DeleteAccount { account_id } => {
+                match self.runtime.delete_account(account_id).await {
+                    Ok(account_id) => ApiResponse::AccountDeleted { account_id },
+                    Err(err) => {
+                        warn!(error = %err, "account delete failed");
+                        ApiResponse::error("account_delete_failed", err.to_string())
+                    }
+                }
+            }
+            ApiRequest::GetProviderSetup { provider_id } => {
+                match self.runtime.provider_setup(provider_id).await {
+                    Ok(setup) => ApiResponse::ProviderSetup { setup },
+                    Err(err) => {
+                        warn!(error = %err, "provider setup lookup failed");
+                        ApiResponse::error("provider_setup_failed", err.to_string())
+                    }
+                }
+            }
+            ApiRequest::UpdateProviderSetup {
+                provider_id,
+                workspace_id,
+            } => match self
+                .runtime
+                .update_provider_setup(provider_id, workspace_id)
+                .await
+            {
+                Ok(setup) => ApiResponse::ProviderSetup { setup },
+                Err(err) => {
+                    warn!(error = %err, "provider setup update failed");
+                    ApiResponse::error("provider_setup_update_failed", err.to_string())
+                }
+            },
+            ApiRequest::RepairProvider {
+                provider_id,
+                account_id,
+            } => match self.runtime.repair_provider(provider_id, account_id).await {
+                Ok(action) => ApiResponse::ProviderAction { action },
+                Err(err) => {
+                    warn!(error = %err, "provider repair failed");
+                    ApiResponse::error("provider_repair_failed", err.to_string())
+                }
+            },
         }
     }
 }
 
-fn supported_usage_snapshots(snapshots: Vec<UsageSnapshot>) -> Vec<UsageSnapshot> {
+fn supported_visible_usage_snapshots(
+    snapshots: Vec<UsageSnapshot>,
+    accounts: &[Account],
+) -> Vec<UsageSnapshot> {
+    let hidden_accounts = hidden_account_ids(accounts);
     snapshots
         .into_iter()
         .filter(|snapshot| is_supported_provider(snapshot.provider_id.as_str()))
+        .filter(|snapshot| !hidden_accounts.contains(snapshot.account_id.as_str()))
         .collect()
+}
+
+fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredDailyUsage]) {
+    for snapshot in snapshots {
+        let matching = history
+            .iter()
+            .filter(|row| {
+                row.provider_id == snapshot.provider_id && row.account_id == snapshot.account_id
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+
+        let rows = matching
+            .iter()
+            .map(|row| {
+                let mut value = serde_json::json!({
+                    "date": row.date.to_string(),
+                    "tokens": row.tokens,
+                });
+                if let Some(cost_usd) = row.cost_usd {
+                    value["cost_usd"] = serde_json::json!(cost_usd);
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let source = matching
+            .last()
+            .map(|row| row.source.as_str())
+            .unwrap_or("persisted_daily_usage");
+        let key = format!("{}_activity", snapshot.provider_id.as_str());
+        if !snapshot.metadata.is_object() {
+            snapshot.metadata = serde_json::json!({});
+        }
+        if !snapshot
+            .metadata
+            .get(&key)
+            .is_some_and(serde_json::Value::is_object)
+        {
+            snapshot.metadata[&key] = serde_json::json!({});
+        }
+        let activity = &mut snapshot.metadata[&key];
+        if activity.get("source").is_none() {
+            activity["source"] = serde_json::json!(source);
+        }
+        activity["retained_history"] = serde_json::json!(true);
+        activity["daily_bucket_count"] = serde_json::json!(rows.len());
+        activity["by_day"] = serde_json::json!(rows);
+        if snapshot.provider_id.as_str() == "codex" {
+            replace_codex_activity_windows(snapshot, &matching);
+        }
+    }
+}
+
+fn replace_codex_activity_windows(snapshot: &mut UsageSnapshot, history: &[&StoredDailyUsage]) {
+    let today = chrono::Local::now().date_naive();
+    let lookback_start = today
+        .checked_sub_days(chrono::Days::new(29))
+        .unwrap_or(today);
+    let today_tokens = history
+        .iter()
+        .find(|row| row.date == today)
+        .map(|row| row.tokens)
+        .unwrap_or(0);
+    let lookback_tokens = history
+        .iter()
+        .filter(|row| row.date >= lookback_start && row.date <= today)
+        .fold(0_u64, |total, row| total.saturating_add(row.tokens));
+    let retained_lifetime_tokens = history
+        .iter()
+        .fold(0_u64, |total, row| total.saturating_add(row.tokens));
+    let reported_lifetime_tokens = snapshot.metadata["codex_activity"]["lifetime_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    let lifetime_tokens = retained_lifetime_tokens.max(reported_lifetime_tokens);
+
+    snapshot.windows.retain(|window| {
+        !matches!(
+            window.window_id.as_str(),
+            "codex_tokens_today" | "codex_tokens_30d" | "codex_tokens_lifetime"
+        )
+    });
+    if today_tokens > 0 {
+        snapshot.windows.push(activity_token_window(
+            "codex_tokens_today",
+            "Codex tokens today",
+            today_tokens,
+            UsageWindowKind::Daily,
+        ));
+    }
+    if lookback_tokens > 0 {
+        snapshot.windows.push(activity_token_window(
+            "codex_tokens_30d",
+            "Codex tokens 30 days",
+            lookback_tokens,
+            UsageWindowKind::Monthly,
+        ));
+    }
+    if lifetime_tokens > 0 {
+        snapshot.windows.push(activity_token_window(
+            "codex_tokens_lifetime",
+            "Codex lifetime tokens",
+            lifetime_tokens,
+            UsageWindowKind::Other("lifetime".to_string()),
+        ));
+    }
+    snapshot.metadata["codex_activity"]["today_tokens"] = serde_json::json!(today_tokens);
+    snapshot.metadata["codex_activity"]["lookback_days"] = serde_json::json!(30);
+    snapshot.metadata["codex_activity"]["lookback_tokens"] = serde_json::json!(lookback_tokens);
+    snapshot.metadata["codex_activity"]["lifetime_tokens"] = serde_json::json!(lifetime_tokens);
+}
+
+fn activity_token_window(
+    window_id: &str,
+    label: &str,
+    tokens: u64,
+    kind: UsageWindowKind,
+) -> UsageWindow {
+    UsageWindow {
+        window_id: window_id.to_string(),
+        label: label.to_string(),
+        kind,
+        used: Some(UsageAmount {
+            value: tokens as f64,
+            unit: UsageUnit::Tokens,
+        }),
+        limit: None,
+        remaining: None,
+        percent_used: None,
+        percent_remaining: None,
+        reset_at: None,
+    }
 }
 
 fn visible_supported_provider_health(
     health: Vec<ProviderHealth>,
+    accounts: &[Account],
     visible_providers: &BTreeSet<String>,
 ) -> Vec<ProviderHealth> {
+    let hidden_accounts = hidden_account_ids(accounts);
     health
         .into_iter()
         .filter(|row| is_supported_provider(row.provider_id.as_str()))
         .filter(|row| visible_providers.contains(row.provider_id.as_str()))
+        .filter(|row| {
+            row.account_id
+                .as_ref()
+                .is_none_or(|id| !hidden_accounts.contains(id.as_str()))
+        })
         .collect()
 }
 
@@ -154,6 +399,14 @@ fn is_supported_provider(provider_id: &str) -> bool {
     provider_id != "opencode"
 }
 
+fn hidden_account_ids(accounts: &[Account]) -> BTreeSet<&str> {
+    accounts
+        .iter()
+        .filter(|account| account.hidden)
+        .map(|account| account.id.as_str())
+        .collect()
+}
+
 fn storage_error(err: anyhow::Error) -> ApiResponse {
     warn!(error = %err, "storage request failed");
     ApiResponse::error("storage_error", err.to_string())
@@ -166,6 +419,11 @@ fn response_summary(response: &ApiResponse) -> &'static str {
         ApiResponse::ProviderHealth { .. } => "provider_health",
         ApiResponse::Accounts { .. } => "accounts",
         ApiResponse::Config { .. } => "config",
+        ApiResponse::AddProviderAccount { .. } => "add_provider_account",
+        ApiResponse::Account { .. } => "account",
+        ApiResponse::AccountDeleted { .. } => "account_deleted",
+        ApiResponse::ProviderSetup { .. } => "provider_setup",
+        ApiResponse::ProviderAction { .. } => "provider_action",
         ApiResponse::Error { .. } => "error",
     }
 }
@@ -210,6 +468,52 @@ mod tests {
             socket_path,
             runtime,
         }
+    }
+
+    #[test]
+    fn merges_retained_daily_usage_and_replaces_local_token_windows() {
+        let today = chrono::Local::now().date_naive();
+        let account_id = usage_core::AccountId::new("account");
+        let provider_id = ProviderId::new("codex");
+        let mut snapshots = vec![UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account_id.clone(),
+            collected_at: chrono::Utc::now(),
+            windows: vec![activity_token_window(
+                "codex_tokens_today",
+                "local fallback",
+                1,
+                UsageWindowKind::Daily,
+            )],
+            metadata: serde_json::json!({
+                "codex_activity": {"lifetime_tokens": 40}
+            }),
+        }];
+        let history = vec![StoredDailyUsage {
+            provider_id,
+            account_id,
+            date: today,
+            tokens: 25,
+            cost_usd: None,
+            source: "codex_account_usage".to_string(),
+        }];
+
+        merge_daily_usage_history(&mut snapshots, &history);
+
+        assert_eq!(
+            snapshots[0].metadata["codex_activity"]["by_day"][0]["tokens"],
+            25
+        );
+        assert_eq!(
+            snapshots[0].metadata["codex_activity"]["lifetime_tokens"],
+            40
+        );
+        let today_window = snapshots[0]
+            .windows
+            .iter()
+            .find(|window| window.window_id == "codex_tokens_today")
+            .unwrap();
+        assert_eq!(today_window.used.as_ref().unwrap().value, 25.0);
     }
 
     async fn request_line(socket_path: &Path, request: &str) -> ApiResponse {
@@ -259,6 +563,7 @@ mod tests {
             "codex".to_string(),
             crate::config::ProviderConfig {
                 enabled: true,
+                profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
             },
@@ -305,6 +610,7 @@ mod tests {
             "codex".to_string(),
             crate::config::ProviderConfig {
                 enabled: false,
+                profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
             },
@@ -312,7 +618,7 @@ mod tests {
         let env = test_env(providers);
         env.runtime
             .storage
-            .upsert_account(&ProviderId::new("codex"), "external-account", None)
+            .upsert_account(&ProviderId::new("codex"), "external-account", None, None)
             .await
             .unwrap();
         let server = SocketServer::new(env.runtime.clone());
@@ -380,6 +686,7 @@ mod tests {
                     updated_at: now,
                 },
             ],
+            &[],
             &visible,
         );
 
@@ -408,6 +715,170 @@ mod tests {
             ApiResponse::Error { error } => assert_eq!(error.code, "invalid_config"),
             other => panic!("unexpected response: {other:?}"),
         }
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn serves_safe_provider_profile_options() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "codex".to_string(),
+            crate::config::ProviderConfig {
+                enabled: true,
+                profiles: vec![crate::config::ProviderProfileConfig {
+                    id: Some("work".to_string()),
+                    display_name: Some("Work".to_string()),
+                    ..Default::default()
+                }],
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
+        let env = test_env(providers);
+        let server = SocketServer::new(env.runtime.clone());
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+
+        wait_for_socket(&env.socket_path).await;
+        let response = request_line(
+            &env.socket_path,
+            r#"{"method":"get_provider_setup","provider_id":"codex"}"#,
+        )
+        .await;
+        match response {
+            ApiResponse::ProviderSetup { setup } => {
+                assert_eq!(setup.provider_id, ProviderId::new("codex"));
+                assert_eq!(setup.profiles.len(), 1);
+                assert_eq!(setup.profiles[0].id, "work");
+                assert_eq!(setup.profiles[0].display_name.as_deref(), Some("Work"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn account_rename_updates_profile_config() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "codex".to_string(),
+            crate::config::ProviderConfig {
+                enabled: true,
+                profiles: vec![crate::config::ProviderProfileConfig {
+                    id: Some("work".to_string()),
+                    display_name: Some("Old name".to_string()),
+                    ..Default::default()
+                }],
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
+        let env = test_env(providers);
+        let account = env
+            .runtime
+            .storage
+            .upsert_account(
+                &ProviderId::new("codex"),
+                "external",
+                Some("work"),
+                Some("Old name"),
+            )
+            .await
+            .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+
+        wait_for_socket(&env.socket_path).await;
+        let request = format!(
+            r#"{{"method":"update_account","account_id":"{}","display_name":"New name"}}"#,
+            account.id
+        );
+        let response = request_line(&env.socket_path, &request).await;
+        match response {
+            ApiResponse::Account { account } => {
+                assert_eq!(account.display_name.as_deref(), Some("New name"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env.root.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted["providers"]["codex"]["profiles"][0]["display_name"],
+            "New name"
+        );
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_removes_data_and_tombstones_profile() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "codex".to_string(),
+            crate::config::ProviderConfig {
+                enabled: true,
+                profiles: vec![crate::config::ProviderProfileConfig {
+                    id: Some("work".to_string()),
+                    display_name: Some("Work".to_string()),
+                    ..Default::default()
+                }],
+                cookie_header: None,
+                workspace_id: None,
+            },
+        );
+        let env = test_env(providers);
+        let account = env
+            .runtime
+            .storage
+            .upsert_account(
+                &ProviderId::new("codex"),
+                "external",
+                Some("work"),
+                Some("Work"),
+            )
+            .await
+            .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+
+        wait_for_socket(&env.socket_path).await;
+        let request = format!(
+            r#"{{"method":"delete_account","account_id":"{}"}}"#,
+            account.id
+        );
+        let response = request_line(&env.socket_path, &request).await;
+        match response {
+            ApiResponse::AccountDeleted { account_id } => assert_eq!(account_id, account.id),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert!(env.runtime.storage.accounts().await.unwrap().is_empty());
+
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env.root.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["providers"]["codex"]["enabled"], false);
+        assert_eq!(
+            persisted["providers"]["codex"]["profiles"][0]["deleted"],
+            true
+        );
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);

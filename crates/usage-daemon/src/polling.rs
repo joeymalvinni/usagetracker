@@ -129,6 +129,7 @@ impl RefreshCoordinator {
             .upsert_account(
                 &provider_id,
                 &discovered.external_account_id,
+                discovered.profile_id.as_deref(),
                 discovered.display_name.as_deref(),
             )
             .await
@@ -147,6 +148,35 @@ impl RefreshCoordinator {
                 );
             }
         };
+
+        if !account.collection_enabled {
+            debug!(
+                provider_id = provider_id.as_str(),
+                account_id = account.id.as_str(),
+                "skipping disabled provider account"
+            );
+            let disabled = health::disabled(provider_id.clone());
+            let disabled = usage_core::ProviderHealth {
+                account_id: Some(account.id.clone()),
+                ..disabled
+            };
+            if let Err(err) = self.storage.upsert_health(&disabled).await {
+                warn!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account.id.as_str(),
+                    error = %err,
+                    "failed to store disabled account health"
+                );
+            }
+            return ProviderRefreshResult {
+                provider_id,
+                account_id: Some(account.id),
+                status: ProviderRefreshStatus::Disabled,
+                collection_mode: None,
+                collected_at: None,
+                message: Some("account collection disabled".to_string()),
+            };
+        }
 
         debug!(
             provider_id = provider_id.as_str(),
@@ -188,6 +218,31 @@ impl RefreshCoordinator {
         account_id: AccountId,
         result: ProviderCollectionResult,
     ) -> ProviderRefreshResult {
+        if !result.daily_usage.is_empty() {
+            if let Err(err) = self
+                .storage
+                .upsert_daily_usage(
+                    &provider_id,
+                    &account_id,
+                    &result.daily_usage,
+                    result.usage.collected_at,
+                )
+                .await
+            {
+                warn!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account_id.as_str(),
+                    error = %err,
+                    "failed to store provider daily usage"
+                );
+                return storage_error_result(
+                    provider_id,
+                    Some(account_id),
+                    format!("failed to store daily usage: {err}"),
+                );
+            }
+        }
+        let daily_usage_days = result.daily_usage.len();
         let snapshot = result.usage.into_snapshot(account_id.clone());
         if snapshot.provider_id != provider_id {
             warn!(
@@ -276,6 +331,7 @@ impl RefreshCoordinator {
             provider_id = provider_id.as_str(),
             account_id = account_id.as_str(),
             windows = snapshot.windows.len(),
+            daily_usage_days,
             collection_mode = result.collection_mode.as_str(),
             elapsed_ms = store_started.elapsed().as_millis(),
             "provider usage stored"
@@ -389,6 +445,7 @@ mod tests {
             Ok(vec![DiscoveredAccount {
                 external_account_id: "external-account".to_string(),
                 display_name: Some("Claude".to_string()),
+                profile_id: None,
             }])
         }
 
@@ -422,8 +479,54 @@ mod tests {
                     }],
                     metadata: json!({}),
                 },
+                daily_usage: Vec::new(),
                 collection_mode: "live".to_string(),
                 account_display_name: None,
+                raw_payload: None,
+                warnings: vec![],
+            })
+        }
+    }
+
+    struct MultiAccountProvider;
+
+    #[async_trait]
+    impl ProviderCollector for MultiAccountProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("codex")
+        }
+
+        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+            Ok(vec![
+                DiscoveredAccount {
+                    external_account_id: "same-openai-account".to_string(),
+                    display_name: Some("Personal".to_string()),
+                    profile_id: Some("personal".to_string()),
+                },
+                DiscoveredAccount {
+                    external_account_id: "same-openai-account".to_string(),
+                    display_name: Some("Work".to_string()),
+                    profile_id: Some("work".to_string()),
+                },
+            ])
+        }
+
+        async fn collect_usage(
+            &self,
+            account: &DiscoveredAccount,
+        ) -> Result<ProviderCollectionResult, ProviderError> {
+            Ok(ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new("codex"),
+                    collected_at: Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({
+                        "credential_profile": account.profile_id.as_deref(),
+                    }),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "test".to_string(),
+                account_display_name: account.display_name.clone(),
                 raw_payload: None,
                 warnings: vec![],
             })
@@ -459,6 +562,67 @@ mod tests {
         assert_eq!(health[0].provider_id, provider_id);
         assert!(health[0].account_id.is_some());
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn refresh_stores_each_discovered_account() {
+        let storage = test_storage();
+        let coordinator =
+            RefreshCoordinator::new(storage.clone(), vec![Arc::new(MultiAccountProvider)]);
+
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(report.provider_results.len(), 2);
+        assert!(report
+            .provider_results
+            .iter()
+            .all(|result| result.status == ProviderRefreshStatus::Ok));
+
+        let accounts = storage.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts
+            .iter()
+            .all(|account| account.external_account_id == "same-openai-account"));
+        assert!(accounts
+            .iter()
+            .any(|account| account.profile_id.as_deref() == Some("personal")));
+        assert!(accounts
+            .iter()
+            .any(|account| account.profile_id.as_deref() == Some("work")));
+
+        let snapshots = storage.latest_usage().await.unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|snapshot| snapshot.provider_id.as_str() == "codex")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_disabled_accounts() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account = storage
+            .upsert_account(&provider_id, "external-account", None, Some("Claude"))
+            .await
+            .unwrap();
+        storage
+            .update_account(&account.id, None, None, Some(false))
+            .await
+            .unwrap();
+
+        let coordinator = RefreshCoordinator::new(storage.clone(), vec![Arc::new(FakeProvider)]);
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(report.provider_results.len(), 1);
+        assert_eq!(
+            report.provider_results[0].status,
+            ProviderRefreshStatus::Disabled
+        );
+        assert!(storage.latest_usage().await.unwrap().is_empty());
     }
 
     fn test_storage() -> Storage {

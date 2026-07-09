@@ -44,10 +44,54 @@ pub struct FileConfig {
 pub struct ProviderConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<ProviderProfileConfig>,
     #[serde(default)]
     pub cookie_header: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default = "default_profile_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_roots: Vec<PathBuf>,
+}
+
+impl Default for ProviderProfileConfig {
+    fn default() -> Self {
+        Self {
+            id: None,
+            enabled: true,
+            deleted: false,
+            display_name: None,
+            auth_path: None,
+            codex_home: None,
+            keychain_account: None,
+            credentials_file: None,
+            cli_enabled: None,
+            project_roots: Vec::new(),
+        }
+    }
 }
 
 impl Config {
@@ -140,6 +184,7 @@ impl Config {
                     .entry(id.clone())
                     .or_insert(ProviderConfig {
                         enabled: false,
+                        profiles: Vec::new(),
                         cookie_header: None,
                         workspace_id: None,
                     })
@@ -171,6 +216,10 @@ impl Config {
 
 fn provider_visible(provider_id: &str, visible_providers: Option<&BTreeSet<String>>) -> bool {
     visible_providers.is_none_or(|ids| ids.contains(provider_id))
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
@@ -211,6 +260,7 @@ impl Default for FileConfig {
             "codex".to_string(),
             ProviderConfig {
                 enabled: true,
+                profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
             },
@@ -219,6 +269,7 @@ impl Default for FileConfig {
             "claude".to_string(),
             ProviderConfig {
                 enabled: false,
+                profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
             },
@@ -227,6 +278,7 @@ impl Default for FileConfig {
             "opencode_go".to_string(),
             ProviderConfig {
                 enabled: false,
+                profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
             },
@@ -258,6 +310,10 @@ fn read_or_create_config(path: &Path) -> anyhow::Result<FileConfig> {
 
 fn default_poll_interval_seconds() -> u64 {
     300
+}
+
+fn default_profile_enabled() -> bool {
+    true
 }
 
 #[cfg(test)]

@@ -420,7 +420,10 @@ mod tests {
             id: account_id.clone(),
             provider_id: ProviderId::new("codex"),
             external_account_id: "joey".to_string(),
+            profile_id: None,
             display_name: None,
+            hidden: false,
+            collection_enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -494,7 +497,10 @@ mod tests {
             id: account_id.clone(),
             provider_id: ProviderId::new("claude"),
             external_account_id: "joey".to_string(),
+            profile_id: None,
             display_name: Some("Claude team".to_string()),
+            hidden: false,
+            collection_enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
