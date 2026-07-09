@@ -2,11 +2,37 @@
 
 Claude support lives in `crates/usage-daemon/src/providers/claude/`. It is disabled by default and only runs when `providers.claude.enabled` is true in `config.json`.
 
+Claude supports multiple configured profiles. Existing configs without `providers.claude.profiles` use one legacy profile: the current `USER` Keychain account, `~/.claude/.credentials.json` as the file fallback, and Claude CLI collection enabled.
+
+Example:
+
+```json
+"claude": {
+  "enabled": true,
+  "profiles": [
+    {
+      "id": "personal",
+      "keychain_account": "your-macos-user",
+      "credentials_file": "~/.claude/.credentials.json",
+      "cli_enabled": true
+    },
+    {
+      "id": "work",
+      "keychain_account": "joey-work",
+      "credentials_file": "~/.claude-work/.credentials.json",
+      "cli_enabled": false
+    }
+  ]
+}
+```
+
+For explicit multi-profile configs, `cli_enabled` defaults to true only on the first profile. This avoids attributing the same local Claude CLI usage and local project log cost scan to every configured account.
+
 ## Credentials
 
-The daemon reads Claude Code OAuth credentials from macOS Keychain first. The Keychain service is hard-coded as `Claude Code-credentials`. The account name is the current `USER` environment variable, falling back to `default` if `USER` is missing.
+The daemon reads Claude Code OAuth credentials from macOS Keychain first. The Keychain service is hard-coded as `Claude Code-credentials`. The account name is the profile's `keychain_account`. In legacy single-profile mode this is the current `USER` environment variable, falling back to `default` if `USER` is missing.
 
-If the Keychain item does not exist, the daemon falls back to `~/.claude/.credentials.json` for Linux systems. Other Keychain errors do not fall back to the file because they may mean the item exists but cannot be read.
+If the Keychain item does not exist, the daemon falls back to the profile's `credentials_file`, defaulting to `~/.claude/.credentials.json`. Other Keychain errors do not fall back to the file because they may mean the item exists but cannot be read.
 
 The expected credential JSON shape is:
 
@@ -25,7 +51,7 @@ The expected credential JSON shape is:
 
 `accessToken` and `refreshToken` are required and must be non-empty after trimming. `expiresAt`, `scopes`, `subscriptionType`, and `rateLimitTier` are optional. Invalid JSON, a missing `claudeAiOauth` object, or blank token fields make the provider credentials invalid.
 
-The discovered Claude account id is the Keychain account name, not an Anthropic account id from the payload. The display name is `Claude <subscriptionType>` when a subscription type exists, otherwise `Claude`.
+The discovered Claude account id is the profile Keychain account name, not an Anthropic account id from the payload. The display name is the configured profile `display_name` when present, otherwise `Claude <subscriptionType>` when a subscription type exists, otherwise `Claude`.
 
 ## Token Refresh
 

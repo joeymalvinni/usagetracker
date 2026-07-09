@@ -64,6 +64,16 @@ The Swift menu bar app uses the same daemon socket by default and stores UI-only
 
 The menu bar app's Settings page can change the polling interval and enable/disable providers while the daemon is running; the daemon applies these immediately and persists them back to `config.json` through its `update_config` API.
 
+On first launch, the menu app opens a setup assistant for choosing providers and connecting accounts. The same connection tools remain available under **Settings → Connections**:
+
+- Codex opens an isolated profile login in Terminal and supports multiple named profiles.
+- Claude opens `claude auth login` in Terminal.
+- OpenCode Go opens its web login, then discovers available workspaces for selection.
+
+Provider errors include a retry or login-repair action. Account names can be changed locally in Settings. Removing an account is a reversible soft removal: collection stops and the account disappears from dashboards, while history is retained and the account can be restored.
+
+Cost values derived from local Codex or Claude logs are estimates at API rates, not billing statements. The app labels estimated and partial totals and exposes their source in the UI.
+
 Daemon options can be passed as flags:
 
 ```sh
@@ -92,10 +102,25 @@ The config file controls which providers are enabled:
   "poll_interval_seconds": 300,
   "providers": {
     "codex": {
-      "enabled": true
+      "enabled": true,
+      "profiles": [
+        {
+          "id": "default",
+          "display_name": "Personal",
+          "codex_home": "~/.codex"
+        }
+      ]
     },
     "claude": {
-      "enabled": false
+      "enabled": false,
+      "profiles": [
+        {
+          "id": "default",
+          "keychain_account": "your-macos-user",
+          "credentials_file": "~/.claude/.credentials.json",
+          "cli_enabled": true
+        }
+      ]
     },
     "opencode_go": {
       "enabled": false
@@ -106,6 +131,51 @@ The config file controls which providers are enabled:
 ```
 
 Codex collection reads credentials from `~/.codex/auth.json`. Claude collection defaults to the local Claude Code terminal usage command, `claude -p /usage --output-format json --no-session-persistence`. If that command fails, Claude collection falls back to Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects quota usage from Anthropic's OAuth usage API.
+
+Codex and Claude can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. For Codex, each profile should point at a separate `codex_home` or `auth_path`. For Claude, each profile can point at a separate Keychain account or credentials file. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile so local Claude CLI usage and local project log costs are not duplicated across accounts.
+
+Example multi-account config:
+
+```json
+{
+  "poll_interval_seconds": 300,
+  "providers": {
+    "codex": {
+      "enabled": true,
+      "profiles": [
+        {
+          "id": "personal",
+          "display_name": "Personal",
+          "codex_home": "~/.codex"
+        },
+        {
+          "id": "work",
+          "display_name": "Work",
+          "codex_home": "~/.codex-work"
+        }
+      ]
+    },
+    "claude": {
+      "enabled": true,
+      "profiles": [
+        {
+          "id": "personal",
+          "keychain_account": "your-macos-user",
+          "cli_enabled": true
+        },
+        {
+          "id": "work",
+          "keychain_account": "joey-work",
+          "cli_enabled": false
+        }
+      ]
+    }
+  },
+  "debug_capture_raw_payloads": false
+}
+```
+
+Quota/rate-limit usage is collected per profile. Local cost estimates are also profile-scoped when separate Codex homes or Claude project roots are configured; otherwise only the CLI-enabled Claude profile receives local log cost enrichment to avoid double-counting.
 
 OpenCode Go collection is disabled by default. `opencode_go` tries authenticated web console usage first, then falls back to the local OpenCode SQLite database at `~/.local/share/opencode/opencode.db` when web collection is unavailable. Zen balance is fetched as optional best-effort enrichment.
 
