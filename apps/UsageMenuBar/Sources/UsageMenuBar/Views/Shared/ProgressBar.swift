@@ -3,6 +3,8 @@ import SwiftUI
 /// Capsule progress bar tinted by provider identity. Charts use the matching
 /// flat color; progress bars use the richer gradient from the same palette.
 struct ProgressBar: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     let percent: Double
     let status: DisplayStatus
     let providerId: String
@@ -21,17 +23,19 @@ struct ProgressBar: View {
                     .fill(fillStyle)
                     .frame(width: fillWidth, height: trackHeight)
                 if let markerOffset = markerOffset(in: geo.size.width) {
-                    // The slim line marks the daemon's projected capacity at
-                    // reset; it deliberately extends beyond the usage track.
+                    // Use an explicit opaque color instead of the semantic
+                    // `.primary` style, which macOS may render translucently.
+                    // The line extends beyond the track so it reads as a
+                    // forecast marker rather than part of the current fill.
                     Capsule()
-                        .fill(.primary)
-                        .frame(width: 2, height: 9)
+                        .fill(markerColor)
+                        .frame(width: 3, height: 11)
                         .offset(x: markerOffset)
                         .accessibilityHidden(true)
                 }
             }
         }
-        .frame(height: 9)
+        .frame(height: 11)
         .accessibilityLabel("Percent remaining")
         .accessibilityValue(accessibilityValue)
         .help(forecastHelp)
@@ -40,7 +44,7 @@ struct ProgressBar: View {
     private func markerOffset(in width: CGFloat) -> CGFloat? {
         guard let forecastPercent, forecastPercent.isFinite else { return nil }
         let fraction = CGFloat(max(0, min(1, forecastPercent / 100)))
-        return min(max(0, width * fraction - 1), max(0, width - 2))
+        return min(max(0, width * fraction - 1.5), max(0, width - 3))
     }
 
     private var accessibilityValue: String {
@@ -53,7 +57,13 @@ struct ProgressBar: View {
         let current = "\(Int(percent.rounded()))% remaining"
         guard let forecastPercent, forecastPercent.isFinite else { return current }
         let forecast = Int(max(0, min(100, forecastPercent)).rounded())
-        return "\(current) · marker forecasts \(forecast)% remaining at reset"
+        return "Projected remaining at reset: \(forecast)% · Current: \(Int(percent.rounded()))%"
+    }
+
+    /// Black in light mode and white in dark mode gives the forecast marker a
+    /// fully opaque, high-contrast treatment over both the track and fill.
+    private var markerColor: Color {
+        colorScheme == .dark ? .white : .black
     }
 
     private var fillStyle: AnyShapeStyle {

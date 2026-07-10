@@ -373,10 +373,52 @@ enum DaemonState { case unknown, online, offline }
         health.compactMap(\.lastSuccessAt).max() ?? snapshots.map(\.collectedAt).max()
     }
 
-    func moveProviders(from source: IndexSet, to destination: Int) {
-        var order = settingsProviders.map(\.id)
-        order.move(fromOffsets: source, toOffset: destination)
-        ui.providerOrder = order
+    /// Reorders the full provider list around two visible rail entries. Providers that
+    /// are currently unavailable stay in the saved order and reappear predictably if
+    /// they are enabled later.
+    func moveProvider(_ providerId: String, over targetProviderId: String) {
+        let order = settingsProviders.map(\.providerId)
+        let reordered = ProviderOrdering.moving(
+            providerId,
+            over: targetProviderId,
+            in: order
+        )
+        guard reordered != order else { return }
+        ui.providerOrder = reordered
+    }
+
+    /// Reorders around a rail entry using the preview slot chosen while dragging, so the
+    /// committed order exactly matches the animated rail preview.
+    func moveProvider(_ providerId: String, relativeTo targetProviderId: String, after: Bool) {
+        let order = settingsProviders.map(\.providerId)
+        let reordered = ProviderOrdering.moving(
+            providerId,
+            relativeTo: targetProviderId,
+            after: after,
+            in: order
+        )
+        guard reordered != order else { return }
+        ui.providerOrder = reordered
+    }
+
+    /// Moves against the entries that are actually shown in the rail, so an unavailable
+    /// provider cannot make a context-menu "Move up" action appear to do nothing.
+    func moveProvider(_ providerId: String, by offset: Int) {
+        let visibleOrder = providers.map(\.providerId)
+        guard let source = visibleOrder.firstIndex(of: providerId) else { return }
+        let target = source + offset
+        guard visibleOrder.indices.contains(target) else { return }
+        moveProvider(providerId, over: visibleOrder[target])
+    }
+
+    func canMoveProvider(_ providerId: String, by offset: Int) -> Bool {
+        let visibleOrder = providers.map(\.providerId)
+        guard let source = visibleOrder.firstIndex(of: providerId) else { return false }
+        return visibleOrder.indices.contains(source + offset)
+    }
+
+    func resetProviderOrder() {
+        ui.providerOrder = []
     }
 
     private static func defaultSocketPath() -> String {

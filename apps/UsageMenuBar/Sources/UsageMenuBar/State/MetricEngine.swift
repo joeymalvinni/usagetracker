@@ -328,7 +328,13 @@ struct MetricEngine {
             }
         }
 
-        let activeIds = Array(activeProviderIds).sorted()
+        // The overview chart is another provider summary surface, so its stack and
+        // hover order should follow the same preference as the rail and cards. A
+        // provider detail dashboard uses account-qualified IDs and keeps its existing
+        // stable account ordering instead.
+        let activeIds = filter == nil
+            ? ordered(Array(activeProviderIds))
+            : Array(activeProviderIds).sorted()
         let providers = activeIds.map { pid in
             CostProviderVM(id: pid, name: filter == nil ? pretty(pid) : pid, symbol: symbol(filter == nil ? pid : String(pid.split(separator: ":").first ?? "")))
         }
@@ -427,10 +433,8 @@ struct MetricEngine {
 
     private func ordered(_ ids: [String]) -> [String] {
         let preferred = ui.providerOrder.filter(isSupportedProvider) + knownProviderIds
-        var seen = Set<String>()
         let supported = ids.filter(isSupportedProvider)
-        let ranked = preferred.filter { supported.contains($0) && seen.insert($0).inserted }
-        return ranked + supported.filter { !ranked.contains($0) }.sorted()
+        return ProviderOrdering.resolve(supported, preferred: preferred)
     }
 
     private func ordered(_ keys: [ProviderAccountKey]) -> [ProviderAccountKey] {
