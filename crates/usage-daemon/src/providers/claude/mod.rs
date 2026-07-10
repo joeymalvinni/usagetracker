@@ -306,6 +306,10 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
     path
 }
 
+fn should_use_cli_fallback(cli_enabled: bool, api_error: &ProviderError) -> bool {
+    cli_enabled && api_error.kind() != ProviderErrorKind::RateLimited
+}
+
 #[async_trait]
 impl ProviderCollector for ClaudeCollector {
     fn provider_id(&self) -> ProviderId {
@@ -375,47 +379,40 @@ impl ProviderCollector for ClaudeCollector {
         let profile = self.profile_for_account(account).await?;
 
         let mut warnings = Vec::new();
-        let (mut usage, collection_mode, raw_payload) = if profile.cli_enabled {
-            match self.collect_usage_with_cli(&profile).await {
-                Ok(cli_usage) => (
-                    cli_usage.usage,
-                    CLAUDE_CLI_COLLECTION_MODE.to_string(),
-                    self.capture_raw_payloads.then_some(cli_usage.raw_output),
-                ),
-                Err(cli_err) => match self.collect_usage_with_api(&profile, account).await {
-                    Ok((usage, payload)) => {
-                        warnings.push(format!(
-                            "Claude CLI usage failed; used OAuth usage API fallback: {}",
-                            cli_err.short_message()
-                        ));
-                        (
-                            usage,
-                            CLAUDE_COLLECTION_MODE.to_string(),
-                            self.capture_raw_payloads.then_some(payload),
-                        )
-                    }
-                    Err(api_err) => {
-                        return Err(ProviderError::new(
-                            cli_err.kind(),
-                            format!(
-                                "Claude CLI usage failed ({}); OAuth usage API fallback failed ({})",
-                                cli_err.short_message(),
-                                api_err.short_message()
-                            ),
-                        ));
-                    }
-                },
-            }
-        } else {
+        let (mut usage, collection_mode, raw_payload) =
             match self.collect_usage_with_api(&profile, account).await {
                 Ok((usage, payload)) => (
                     usage,
                     CLAUDE_COLLECTION_MODE.to_string(),
                     self.capture_raw_payloads.then_some(payload),
                 ),
+                Err(api_err) if should_use_cli_fallback(profile.cli_enabled, &api_err) => {
+                    match self.collect_usage_with_cli(&profile).await {
+                        Ok(cli_usage) => {
+                            warnings.push(format!(
+                                "Claude OAuth usage API failed; used CLI fallback: {}",
+                                api_err.short_message()
+                            ));
+                            (
+                                cli_usage.usage,
+                                CLAUDE_CLI_COLLECTION_MODE.to_string(),
+                                self.capture_raw_payloads.then_some(cli_usage.raw_output),
+                            )
+                        }
+                        Err(cli_err) => {
+                            return Err(ProviderError::new(
+                                api_err.kind(),
+                                format!(
+                                    "Claude OAuth usage API failed ({}); CLI fallback failed ({})",
+                                    api_err.short_message(),
+                                    cli_err.short_message()
+                                ),
+                            ));
+                        }
+                    }
+                }
                 Err(api_err) => return Err(api_err),
-            }
-        };
+            };
 
         if profile.cli_enabled {
             let project_roots = profile.project_roots.clone();
@@ -475,6 +472,22 @@ mod tests {
             keychain_service_for_config_dir(Path::new("/tmp/claude-profile")),
             "Claude Code-credentials-7182514b"
         );
+    }
+
+    #[test]
+    fn rate_limits_do_not_launch_the_cli_fallback() {
+        let rate_limited = ProviderError::new(
+            ProviderErrorKind::RateLimited,
+            "usage endpoint rate limited",
+        );
+        let unavailable = ProviderError::new(
+            ProviderErrorKind::ProviderUnavailable,
+            "endpoint unavailable",
+        );
+
+        assert!(!should_use_cli_fallback(true, &rate_limited));
+        assert!(should_use_cli_fallback(true, &unavailable));
+        assert!(!should_use_cli_fallback(false, &unavailable));
     }
 
     #[test]
