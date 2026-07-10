@@ -578,8 +578,15 @@ enum DaemonState { case unknown, online, offline }
     /// resolved-then-recurring alert (e.g. a weekly limit that resets and fills again)
     /// re-alerts, and an escalation (warning → critical) is treated as a new alert.
     private func pruneStaleAcknowledgements() {
-        let live = Set(providers.flatMap { ($0.subAccounts ?? [$0]).compactMap(\.alertSignature) })
-        let pruned = ui.pruningAlertAcknowledgements(to: live)
+        let liveAlerts = Set(providers.flatMap { ($0.subAccounts ?? [$0]).compactMap(\.alertSignature) })
+        let dashboards = [cost] + providers.flatMap { provider in
+            [provider.costDashboard] + (provider.subAccounts ?? []).map(\.costDashboard)
+        }
+        let livePricingNotices = Set(dashboards.compactMap(\.pricingNoticeId))
+        let pruned = ui.pruningAcknowledgements(
+            to: liveAlerts,
+            pricingNotices: livePricingNotices
+        )
         guard pruned != ui else { return }
         // UIConfig is a value type whose property observer rebuilds the view models.
         // Assign the fully-pruned value once so a partial update cannot recursively
@@ -604,6 +611,16 @@ enum DaemonState { case unknown, online, offline }
     func showsAlertBanner(_ vm: ProviderVM) -> Bool {
         guard let sig = vm.alertSignature else { return false }
         return !ui.dismissedAlerts.contains(sig)
+    }
+
+    func dismissPricingNotice(_ dashboard: CostDashboardVM) {
+        guard let noticeId = dashboard.pricingNoticeId else { return }
+        ui.dismissedPricingNotices.insert(noticeId)
+    }
+
+    func showsPricingNotice(_ dashboard: CostDashboardVM) -> Bool {
+        guard let noticeId = dashboard.pricingNoticeId else { return false }
+        return !ui.dismissedPricingNotices.contains(noticeId)
     }
     private func menuContent() -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
         guard daemon != .offline else { return ("Usage offline", .offline, []) }

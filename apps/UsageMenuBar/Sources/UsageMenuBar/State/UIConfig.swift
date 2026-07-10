@@ -24,6 +24,8 @@ struct UIConfig: Codable, Equatable {
     var seenAlerts = Set<String>()
     /// Alert signatures whose banner the user has dismissed.
     var dismissedAlerts = Set<String>()
+    /// Pricing coverage notices dismissed for the current set of unknown models.
+    var dismissedPricingNotices = Set<String>()
 
     init() {}
 
@@ -39,6 +41,7 @@ struct UIConfig: Codable, Equatable {
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
         dismissedAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedAlerts) ?? []
+        dismissedPricingNotices = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedPricingNotices) ?? []
     }
 
     static func load() -> Self {
@@ -48,10 +51,14 @@ struct UIConfig: Codable, Equatable {
         return config
     }
 
-    func pruningAlertAcknowledgements(to live: Set<String>) -> Self {
+    func pruningAcknowledgements(
+        to liveAlerts: Set<String>,
+        pricingNotices livePricingNotices: Set<String>
+    ) -> Self {
         var pruned = self
-        pruned.seenAlerts.formIntersection(live)
-        pruned.dismissedAlerts.formIntersection(live)
+        pruned.seenAlerts.formIntersection(liveAlerts)
+        pruned.dismissedAlerts.formIntersection(liveAlerts)
+        pruned.dismissedPricingNotices.formIntersection(livePricingNotices)
         return pruned
     }
 

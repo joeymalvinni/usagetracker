@@ -68,7 +68,7 @@ struct CostDashboard: View {
     }
 
     private var activitySubtitle: String {
-        if dashboard.hasData { "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated spend" : (metric == .cost ? "spend" : "tokens"))" }
+        if dashboard.hasData { "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated cost" : (metric == .cost ? "cost" : "tokens"))" }
         else { "No activity yet" }
     }
     private func hoverText(_ value: CostProviderDayVM) -> String {

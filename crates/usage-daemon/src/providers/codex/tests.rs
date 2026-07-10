@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{Days, FixedOffset, Local, NaiveDate, Utc};
+use chrono::{Days, FixedOffset, NaiveDate, Utc};
 use serde_json::json;
 use usage_core::{AccountId, ProviderId, UsageWindow, UsageWindowKind};
 
@@ -19,6 +19,7 @@ use super::cost::{
     normalize_codex_model, scan_codex_session_file, CodexCostReport, CodexTokenTotals,
     CodexUsageCostExt, DailyCostSummary,
 };
+use super::pricing::CodexPricingCatalog;
 use super::rate_limits::{normalize_app_server_usage, normalize_usage};
 use super::{codex_credentials_from_auth_json, CodexCollector, PROVIDER_ID};
 
@@ -46,7 +47,7 @@ fn does_not_duplicate_standard_codex_session_root() {
 
 #[test]
 fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() {
-    let today = Local::now().date_naive();
+    let today = Utc::now().date_naive();
     let yesterday = today.checked_sub_days(Days::new(1)).unwrap();
     let activity = normalize_account_token_usage(&json!({
         "summary": {
@@ -80,6 +81,8 @@ fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() 
         DailyCostSummary {
             cost_usd: 1.25,
             tokens: 100,
+            priced_tokens: 100,
+            ..Default::default()
         },
     );
     usage.merge_cost_report(
@@ -569,7 +572,7 @@ fn reads_nested_codex_event_timestamps() {
 }
 
 #[test]
-fn groups_codex_events_by_the_users_local_calendar_day() {
+fn can_convert_codex_events_to_a_requested_calendar_day() {
     let event = json!({"timestamp": "2026-07-10T03:00:00Z"});
     let pacific_daylight_time = FixedOffset::west_opt(7 * 60 * 60).unwrap();
 
@@ -613,6 +616,7 @@ fn seeds_total_only_baseline_before_emitting_deltas() {
         CodexTokenTotals {
             input: 1_000,
             cached: 500,
+            cache_write: 0,
             output: 50,
         }
     );
@@ -647,10 +651,17 @@ fn keeps_undated_codex_usage_out_of_today_and_lookback() {
     .collect::<Vec<_>>()
     .join("\n");
     std::fs::write(&path, contents).unwrap();
-    let today = Local::now().date_naive();
+    let today = Utc::now().date_naive();
     let mut report = CodexCostReport::default();
 
-    scan_codex_session_file(&path, today, today, &mut report).unwrap();
+    scan_codex_session_file(
+        &path,
+        today,
+        today,
+        &CodexPricingCatalog::bundled(),
+        &mut report,
+    )
+    .unwrap();
 
     assert_eq!(report.total_tokens, 110);
     assert_eq!(report.undated_tokens, 110);
@@ -685,6 +696,7 @@ fn prices_codex_tokens_with_cache_and_model_normalization() {
         CodexTokenTotals {
             input: 1000,
             cached: 400,
+            cache_write: 0,
             output: 100,
         },
     )
@@ -698,10 +710,85 @@ fn prices_codex_tokens_with_cache_and_model_normalization() {
 }
 
 #[test]
+fn prices_gpt_56_and_uses_distinct_long_context_rates() {
+    let short = codex_cost_usd(
+        "gpt-5.6-sol",
+        CodexTokenTotals {
+            input: 100_000,
+            cached: 80_000,
+            cache_write: 10_000,
+            output: 10_000,
+        },
+    )
+    .unwrap();
+    assert!((short - 0.4525).abs() < 1e-12);
+
+    let long = codex_cost_usd(
+        "gpt-5.6-sol",
+        CodexTokenTotals {
+            input: 300_000,
+            cached: 100_000,
+            cache_write: 0,
+            output: 10_000,
+        },
+    )
+    .unwrap();
+    assert!((long - 2.55).abs() < 1e-12);
+}
+
+#[test]
+fn records_unknown_model_tokens_as_unpriced_daily_usage() {
+    let path = std::env::temp_dir().join(format!(
+        "usagetracker-codex-unpriced-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let today = Utc::now().date_naive();
+    let timestamp = format!("{}T12:00:00Z", today);
+    let contents = [
+        json!({"type": "turn_context", "payload": {"model": "gpt-future"}}),
+        json!({
+            "type": "token_count",
+            "timestamp": timestamp,
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 50,
+                    "output_tokens": 10
+                }
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|event| serde_json::to_string(&event).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(&path, contents).unwrap();
+    let mut report = CodexCostReport::default();
+
+    scan_codex_session_file(
+        &path,
+        today,
+        today,
+        &CodexPricingCatalog::bundled(),
+        &mut report,
+    )
+    .unwrap();
+
+    assert_eq!(report.total_tokens, 110);
+    assert_eq!(report.priced_tokens, 0);
+    assert_eq!(report.unpriced_tokens, 110);
+    assert_eq!(report.unpriced_models["gpt-future"], 110);
+    assert_eq!(report.by_day[&today].unpriced_tokens, 110);
+    assert_eq!(report.by_day[&today].unpriced_models["gpt-future"], 110);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn token_total_does_not_double_count_cached_input() {
     let totals = CodexTokenTotals {
         input: 1_000,
         cached: 800,
+        cache_write: 0,
         output: 100,
     };
 

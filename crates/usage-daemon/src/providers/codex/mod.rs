@@ -36,6 +36,7 @@ pub struct CodexCollector {
     profiles: Vec<CodexProfile>,
     local_codex_home: PathBuf,
     client: reqwest::Client,
+    pricing: CodexPricingManager,
     capture_raw_payloads: bool,
 }
 
@@ -58,12 +59,14 @@ impl CodexCollector {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .user_agent("codex-cli")
             .build()?;
+        let pricing = CodexPricingManager::new(client.clone());
         let local_codex_home = local_codex_home(&home);
         let profiles = codex_profiles(config, &local_codex_home);
         Ok(Self {
             profiles,
             local_codex_home,
             client,
+            pricing,
             capture_raw_payloads,
         })
     }
@@ -464,6 +467,11 @@ impl ProviderCollector for CodexCollector {
             collected.usage.metadata["profile_display_name"] = json!(display_name);
         }
 
+        let (pricing, pricing_warning) = self.pricing.catalog().await;
+        if let Some(warning) = pricing_warning {
+            collected.warnings.push(warning);
+        }
+
         let cost_cache = profile.cost_cache.clone();
         let local_codex_home = self.local_codex_home.clone();
         let profile_codex_home = profile.codex_home.clone();
@@ -476,7 +484,7 @@ impl ProviderCollector for CodexCollector {
                 &local_codex_home,
                 owns_default_activity,
             );
-            scan_codex_local_costs_cached(cost_cache, cost_roots)
+            scan_codex_local_costs_cached(cost_cache, cost_roots, pricing)
         })
         .await
         {
@@ -488,6 +496,7 @@ impl ProviderCollector for CodexCollector {
                     token_count_events = scan.report.token_count_events,
                     today_tokens = scan.report.today_tokens,
                     lookback_tokens = scan.report.lookback_tokens,
+                    unpriced_tokens = scan.report.unpriced_tokens,
                     "codex local cost scan completed"
                 );
                 collected
@@ -659,10 +668,12 @@ fn nonempty_string(value: Option<String>) -> Option<String> {
 
 mod app_server;
 mod cost;
+mod pricing;
 mod rate_limits;
 
 use app_server::collect_usage_from_app_server;
 use cost::{codex_session_roots, scan_codex_local_costs_cached, CodexCostCache, CodexUsageCostExt};
+use pricing::CodexPricingManager;
 use rate_limits::{normalize_usage, number_from_json_value};
 
 #[cfg(test)]

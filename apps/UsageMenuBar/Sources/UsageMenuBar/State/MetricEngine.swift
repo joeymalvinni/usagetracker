@@ -10,6 +10,18 @@ private struct ProviderAccountKey: Hashable {
     }
 }
 
+private struct LocalCostCoverage {
+    var cost: Double
+    var tokens: UInt64
+    var pricedTokens: UInt64
+}
+
+private var utcCalendar: Calendar {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    return calendar
+}
+
 struct MetricEngine {
     let config: ConfigResponse?
     let accounts: [Account]
@@ -245,7 +257,7 @@ struct MetricEngine {
     }
 
     private func buildCostDashboard(filter: ((UsageSnapshot) -> Bool)?) -> CostDashboardVM {
-        let calendar = Calendar.current
+        let calendar = utcCalendar
         let today = calendar.startOfDay(for: Date())
         let dayStarts = (0..<30).compactMap { offset in
             calendar.date(byAdding: .day, value: offset - 29, to: today)
@@ -256,7 +268,9 @@ struct MetricEngine {
         let filtered = filter.map { visibleSnapshots.filter($0) } ?? visibleSnapshots
         let codexReferenceCostPerToken = codexCostPerToken(in: visibleSnapshots)
         var providerRows = [String: [String: (cost: Double, tokens: UInt64)]]()
+        var localCostCoverage = [String: [String: LocalCostCoverage]]()
         var activeProviderIds = Set<String>()
+        var unpricedModels = Set<String>()
         var isEstimated = false
         var isPartial = false
         var sources = Set<String>()
@@ -278,20 +292,33 @@ struct MetricEngine {
             }
             if let source = activity?["source"]?.string { sources.insert(source) }
             let pKey = scalarKey(snapshot)
+            let coverageKey = "\(providerId):\(snapshot.accountId)"
             let costRows = cost?["by_day"]?.array
                 ?? cost.map { synthesizedTodayRow(from: $0, todayKey: dayKeys.last) }
                 ?? []
-            var pricedDayKeys = Set<String>()
             for rowValue in costRows {
                 guard let row = rowValue.object,
                       let dateKey = row["date"]?.string,
                       dayKeys.contains(dateKey)
                 else { continue }
-                // A zero-cost row is still authoritative (for example, a
-                // no-charge model) and must not be replaced by an estimate.
-                pricedDayKeys.insert(dateKey)
                 let rowCost = row["cost_usd"]?.double ?? 0
-                if rowCost <= 0 { continue }
+                let rowTokens = row["tokens"]?.uint64 ?? 0
+                let rowUnpricedTokens = row["unpriced_tokens"]?.uint64 ?? 0
+                let rowPricedTokens = row["priced_tokens"]?.uint64
+                    ?? rowTokens.saturatingSubtract(rowUnpricedTokens)
+                localCostCoverage[coverageKey, default: [:]][dateKey] = LocalCostCoverage(
+                    cost: rowCost,
+                    tokens: rowTokens,
+                    pricedTokens: rowPricedTokens
+                )
+                if rowUnpricedTokens > 0 {
+                    let models = row["unpriced_models"]?.array ?? []
+                    let names = models.compactMap { $0.object?["model"]?.string }
+                    if names.isEmpty { unpricedModels.insert("unknown") }
+                    else { unpricedModels.formUnion(names) }
+                }
+                guard rowCost > 0 else { continue }
+                if providerId == "codex" { continue }
                 let existing = providerRows[pKey]?[dateKey] ?? (0, 0)
                 providerRows[pKey, default: [:]][dateKey] = (
                     existing.cost + rowCost,
@@ -308,20 +335,36 @@ struct MetricEngine {
                 let rowTokens = row["tokens"]?.uint64 ?? 0
                 if rowTokens == 0 { continue }
                 let existing = providerRows[pKey]?[dateKey] ?? (0, 0)
-                let remoteCostEstimate: Double
-                if providerId == "codex",
-                   !pricedDayKeys.contains(dateKey),
-                   let codexReferenceCostPerToken
-                {
-                    remoteCostEstimate = Double(rowTokens) * codexReferenceCostPerToken
-                    isEstimated = true
-                    isPartial = true
-                    sources.insert("codex_observed_rate_estimate")
+                let costEstimate: Double
+                if providerId == "codex" {
+                    if let local = localCostCoverage[coverageKey]?[dateKey],
+                       local.cost > 0,
+                       local.tokens > 0,
+                       local.pricedTokens > 0
+                    {
+                        if rowTokens < local.tokens {
+                            costEstimate = local.cost * Double(rowTokens) / Double(local.tokens)
+                        } else {
+                            let remoteTokens = rowTokens.saturatingSubtract(local.tokens)
+                            costEstimate = local.cost
+                                + Double(remoteTokens) * local.cost / Double(local.pricedTokens)
+                        }
+                        if rowTokens != local.tokens {
+                            sources.insert("codex_observed_rate_estimate")
+                        }
+                    } else if localCostCoverage[coverageKey]?[dateKey] == nil,
+                              let codexReferenceCostPerToken
+                    {
+                        costEstimate = Double(rowTokens) * codexReferenceCostPerToken
+                        sources.insert("codex_observed_rate_estimate")
+                    } else {
+                        costEstimate = 0
+                    }
                 } else {
-                    remoteCostEstimate = 0
+                    costEstimate = 0
                 }
                 providerRows[pKey, default: [:]][dateKey] = (
-                    existing.cost + remoteCostEstimate,
+                    existing.cost + costEstimate,
                     existing.tokens.saturatingAdd(rowTokens)
                 )
                 activeProviderIds.insert(pKey)
@@ -357,12 +400,16 @@ struct MetricEngine {
             )
         }
         let sourceText = sources.sorted().map(sourceLabel).joined(separator: " + ")
+        let pricingNoticeId = unpricedModels.isEmpty
+            ? nil
+            : "unpriced-models:\(unpricedModels.sorted().joined(separator: ","))"
         return CostDashboardVM(
             days: days,
             providers: providers,
             isEstimated: isEstimated,
             isPartial: isPartial,
-            sourceLabel: sourceText.isEmpty ? nil : sourceText
+            sourceLabel: sourceText.isEmpty ? nil : sourceText,
+            pricingNoticeId: pricingNoticeId
         )
     }
 
@@ -376,7 +423,7 @@ struct MetricEngine {
         for snapshot in snapshots where snapshot.providerId == "codex" {
             guard let cost = snapshot.metadata.object?["codex_cost"]?.object,
                   let costUsd = cost["total_cost_usd"]?.double,
-                  let tokens = cost["total_tokens"]?.uint64,
+                  let tokens = cost["priced_tokens"]?.uint64 ?? cost["total_tokens"]?.uint64,
                   costUsd > 0,
                   tokens > 0
             else { continue }
@@ -692,7 +739,7 @@ struct MetricEngine {
     }
 
     private func dailyTokens(providerId: String, accountId: String?) -> (sparkline: [Double], total: UInt64) {
-        let calendar = Calendar.current
+        let calendar = utcCalendar
         let today = calendar.startOfDay(for: Date())
         let dayKeys = (0..<30).compactMap { offset in
             calendar.date(byAdding: .day, value: offset - 29, to: today)
@@ -797,5 +844,5 @@ func formatTokens(_ value: UInt64) -> String {
 }
 
 func shortDate(_ date: Date) -> String {
-    date.formatted(.dateTime.month(.abbreviated).day())
+    DateFormats.shortDay.string(from: date)
 }

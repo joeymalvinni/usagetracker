@@ -9,6 +9,11 @@ struct Summary: View {
             Header(title: "UsageTracker", subtitleStyle: summarySubtitle)
             ScrollView {
                 LazyVStack(spacing: Theme.Spacing.xs + 2) {
+                    if state.showsPricingNotice(state.cost) {
+                        PricingCoverageNotice {
+                            state.dismissPricingNotice(state.cost)
+                        }
+                    }
                     if state.providers.isEmpty {
                         EmptyState(
                             text: state.daemon == .offline ? "Daemon unavailable" : "No providers enabled",

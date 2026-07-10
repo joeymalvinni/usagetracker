@@ -56,13 +56,18 @@ login do not move historical local activity between profiles.
 Local cost metadata is stored under `metadata.codex_cost` with `estimate=true`, `partial=true`, and
 `complete_lookback=false`. When account activity is available, local token counts are not added to
 account token counts. The Swift dashboard uses account activity for tokens and local logs only for
-directly calculated estimated spend. When a Codex account has account-wide daily tokens but no
-local cost row for a day, the dashboard applies the effective cost-per-token observed from that
-provider's visible local Codex logs. Only the scalar pricing reference is shared: dates and token
-counts always come from the selected account's own account-wide history. This gives remote-only
-profiles an approximate cost graph without pretending the account API supplied model or
-input/output details. These values remain labeled as estimated and partial, and zero-cost local
-rows are never replaced by the fallback.
+directly calculated estimated cost. For account activity that is not represented in local logs, the
+dashboard applies the effective same-day local cost per priced token. When no same-day local row is
+available, it falls back to the provider-wide observed rate, whose denominator excludes unpriced
+tokens. Dates and token counts always come from the selected account's own account-wide history.
+
+Standard API-equivalent model prices are refreshed from OpenAI's official pricing page once every
+24 hours and cached in `~/.usagetracker/openai-pricing.json`. A validated bundled catalog is used
+when no cache is available and the refresh fails. Refresh failures do not fail provider collection.
+Pricing changes invalidate the local cost scan cache so retained logs are recalculated. Cost rows
+include priced and unpriced token coverage plus unpriced model names. The menu bar app shows one
+dismissible notice when recent chart data includes a model without pricing instead of treating
+those tokens as zero-cost usage.
 
 Codex daily buckets and local cost rollups use UTC calendar dates so server-provided `startDate`
 values and timestamped local events share one day boundary. Local events without a valid timestamp

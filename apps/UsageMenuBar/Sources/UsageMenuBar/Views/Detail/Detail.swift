@@ -41,6 +41,11 @@ struct Detail: View {
                 Header(title: group.name, subtitleStyle: subtitleStyle) {
                     Task { await state.refreshProvider(providerId) }
                 }
+                if state.showsPricingNotice(activeProvider.costDashboard) {
+                    PricingCoverageNotice {
+                        state.dismissPricingNotice(activeProvider.costDashboard)
+                    }
+                }
                 if state.showsAlertBanner(activeProvider) {
                     AlertBanner(
                         provider: activeProvider,
@@ -72,7 +77,7 @@ struct Detail: View {
                             }
                         }
                         if !activeProvider.spend.isEmpty {
-                            ProviderSection(title: activeProvider.isEstimate ? "Estimated spend" : "Spend") {
+                            ProviderSection(title: activeProvider.isEstimate ? "Estimated cost" : "Cost") {
                                 ForEach(SpendLine.grouped(activeProvider.spend)) { line in
                                     SpendLineRow(line: line)
                                 }
@@ -384,12 +389,16 @@ private struct SpendLine: Identifiable {
     private static func normalizedKey(_ label: String) -> String {
         label
             .lowercased()
+            .replacingOccurrences(of: " estimated cost ", with: " ")
+            .replacingOccurrences(of: " cost ", with: " ")
             .replacingOccurrences(of: " spend ", with: " ")
             .replacingOccurrences(of: " tokens ", with: " ")
     }
 
     private static func normalizedLabel(_ label: String) -> String {
         label
+            .replacingOccurrences(of: " estimated cost ", with: " ")
+            .replacingOccurrences(of: " cost ", with: " ")
             .replacingOccurrences(of: " spend ", with: " ")
             .replacingOccurrences(of: " tokens ", with: " ")
     }
@@ -490,7 +499,7 @@ private struct ProviderActivityCard: View {
 
     private var activitySubtitle: String {
         guard hasData else { return "No recent cost or token activity" }
-        return "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated spend" : (metric == .cost ? "spend" : "tokens"))"
+        return "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated cost" : (metric == .cost ? "cost" : "tokens"))"
     }
 
     private var todayValue: String {

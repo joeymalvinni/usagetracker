@@ -140,6 +140,7 @@ struct CostDashboardVM: Equatable {
     var isEstimated: Bool = false
     var isPartial: Bool = false
     var sourceLabel: String? = nil
+    var pricingNoticeId: String? = nil
 
     var hasData: Bool { days.contains { $0.totalCost > 0 || $0.totalTokens > 0 } }
     var todayCost: Double { days.last?.totalCost ?? 0 }
@@ -172,5 +173,9 @@ extension UInt64 {
     func saturatingAdd(_ other: UInt64) -> UInt64 {
         let result = addingReportingOverflow(other)
         return result.overflow ? UInt64.max : result.partialValue
+    }
+
+    func saturatingSubtract(_ other: UInt64) -> UInt64 {
+        subtractingReportingOverflow(other).overflow ? 0 : self - other
     }
 }

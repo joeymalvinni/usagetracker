@@ -10,13 +10,13 @@ use std::{
     time::{Instant, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Days, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Days, NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
 use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 
 use crate::providers::ProviderUsage;
 
-use super::{CODEX_COST_SCAN_MIN_INTERVAL, COST_LOOKBACK_DAYS};
+use super::{pricing::CodexPricingCatalog, CODEX_COST_SCAN_MIN_INTERVAL, COST_LOOKBACK_DAYS};
 
 pub(super) trait CodexUsageCostExt {
     fn merge_cost_report(&mut self, report: CodexCostReport, include_token_activity: bool);
@@ -36,41 +36,45 @@ impl CodexUsageCostExt for ProviderUsage {
                 "baseline_seeded_events": report.baseline_seeded_events,
                 "undated_tokens": report.undated_tokens,
                 "undated_cost_usd": report.undated_cost_usd,
+                "priced_tokens": report.priced_tokens,
                 "unpriced_tokens": report.unpriced_tokens,
+                "unpriced_models": unpriced_model_rows(&report.unpriced_models),
+                "pricing_source": report.pricing_source,
+                "pricing_fetched_at": report.pricing_fetched_at,
             });
             return;
         }
 
-        if report.today_tokens > 0 {
+        if report.today_cost_usd > 0.0 {
             self.windows.push(cost_window(
                 "codex_estimated_spend_today",
-                "Codex spend today",
+                "Codex estimated cost today",
                 report.today_cost_usd,
             ));
-            if include_token_activity {
-                self.windows.push(token_window(
-                    "codex_tokens_today",
-                    "Codex tokens today",
-                    report.today_tokens,
-                    UsageWindowKind::Daily,
-                ));
-            }
+        }
+        if include_token_activity && report.today_tokens > 0 {
+            self.windows.push(token_window(
+                "codex_tokens_today",
+                "Codex tokens today",
+                report.today_tokens,
+                UsageWindowKind::Daily,
+            ));
         }
 
-        if report.lookback_tokens > 0 {
+        if report.lookback_cost_usd > 0.0 {
             self.windows.push(cost_window(
                 "codex_estimated_spend_30d",
-                "Codex spend 30 days",
+                "Codex estimated cost 30 days",
                 report.lookback_cost_usd,
             ));
-            if include_token_activity {
-                self.windows.push(token_window(
-                    "codex_tokens_30d",
-                    "Codex tokens 30 days",
-                    report.lookback_tokens,
-                    UsageWindowKind::Monthly,
-                ));
-            }
+        }
+        if include_token_activity && report.lookback_tokens > 0 {
+            self.windows.push(token_window(
+                "codex_tokens_30d",
+                "Codex tokens 30 days",
+                report.lookback_tokens,
+                UsageWindowKind::Monthly,
+            ));
         }
 
         self.metadata["codex_cost"] = json!({
@@ -92,7 +96,11 @@ impl CodexUsageCostExt for ProviderUsage {
             "total_tokens": report.total_tokens,
             "undated_cost_usd": report.undated_cost_usd,
             "undated_tokens": report.undated_tokens,
+            "priced_tokens": report.priced_tokens,
             "unpriced_tokens": report.unpriced_tokens,
+            "unpriced_models": unpriced_model_rows(&report.unpriced_models),
+            "pricing_source": report.pricing_source,
+            "pricing_fetched_at": report.pricing_fetched_at,
             "by_day": daily_cost_rows(&report.by_day),
             "by_model": report.by_model,
         });
@@ -141,6 +149,7 @@ pub(super) fn token_window(
 #[derive(Clone, Debug)]
 pub(super) struct CodexCostCache {
     fingerprint: CodexSessionFingerprint,
+    pricing_revision: u64,
     report: CodexCostReport,
     scanned_at: Instant,
 }
@@ -190,7 +199,11 @@ pub(super) struct CodexCostReport {
     pub(super) total_tokens: u64,
     pub(super) undated_cost_usd: f64,
     pub(super) undated_tokens: u64,
+    pub(super) priced_tokens: u64,
     pub(super) unpriced_tokens: u64,
+    pub(super) unpriced_models: BTreeMap<String, u64>,
+    pub(super) pricing_source: String,
+    pub(super) pricing_fetched_at: Option<DateTime<Utc>>,
     pub(super) by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     pub(super) by_model: BTreeMap<String, CodexModelCostSummary>,
 }
@@ -199,6 +212,9 @@ pub(super) struct CodexCostReport {
 pub(super) struct DailyCostSummary {
     pub(super) cost_usd: f64,
     pub(super) tokens: u64,
+    pub(super) priced_tokens: u64,
+    pub(super) unpriced_tokens: u64,
+    pub(super) unpriced_models: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -206,12 +222,22 @@ pub(super) struct DailyCostRow {
     date: String,
     cost_usd: f64,
     tokens: u64,
+    priced_tokens: u64,
+    unpriced_tokens: u64,
+    unpriced_models: Vec<UnpricedModelRow>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct UnpricedModelRow {
+    model: String,
+    tokens: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub(super) struct CodexModelCostSummary {
     input_tokens: u64,
     cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
     output_tokens: u64,
     cost_usd: f64,
 }
@@ -220,6 +246,7 @@ pub(super) struct CodexModelCostSummary {
 pub(super) struct CodexTokenTotals {
     pub(super) input: u64,
     pub(super) cached: u64,
+    pub(super) cache_write: u64,
     pub(super) output: u64,
 }
 
@@ -232,6 +259,7 @@ impl CodexTokenTotals {
         Self {
             input: self.input.saturating_sub(previous.input),
             cached: self.cached.saturating_sub(previous.cached),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
             output: self.output.saturating_sub(previous.output),
         }
     }
@@ -240,8 +268,10 @@ impl CodexTokenTotals {
 pub(super) fn scan_codex_local_costs_cached(
     cache: Arc<Mutex<Option<CodexCostCache>>>,
     roots: Vec<PathBuf>,
+    pricing: CodexPricingCatalog,
 ) -> anyhow::Result<CodexCostScan> {
     let fingerprint = codex_session_fingerprint(&roots)?;
+    let pricing_revision = pricing.revision();
     let session_roots = roots
         .iter()
         .map(|path| path.display().to_string())
@@ -252,13 +282,19 @@ pub(super) fn scan_codex_local_costs_cached(
         .as_ref()
     {
         let same_roots = cached.report.session_roots == session_roots;
-        if same_roots && cached.fingerprint == fingerprint {
+        if same_roots
+            && cached.fingerprint == fingerprint
+            && cached.pricing_revision == pricing_revision
+        {
             return Ok(CodexCostScan {
                 report: cached.report.clone(),
                 cache_status: CodexCostCacheStatus::Hit,
             });
         }
-        if same_roots && cached.scanned_at.elapsed() < CODEX_COST_SCAN_MIN_INTERVAL {
+        if same_roots
+            && cached.pricing_revision == pricing_revision
+            && cached.scanned_at.elapsed() < CODEX_COST_SCAN_MIN_INTERVAL
+        {
             return Ok(CodexCostScan {
                 report: cached.report.clone(),
                 cache_status: CodexCostCacheStatus::Throttled,
@@ -266,11 +302,12 @@ pub(super) fn scan_codex_local_costs_cached(
         }
     }
 
-    let report = scan_codex_local_costs_from_roots(roots)?;
+    let report = scan_codex_local_costs_from_roots(roots, &pricing)?;
     *cache
         .lock()
         .map_err(|_| anyhow::anyhow!("Codex cost cache mutex poisoned"))? = Some(CodexCostCache {
         fingerprint,
+        pricing_revision,
         report: report.clone(),
         scanned_at: Instant::now(),
     });
@@ -280,8 +317,11 @@ pub(super) fn scan_codex_local_costs_cached(
     })
 }
 
-fn scan_codex_local_costs_from_roots(roots: Vec<PathBuf>) -> anyhow::Result<CodexCostReport> {
-    let today = Local::now().date_naive();
+fn scan_codex_local_costs_from_roots(
+    roots: Vec<PathBuf>,
+    pricing: &CodexPricingCatalog,
+) -> anyhow::Result<CodexCostReport> {
+    let today = Utc::now().date_naive();
     let lookback_start = today
         .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
         .unwrap_or(today);
@@ -290,13 +330,15 @@ fn scan_codex_local_costs_from_roots(roots: Vec<PathBuf>) -> anyhow::Result<Code
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>(),
+        pricing_source: pricing.source().to_string(),
+        pricing_fetched_at: pricing.fetched_at(),
         ..Default::default()
     };
 
     for root in roots {
         collect_codex_session_files(&root, &mut |path| {
             report.files_scanned += 1;
-            scan_codex_session_file(path, today, lookback_start, &mut report)
+            scan_codex_session_file(path, today, lookback_start, pricing, &mut report)
         })?;
     }
 
@@ -373,6 +415,7 @@ pub(super) fn scan_codex_session_file(
     path: &Path,
     today: NaiveDate,
     lookback_start: NaiveDate,
+    pricing: &CodexPricingCatalog,
     report: &mut CodexCostReport,
 ) -> anyhow::Result<()> {
     let file = File::open(path)?;
@@ -405,15 +448,17 @@ pub(super) fn scan_codex_session_file(
         }
 
         let model = current_model.as_deref().unwrap_or("unknown");
-        let cost = codex_cost_usd_for_normalized_model(model, delta);
+        let cost = codex_cost_usd_for_normalized_model(pricing, model, delta);
         let tokens = delta.total();
-        let date = codex_event_date_in_timezone(&event, &Local);
+        let date = codex_event_date_in_timezone(&event, &Utc);
 
         report.total_tokens = report.total_tokens.saturating_add(tokens);
         if let Some(cost) = cost {
             report.total_cost_usd += cost;
+            report.priced_tokens = report.priced_tokens.saturating_add(tokens);
         } else {
             report.unpriced_tokens = report.unpriced_tokens.saturating_add(tokens);
+            add_unpriced_model(&mut report.unpriced_models, model, tokens);
         }
 
         if let Some(date) = date {
@@ -432,6 +477,10 @@ pub(super) fn scan_codex_session_file(
                 day.tokens = day.tokens.saturating_add(tokens);
                 if let Some(cost) = cost {
                     day.cost_usd += cost;
+                    day.priced_tokens = day.priced_tokens.saturating_add(tokens);
+                } else {
+                    day.unpriced_tokens = day.unpriced_tokens.saturating_add(tokens);
+                    add_unpriced_model(&mut day.unpriced_models, model, tokens);
                 }
             }
         } else {
@@ -452,6 +501,9 @@ pub(super) fn scan_codex_session_file(
             .expect("model summary exists");
         summary.input_tokens = summary.input_tokens.saturating_add(delta.input);
         summary.cached_input_tokens = summary.cached_input_tokens.saturating_add(delta.cached);
+        summary.cache_write_input_tokens = summary
+            .cache_write_input_tokens
+            .saturating_add(delta.cache_write);
         summary.output_tokens = summary.output_tokens.saturating_add(delta.output);
         if let Some(cost) = cost {
             summary.cost_usd += cost;
@@ -497,6 +549,24 @@ fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) -> Vec<DailyC
             date: date.to_string(),
             cost_usd: summary.cost_usd,
             tokens: summary.tokens,
+            priced_tokens: summary.priced_tokens,
+            unpriced_tokens: summary.unpriced_tokens,
+            unpriced_models: unpriced_model_rows(&summary.unpriced_models),
+        })
+        .collect()
+}
+
+fn add_unpriced_model(models: &mut BTreeMap<String, u64>, model: &str, tokens: u64) {
+    let total = models.entry(model.to_string()).or_default();
+    *total = total.saturating_add(tokens);
+}
+
+fn unpriced_model_rows(models: &BTreeMap<String, u64>) -> Vec<UnpricedModelRow> {
+    models
+        .iter()
+        .map(|(model, tokens)| UnpricedModelRow {
+            model: model.clone(),
+            tokens: *tokens,
         })
         .collect()
 }
@@ -510,6 +580,7 @@ impl CodexTotalsAdd for CodexTokenTotals {
         Self {
             input: self.input.saturating_add(delta.input),
             cached: self.cached.saturating_add(delta.cached),
+            cache_write: self.cache_write.saturating_add(delta.cache_write),
             output: self.output.saturating_add(delta.output),
         }
     }
@@ -568,6 +639,11 @@ pub(super) fn codex_totals_from_value(value: &Value) -> Option<CodexTokenTotals>
             .get("cached_input_tokens")
             .and_then(u64_from_json_value)
             .unwrap_or(0),
+        cache_write: value
+            .get("cache_write_tokens")
+            .or_else(|| value.get("cache_creation_input_tokens"))
+            .and_then(u64_from_json_value)
+            .unwrap_or(0),
         output: u64_from_json_value(value.get("output_tokens")?)?,
     })
 }
@@ -580,78 +656,44 @@ pub(super) fn u64_from_json_value(value: &Value) -> Option<u64> {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct CodexPricing {
-    input: f64,
-    cached_input: Option<f64>,
-    output: f64,
-    long_context_threshold: Option<u64>,
-    long_context_multiplier: f64,
-}
-
 #[cfg(test)]
 pub(super) fn codex_cost_usd(model: &str, totals: CodexTokenTotals) -> Option<f64> {
     let model = normalize_codex_model(model);
-    codex_cost_usd_for_normalized_model(&model, totals)
+    codex_cost_usd_for_normalized_model(&CodexPricingCatalog::bundled(), &model, totals)
 }
 
 fn codex_cost_usd_for_normalized_model(
+    catalog: &CodexPricingCatalog,
     normalized_model: &str,
     totals: CodexTokenTotals,
 ) -> Option<f64> {
-    let pricing = codex_pricing(normalized_model)?;
+    let pricing = catalog.pricing(normalized_model)?;
     let cached = totals.cached.min(totals.input);
     let non_cached = totals.input.saturating_sub(cached);
-    let multiplier = pricing
+    let cache_write = totals.cache_write.min(non_cached);
+    let ordinary_input = non_cached.saturating_sub(cache_write);
+    let rates = pricing
         .long_context_threshold
         .filter(|threshold| totals.input > *threshold)
-        .map(|_| pricing.long_context_multiplier)
-        .unwrap_or(1.0);
-    let cached_rate = pricing.cached_input.unwrap_or(pricing.input);
+        .and(pricing.long_context)
+        .unwrap_or(pricing.standard);
+    let cached_rate = rates
+        .cached_input_per_million
+        .unwrap_or(rates.input_per_million);
+    let cache_write_rate = rates
+        .cache_write_per_million
+        .unwrap_or(rates.input_per_million);
 
     Some(
-        non_cached as f64 * pricing.input * multiplier
-            + cached as f64 * cached_rate * multiplier
-            + totals.output as f64 * pricing.output * multiplier,
+        ordinary_input as f64 * per_token(rates.input_per_million)
+            + cached as f64 * per_token(cached_rate)
+            + cache_write as f64 * per_token(cache_write_rate)
+            + totals.output as f64 * per_token(rates.output_per_million),
     )
 }
 
-fn codex_pricing(model: &str) -> Option<CodexPricing> {
-    let p = |input_per_million: f64, output_per_million: f64, cache_per_million: Option<f64>| {
-        CodexPricing {
-            input: input_per_million / 1_000_000.0,
-            cached_input: cache_per_million.map(|value| value / 1_000_000.0),
-            output: output_per_million / 1_000_000.0,
-            long_context_threshold: None,
-            long_context_multiplier: 1.0,
-        }
-    };
-    let lc =
-        |input_per_million: f64, output_per_million: f64, cache_per_million: f64| CodexPricing {
-            input: input_per_million / 1_000_000.0,
-            cached_input: Some(cache_per_million / 1_000_000.0),
-            output: output_per_million / 1_000_000.0,
-            long_context_threshold: Some(272_000),
-            long_context_multiplier: 2.0,
-        };
-
-    Some(match model {
-        "gpt-5" | "gpt-5-codex" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.1-codex-max" => {
-            p(1.25, 10.00, Some(0.125))
-        }
-        "gpt-5-mini" => p(0.25, 2.00, Some(0.025)),
-        "gpt-5-nano" => p(0.05, 0.40, Some(0.005)),
-        "gpt-5-pro" => p(15.00, 120.00, None),
-        "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" => p(1.75, 14.00, Some(0.175)),
-        "gpt-5.2-pro" => p(21.00, 168.00, None),
-        "gpt-5.3-codex-spark" => p(0.0, 0.0, Some(0.0)),
-        "gpt-5.4" => lc(2.50, 15.00, 0.25),
-        "gpt-5.4-mini" => p(0.75, 4.50, Some(0.075)),
-        "gpt-5.4-nano" => p(0.20, 1.25, Some(0.02)),
-        "gpt-5.4-pro" | "gpt-5.5-pro" => p(30.00, 180.00, None),
-        "gpt-5.5" => lc(5.00, 30.00, 0.50),
-        _ => return None,
-    })
+fn per_token(per_million: f64) -> f64 {
+    per_million / 1_000_000.0
 }
 
 pub(super) fn normalize_codex_model(model: &str) -> String {

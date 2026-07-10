@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::{Days, Local, NaiveDate};
+use chrono::{Days, NaiveDate, Utc};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 use usage_core::UsageWindowKind;
@@ -429,7 +429,7 @@ pub(super) trait CodexAccountActivityExt {
 
 impl CodexAccountActivityExt for ProviderUsage {
     fn merge_account_activity(&mut self, activity: CodexAccountActivity) {
-        let today = Local::now().date_naive();
+        let today = Utc::now().date_naive();
         let lookback_start = today
             .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
             .unwrap_or(today);
