@@ -53,6 +53,10 @@ enum DaemonState { case unknown, online, offline }
     }
 
     func bootstrap() async {
+        // A bundled daemon can outlive the app that launched it. Check it
+        // before the first API request so replacing the app bundle also
+        // replaces an older daemon instead of silently serving stale data.
+        _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
         await load(all: true)
     }
     func refreshForPopoverOpen() async { await load(all: false) }
