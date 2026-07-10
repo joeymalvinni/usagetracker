@@ -1,8 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Days, Local, NaiveDate, Utc};
@@ -12,6 +15,7 @@ use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 use crate::providers::ProviderUsage;
 
 const COST_LOOKBACK_DAYS: u64 = 30;
+const COST_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) fn merge_local_cost_report(usage: &mut ProviderUsage, report: ClaudeCostReport) {
     if report.total_tokens == 0 {
@@ -108,7 +112,7 @@ fn token_window(window_id: &str, label: &str, tokens: u64, kind: UsageWindowKind
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ClaudeCostReport {
     project_roots: Vec<String>,
     files_scanned: usize,
@@ -124,7 +128,7 @@ pub(super) struct ClaudeCostReport {
     by_model: BTreeMap<String, ClaudeModelCostSummary>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct DailyCostSummary {
     cost_usd: f64,
     tokens: u64,
@@ -137,7 +141,7 @@ struct DailyCostRow {
     tokens: u64,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 struct ClaudeModelCostSummary {
     input_tokens: u64,
     cache_creation_input_tokens: u64,
@@ -173,14 +177,82 @@ impl ClaudeTokenTotals {
     }
 }
 
-pub(super) fn scan_claude_local_costs_from_roots(
+#[derive(Clone, Debug)]
+pub(super) struct ClaudeCostCache {
+    fingerprint: ClaudeProjectFingerprint,
+    report: ClaudeCostReport,
+    scanned_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ClaudeCostScan {
+    pub(super) report: ClaudeCostReport,
+    pub(super) cache_status: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClaudeProjectFingerprint {
+    files: usize,
+    total_size: u64,
+    latest_modified_ns: u128,
+    digest: u64,
+}
+
+pub(super) fn scan_claude_local_costs_cached(
+    cache: Arc<Mutex<Option<ClaudeCostCache>>>,
     configured_roots: Vec<PathBuf>,
-) -> anyhow::Result<ClaudeCostReport> {
+) -> anyhow::Result<ClaudeCostScan> {
+    let roots = resolved_project_roots(configured_roots)?;
+    let fingerprint = claude_project_fingerprint(&roots)?;
+    let project_roots = roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if let Some(cached) = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Claude cost cache mutex poisoned"))?
+        .as_ref()
+    {
+        let same_roots = cached.report.project_roots == project_roots;
+        if same_roots && cached.fingerprint == fingerprint {
+            return Ok(ClaudeCostScan {
+                report: cached.report.clone(),
+                cache_status: "hit",
+            });
+        }
+        if same_roots && cached.scanned_at.elapsed() < COST_SCAN_MIN_INTERVAL {
+            return Ok(ClaudeCostScan {
+                report: cached.report.clone(),
+                cache_status: "throttled",
+            });
+        }
+    }
+
+    let report = scan_claude_local_costs(roots)?;
+    *cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Claude cost cache mutex poisoned"))? =
+        Some(ClaudeCostCache {
+            fingerprint,
+            report: report.clone(),
+            scanned_at: Instant::now(),
+        });
+    Ok(ClaudeCostScan {
+        report,
+        cache_status: "refreshed",
+    })
+}
+
+fn resolved_project_roots(configured_roots: Vec<PathBuf>) -> anyhow::Result<Vec<PathBuf>> {
     let roots = if configured_roots.is_empty() {
         claude_project_roots()?
     } else {
         configured_roots
     };
+    Ok(roots)
+}
+
+fn scan_claude_local_costs(roots: Vec<PathBuf>) -> anyhow::Result<ClaudeCostReport> {
     let today = Local::now().date_naive();
     let lookback_start = today
         .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
@@ -201,6 +273,38 @@ pub(super) fn scan_claude_local_costs_from_roots(
     }
 
     Ok(report)
+}
+
+fn claude_project_fingerprint(roots: &[PathBuf]) -> anyhow::Result<ClaudeProjectFingerprint> {
+    let mut files = Vec::new();
+    for root in roots {
+        collect_claude_project_files(root, &mut |path| {
+            let metadata = std::fs::metadata(path)?;
+            let modified_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            files.push((path.to_path_buf(), metadata.len(), modified_ns));
+            Ok(())
+        })?;
+    }
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = DefaultHasher::new();
+    let mut fingerprint = ClaudeProjectFingerprint {
+        files: files.len(),
+        ..Default::default()
+    };
+    for (path, size, modified_ns) in files {
+        path.hash(&mut digest);
+        size.hash(&mut digest);
+        modified_ns.hash(&mut digest);
+        fingerprint.total_size = fingerprint.total_size.saturating_add(size);
+        fingerprint.latest_modified_ns = fingerprint.latest_modified_ns.max(modified_ns);
+    }
+    fingerprint.digest = digest.finish();
+    Ok(fingerprint)
 }
 
 fn claude_project_roots() -> anyhow::Result<Vec<PathBuf>> {
@@ -526,13 +630,14 @@ fn normalize_claude_model(model: &str) -> String {
         .map(|(base, _)| base)
         .unwrap_or(model);
 
-    if model.len() > 9 {
-        let suffix = &model[model.len() - 8..];
-        if model.as_bytes()[model.len() - 9] == b'-'
-            && suffix.as_bytes().iter().all(u8::is_ascii_digit)
-        {
-            return model[..model.len() - 9].to_string();
-        }
+    // Strip a trailing `-YYYYMMDD` date stamp. Check the ASCII bytes before
+    // slicing so a non-ASCII model name can never split a UTF-8 codepoint.
+    let bytes = model.as_bytes();
+    if bytes.len() > 9
+        && bytes[bytes.len() - 9] == b'-'
+        && bytes[bytes.len() - 8..].iter().all(u8::is_ascii_digit)
+    {
+        return model[..model.len() - 9].to_string();
     }
 
     model.to_string()
@@ -628,5 +733,17 @@ mod tests {
         .expect("priced long context");
 
         assert!((cost - 1.222506).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn caches_unchanged_project_scans() {
+        let root = std::env::temp_dir().join(format!("claude-cost-{}", uuid::Uuid::new_v4()));
+        let cache = Arc::new(Mutex::new(None));
+
+        let first = scan_claude_local_costs_cached(cache.clone(), vec![root.clone()]).unwrap();
+        let second = scan_claude_local_costs_cached(cache, vec![root]).unwrap();
+
+        assert_eq!(first.cache_status, "refreshed");
+        assert_eq!(second.cache_status, "hit");
     }
 }

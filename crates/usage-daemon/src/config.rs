@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -12,6 +14,7 @@ use usage_core::{
 };
 
 const POLL_INTERVAL_ENV: &str = "USAGE_TRACKER_POLL_INTERVAL_SECONDS";
+const SUPPORTED_PROVIDER_IDS: [&str; 3] = ["codex", "claude", "opencode_go"];
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -105,7 +108,8 @@ impl Config {
         let db_path = db_override.unwrap_or(paths.db);
         let socket_path = socket_override.unwrap_or(paths.socket);
 
-        let file_config = read_or_create_config(&config_path)?;
+        let mut file_config = read_or_create_config(&config_path)?;
+        add_missing_default_providers(&mut file_config);
         let poll_interval_seconds = poll_interval_seconds(file_config.poll_interval_seconds)?;
 
         Ok(Self {
@@ -200,17 +204,7 @@ impl Config {
             providers: self.providers.clone(),
             debug_capture_raw_payloads: self.debug_capture_raw_payloads,
         };
-        if let Some(parent) = self
-            .paths
-            .config
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.paths.config, serde_json::to_vec_pretty(&file_config)?)
-            .with_context(|| format!("failed to write {}", self.paths.config.display()))?;
-        Ok(())
+        write_config_atomically(&self.paths.config, &file_config)
     }
 }
 
@@ -223,7 +217,13 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
-    provider_id != "opencode"
+    SUPPORTED_PROVIDER_IDS.contains(&provider_id)
+}
+
+fn add_missing_default_providers(config: &mut FileConfig) {
+    for (id, provider) in FileConfig::default().providers {
+        config.providers.entry(id).or_insert(provider);
+    }
 }
 
 fn default_paths() -> anyhow::Result<Paths> {
@@ -294,6 +294,9 @@ impl Default for FileConfig {
 fn read_or_create_config(path: &Path) -> anyhow::Result<FileConfig> {
     if path.exists() {
         let contents = fs::read_to_string(path)?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
         return Ok(serde_json::from_str(&contents)?);
     }
 
@@ -304,8 +307,41 @@ fn read_or_create_config(path: &Path) -> anyhow::Result<FileConfig> {
     {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&config)?)?;
+    write_config_atomically(path, &config)?;
     Ok(config)
+}
+
+fn write_config_atomically(path: &Path, config: &FileConfig) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.json");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(config)?)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        if let Ok(directory) = fs::File::open(parent) {
+            directory.sync_all()?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result.with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn default_poll_interval_seconds() -> u64 {
@@ -319,6 +355,7 @@ fn default_profile_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn default_config_enables_codex_only() {
@@ -345,5 +382,66 @@ mod tests {
         assert!(paths.config.ends_with(".usagetracker/config.json"));
         assert!(paths.db.ends_with(".usagetracker/usage.sqlite3"));
         assert!(paths.socket.ends_with(".usagetracker/usage.sock"));
+    }
+
+    #[test]
+    fn atomically_written_configs_are_private() {
+        let root = std::env::temp_dir().join(format!("usage-config-{}", uuid::Uuid::new_v4()));
+        let path = root.join("config.json");
+
+        write_config_atomically(&path, &FileConfig::default()).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fills_provider_defaults_for_older_configs() {
+        let mut config = FileConfig {
+            providers: BTreeMap::from([(
+                "codex".to_string(),
+                ProviderConfig {
+                    enabled: false,
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..FileConfig::default()
+        };
+
+        add_missing_default_providers(&mut config);
+
+        assert_eq!(config.providers.len(), 3);
+        assert!(!config.providers["codex"].enabled);
+        assert!(config.providers.contains_key("claude"));
+        assert!(config.providers.contains_key("opencode_go"));
+        assert!(!is_supported_provider("unknown"));
+        assert!(!is_supported_provider("opencode"));
+    }
+
+    #[test]
+    fn tightens_permissions_on_existing_configs() {
+        let root = std::env::temp_dir().join(format!("usage-config-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        fs::write(&path, serde_json::to_vec(&FileConfig::default()).unwrap()).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        read_or_create_config(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

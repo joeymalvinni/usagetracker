@@ -29,7 +29,7 @@ struct Args {
     socket_path: Option<PathBuf>,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_tracing(&args.log_level)?;

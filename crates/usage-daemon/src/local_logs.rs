@@ -1,25 +1,34 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use usage_core::ProviderId;
 
 use crate::polling::RefreshCoordinator;
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
+const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const WATCH_EVENT_QUEUE_CAPACITY: usize = 256;
 
 pub fn spawn_change_log_loop(refresh: Arc<RefreshCoordinator>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let targets = local_log_targets();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(WATCH_EVENT_QUEUE_CAPACITY);
+        let overflowed = Arc::new(AtomicBool::new(false));
+        let callback_overflowed = overflowed.clone();
         let mut watcher = match RecommendedWatcher::new(
             move |event| {
-                let _ = tx.send(event);
+                if tx.try_send(event).is_err() {
+                    callback_overflowed.store(true, Ordering::Release);
+                }
             },
             Config::default(),
         ) {
@@ -39,33 +48,82 @@ pub fn spawn_change_log_loop(refresh: Arc<RefreshCoordinator>) -> tokio::task::J
         );
 
         let mut pending = BTreeSet::new();
-        while let Some(event) = rx.recv().await {
-            match event {
-                Ok(event) => {
-                    pending.extend(watch_state.sync(&mut watcher, &targets));
-                    if let Some(provider_id) = provider_id_for_event(&targets, &event) {
-                        pending.insert(provider_id.to_string());
+        let mut refresh_at = None;
+        let mut last_refresh = None;
+        loop {
+            if let Some(deadline) = refresh_at {
+                tokio::select! {
+                    event = rx.recv() => {
+                        let Some(event) = event else { return };
+                        handle_watch_event(
+                            event,
+                            &mut watch_state,
+                            &mut watcher,
+                            &targets,
+                            &mut pending,
+                        );
                     }
-                }
-                Err(err) => warn!(error = %err, "local message log watcher error"),
-            }
-
-            while let Ok(event) = tokio::time::timeout(CHANGE_DEBOUNCE, rx.recv()).await {
-                match event {
-                    Some(Ok(event)) => {
-                        pending.extend(watch_state.sync(&mut watcher, &targets));
-                        if let Some(provider_id) = provider_id_for_event(&targets, &event) {
-                            pending.insert(provider_id.to_string());
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if overflowed.swap(false, Ordering::AcqRel) {
+                            pending.extend(targets.iter().map(|target| target.provider_id.to_string()));
+                            warn!(
+                                queue_capacity = WATCH_EVENT_QUEUE_CAPACITY,
+                                "local message log watcher queue overflowed; refreshing all local providers"
+                            );
                         }
+                        refresh_local_usage(&refresh, std::mem::take(&mut pending)).await;
+                        last_refresh = Some(tokio::time::Instant::now());
+                        refresh_at = None;
                     }
-                    Some(Err(err)) => warn!(error = %err, "local message log watcher error"),
-                    None => return,
                 }
+            } else {
+                let Some(event) = rx.recv().await else { return };
+                handle_watch_event(
+                    event,
+                    &mut watch_state,
+                    &mut watcher,
+                    &targets,
+                    &mut pending,
+                );
             }
 
-            refresh_local_usage(&refresh, std::mem::take(&mut pending)).await;
+            if refresh_at.is_none() && !pending.is_empty() {
+                refresh_at = Some(local_refresh_deadline(
+                    tokio::time::Instant::now(),
+                    last_refresh,
+                ));
+            }
         }
     })
+}
+
+fn handle_watch_event(
+    event: notify::Result<Event>,
+    watch_state: &mut LocalLogWatchState,
+    watcher: &mut RecommendedWatcher,
+    targets: &[LocalLogTarget],
+    pending: &mut BTreeSet<String>,
+) {
+    match event {
+        Ok(event) => {
+            pending.extend(watch_state.sync(watcher, targets));
+            if let Some(provider_id) = provider_id_for_event(targets, &event) {
+                pending.insert(provider_id.to_string());
+            }
+        }
+        Err(err) => warn!(error = %err, "local message log watcher error"),
+    }
+}
+
+fn local_refresh_deadline(
+    now: tokio::time::Instant,
+    last_refresh: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let debounced = now + CHANGE_DEBOUNCE;
+    let rate_limited = last_refresh
+        .map(|last| last + LOCAL_REFRESH_MIN_INTERVAL)
+        .unwrap_or(now);
+    debounced.max(rate_limited)
 }
 
 #[derive(Debug)]
@@ -191,7 +249,7 @@ fn provider_id_for_event<'a>(targets: &'a [LocalLogTarget], event: &Event) -> Op
     }
 
     let provider_id = provider_id_for_paths(targets, &paths).unwrap_or("unknown");
-    info!(
+    debug!(
         provider_id,
         kind = ?event.kind,
         paths = ?display_paths(&paths),
@@ -340,5 +398,17 @@ mod tests {
         assert_eq!(nearest_existing_parent(&missing_root), Some(existing));
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn refresh_deadline_debounces_and_rate_limits() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(local_refresh_deadline(now, None), now + CHANGE_DEBOUNCE);
+
+        let recent = now - Duration::from_secs(5);
+        assert_eq!(
+            local_refresh_deadline(now, Some(recent)),
+            recent + LOCAL_REFRESH_MIN_INTERVAL
+        );
     }
 }

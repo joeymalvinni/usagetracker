@@ -1,16 +1,29 @@
-use std::{collections::BTreeSet, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeSet, HashMap},
+    io,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
+    sync::Semaphore,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 use usage_core::{
     Account, ApiRequest, ApiResponse, ProviderHealth, UsageAmount, UsageSnapshot, UsageUnit,
     UsageWindow, UsageWindowKind,
 };
 
-use crate::{daemon::DaemonRuntime, storage::StoredDailyUsage};
+use crate::{daemon::DaemonRuntime, storage::StoredDailyUsageHistory};
+
+const MAX_CLIENT_CONNECTIONS: usize = 64;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DASHBOARD_HISTORY_DAYS: u64 = 30;
 
 #[derive(Clone)]
 pub struct SocketServer {
@@ -22,14 +35,45 @@ impl SocketServer {
         Self { runtime }
     }
 
+    #[cfg(test)]
     pub async fn run(self, socket_path: &Path) -> anyhow::Result<()> {
+        let listener = Self::bind(socket_path)?;
+        self.serve(listener, socket_path).await
+    }
+
+    pub fn bind(socket_path: &Path) -> io::Result<UnixListener> {
         let listener = UnixListener::bind(socket_path)?;
+        let permission_result = (|| {
+            let mut permissions = std::fs::metadata(socket_path)?.permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(socket_path, permissions)
+        })();
+        match permission_result {
+            Ok(()) => Ok(listener),
+            Err(err) => {
+                drop(listener);
+                let _ = std::fs::remove_file(socket_path);
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn serve(self, listener: UnixListener, socket_path: &Path) -> anyhow::Result<()> {
         tracing::info!(socket = %socket_path.display(), "daemon socket listening");
+        let connections = Arc::new(Semaphore::new(MAX_CLIENT_CONNECTIONS));
 
         loop {
             let (stream, _) = listener.accept().await?;
+            let Ok(permit) = connections.clone().try_acquire_owned() else {
+                debug!(
+                    max_connections = MAX_CLIENT_CONNECTIONS,
+                    "rejecting daemon client because the connection limit was reached"
+                );
+                continue;
+            };
             let server = self.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(err) = server.handle_client(stream).await {
                     debug!(error = %err, "client connection ended");
                 }
@@ -39,19 +83,43 @@ impl SocketServer {
 
     async fn handle_client(&self, stream: UnixStream) -> anyhow::Result<()> {
         let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
+        let mut reader = BufReader::with_capacity(8 * 1024, reader);
+        let mut line = Vec::with_capacity(1024);
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
+        loop {
+            let frame = match tokio::time::timeout(
+                CLIENT_IDLE_TIMEOUT,
+                read_request_frame(&mut reader, &mut line),
+            )
+            .await
+            {
+                Ok(frame) => frame?,
+                Err(_) => {
+                    debug!("closing idle daemon client connection");
+                    return Ok(());
+                }
+            };
+            let RequestFrame::Line(line) = frame else {
+                if frame == RequestFrame::TooLarge {
+                    let response = ApiResponse::error(
+                        "request_too_large",
+                        format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
+                    );
+                    writer.write_all(&serde_json::to_vec(&response)?).await?;
+                    writer.write_all(b"\n").await?;
+                }
+                return Ok(());
+            };
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
 
-            let response = match serde_json::from_str::<ApiRequest>(&line) {
+            let response = match serde_json::from_slice::<ApiRequest>(line) {
                 Ok(request) => {
-                    info!(request = ?request, "daemon request received");
+                    debug!(request = ?request, "daemon request received");
                     let started = Instant::now();
                     let response = self.handle_request(request).await;
-                    info!(
+                    debug!(
                         response = response_summary(&response),
                         elapsed_ms = started.elapsed().as_millis(),
                         "daemon request completed"
@@ -67,19 +135,23 @@ impl SocketServer {
             let bytes = serde_json::to_vec(&response)?;
             writer.write_all(&bytes).await?;
             writer.write_all(b"\n").await?;
-            writer.flush().await?;
         }
-
-        Ok(())
     }
 
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
         match request {
             ApiRequest::GetUsage => {
+                let today = chrono::Utc::now().date_naive();
+                let recent_since = today
+                    .checked_sub_days(chrono::Days::new(DASHBOARD_HISTORY_DAYS - 1))
+                    .unwrap_or(today);
                 match (
                     self.runtime.storage.latest_usage().await,
                     self.runtime.storage.accounts().await,
-                    self.runtime.storage.daily_usage_history().await,
+                    self.runtime
+                        .storage
+                        .daily_usage_dashboard(recent_since)
+                        .await,
                 ) {
                     (Ok(mut snapshots), Ok(accounts), Ok(history)) => {
                         merge_daily_usage_history(&mut snapshots, &history);
@@ -225,6 +297,51 @@ impl SocketServer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestFrame<'a> {
+    Line(&'a [u8]),
+    TooLarge,
+    EndOfStream,
+}
+
+async fn read_request_frame<'a, R>(
+    reader: &mut R,
+    line: &'a mut Vec<u8>,
+) -> io::Result<RequestFrame<'a>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    line.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                RequestFrame::EndOfStream
+            } else {
+                RequestFrame::Line(line)
+            });
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > MAX_REQUEST_BYTES {
+            reader.consume(take);
+            return Ok(RequestFrame::TooLarge);
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(RequestFrame::Line(line));
+        }
+    }
+}
+
 fn supported_visible_usage_snapshots(
     snapshots: Vec<UsageSnapshot>,
     accounts: &[Account],
@@ -237,19 +354,25 @@ fn supported_visible_usage_snapshots(
         .collect()
 }
 
-fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredDailyUsage]) {
+fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredDailyUsageHistory]) {
+    let history_by_account = history
+        .iter()
+        .map(|history| {
+            (
+                (history.provider_id.as_str(), history.account_id.as_str()),
+                history,
+            )
+        })
+        .collect::<HashMap<_, _>>();
     for snapshot in snapshots {
-        let matching = history
-            .iter()
-            .filter(|row| {
-                row.provider_id == snapshot.provider_id && row.account_id == snapshot.account_id
-            })
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
+        let Some(matching) =
+            history_by_account.get(&(snapshot.provider_id.as_str(), snapshot.account_id.as_str()))
+        else {
             continue;
-        }
+        };
 
         let rows = matching
+            .recent
             .iter()
             .map(|row| {
                 let mut value = serde_json::json!({
@@ -263,6 +386,7 @@ fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredD
             })
             .collect::<Vec<_>>();
         let source = matching
+            .recent
             .last()
             .map(|row| row.source.as_str())
             .unwrap_or("persisted_daily_usage");
@@ -282,35 +406,35 @@ fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredD
             activity["source"] = serde_json::json!(source);
         }
         activity["retained_history"] = serde_json::json!(true);
-        activity["daily_bucket_count"] = serde_json::json!(rows.len());
+        activity["daily_bucket_count"] = serde_json::json!(matching.bucket_count);
+        activity["history_days"] = serde_json::json!(DASHBOARD_HISTORY_DAYS);
         activity["by_day"] = serde_json::json!(rows);
         if snapshot.provider_id.as_str() == "codex" {
-            replace_codex_activity_windows(snapshot, &matching);
+            replace_codex_activity_windows(snapshot, matching);
         }
     }
 }
 
-fn replace_codex_activity_windows(snapshot: &mut UsageSnapshot, history: &[&StoredDailyUsage]) {
-    let today = chrono::Local::now().date_naive();
+fn replace_codex_activity_windows(snapshot: &mut UsageSnapshot, history: &StoredDailyUsageHistory) {
+    let today = chrono::Utc::now().date_naive();
     let lookback_start = today
         .checked_sub_days(chrono::Days::new(29))
         .unwrap_or(today);
     let today_tokens = history
+        .recent
         .iter()
         .find(|row| row.date == today)
         .map(|row| row.tokens)
         .unwrap_or(0);
     let lookback_tokens = history
+        .recent
         .iter()
         .filter(|row| row.date >= lookback_start && row.date <= today)
-        .fold(0_u64, |total, row| total.saturating_add(row.tokens));
-    let retained_lifetime_tokens = history
-        .iter()
         .fold(0_u64, |total, row| total.saturating_add(row.tokens));
     let reported_lifetime_tokens = snapshot.metadata["codex_activity"]["lifetime_tokens"]
         .as_u64()
         .unwrap_or(0);
-    let lifetime_tokens = retained_lifetime_tokens.max(reported_lifetime_tokens);
+    let lifetime_tokens = history.total_tokens.max(reported_lifetime_tokens);
 
     snapshot.windows.retain(|window| {
         !matches!(
@@ -396,7 +520,7 @@ fn supported_accounts(accounts: Vec<Account>) -> Vec<Account> {
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
-    provider_id != "opencode"
+    matches!(provider_id, "codex" | "claude" | "opencode_go")
 }
 
 fn hidden_account_ids(accounts: &[Account]) -> BTreeSet<&str> {
@@ -432,7 +556,9 @@ fn response_summary(response: &ApiResponse) -> &'static str {
 mod tests {
     use super::*;
     use crate::polling::RefreshCoordinator;
+    use crate::storage::StoredDailyUsage;
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
     use tokio::time::{timeout, Duration};
     use usage_core::ProviderId;
     use uuid::Uuid;
@@ -472,7 +598,7 @@ mod tests {
 
     #[test]
     fn merges_retained_daily_usage_and_replaces_local_token_windows() {
-        let today = chrono::Local::now().date_naive();
+        let today = chrono::Utc::now().date_naive();
         let account_id = usage_core::AccountId::new("account");
         let provider_id = ProviderId::new("codex");
         let mut snapshots = vec![UsageSnapshot {
@@ -489,13 +615,19 @@ mod tests {
                 "codex_activity": {"lifetime_tokens": 40}
             }),
         }];
-        let history = vec![StoredDailyUsage {
-            provider_id,
-            account_id,
-            date: today,
-            tokens: 25,
-            cost_usd: None,
-            source: "codex_account_usage".to_string(),
+        let history = vec![StoredDailyUsageHistory {
+            provider_id: provider_id.clone(),
+            account_id: account_id.clone(),
+            bucket_count: 2,
+            total_tokens: 40,
+            recent: vec![StoredDailyUsage {
+                provider_id,
+                account_id,
+                date: today,
+                tokens: 25,
+                cost_usd: None,
+                source: "codex_account_usage".to_string(),
+            }],
         }];
 
         merge_daily_usage_history(&mut snapshots, &history);
@@ -507,6 +639,10 @@ mod tests {
         assert_eq!(
             snapshots[0].metadata["codex_activity"]["lifetime_tokens"],
             40
+        );
+        assert_eq!(
+            snapshots[0].metadata["codex_activity"]["daily_bucket_count"],
+            2
         );
         let today_window = snapshots[0]
             .windows
@@ -531,6 +667,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounds_request_frames_before_allocating_the_entire_line() {
+        let mut input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        input.push(b'\n');
+        let mut reader = BufReader::with_capacity(1024, input.as_slice());
+        let mut line = Vec::new();
+
+        let frame = read_request_frame(&mut reader, &mut line).await.unwrap();
+
+        assert_eq!(frame, RequestFrame::TooLarge);
+        assert!(line.len() <= MAX_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
     async fn serves_config_request_over_socket() {
         let env = test_env(BTreeMap::new());
         let server = SocketServer::new(env.runtime.clone());
@@ -541,6 +690,14 @@ mod tests {
         });
 
         wait_for_socket(&env.socket_path).await;
+        assert_eq!(
+            std::fs::metadata(&env.socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let response = request_line(&env.socket_path, r#"{"method":"get_config"}"#).await;
 
         match response {

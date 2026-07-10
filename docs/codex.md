@@ -1,6 +1,7 @@
 # Codex collection
 
-Codex support lives in `crates/usage-daemon/src/providers/codex.rs` and is enabled by default.
+Codex support lives in the `crates/usage-daemon/src/providers/codex/` module tree and is enabled by
+default.
 Each configured profile runs in its own `CODEX_HOME`, which lets the daemon query multiple
 ChatGPT/Codex accounts without changing the user's active terminal login.
 
@@ -18,9 +19,11 @@ stores every returned bucket in `provider_daily_usage`, keyed by provider, accou
 are updated when Codex revises a day but are never removed merely because a later response omits an
 older day. This preserves history beyond any upstream response-retention window.
 
-The Swift app receives retained rows under `metadata.codex_activity.by_day`. It uses those rows for
-token charts and totals. The summary fields from the latest response remain under
-`metadata.codex_activity`, including lifetime tokens, peak daily tokens, streaks, and longest turn.
+The daemon keeps every retained row, but socket responses include only the latest 30 days under
+`metadata.codex_activity.by_day`, which is the range consumed by the Swift charts. An incrementally
+maintained SQLite summary keeps `lifetime_tokens` and `daily_bucket_count` exact without scanning or
+serializing the entire history on every UI refresh. Summary fields from the latest provider response
+remain under `metadata.codex_activity`, including peak daily tokens, streaks, and longest turn.
 
 ## WHAM fallback
 
@@ -45,7 +48,14 @@ Local cost metadata is stored under `metadata.codex_cost` with `estimate=true`, 
 account token counts. The Swift dashboard uses account activity for tokens and local logs only for
 estimated spend.
 
+Codex daily buckets and local cost rollups use UTC calendar dates so server-provided `startDate`
+values and timestamped local events share one day boundary. Local events without a valid timestamp
+remain in lifetime and model totals but are excluded from today, lookback, and per-day totals.
+
 ## Persistence
 
 Migration `0002_provider_daily_usage.sql` creates the durable daily table. Permanent account deletion
 also deletes that account's daily history. Hiding or disabling an account does not delete history.
+Daily rows and lifetime aggregates are retained permanently. High-resolution normalized snapshots
+are bounded to 90 days and 10,000 rows per account, and debug raw payloads are bounded to 100 per
+account, preventing polling data from growing without limit.

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
+use futures_util::StreamExt;
 use thiserror::Error;
 use usage_core::{ProviderId, UsageSnapshot, UsageWindow};
 
@@ -11,6 +12,46 @@ pub mod opencode;
 
 pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+pub async fn read_response_body(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<Vec<u8>, ProviderError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Parse,
+            format!("{label} exceeded the {MAX_PROVIDER_RESPONSE_BYTES}-byte response limit"),
+        ));
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_PROVIDER_RESPONSE_BYTES as u64) as usize,
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::Network,
+                format!("failed to read {label}: {err}"),
+            )
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Parse,
+                format!("{label} exceeded the {MAX_PROVIDER_RESPONSE_BYTES}-byte response limit"),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredAccount {

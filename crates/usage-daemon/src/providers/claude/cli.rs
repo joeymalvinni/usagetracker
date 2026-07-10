@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io::Read,
     process::{Command, Stdio},
+    thread,
     time::Duration,
 };
 
@@ -17,6 +18,8 @@ use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
 use super::{CLAUDE_CLI_COLLECTION_MODE, PROVIDER_ID};
 
 const CLAUDE_CLI_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_CLAUDE_CLI_STDOUT_BYTES: u64 = 1024 * 1024;
+const MAX_CLAUDE_CLI_STDERR_BYTES: u64 = 64 * 1024;
 const MAX_PERCENT: f64 = 100.0;
 
 pub(super) struct ClaudeCliUsage {
@@ -63,6 +66,29 @@ fn run_claude_usage_cli() -> anyhow::Result<String> {
         .stderr(Stdio::piped())
         .spawn()?;
 
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open Claude CLI stdout"))?;
+    let stdout_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_CLAUDE_CLI_STDOUT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open Claude CLI stderr"))?;
+    let stderr_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .take(MAX_CLAUDE_CLI_STDERR_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    });
+
     let status = match child.wait_timeout(CLAUDE_CLI_TIMEOUT)? {
         Some(status) => status,
         None => {
@@ -72,14 +98,24 @@ fn run_claude_usage_cli() -> anyhow::Result<String> {
         }
     };
 
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_string(&mut stdout)?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("Claude CLI stdout reader panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("Claude CLI stderr reader panicked"))??;
+    if stdout.len() > MAX_CLAUDE_CLI_STDOUT_BYTES as usize {
+        anyhow::bail!(
+            "claude -p /usage exceeded the {MAX_CLAUDE_CLI_STDOUT_BYTES}-byte stdout limit"
+        );
     }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut stderr)?;
+    if stderr.len() > MAX_CLAUDE_CLI_STDERR_BYTES as usize {
+        anyhow::bail!(
+            "claude -p /usage exceeded the {MAX_CLAUDE_CLI_STDERR_BYTES}-byte stderr limit"
+        );
     }
+    let stdout = String::from_utf8(stdout)?;
+    let stderr = String::from_utf8_lossy(&stderr);
 
     if !status.success() {
         anyhow::bail!(
