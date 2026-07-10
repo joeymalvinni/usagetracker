@@ -1,5 +1,6 @@
 mod config;
 mod daemon;
+mod forecast;
 mod health;
 mod local_logs;
 mod polling;

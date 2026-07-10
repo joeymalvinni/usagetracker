@@ -810,6 +810,39 @@ impl Storage {
         .await
     }
 
+    pub async fn recent_usage(
+        &self,
+        provider_id: &ProviderId,
+        account_id: &AccountId,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<UsageSnapshot>> {
+        let provider_id = provider_id.clone();
+        let account_id = account_id.clone();
+        let limit = limit.min(MAX_SNAPSHOTS_PER_ACCOUNT) as i64;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT normalized_json FROM usage_snapshots
+                 WHERE provider_id = ?1 AND account_id = ?2 AND collected_at >= ?3
+                 ORDER BY collected_at DESC, rowid DESC
+                 LIMIT ?4",
+            )?;
+            let snapshots = stmt
+                .query_map(
+                    params![
+                        provider_id.as_str(),
+                        account_id.as_str(),
+                        since.to_rfc3339(),
+                        limit,
+                    ],
+                    usage_snapshot_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(snapshots)
+        })
+        .await
+    }
+
     pub async fn accounts(&self) -> anyhow::Result<Vec<Account>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -1299,6 +1332,7 @@ fn health_status_from_sql(value: &str) -> ProviderHealthStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
@@ -1372,6 +1406,54 @@ mod tests {
         assert_eq!(health.len(), 1);
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
         assert_eq!(health[0].collection_mode.as_deref(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn recent_usage_is_bounded_filtered_and_newest_first() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("codex");
+        let account = storage
+            .upsert_account(&provider_id, "external-account", None, None, None)
+            .await
+            .unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+        let mut snapshot = UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id.clone(),
+            collected_at: start,
+            windows: Vec::new(),
+            metadata: json!({}),
+        };
+        for offset in [0, 5, 10] {
+            snapshot.collected_at = start + chrono::TimeDelta::minutes(offset);
+            storage.insert_snapshot(&snapshot, None).await.unwrap();
+        }
+
+        let recent = storage
+            .recent_usage(
+                &provider_id,
+                &account.id,
+                start + chrono::TimeDelta::minutes(4),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(
+            recent[0].collected_at,
+            start + chrono::TimeDelta::minutes(10)
+        );
+        assert_eq!(
+            recent[1].collected_at,
+            start + chrono::TimeDelta::minutes(5)
+        );
+
+        let limited = storage
+            .recent_usage(&provider_id, &account.id, start, 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].collected_at, recent[0].collected_at);
     }
 
     #[test]

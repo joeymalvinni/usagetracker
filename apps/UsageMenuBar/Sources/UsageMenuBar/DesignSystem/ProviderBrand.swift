@@ -21,24 +21,24 @@ enum ProviderBrand {
     private static let fallbackPalette = ProviderPalette(
         chart: Color(red: 0.45, green: 0.52, blue: 0.78),
         progressStart: Color(red: 0.58, green: 0.64, blue: 0.90),
-        progressEnd: Color(red: 0.35, green: 0.42, blue: 0.68)
+        progressEnd: Color(red: 0.39, green: 0.46, blue: 0.72)
     )
 
     private static let palettes: [String: ProviderPalette] = [
         "claude": ProviderPalette(
             chart: Color(red: 0.85, green: 0.47, blue: 0.34),
             progressStart: Color(red: 0.96, green: 0.61, blue: 0.45),
-            progressEnd: Color(red: 0.70, green: 0.34, blue: 0.24)
+            progressEnd: Color(red: 0.76, green: 0.39, blue: 0.28)
         ),
         "codex": ProviderPalette(
             chart: Color(red: 0.28, green: 0.62, blue: 0.60),
             progressStart: Color(red: 0.38, green: 0.76, blue: 0.74),
-            progressEnd: Color(red: 0.20, green: 0.47, blue: 0.50)
+            progressEnd: Color(red: 0.23, green: 0.53, blue: 0.54)
         ),
         "opencode_go": ProviderPalette(
             chart: Color(red: 0.18, green: 0.21, blue: 0.25),
             progressStart: Color(red: 0.42, green: 0.47, blue: 0.55),
-            progressEnd: Color(red: 0.08, green: 0.10, blue: 0.13)
+            progressEnd: Color(red: 0.12, green: 0.14, blue: 0.18)
         ),
     ]
 

@@ -55,8 +55,17 @@ struct WindowRow: View {
             }
 
             if let p = window.percent {
-                ProgressBar(percent: p, status: window.status, providerId: window.providerId)
+                ProgressBar(
+                    percent: p,
+                    status: window.status,
+                    providerId: window.providerId,
+                    forecastPercent: window.forecast?.projectedPercentRemaining
+                )
                     .animation(.spring(duration: 0.4), value: p)
+                    .animation(
+                        .spring(duration: 0.4),
+                        value: window.forecast?.projectedPercentRemaining
+                    )
             }
 
             if showsResetDropdown {
@@ -84,16 +93,26 @@ struct WindowRow: View {
             Button {
                 withAnimation(.spring(duration: 0.28)) { resetExpanded.toggle() }
             } label: {
-                HStack(spacing: Theme.Spacing.xs) {
-                    Image(systemName: "clock")
-                    Text(relativeReset)
-                        .monospacedDigit()
-                    Spacer()
-                    Image(systemName: "chevron.down")
-                        .font(Theme.Typography.micro.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                        .rotationEffect(.degrees(resetExpanded ? 0 : -90))
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: Theme.Spacing.xs) {
+                        Image(systemName: "clock")
+                        Text(relativeReset)
+                            .monospacedDigit()
+                        Spacer()
+                        Image(systemName: "chevron.down")
+                            .font(Theme.Typography.micro.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(resetExpanded ? 0 : -90))
+                    }
+                    if let forecast = window.forecast {
+                        HStack(spacing: Theme.Spacing.xs) {
+                            Image(systemName: "chart.line.uptrend.xyaxis")
+                            Text(forecast.summary)
+                            Spacer()
+                        }
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .font(Theme.Typography.micro)
                 .foregroundStyle(.secondary)
                 .contentShape(Rectangle())
@@ -101,13 +120,17 @@ struct WindowRow: View {
             .buttonStyle(.plain)
 
             if resetExpanded {
-                HStack {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(explicitReset)
-                        .font(Theme.Typography.micro)
                         .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
+                    if let forecast = window.forecast {
+                        Text(forecast.detail)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .font(Theme.Typography.micro)
+                .fixedSize(horizontal: false, vertical: true)
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
@@ -126,7 +149,8 @@ struct WindowRow: View {
 
     private var resetHelp: String {
         let prefix = "\(window.providerName) · \(window.label)"
-        return window.reset.isEmpty ? prefix : "\(prefix) · \(window.reset)"
+        let reset = window.reset.isEmpty ? prefix : "\(prefix) · \(window.reset)"
+        return window.forecast.map { "\(reset) · \($0.summary)" } ?? reset
     }
 }
 

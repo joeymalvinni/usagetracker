@@ -18,12 +18,14 @@ use usage_core::{
     UsageWindow, UsageWindowKind,
 };
 
-use crate::{daemon::DaemonRuntime, storage::StoredDailyUsageHistory};
+use crate::{daemon::DaemonRuntime, forecast, storage::StoredDailyUsageHistory};
 
 const MAX_CLIENT_CONNECTIONS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DASHBOARD_HISTORY_DAYS: u64 = 30;
+const FORECAST_HISTORY_DAYS: i64 = 35;
+const FORECAST_HISTORY_LIMIT: usize = 10_000;
 
 #[derive(Clone)]
 pub struct SocketServer {
@@ -155,8 +157,34 @@ impl SocketServer {
                 ) {
                     (Ok(mut snapshots), Ok(accounts), Ok(history)) => {
                         merge_daily_usage_history(&mut snapshots, &history);
+                        let snapshots = supported_visible_usage_snapshots(snapshots, &accounts);
+                        let generated_at = chrono::Utc::now();
+                        let since = generated_at - chrono::TimeDelta::days(FORECAST_HISTORY_DAYS);
+                        let mut forecasts = Vec::new();
+                        for snapshot in &snapshots {
+                            let history = match self
+                                .runtime
+                                .storage
+                                .recent_usage(
+                                    &snapshot.provider_id,
+                                    &snapshot.account_id,
+                                    since,
+                                    FORECAST_HISTORY_LIMIT,
+                                )
+                                .await
+                            {
+                                Ok(history) => history,
+                                Err(err) => return storage_error(err),
+                            };
+                            forecasts.extend(forecast::forecast_snapshot(
+                                snapshot,
+                                &history,
+                                generated_at,
+                            ));
+                        }
                         ApiResponse::Usage {
-                            snapshots: supported_visible_usage_snapshots(snapshots, &accounts),
+                            snapshots,
+                            forecasts,
                         }
                     }
                     (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => storage_error(err),

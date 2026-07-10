@@ -116,6 +116,13 @@ struct WindowVM: Identifiable, Equatable {
     /// Raw reset/expiry instant, when known. Powers relative countdowns and
     /// the explicit-date disclosure; `reset` is its pre-rendered short form.
     var resetAt: Date? = nil
+    var forecast: WindowForecastVM? = nil
+}
+
+struct WindowForecastVM: Equatable {
+    let summary: String
+    let detail: String
+    let projectedPercentRemaining: Double?
 }
 
 struct ResetCreditVM: Identifiable, Equatable {

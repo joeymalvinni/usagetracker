@@ -3,7 +3,10 @@ use std::fmt::Write;
 
 use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
 use serde_json::Value;
-use usage_core::{Account, UsageAmount, UsageSnapshot, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{
+    Account, ForecastStatus, UsageAmount, UsageForecast, UsageSnapshot, UsageUnit, UsageWindow,
+    UsageWindowKind,
+};
 
 use crate::{
     render::{
@@ -21,11 +24,12 @@ const BAR_WIDTH: usize = 12;
 
 pub fn render_usage(
     snapshots: &[UsageSnapshot],
+    forecasts: &[UsageForecast],
     accounts: &[Account],
     style: OutputStyle,
     color: bool,
 ) -> String {
-    let dashboard = Dashboard::from_snapshots(snapshots, accounts);
+    let dashboard = Dashboard::from_snapshots(snapshots, forecasts, accounts);
     let theme = Theme::new(color);
     match style {
         OutputStyle::Dashboard => render_dashboard(&dashboard, theme),
@@ -83,7 +87,11 @@ struct PaceLine {
 }
 
 impl Dashboard {
-    fn from_snapshots(snapshots: &[UsageSnapshot], accounts: &[Account]) -> Self {
+    fn from_snapshots(
+        snapshots: &[UsageSnapshot],
+        forecasts: &[UsageForecast],
+        accounts: &[Account],
+    ) -> Self {
         let account_by_id = accounts
             .iter()
             .map(|account| (account.id.as_str().to_string(), account))
@@ -101,6 +109,7 @@ impl Dashboard {
             .map(|snapshot| {
                 ProviderPanel::from_snapshot(
                     snapshot,
+                    forecasts,
                     account_by_id.get(snapshot.account_id.as_str()).copied(),
                 )
             })
@@ -115,20 +124,28 @@ impl Dashboard {
 }
 
 impl ProviderPanel {
-    fn from_snapshot(snapshot: &UsageSnapshot, account: Option<&Account>) -> Self {
+    fn from_snapshot(
+        snapshot: &UsageSnapshot,
+        forecasts: &[UsageForecast],
+        account: Option<&Account>,
+    ) -> Self {
         let session_window = select_window(snapshot, WindowRole::Session);
         let weekly_window = select_window(snapshot, WindowRole::Weekly);
         let monthly_window = select_window(snapshot, WindowRole::Monthly);
         let pace_window = weekly_window.or(session_window);
-        let pace = pace_window.and_then(pace_line);
-        let forecast = pace.as_ref().map(|pace| {
-            if pace.percent_used <= pace.percent_expected + 5.0 {
-                "lasts      until reset".to_string()
-            } else if pace.percent_used >= 100.0 {
-                "exhausted   until reset".to_string()
-            } else {
-                "tight       before reset".to_string()
-            }
+        let daemon_forecast = pace_window.and_then(|window| {
+            forecasts.iter().find(|forecast| {
+                forecast.provider_id == snapshot.provider_id
+                    && forecast.account_id == snapshot.account_id
+                    && forecast.window_id == window.window_id
+            })
+        });
+        let pace = daemon_forecast.and_then(pace_line);
+        let forecast = daemon_forecast.map(|forecast| match forecast.status {
+            ForecastStatus::Safe | ForecastStatus::OnPace => "lasts      until reset".to_string(),
+            ForecastStatus::AtRisk => "tight       before reset".to_string(),
+            ForecastStatus::Exhausted => "exhausted   until reset".to_string(),
+            ForecastStatus::InsufficientData => "insufficient data".to_string(),
         });
 
         let labels = identity_labels(account, Some(snapshot));
@@ -473,10 +490,9 @@ fn reset_credits_line(snapshot: &UsageSnapshot) -> Option<String> {
     ))
 }
 
-fn pace_line(window: &UsageWindow) -> Option<PaceLine> {
-    let percent_used = window.percent_used?;
-    let percent_expected = expected_percent_used(window)?;
-    let delta = percent_used - percent_expected;
+fn pace_line(forecast: &UsageForecast) -> Option<PaceLine> {
+    let percent_expected = forecast.expected_percent_used?;
+    let delta = forecast.pace_delta_percent?;
     let status = if delta > 5.0 {
         "over"
     } else if delta < -5.0 {
@@ -486,38 +502,9 @@ fn pace_line(window: &UsageWindow) -> Option<PaceLine> {
     };
     Some(PaceLine {
         status,
-        percent_used,
+        percent_used: forecast.current_percent_used,
         percent_expected,
     })
-}
-
-fn expected_percent_used(window: &UsageWindow) -> Option<f64> {
-    let reset_at = window.reset_at?;
-    let duration = expected_window_duration(window)?;
-    let now = Utc::now();
-    let start_at = reset_at - duration;
-    let elapsed = (now - start_at).num_seconds().max(0) as f64;
-    let total = duration.num_seconds().max(1) as f64;
-    Some((elapsed / total * 100.0).clamp(0.0, 100.0))
-}
-
-fn expected_window_duration(window: &UsageWindow) -> Option<TimeDelta> {
-    let name = format!(
-        "{} {}",
-        window.window_id.to_ascii_lowercase(),
-        window.label.to_ascii_lowercase()
-    );
-    if name.contains("five_hour") || name.contains("five hour") || name.contains("session") {
-        Some(TimeDelta::hours(5))
-    } else if name.contains("seven_day") || name.contains("seven day") || name.contains("weekly") {
-        Some(TimeDelta::days(7))
-    } else if name.contains("daily") || name.contains("today") {
-        Some(TimeDelta::days(1))
-    } else if name.contains("monthly") || name.contains("30d") || name.contains("30 days") {
-        Some(TimeDelta::days(30))
-    } else {
-        None
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -875,13 +862,13 @@ mod tests {
     use crate::render::style::strip_ansi;
     use chrono::TimeZone;
     use serde_json::json;
-    use usage_core::{AccountId, ProviderId};
+    use usage_core::{AccountId, ForecastConfidence, ProviderId};
 
     #[test]
     fn renders_dashboard_sections() {
         let (snapshot, account) = sample_dashboard();
 
-        let rendered = render_usage(&[snapshot], &[account], OutputStyle::Dashboard, false);
+        let rendered = render_usage(&[snapshot], &[], &[account], OutputStyle::Dashboard, false);
 
         assert!(rendered.contains("Overview"));
         assert!(rendered.contains("Activity · last 7 days"));
@@ -899,13 +886,47 @@ mod tests {
         snapshot.windows[0].percent_used = Some(92.0);
         snapshot.windows[0].percent_remaining = Some(8.0);
 
-        let rendered = render_usage(&[snapshot], &[account], OutputStyle::Dashboard, true);
+        let rendered = render_usage(&[snapshot], &[], &[account], OutputStyle::Dashboard, true);
 
         assert!(rendered.contains("\x1b["));
         assert!(strip_ansi(&rendered).contains("Codex · openai-web · Pro Lite"));
         for line in rendered.lines().filter(|line| !line.is_empty()) {
             assert_eq!(visible_len(line), DASHBOARD_WIDTH);
         }
+    }
+
+    #[test]
+    fn renders_daemon_generated_pace_and_forecast() {
+        let (snapshot, account) = sample_dashboard();
+        let forecast = UsageForecast {
+            provider_id: snapshot.provider_id.clone(),
+            account_id: snapshot.account_id.clone(),
+            window_id: "codex_weekly".to_string(),
+            generated_at: Utc::now(),
+            reset_at: snapshot.windows[1].reset_at,
+            current_percent_used: 40.0,
+            expected_percent_used: Some(30.0),
+            pace_delta_percent: Some(10.0),
+            rate_percent_per_hour: Some(2.0),
+            projected_percent_at_reset: Some(110.0),
+            projected_percent_remaining_at_reset: Some(0.0),
+            predicted_exhaustion_at: Some(Utc::now() + TimeDelta::days(2)),
+            status: ForecastStatus::AtRisk,
+            sample_count: 12,
+            confidence: ForecastConfidence::High,
+        };
+
+        let rendered = render_usage(
+            &[snapshot],
+            &[forecast],
+            &[account],
+            OutputStyle::Dashboard,
+            false,
+        );
+
+        assert!(rendered.contains("Pace"));
+        assert!(rendered.contains("over"));
+        assert!(rendered.contains("tight       before reset"));
     }
 
     #[test]

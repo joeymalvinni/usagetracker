@@ -66,12 +66,25 @@ enum DaemonRequest: Encodable {
     }
 }
 
+struct UsageResponse: Decodable {
+    let snapshots: [UsageSnapshot]
+    let forecasts: [UsageForecast]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        snapshots = try c.decode([UsageSnapshot].self, forKey: .snapshots)
+        forecasts = try c.decodeIfPresent([UsageForecast].self, forKey: .forecasts) ?? []
+    }
+
+    private enum K: String, CodingKey { case snapshots, forecasts }
+}
+
 enum DaemonResponse: Decodable {
-    case usage([UsageSnapshot]), refresh(RefreshResponse), providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse), addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String), providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
+    case usage(UsageResponse), refresh(RefreshResponse), providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse), addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String), providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         switch try c.decode(String.self, forKey: .type) {
-        case "usage": self = .usage(try c.decode([UsageSnapshot].self, forKey: .snapshots))
+        case "usage": self = .usage(try UsageResponse(from: decoder))
         case "refresh": self = .refresh(try RefreshResponse(from: decoder))
         case "provider_health": self = .providerHealth(try c.decode([ProviderHealth].self, forKey: .health))
         case "accounts": self = .accounts(try c.decode([Account].self, forKey: .accounts))

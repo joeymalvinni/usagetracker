@@ -59,6 +59,44 @@ pub struct UsageWindow {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UsageForecast {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    pub window_id: String,
+    pub generated_at: DateTime<Utc>,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub current_percent_used: f64,
+    pub expected_percent_used: Option<f64>,
+    pub pace_delta_percent: Option<f64>,
+    pub rate_percent_per_hour: Option<f64>,
+    pub projected_percent_at_reset: Option<f64>,
+    #[serde(default)]
+    pub projected_percent_remaining_at_reset: Option<f64>,
+    pub predicted_exhaustion_at: Option<DateTime<Utc>>,
+    pub status: ForecastStatus,
+    pub sample_count: usize,
+    pub confidence: ForecastConfidence,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForecastStatus {
+    InsufficientData,
+    Safe,
+    OnPace,
+    AtRisk,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForecastConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageWindowKind {
     Session,
