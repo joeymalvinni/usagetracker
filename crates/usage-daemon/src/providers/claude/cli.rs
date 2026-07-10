@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::Read,
+    path::Path,
     process::{Command, Stdio},
     thread,
     time::Duration,
@@ -27,8 +28,10 @@ pub(super) struct ClaudeCliUsage {
     pub raw_output: serde_json::Value,
 }
 
-pub(super) fn collect_usage_from_cli() -> Result<ClaudeCliUsage, ProviderError> {
-    let raw_output = run_claude_usage_cli().map_err(|err| {
+pub(super) fn collect_usage_from_cli(
+    config_dir: Option<&Path>,
+) -> Result<ClaudeCliUsage, ProviderError> {
+    let raw_output = run_claude_usage_cli(config_dir).map_err(|err| {
         ProviderError::new(
             ProviderErrorKind::ProviderUnavailable,
             format!("Claude CLI usage fallback failed: {err}"),
@@ -49,8 +52,9 @@ pub(super) fn collect_usage_from_cli() -> Result<ClaudeCliUsage, ProviderError> 
     })
 }
 
-fn run_claude_usage_cli() -> anyhow::Result<String> {
-    let mut child = Command::new("claude")
+fn run_claude_usage_cli(config_dir: Option<&Path>) -> anyhow::Result<String> {
+    let mut command = Command::new("claude");
+    command
         .arg("-p")
         .arg("/usage")
         .arg("--output-format")
@@ -63,8 +67,13 @@ fn run_claude_usage_cli() -> anyhow::Result<String> {
         .env_remove("https_proxy")
         .env_remove("all_proxy")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    if let Some(config_dir) = config_dir {
+        command
+            .env("CLAUDE_CONFIG_DIR", config_dir)
+            .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+    }
+    let mut child = command.spawn()?;
 
     let stdout = child
         .stdout

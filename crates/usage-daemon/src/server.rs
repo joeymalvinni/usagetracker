@@ -293,6 +293,15 @@ impl SocketServer {
                     ApiResponse::error("provider_repair_failed", err.to_string())
                 }
             },
+            ApiRequest::LaunchProviderAccount { account_id } => {
+                match self.runtime.launch_provider_account(account_id).await {
+                    Ok(action) => ApiResponse::ProviderAction { action },
+                    Err(err) => {
+                        warn!(error = %err, "provider account launch failed");
+                        ApiResponse::error("provider_account_launch_failed", err.to_string())
+                    }
+                }
+            }
         }
     }
 }

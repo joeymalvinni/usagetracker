@@ -54,6 +54,9 @@ pub enum ApiRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<AccountId>,
     },
+    LaunchProviderAccount {
+        account_id: AccountId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -180,6 +183,26 @@ impl ApiResponse {
                 code: code.into(),
                 message: message.into(),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_profile_session_launch_request() {
+        let request: ApiRequest = serde_json::from_str(
+            r#"{"method":"launch_provider_account","account_id":"account-1"}"#,
+        )
+        .unwrap();
+
+        match request {
+            ApiRequest::LaunchProviderAccount { account_id } => {
+                assert_eq!(account_id.as_str(), "account-1");
+            }
+            _ => panic!("unexpected request variant"),
         }
     }
 }

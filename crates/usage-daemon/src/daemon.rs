@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::unix::net::UnixStream as StdUnixStream,
+    fs::OpenOptions,
+    io::Write,
+    os::unix::{fs::OpenOptionsExt, net::UnixStream as StdUnixStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -20,7 +22,9 @@ use crate::{
     health, local_logs,
     polling::RefreshCoordinator,
     providers::{
-        claude::{ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID},
+        claude::{
+            keychain_service_for_config_dir, ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID,
+        },
         codex::{CodexCollector, PROVIDER_ID as CODEX_PROVIDER_ID},
         opencode::{clear_cached_cookie_cache, OpenCodeCollector, OPENCODE_GO_PROVIDER_ID},
         ProviderCollector,
@@ -44,6 +48,12 @@ pub struct DaemonRuntime {
 struct ProviderRegistration {
     id: &'static str,
     build: fn(&Config) -> anyhow::Result<Arc<dyn ProviderCollector>>,
+}
+
+struct ClaudeLoginTarget {
+    profile_id: String,
+    display_name: Option<String>,
+    config_dir: Option<PathBuf>,
 }
 
 const PROVIDER_REGISTRY: &[ProviderRegistration] = &[
@@ -96,7 +106,17 @@ impl Daemon {
         });
 
         let mut poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
-        let local_log_task = local_logs::spawn_change_log_loop(self.runtime.refresh.clone());
+        let claude_config = self
+            .runtime
+            .config
+            .read()
+            .await
+            .providers
+            .get(CLAUDE_PROVIDER_ID)
+            .cloned()
+            .unwrap_or_default();
+        let local_log_task =
+            local_logs::spawn_change_log_loop(self.runtime.refresh.clone(), claude_config);
 
         let outcome = tokio::select! {
             signal = shutdown_signal() => {
@@ -226,13 +246,21 @@ impl DaemonRuntime {
         provider_id: ProviderId,
         display_name: Option<String>,
     ) -> anyhow::Result<AddProviderAccountResponse> {
-        if provider_id.as_str() != CODEX_PROVIDER_ID {
-            anyhow::bail!("adding accounts is currently supported for Codex only");
-        }
-
         let display_name = display_name
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        match provider_id.as_str() {
+            CODEX_PROVIDER_ID => self.add_codex_account(provider_id, display_name).await,
+            CLAUDE_PROVIDER_ID => self.add_claude_account(provider_id, display_name).await,
+            _ => anyhow::bail!("adding accounts is not supported for {provider_id}"),
+        }
+    }
+
+    async fn add_codex_account(
+        &self,
+        provider_id: ProviderId,
+        display_name: Option<String>,
+    ) -> anyhow::Result<AddProviderAccountResponse> {
         let mut config = self.config.write().await;
         let mut updated_config = config.clone();
         let provider = updated_config
@@ -285,6 +313,67 @@ impl DaemonRuntime {
             provider_id,
             profile_id,
             display_name: profile_name,
+            profile_path: profile_path.display().to_string(),
+        })
+    }
+
+    async fn add_claude_account(
+        &self,
+        provider_id: ProviderId,
+        display_name: Option<String>,
+    ) -> anyhow::Result<AddProviderAccountResponse> {
+        let connected_profiles = self
+            .storage
+            .accounts()
+            .await?
+            .into_iter()
+            .filter(|account| account.provider_id.as_str() == CLAUDE_PROVIDER_ID)
+            .filter_map(|account| account.profile_id)
+            .collect::<BTreeSet<_>>();
+
+        let mut config = self.config.write().await;
+        let mut updated_config = config.clone();
+        let provider = updated_config
+            .providers
+            .entry(CLAUDE_PROVIDER_ID.to_string())
+            .or_default();
+        provider.enabled = true;
+        let target = if let Some(target) = pending_claude_profile(provider, &connected_profiles) {
+            target
+        } else {
+            create_managed_claude_profile(provider, display_name.clone())?
+        };
+
+        let collectors = build_providers(&updated_config, &self.storage).await?;
+        updated_config.persist()?;
+        *config = updated_config;
+        self.refresh.set_providers(collectors).await;
+        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
+        drop(config);
+
+        let profile_path = target
+            .config_dir
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("managed Claude profile is missing its config path"))?;
+        let child = launch_claude_login(Some(&profile_path))?;
+        monitor_provider_login(
+            child,
+            self.refresh.clone(),
+            CLAUDE_PROVIDER_ID,
+            Some(target.profile_id.clone()),
+        );
+
+        info!(
+            provider_id = provider_id.as_str(),
+            profile_id = target.profile_id.as_str(),
+            profile_path = %profile_path.display(),
+            "provider account login launched"
+        );
+
+        Ok(AddProviderAccountResponse {
+            provider_id,
+            profile_id: target.profile_id,
+            display_name: target.display_name,
             profile_path: profile_path.display().to_string(),
         })
     }
@@ -367,6 +456,12 @@ impl DaemonRuntime {
                         .as_ref()
                         .map(|path| expand_home_path(path.clone()))
                         .filter(|path| is_managed_codex_profile(path));
+                } else if account.provider_id.as_str() == CLAUDE_PROVIDER_ID {
+                    managed_profile_path = profile
+                        .claude_config_dir
+                        .as_ref()
+                        .map(|path| expand_home_path(path.clone()))
+                        .filter(|path| is_managed_claude_profile(path));
                 }
                 profile.enabled = false;
                 profile.deleted = true;
@@ -374,9 +469,13 @@ impl DaemonRuntime {
                 profile.auth_path = None;
                 profile.codex_home = None;
                 profile.keychain_account = None;
+                profile.keychain_service = None;
                 profile.credentials_file = None;
+                profile.claude_config_dir = None;
                 profile.cli_enabled = None;
                 profile.project_roots.clear();
+                profile.owns_default_codex_activity = false;
+                profile.owns_default_claude_activity = false;
             } else {
                 provider.profiles.push(ProviderProfileConfig {
                     id: Some(profile_id.to_string()),
@@ -601,15 +700,15 @@ impl DaemonRuntime {
                     .to_string()
             }
             CLAUDE_PROVIDER_ID => {
-                let profile_id = self
+                let target = self
                     .prepare_claude_login_profile(account_id.as_ref())
                     .await?;
-                let child = launch_claude_login()?;
+                let child = launch_claude_login(target.config_dir.as_deref())?;
                 monitor_provider_login(
                     child,
                     self.refresh.clone(),
                     CLAUDE_PROVIDER_ID,
-                    Some(profile_id),
+                    Some(target.profile_id),
                 );
                 "Finish signing in to Claude in your browser. UsageTracker will refresh automatically."
                     .to_string()
@@ -628,10 +727,65 @@ impl DaemonRuntime {
         })
     }
 
+    pub async fn launch_provider_account(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<ProviderActionResponse> {
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        if account.provider_id.as_str() != CLAUDE_PROVIDER_ID {
+            anyhow::bail!("profile sessions are currently supported for Claude only");
+        }
+        if !account.collection_enabled {
+            anyhow::bail!("enable Claude account tracking before opening a profile session");
+        }
+
+        let profile_id = account
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?;
+        let config = self.config.read().await;
+        let provider = config
+            .providers
+            .get(CLAUDE_PROVIDER_ID)
+            .ok_or_else(|| anyhow::anyhow!("Claude is not configured"))?;
+        let config_dir = if provider.profiles.is_empty() && profile_id == "default" {
+            None
+        } else {
+            let profile = provider
+                .profiles
+                .iter()
+                .find(|profile| {
+                    profile.enabled && !profile.deleted && profile.id.as_deref() == Some(profile_id)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Claude profile {profile_id} is no longer configured")
+                })?;
+            profile.claude_config_dir.clone().map(expand_home_path)
+        };
+        drop(config);
+
+        let launcher = write_claude_profile_launcher(&account_id, config_dir.as_deref())?;
+        open_terminal_launcher(&launcher)?;
+        Ok(ProviderActionResponse {
+            provider_id: account.provider_id,
+            message: format!(
+                "Opened a Claude session for {}. Activity from this terminal stays with this profile.",
+                account
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(profile_id)
+            ),
+        })
+    }
+
     async fn prepare_claude_login_profile(
         &self,
         account_id: Option<&AccountId>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ClaudeLoginTarget> {
         let requested_profile_id = match account_id {
             Some(account_id) => self
                 .storage
@@ -648,14 +802,14 @@ impl DaemonRuntime {
             .entry(CLAUDE_PROVIDER_ID.to_string())
             .or_default();
         provider.enabled = true;
-        let profile_id = ensure_claude_login_profile(provider, requested_profile_id.as_deref())?;
+        let target = ensure_claude_login_profile(provider, requested_profile_id.as_deref())?;
 
         let collectors = build_providers(&updated_config, &self.storage).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
         let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
-        Ok(profile_id)
+        Ok(target)
     }
 }
 
@@ -694,6 +848,15 @@ fn codex_profile_home(profile_id: &str) -> anyhow::Result<PathBuf> {
         .join(profile_id))
 }
 
+fn claude_profile_home(profile_id: &str) -> anyhow::Result<PathBuf> {
+    let app_dir = default_app_dir()
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
+    Ok(app_dir
+        .join("profiles")
+        .join(CLAUDE_PROVIDER_ID)
+        .join(profile_id))
+}
+
 fn pending_codex_profile(provider: &ProviderConfig) -> Option<(String, PathBuf, Option<String>)> {
     provider.profiles.iter().rev().find_map(|profile| {
         if !profile.enabled || profile.deleted {
@@ -719,6 +882,12 @@ fn is_managed_codex_profile(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_managed_claude_profile(path: &Path) -> bool {
+    default_app_dir()
+        .map(|root| path.starts_with(root.join("profiles").join(CLAUDE_PROVIDER_ID)))
+        .unwrap_or(false)
+}
+
 fn default_codex_profile() -> anyhow::Result<ProviderProfileConfig> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?;
@@ -733,16 +902,28 @@ fn default_codex_profile() -> anyhow::Result<ProviderProfileConfig> {
 fn ensure_claude_login_profile(
     provider: &mut ProviderConfig,
     requested_profile_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ClaudeLoginTarget> {
+    if provider.profiles.is_empty() && requested_profile_id == Some("default") {
+        return Ok(ClaudeLoginTarget {
+            profile_id: "default".to_string(),
+            display_name: None,
+            config_dir: None,
+        });
+    }
     if let Some(requested_profile_id) = requested_profile_id {
-        if let Some(profile) = provider
-            .profiles
-            .iter_mut()
-            .find(|profile| !profile.deleted && profile.id.as_deref() == Some(requested_profile_id))
+        if let Some((index, profile)) =
+            provider
+                .profiles
+                .iter_mut()
+                .enumerate()
+                .find(|(_, profile)| {
+                    !profile.deleted && profile.id.as_deref() == Some(requested_profile_id)
+                })
         {
             profile.enabled = true;
-            return Ok(requested_profile_id.to_string());
+            return Ok(claude_login_target(profile, index));
         }
+        anyhow::bail!("Claude profile {requested_profile_id} is no longer configured");
     }
 
     if let Some((index, profile)) = provider
@@ -751,39 +932,91 @@ fn ensure_claude_login_profile(
         .enumerate()
         .find(|(_, profile)| profile.enabled && !profile.deleted)
     {
-        return Ok(profile
-            .id
-            .clone()
-            .filter(|id| !id.trim().is_empty())
-            .unwrap_or_else(|| {
-                if index == 0 {
-                    "default".to_string()
-                } else {
-                    format!("profile-{}", index + 1)
-                }
-            }));
+        return Ok(claude_login_target(profile, index));
     }
 
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Claude login"))?;
+    create_managed_claude_profile(provider, None)
+}
+
+fn create_managed_claude_profile(
+    provider: &mut ProviderConfig,
+    display_name: Option<String>,
+) -> anyhow::Result<ClaudeLoginTarget> {
+    let profile_id = unique_profile_id(&provider.profiles, display_name.as_deref());
+    let config_dir = claude_profile_home(&profile_id)?;
+    push_managed_claude_profile(provider, profile_id, display_name, config_dir)
+}
+
+fn push_managed_claude_profile(
+    provider: &mut ProviderConfig,
+    profile_id: String,
+    display_name: Option<String>,
+    config_dir: PathBuf,
+) -> anyhow::Result<ClaudeLoginTarget> {
     let keychain_account = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
-    let profile_id = if provider
+    let owns_default_claude_activity = !provider
         .profiles
         .iter()
-        .all(|profile| profile.id.as_deref() != Some("default"))
-    {
-        "default".to_string()
-    } else {
-        unique_profile_id(&provider.profiles, Some("claude"))
-    };
+        .any(|profile| profile.enabled && !profile.deleted);
+    std::fs::create_dir_all(&config_dir)?;
+    let keychain_service = keychain_service_for_config_dir(&config_dir);
     provider.profiles.push(ProviderProfileConfig {
         id: Some(profile_id.clone()),
+        display_name: display_name.clone(),
         keychain_account: Some(keychain_account),
-        credentials_file: Some(home.join(".claude").join(".credentials.json")),
+        keychain_service: Some(keychain_service),
+        credentials_file: Some(config_dir.join(".credentials.json")),
+        claude_config_dir: Some(config_dir.clone()),
         cli_enabled: Some(true),
+        project_roots: vec![config_dir.join("projects")],
+        owns_default_claude_activity,
         ..ProviderProfileConfig::default()
     });
-    Ok(profile_id)
+    Ok(ClaudeLoginTarget {
+        profile_id,
+        display_name,
+        config_dir: Some(config_dir),
+    })
+}
+
+fn pending_claude_profile(
+    provider: &ProviderConfig,
+    connected_profiles: &BTreeSet<String>,
+) -> Option<ClaudeLoginTarget> {
+    provider
+        .profiles
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, profile)| {
+            if !profile.enabled || profile.deleted {
+                return None;
+            }
+            let target = claude_login_target(profile, index);
+            let config_dir = target.config_dir.as_deref()?;
+            (is_managed_claude_profile(config_dir)
+                && !connected_profiles.contains(&target.profile_id))
+            .then_some(target)
+        })
+}
+
+fn claude_login_target(profile: &ProviderProfileConfig, index: usize) -> ClaudeLoginTarget {
+    let profile_id = profile
+        .id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| {
+            if index == 0 {
+                "default".to_string()
+            } else {
+                format!("profile-{}", index + 1)
+            }
+        });
+    ClaudeLoginTarget {
+        profile_id,
+        display_name: profile.display_name.clone(),
+        config_dir: profile.claude_config_dir.clone().map(expand_home_path),
+    }
 }
 
 fn unique_profile_id(profiles: &[ProviderProfileConfig], display_name: Option<&str>) -> String {
@@ -889,9 +1122,10 @@ fn monitor_provider_login(
     });
 }
 
-fn launch_claude_login() -> anyhow::Result<std::process::Child> {
+fn launch_claude_login(config_dir: Option<&Path>) -> anyhow::Result<std::process::Child> {
     let mut direct = Command::new("claude");
     direct.args(["auth", "login"]);
+    configure_claude_login_environment(&mut direct, config_dir);
     configure_browser_login_stdio(&mut direct);
     match direct.spawn() {
         Ok(child) => Ok(child),
@@ -900,6 +1134,7 @@ fn launch_claude_login() -> anyhow::Result<std::process::Child> {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
             let mut fallback = Command::new(shell);
             fallback.args(["-lic", "exec claude auth login"]);
+            configure_claude_login_environment(&mut fallback, config_dir);
             configure_browser_login_stdio(&mut fallback);
             fallback.spawn().map_err(|fallback_err| {
                 anyhow::anyhow!("failed to start Claude login: {fallback_err}")
@@ -909,11 +1144,89 @@ fn launch_claude_login() -> anyhow::Result<std::process::Child> {
     }
 }
 
+fn configure_claude_login_environment(command: &mut Command, config_dir: Option<&Path>) {
+    if let Some(config_dir) = config_dir {
+        command
+            .env("CLAUDE_CONFIG_DIR", config_dir)
+            .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+    }
+}
+
 fn configure_browser_login_stdio(command: &mut Command) {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+}
+
+fn write_claude_profile_launcher(
+    account_id: &AccountId,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let app_dir = default_app_dir()
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
+    let launcher_dir = app_dir.join("launchers");
+    std::fs::create_dir_all(&launcher_dir)?;
+    let launcher = launcher_dir.join(format!("claude-{}.command", account_id.as_str()));
+    let temporary = launcher_dir.join(format!(
+        ".claude-{}.{}.tmp",
+        account_id.as_str(),
+        uuid::Uuid::new_v4()
+    ));
+    let contents = claude_launcher_contents(config_dir);
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &launcher)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(launcher)
+}
+
+fn claude_launcher_contents(config_dir: Option<&Path>) -> String {
+    let profile_setup = match config_dir {
+        Some(path) => format!(
+            "export CLAUDE_CONFIG_DIR={}\n",
+            shell_single_quote(&path.display().to_string())
+        ),
+        None => "unset CLAUDE_CONFIG_DIR\n".to_string(),
+    };
+    format!("#!/bin/zsh -l\nunset CLAUDE_SECURESTORAGE_CONFIG_DIR\n{profile_setup}exec claude\n")
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn open_terminal_launcher(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .args(["-a", "Terminal"])
+            .arg(path)
+            .status()
+            .map_err(|err| anyhow::anyhow!("failed to open Claude profile terminal: {err}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("failed to open Claude profile terminal")
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        anyhow::bail!("opening Claude profile terminals is only supported on macOS")
+    }
 }
 
 fn open_url(url: &str) -> anyhow::Result<()> {
@@ -1102,29 +1415,64 @@ mod tests {
     }
 
     #[test]
-    fn claude_login_creates_a_new_profile_after_all_connections_were_deleted() {
-        let mut provider = ProviderConfig {
-            enabled: true,
-            profiles: vec![ProviderProfileConfig {
-                id: Some("default".to_string()),
-                enabled: false,
-                deleted: true,
-                ..ProviderProfileConfig::default()
-            }],
-            ..ProviderConfig::default()
-        };
+    fn creates_an_isolated_managed_claude_profile() {
+        let root = std::env::temp_dir().join(format!("claude-profile-{}", uuid::Uuid::new_v4()));
+        let mut provider = ProviderConfig::default();
 
-        let profile_id = ensure_claude_login_profile(&mut provider, None).unwrap();
+        let target = push_managed_claude_profile(
+            &mut provider,
+            "work".to_string(),
+            Some("Work".to_string()),
+            root.clone(),
+        )
+        .unwrap();
 
-        assert_eq!(profile_id, "claude");
-        assert_eq!(provider.profiles.len(), 2);
-        let profile = provider.profiles.last().unwrap();
+        assert_eq!(target.profile_id, "work");
+        assert_eq!(target.config_dir.as_deref(), Some(root.as_path()));
+        let profile = provider.profiles.first().unwrap();
         assert!(profile.enabled);
         assert!(!profile.deleted);
+        assert_eq!(profile.display_name.as_deref(), Some("Work"));
+        assert_eq!(profile.claude_config_dir.as_deref(), Some(root.as_path()));
         assert_eq!(
-            profile.keychain_account.as_deref(),
-            std::env::var("USER").ok().as_deref()
+            profile.keychain_service.as_deref(),
+            Some(keychain_service_for_config_dir(&root).as_str())
         );
+        assert_eq!(
+            profile.credentials_file.as_deref(),
+            Some(root.join(".credentials.json").as_path())
+        );
+        assert_eq!(profile.project_roots, vec![root.join("projects")]);
+        assert!(profile.owns_default_claude_activity);
         assert_eq!(profile.cli_enabled, Some(true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repairing_a_legacy_claude_account_keeps_the_default_profile() {
+        let mut provider = ProviderConfig::default();
+
+        let target = ensure_claude_login_profile(&mut provider, Some("default")).unwrap();
+
+        assert_eq!(target.profile_id, "default");
+        assert!(target.config_dir.is_none());
+        assert!(provider.profiles.is_empty());
+    }
+
+    #[test]
+    fn claude_launcher_pins_activity_to_the_profile_config_directory() {
+        let contents = claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")));
+
+        assert!(contents.contains("unset CLAUDE_SECURESTORAGE_CONFIG_DIR"));
+        assert!(contents.contains("export CLAUDE_CONFIG_DIR='/tmp/Claude'\"'\"'s Work'"));
+        assert!(contents.ends_with("exec claude\n"));
+    }
+
+    #[test]
+    fn legacy_claude_launcher_clears_profile_overrides() {
+        let contents = claude_launcher_contents(None);
+
+        assert!(contents.contains("unset CLAUDE_CONFIG_DIR"));
+        assert!(!contents.contains("export CLAUDE_CONFIG_DIR"));
     }
 }

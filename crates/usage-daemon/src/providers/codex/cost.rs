@@ -10,13 +10,13 @@ use std::{
     time::{Instant, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, Local, NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
 use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 
 use crate::providers::ProviderUsage;
 
-use super::{nonempty_string, CodexAuth, CODEX_COST_SCAN_MIN_INTERVAL, COST_LOOKBACK_DAYS};
+use super::{CODEX_COST_SCAN_MIN_INTERVAL, COST_LOOKBACK_DAYS};
 
 pub(super) trait CodexUsageCostExt {
     fn merge_cost_report(&mut self, report: CodexCostReport, include_token_activity: bool);
@@ -281,7 +281,7 @@ pub(super) fn scan_codex_local_costs_cached(
 }
 
 fn scan_codex_local_costs_from_roots(roots: Vec<PathBuf>) -> anyhow::Result<CodexCostReport> {
-    let today = Utc::now().date_naive();
+    let today = Local::now().date_naive();
     let lookback_start = today
         .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
         .unwrap_or(today);
@@ -335,20 +335,13 @@ fn codex_session_fingerprint(roots: &[PathBuf]) -> anyhow::Result<CodexSessionFi
     Ok(fingerprint)
 }
 
-pub(super) fn codex_account_id_from_auth_file(codex_home: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(codex_home.join("auth.json")).ok()?;
-    let auth: CodexAuth = serde_json::from_str(&contents).ok()?;
-    nonempty_string(Some(auth.tokens?.account_id))
-}
-
 pub(super) fn codex_session_roots(
     profile_home: &Path,
     local_codex_home: &Path,
-    local_account_id: Option<&str>,
-    profile_account_id: &str,
+    owns_default_activity: bool,
 ) -> Vec<PathBuf> {
     let mut roots = vec![profile_home.join("sessions")];
-    if profile_home != local_codex_home && local_account_id == Some(profile_account_id) {
+    if profile_home != local_codex_home && owns_default_activity {
         roots.push(local_codex_home.join("sessions"));
     }
     roots.sort();
@@ -414,7 +407,7 @@ pub(super) fn scan_codex_session_file(
         let model = current_model.as_deref().unwrap_or("unknown");
         let cost = codex_cost_usd_for_normalized_model(model, delta);
         let tokens = delta.total();
-        let date = codex_event_timestamp(&event).map(|timestamp| timestamp.date_naive());
+        let date = codex_event_date_in_timezone(&event, &Local);
 
         report.total_tokens = report.total_tokens.saturating_add(tokens);
         if let Some(cost) = cost {
@@ -559,6 +552,13 @@ pub(super) fn codex_event_timestamp(event: &Value) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp)
         .ok()
         .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+pub(super) fn codex_event_date_in_timezone<Tz: TimeZone>(
+    event: &Value,
+    timezone: &Tz,
+) -> Option<NaiveDate> {
+    codex_event_timestamp(event).map(|timestamp| timestamp.with_timezone(timezone).date_naive())
 }
 
 pub(super) fn codex_totals_from_value(value: &Value) -> Option<CodexTokenTotals> {

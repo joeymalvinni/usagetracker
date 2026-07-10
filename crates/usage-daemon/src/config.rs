@@ -73,11 +73,19 @@ pub struct ProviderProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keychain_account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owns_default_codex_activity: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owns_default_claude_activity: bool,
 }
 
 impl Default for ProviderProfileConfig {
@@ -90,9 +98,13 @@ impl Default for ProviderProfileConfig {
             auth_path: None,
             codex_home: None,
             keychain_account: None,
+            keychain_service: None,
             credentials_file: None,
+            claude_config_dir: None,
             cli_enabled: None,
             project_roots: Vec::new(),
+            owns_default_codex_activity: false,
+            owns_default_claude_activity: false,
         }
     }
 }
@@ -110,6 +122,11 @@ impl Config {
 
         let mut file_config = read_or_create_config(&config_path)?;
         add_missing_default_providers(&mut file_config);
+        let assigned_codex_owner = assign_default_codex_activity_owner(&mut file_config);
+        let assigned_claude_owner = assign_default_claude_activity_owner(&mut file_config);
+        if assigned_codex_owner || assigned_claude_owner {
+            write_config_atomically(&config_path, &file_config)?;
+        }
         let poll_interval_seconds = poll_interval_seconds(file_config.poll_interval_seconds)?;
 
         Ok(Self {
@@ -224,6 +241,148 @@ fn add_missing_default_providers(config: &mut FileConfig) {
     for (id, provider) in FileConfig::default().providers {
         config.providers.entry(id).or_insert(provider);
     }
+}
+
+fn assign_default_codex_activity_owner(config: &mut FileConfig) -> bool {
+    let Some(local_codex_home) = default_codex_home() else {
+        return false;
+    };
+    assign_default_codex_activity_owner_for_home(config, &local_codex_home)
+}
+
+fn assign_default_codex_activity_owner_for_home(
+    config: &mut FileConfig,
+    local_codex_home: &Path,
+) -> bool {
+    let Some(local_account_id) = codex_account_id_from_auth(&local_codex_home.join("auth.json"))
+    else {
+        return false;
+    };
+    let Some(provider) = config.providers.get_mut("codex") else {
+        return false;
+    };
+    if provider
+        .profiles
+        .iter()
+        .any(|profile| profile.enabled && !profile.deleted && profile.owns_default_codex_activity)
+    {
+        return false;
+    }
+
+    let active_profile_homes = provider
+        .profiles
+        .iter()
+        .filter(|profile| profile.enabled && !profile.deleted)
+        .map(|profile| {
+            profile
+                .codex_home
+                .as_deref()
+                .map(expand_home_path)
+                .unwrap_or_else(|| local_codex_home.to_path_buf())
+        })
+        .collect::<Vec<_>>();
+    if active_profile_homes
+        .iter()
+        .any(|codex_home| codex_home == local_codex_home)
+    {
+        return false;
+    }
+
+    let matching = provider
+        .profiles
+        .iter()
+        .enumerate()
+        .filter(|(_, profile)| profile.enabled && !profile.deleted)
+        .filter_map(|(index, profile)| {
+            let codex_home = profile
+                .codex_home
+                .as_deref()
+                .map(expand_home_path)
+                .unwrap_or_else(|| local_codex_home.to_path_buf());
+            if codex_home == local_codex_home {
+                return None;
+            }
+            let auth_path = profile
+                .auth_path
+                .as_deref()
+                .map(expand_home_path)
+                .unwrap_or_else(|| codex_home.join("auth.json"));
+            (codex_account_id_from_auth(&auth_path).as_deref() == Some(local_account_id.as_str()))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return false;
+    }
+    provider.profiles[matching[0]].owns_default_codex_activity = true;
+    true
+}
+
+fn default_codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|path| expand_home_path(&path))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+}
+
+fn codex_account_id_from_auth(path: &Path) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    value
+        .get("tokens")?
+        .get("account_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let Some(value) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if value == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn assign_default_claude_activity_owner(config: &mut FileConfig) -> bool {
+    let Some(provider) = config.providers.get_mut("claude") else {
+        return false;
+    };
+    let active = provider
+        .profiles
+        .iter()
+        .enumerate()
+        .filter(|(_, profile)| profile.enabled && !profile.deleted)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if active.len() != 1 {
+        return false;
+    }
+    let profile = &provider.profiles[active[0]];
+    if profile.owns_default_claude_activity
+        || profile.claude_config_dir.is_none()
+        || profile
+            .project_roots
+            .iter()
+            .any(|root| is_default_claude_project_root(root))
+    {
+        return false;
+    }
+    provider.profiles[active[0]].owns_default_claude_activity = true;
+    true
+}
+
+fn is_default_claude_project_root(path: &Path) -> bool {
+    let value = path.to_string_lossy();
+    value.ends_with("/.claude/projects") || value.ends_with("/.config/claude/projects")
 }
 
 fn default_paths() -> anyhow::Result<Paths> {
@@ -442,6 +601,176 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sole_managed_claude_profile_adopts_unowned_default_activity() {
+        let mut config = FileConfig::default();
+        config.providers.get_mut("claude").unwrap().profiles = vec![ProviderProfileConfig {
+            id: Some("managed".to_string()),
+            claude_config_dir: Some(PathBuf::from("/profiles/managed")),
+            project_roots: vec![PathBuf::from("/profiles/managed/projects")],
+            ..ProviderProfileConfig::default()
+        }];
+
+        assert!(assign_default_claude_activity_owner(&mut config));
+        assert!(config.providers["claude"].profiles[0].owns_default_claude_activity);
+        assert!(!assign_default_claude_activity_owner(&mut config));
+    }
+
+    #[test]
+    fn matching_codex_profile_durably_adopts_default_activity() {
+        let root = std::env::temp_dir().join(format!("codex-owner-{}", uuid::Uuid::new_v4()));
+        let local_home = root.join("default");
+        let personal_home = root.join("personal");
+        let work_home = root.join("work");
+        fs::create_dir_all(&local_home).unwrap();
+        fs::create_dir_all(&personal_home).unwrap();
+        fs::create_dir_all(&work_home).unwrap();
+        fs::write(
+            local_home.join("auth.json"),
+            r#"{"tokens":{"account_id":"personal"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            personal_home.join("auth.json"),
+            r#"{"tokens":{"account_id":"personal"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            work_home.join("auth.json"),
+            r#"{"tokens":{"account_id":"work"}}"#,
+        )
+        .unwrap();
+
+        let mut config = FileConfig::default();
+        config.providers.get_mut("codex").unwrap().profiles = vec![
+            ProviderProfileConfig {
+                id: Some("personal".to_string()),
+                codex_home: Some(personal_home),
+                ..ProviderProfileConfig::default()
+            },
+            ProviderProfileConfig {
+                id: Some("work".to_string()),
+                codex_home: Some(work_home),
+                ..ProviderProfileConfig::default()
+            },
+        ];
+
+        assert!(assign_default_codex_activity_owner_for_home(
+            &mut config,
+            &local_home
+        ));
+        assert!(config.providers["codex"].profiles[0].owns_default_codex_activity);
+        assert!(!config.providers["codex"].profiles[1].owns_default_codex_activity);
+
+        let persisted: FileConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(persisted.providers["codex"].profiles[0].owns_default_codex_activity);
+        assert!(!persisted.providers["codex"].profiles[1].owns_default_codex_activity);
+
+        fs::write(
+            local_home.join("auth.json"),
+            r#"{"tokens":{"account_id":"work"}}"#,
+        )
+        .unwrap();
+        assert!(!assign_default_codex_activity_owner_for_home(
+            &mut config,
+            &local_home
+        ));
+        assert!(config.providers["codex"].profiles[0].owns_default_codex_activity);
+        assert!(!config.providers["codex"].profiles[1].owns_default_codex_activity);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_default_codex_profile_prevents_managed_duplicate_owner() {
+        let root = std::env::temp_dir().join(format!("codex-owner-{}", uuid::Uuid::new_v4()));
+        let local_home = root.join("default");
+        let managed_home = root.join("managed");
+        fs::create_dir_all(&local_home).unwrap();
+        fs::create_dir_all(&managed_home).unwrap();
+        for home in [&local_home, &managed_home] {
+            fs::write(
+                home.join("auth.json"),
+                r#"{"tokens":{"account_id":"same-account"}}"#,
+            )
+            .unwrap();
+        }
+
+        let mut config = FileConfig::default();
+        config.providers.get_mut("codex").unwrap().profiles = vec![
+            ProviderProfileConfig {
+                id: Some("default".to_string()),
+                codex_home: Some(local_home.clone()),
+                ..ProviderProfileConfig::default()
+            },
+            ProviderProfileConfig {
+                id: Some("managed".to_string()),
+                codex_home: Some(managed_home),
+                ..ProviderProfileConfig::default()
+            },
+        ];
+
+        assert!(!assign_default_codex_activity_owner_for_home(
+            &mut config,
+            &local_home
+        ));
+        assert!(config.providers["codex"]
+            .profiles
+            .iter()
+            .all(|profile| !profile.owns_default_codex_activity));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multiple_managed_claude_profiles_never_share_default_activity() {
+        let mut config = FileConfig::default();
+        config.providers.get_mut("claude").unwrap().profiles = vec![
+            ProviderProfileConfig {
+                id: Some("personal".to_string()),
+                claude_config_dir: Some(PathBuf::from("/profiles/personal")),
+                ..ProviderProfileConfig::default()
+            },
+            ProviderProfileConfig {
+                id: Some("work".to_string()),
+                claude_config_dir: Some(PathBuf::from("/profiles/work")),
+                ..ProviderProfileConfig::default()
+            },
+        ];
+
+        assert!(!assign_default_claude_activity_owner(&mut config));
+        assert!(config.providers["claude"]
+            .profiles
+            .iter()
+            .all(|profile| !profile.owns_default_claude_activity));
+    }
+
+    #[test]
+    fn loading_config_persists_default_claude_activity_owner_migration() {
+        let root = std::env::temp_dir().join(format!("usage-config-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let mut file_config = FileConfig::default();
+        file_config.providers.get_mut("claude").unwrap().profiles = vec![ProviderProfileConfig {
+            id: Some("managed".to_string()),
+            claude_config_dir: Some(root.join("profiles/managed")),
+            project_roots: vec![root.join("profiles/managed/projects")],
+            ..ProviderProfileConfig::default()
+        }];
+        write_config_atomically(&config_path, &file_config).unwrap();
+
+        let loaded = Config::load(
+            Some(config_path.clone()),
+            Some(root.join("usage.sqlite3")),
+            Some(root.join("usage.sock")),
+        )
+        .unwrap();
+        let persisted: FileConfig =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        assert!(loaded.providers["claude"].profiles[0].owns_default_claude_activity);
+        assert!(persisted.providers["claude"].profiles[0].owns_default_claude_activity);
         fs::remove_dir_all(root).unwrap();
     }
 }

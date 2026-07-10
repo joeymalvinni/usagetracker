@@ -7,10 +7,7 @@ use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKin
 
 use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
 
-use super::{
-    credentials::{ClaudeCredentials, CLAUDE_KEYCHAIN_SERVICE},
-    CLAUDE_COLLECTION_MODE, PROVIDER_ID,
-};
+use super::{credentials::ClaudeCredentials, CLAUDE_COLLECTION_MODE, PROVIDER_ID};
 
 const MAX_PERCENT: f64 = 100.0;
 const UNIX_MILLIS_THRESHOLD: f64 = 10_000_000_000.0;
@@ -54,7 +51,7 @@ pub(super) fn normalize_usage(
         windows,
         metadata: json!({
             "collection_mode": CLAUDE_COLLECTION_MODE,
-            "keychain_service": CLAUDE_KEYCHAIN_SERVICE,
+            "keychain_service": credentials.keychain_service,
             "keychain_account": credentials.keychain_account,
             "subscription_type": credentials.subscription_type,
             "rate_limit_tier": credentials.rate_limit_tier,
@@ -647,6 +644,7 @@ mod tests {
                     "rateLimitTier": "default"
                 }
             }"#,
+            super::super::credentials::CLAUDE_KEYCHAIN_SERVICE,
             "joey",
             CredentialSource::Keychain,
         )

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{Days, Utc};
+use chrono::{Days, FixedOffset, Local, NaiveDate, Utc};
 use serde_json::json;
 use usage_core::{AccountId, ProviderId, UsageWindow, UsageWindowKind};
 
@@ -11,54 +11,39 @@ use crate::providers::{ProviderErrorKind, ProviderUsage};
 
 use super::app_server::{normalize_account_token_usage, CodexAccountActivityExt};
 use super::cost::{
-    codex_cost_usd, codex_event_timestamp, codex_session_roots, codex_token_count_info,
-    codex_token_delta, codex_totals_from_value, codex_turn_context_model, normalize_codex_model,
-    scan_codex_session_file, CodexCostReport, CodexTokenTotals, CodexUsageCostExt,
-    DailyCostSummary,
+    codex_cost_usd, codex_event_date_in_timezone, codex_event_timestamp, codex_session_roots,
+    codex_token_count_info, codex_token_delta, codex_totals_from_value, codex_turn_context_model,
+    normalize_codex_model, scan_codex_session_file, CodexCostReport, CodexTokenTotals,
+    CodexUsageCostExt, DailyCostSummary,
 };
 use super::rate_limits::{normalize_app_server_usage, normalize_usage};
 use super::{codex_credentials_from_auth_json, PROVIDER_ID};
 
 #[test]
-fn adds_standard_codex_sessions_only_for_the_active_account() {
+fn adds_standard_codex_sessions_only_for_the_designated_owner() {
     let profile_home = Path::new("/profiles/personal");
     let local_home = Path::new("/home/.codex");
 
-    let matching = codex_session_roots(
-        profile_home,
-        local_home,
-        Some("personal-account"),
-        "personal-account",
-    );
+    let matching = codex_session_roots(profile_home, local_home, true);
     assert_eq!(matching.len(), 2);
     assert!(matching.contains(&profile_home.join("sessions")));
     assert!(matching.contains(&local_home.join("sessions")));
 
-    let different = codex_session_roots(
-        Path::new("/profiles/work"),
-        local_home,
-        Some("personal-account"),
-        "work-account",
-    );
+    let different = codex_session_roots(Path::new("/profiles/work"), local_home, false);
     assert_eq!(different, vec![PathBuf::from("/profiles/work/sessions")]);
 }
 
 #[test]
 fn does_not_duplicate_standard_codex_session_root() {
     let local_home = Path::new("/home/.codex");
-    let roots = codex_session_roots(
-        local_home,
-        local_home,
-        Some("personal-account"),
-        "personal-account",
-    );
+    let roots = codex_session_roots(local_home, local_home, true);
 
     assert_eq!(roots, vec![local_home.join("sessions")]);
 }
 
 #[test]
 fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() {
-    let today = Utc::now().date_naive();
+    let today = Local::now().date_naive();
     let yesterday = today.checked_sub_days(Days::new(1)).unwrap();
     let activity = normalize_account_token_usage(&json!({
         "summary": {
@@ -475,6 +460,17 @@ fn reads_nested_codex_event_timestamps() {
 }
 
 #[test]
+fn groups_codex_events_by_the_users_local_calendar_day() {
+    let event = json!({"timestamp": "2026-07-10T03:00:00Z"});
+    let pacific_daylight_time = FixedOffset::west_opt(7 * 60 * 60).unwrap();
+
+    assert_eq!(
+        codex_event_date_in_timezone(&event, &pacific_daylight_time),
+        NaiveDate::from_ymd_opt(2026, 7, 9)
+    );
+}
+
+#[test]
 fn seeds_total_only_baseline_before_emitting_deltas() {
     let mut previous = None;
     let first = json!({
@@ -542,7 +538,7 @@ fn keeps_undated_codex_usage_out_of_today_and_lookback() {
     .collect::<Vec<_>>()
     .join("\n");
     std::fs::write(&path, contents).unwrap();
-    let today = Utc::now().date_naive();
+    let today = Local::now().date_naive();
     let mut report = CodexCostReport::default();
 
     scan_codex_session_file(&path, today, today, &mut report).unwrap();
