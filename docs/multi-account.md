@@ -9,6 +9,8 @@
 - Keep normal usage and health surfaces filtered to visible accounts.
 - Keep user labels, generated labels, and provider email addresses as separate account identity fields so refreshes cannot overwrite a rename.
 - Assign short generated labels (`Codex 1`, `Claude 1`, `OpenCode Go`) when a profile has no user label.
+- Enforce one profile per real provider account for Codex and Claude, independent of labels.
+- Reject authenticated identity changes on an existing profile so reconnecting cannot merge histories.
 
 ## Collection behavior
 
@@ -32,8 +34,8 @@
 
 ## Provider-specific gaps
 
-- Codex: account add/remove should continue to map to isolated profile homes.
-- Claude: account creation now maps to isolated managed Claude config directories and Keychain services; advanced profile field editing remains config-file-only.
+- Codex: account add/remove maps to isolated profile homes; duplicate `account_id` values are rejected.
+- Claude: account creation maps to isolated managed Claude config directories and Keychain services, and `account.uuid` supplies canonical identity; advanced profile field editing remains config-file-only.
 - OpenCode Go: decide whether account-level disable should clear cached cookies, disable only collection, or support named cookie/workspace profiles.
 - All providers: expose credential/source diagnostics per account, not only per provider.
 

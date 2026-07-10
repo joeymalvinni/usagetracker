@@ -69,7 +69,11 @@ The expected credential JSON shape is:
 
 `accessToken` and `refreshToken` are required and must be non-empty after trimming. `expiresAt`, `scopes`, `subscriptionType`, and `rateLimitTier` are optional. Invalid JSON, a missing `claudeAiOauth` object, or blank token fields make the provider credentials invalid.
 
-The discovered Claude account id is the profile Keychain account name, not an Anthropic account id from the payload. A configured profile `display_name` is treated as a user label. Without one, storage assigns a stable generated label such as `Claude 1`; the subscription type remains usage metadata rather than becoming the account name.
+After loading and refreshing credentials, the daemon requests `GET https://api.anthropic.com/api/oauth/profile` and uses the response's `account.uuid` as the stable Claude account identity. The response email is stored separately as account metadata. A configured profile `display_name` remains only a user label, so renaming cannot change identity or bypass duplicate detection. Without a label, storage assigns a generated name such as `Claude 1`.
+
+The same Anthropic account UUID may only be connected once. When multiple profiles authenticate as the same account, the first enabled profile in config order is canonical and later duplicates are not collected. Storage also rejects a profile whose UUID changes, preventing a reconnect from merging two accounts' history. Existing installations are upgraded once from the legacy Keychain-account identity to the canonical UUID; UUID-to-UUID changes remain blocked.
+
+Current Claude Code logins include the `user:profile` OAuth scope. For older tokens without that scope, the daemon may read Claude Code's cached `oauthAccount.accountUuid` from `<CLAUDE_CONFIG_DIR>/.claude.json` (or `~/.claude.json` for the default profile). It never substitutes an email address, macOS username, subscription tier, or display name as account identity. Tokens that declare `user:profile` must successfully resolve the token-bound profile response rather than falling back to potentially stale cached identity.
 
 ## Token Refresh
 
@@ -192,6 +196,8 @@ extra_usage_enabled
 top_level_keys
 ```
 
+Identity discovery uses the neighboring OAuth profile endpoint and is not stored as a raw payload.
+
 Raw provider payloads are only stored when `debug_capture_raw_payloads` is enabled.
 
 ## Claude CLI Fallback
@@ -228,7 +234,7 @@ The collector records a warning when this fallback is needed. If `debug_capture_
 
 JSONL filesystem events are only an activity signal; percentages are never estimated from local token counts. Events are trailing-edge debounced until writes have been quiet for 30 seconds, then coalesced into one OAuth usage refresh. Watcher-triggered refreshes run at most once per minute. The normal configured poll remains the fallback for activity that occurs somewhere the local daemon cannot observe.
 
-Account discovery falls back to a generic Claude account using the current `USER` account name when OAuth credentials are missing or invalid. This lets collection use the CLI fallback on machines where Claude Code itself is logged in but the daemon cannot read or parse the OAuth credential store.
+Account discovery requires a real Anthropic account UUID from the OAuth profile endpoint or the narrowly scoped legacy cache fallback described above. Missing or invalid credentials no longer create a synthetic account from the current `USER`, because that identity cannot safely distinguish or deduplicate Claude accounts.
 
 ## Failure Cases
 

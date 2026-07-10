@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_stores_each_discovered_account() {
+    async fn refresh_rejects_duplicate_external_accounts_from_distinct_profiles() {
         let storage = test_storage();
         let coordinator =
             RefreshCoordinator::new(storage.clone(), vec![Arc::new(MultiAccountProvider)]);
@@ -780,31 +780,36 @@ mod tests {
         let report = coordinator.refresh(None).await;
 
         assert_eq!(report.provider_results.len(), 2);
-        assert!(report
+        assert_eq!(
+            report
+                .provider_results
+                .iter()
+                .filter(|result| result.status == ProviderRefreshStatus::Ok)
+                .count(),
+            1
+        );
+        let conflict = report
             .provider_results
             .iter()
-            .all(|result| result.status == ProviderRefreshStatus::Ok));
+            .find(|result| result.status == ProviderRefreshStatus::StorageError)
+            .expect("duplicate identity should be reported as a storage error");
+        assert!(conflict
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("is already connected through profile")));
 
         let accounts = storage.accounts().await.unwrap();
-        assert_eq!(accounts.len(), 2);
-        assert!(accounts
-            .iter()
-            .all(|account| account.external_account_id == "same-openai-account"));
-        assert!(accounts
-            .iter()
-            .any(|account| account.profile_id.as_deref() == Some("personal")));
-        assert!(accounts
-            .iter()
-            .any(|account| account.profile_id.as_deref() == Some("work")));
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].external_account_id, "same-openai-account");
 
         let snapshots = storage.latest_usage().await.unwrap();
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 1);
         assert_eq!(
             snapshots
                 .iter()
                 .filter(|snapshot| snapshot.provider_id.as_str() == "codex")
                 .count(),
-            2
+            1
         );
     }
 

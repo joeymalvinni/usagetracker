@@ -1,7 +1,7 @@
 //! Codex collection orchestration and profile management.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -115,6 +115,22 @@ impl CodexCollector {
                     ProviderErrorKind::CredentialsInvalid,
                     "Codex account changed since discovery",
                 ));
+            }
+            for candidate in &self.profiles {
+                if candidate.id == profile.id {
+                    break;
+                }
+                if self
+                    .load_credentials(candidate)
+                    .await
+                    .is_ok_and(|credentials| credentials.account_id == account.external_account_id)
+                {
+                    return Err(duplicate_profile_error(
+                        &account.external_account_id,
+                        &candidate.id,
+                        &profile.id,
+                    ));
+                }
             }
             return Ok((profile.clone(), credentials));
         }
@@ -359,8 +375,25 @@ impl ProviderCollector for CodexCollector {
         }
 
         if !accounts.is_empty() {
-            let mut seen = BTreeSet::new();
-            accounts.retain(|account| seen.insert(account.external_account_id.clone()));
+            let mut canonical_profiles: BTreeMap<String, String> = BTreeMap::new();
+            accounts.retain(|account| {
+                let profile_id = account.profile_id.as_deref().unwrap_or("unknown");
+                if let Some(canonical_profile_id) =
+                    canonical_profiles.get(&account.external_account_id)
+                {
+                    warn!(
+                        external_account_id = account.external_account_id.as_str(),
+                        canonical_profile_id = canonical_profile_id.as_str(),
+                        duplicate_profile_id = profile_id,
+                        "duplicate Codex account ignored; each account can only be connected once"
+                    );
+                    false
+                } else {
+                    canonical_profiles
+                        .insert(account.external_account_id.clone(), profile_id.to_string());
+                    true
+                }
+            });
             return Ok(accounts);
         }
         Err(failures.into_iter().next().unwrap_or_else(|| {
@@ -564,9 +597,23 @@ fn codex_credentials_from_auth_json(contents: &str) -> Result<CodexCredentials, 
 
     Ok(CodexCredentials {
         access_token: tokens.access_token,
-        account_id: tokens.account_id,
+        account_id: tokens.account_id.trim().to_string(),
         account_display_name,
     })
+}
+
+fn duplicate_profile_error(
+    external_account_id: &str,
+    canonical_profile_id: &str,
+    duplicate_profile_id: &str,
+) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::CredentialsInvalid,
+        format!(
+            "Codex account {external_account_id} is already connected by profile \
+             {canonical_profile_id}; duplicate profile {duplicate_profile_id} cannot be collected"
+        ),
+    )
 }
 
 fn codex_display_name_from_id_token(id_token: &str) -> Option<String> {

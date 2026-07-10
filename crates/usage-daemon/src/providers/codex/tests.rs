@@ -7,7 +7,10 @@ use chrono::{Days, FixedOffset, Local, NaiveDate, Utc};
 use serde_json::json;
 use usage_core::{AccountId, ProviderId, UsageWindow, UsageWindowKind};
 
-use crate::providers::{ProviderErrorKind, ProviderUsage};
+use crate::{
+    config::{ProviderConfig, ProviderProfileConfig},
+    providers::{DiscoveredAccount, ProviderCollector, ProviderErrorKind, ProviderUsage},
+};
 
 use super::app_server::{normalize_account_token_usage, CodexAccountActivityExt};
 use super::cost::{
@@ -17,7 +20,7 @@ use super::cost::{
     CodexUsageCostExt, DailyCostSummary,
 };
 use super::rate_limits::{normalize_app_server_usage, normalize_usage};
-use super::{codex_credentials_from_auth_json, PROVIDER_ID};
+use super::{codex_credentials_from_auth_json, CodexCollector, PROVIDER_ID};
 
 #[test]
 fn adds_standard_codex_sessions_only_for_the_designated_owner() {
@@ -164,6 +167,112 @@ fn ignores_invalid_codex_id_token_identity_claims() {
     .unwrap();
 
     assert_eq!(credentials.account_display_name, None);
+}
+
+#[tokio::test]
+async fn discovers_each_codex_identity_once_regardless_of_profile_nickname() {
+    let root = std::env::temp_dir().join(format!(
+        "usagetracker-codex-duplicate-discovery-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let first_auth = root.join("first-auth.json");
+    let duplicate_auth = root.join("duplicate-auth.json");
+    let distinct_auth = root.join("distinct-auth.json");
+    write_codex_auth(&first_auth, " shared-account ");
+    write_codex_auth(&duplicate_auth, "shared-account");
+    write_codex_auth(&distinct_auth, "distinct-account");
+
+    let collector = CodexCollector::new(
+        ProviderConfig {
+            enabled: true,
+            profiles: vec![
+                codex_test_profile("first", "Personal", first_auth),
+                codex_test_profile("duplicate", "Renamed copy", duplicate_auth),
+                codex_test_profile("distinct", "Work", distinct_auth),
+            ],
+            ..ProviderConfig::default()
+        },
+        false,
+    )
+    .unwrap();
+
+    let accounts = collector.discover_accounts().await.unwrap();
+
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0].external_account_id, "shared-account");
+    assert_eq!(accounts[0].profile_id.as_deref(), Some("first"));
+    assert_eq!(accounts[0].display_name.as_deref(), Some("Personal"));
+    assert_eq!(accounts[1].external_account_id, "distinct-account");
+    assert_eq!(accounts[1].profile_id.as_deref(), Some("distinct"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn rejects_collection_through_a_later_duplicate_codex_profile() {
+    let root = std::env::temp_dir().join(format!(
+        "usagetracker-codex-duplicate-collection-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let canonical_auth = root.join("canonical-auth.json");
+    let duplicate_auth = root.join("duplicate-auth.json");
+    write_codex_auth(&canonical_auth, "same-account");
+    write_codex_auth(&duplicate_auth, "same-account");
+
+    let collector = CodexCollector::new(
+        ProviderConfig {
+            enabled: true,
+            profiles: vec![
+                codex_test_profile("canonical", "First nickname", canonical_auth),
+                codex_test_profile("duplicate", "Different nickname", duplicate_auth),
+            ],
+            ..ProviderConfig::default()
+        },
+        false,
+    )
+    .unwrap();
+    let duplicate = DiscoveredAccount {
+        external_account_id: "same-account".to_string(),
+        display_name: Some("Different nickname".to_string()),
+        email: None,
+        profile_id: Some("duplicate".to_string()),
+    };
+
+    let err = match collector.profile_for_account(&duplicate).await {
+        Ok(_) => panic!("duplicate profile unexpectedly passed identity validation"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.kind(), ProviderErrorKind::CredentialsInvalid);
+    assert_eq!(
+        err.short_message(),
+        "Codex account same-account is already connected by profile canonical; duplicate profile duplicate cannot be collected"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn codex_test_profile(id: &str, display_name: &str, auth_path: PathBuf) -> ProviderProfileConfig {
+    ProviderProfileConfig {
+        id: Some(id.to_string()),
+        display_name: Some(display_name.to_string()),
+        auth_path: Some(auth_path),
+        ..ProviderProfileConfig::default()
+    }
+}
+
+fn write_codex_auth(path: &Path, account_id: &str) {
+    std::fs::write(
+        path,
+        serde_json::to_vec(&json!({
+            "tokens": {
+                "access_token": "access-token",
+                "account_id": account_id
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
