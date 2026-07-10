@@ -22,6 +22,8 @@ const DAILY_USAGE_SUMMARY_MIGRATION: &str =
 const SNAPSHOT_RETENTION_INDEXES_MIGRATION: &str =
     include_str!("../migrations/0004_snapshot_retention_indexes.sql");
 const ACCOUNT_IDENTITY_MIGRATION: &str = include_str!("../migrations/0005_account_identity.sql");
+const NOTIFICATION_STATE_MIGRATION: &str =
+    include_str!("../migrations/0006_notification_state.sql");
 const SNAPSHOT_RETENTION_DAYS: u64 = 90;
 const MAX_SNAPSHOTS_PER_ACCOUNT: usize = 10_000;
 const MAX_RAW_PAYLOADS_PER_ACCOUNT: usize = 100;
@@ -43,6 +45,14 @@ pub struct StoredDailyUsageHistory {
     pub bucket_count: usize,
     pub total_tokens: u64,
     pub recent: Vec<StoredDailyUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotificationWindowState {
+    pub last_percent: f64,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub notified_mask: u8,
+    pub last_attempt_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -77,6 +87,7 @@ impl Storage {
         conn.execute_batch(DAILY_USAGE_MIGRATION)?;
         conn.execute_batch(DAILY_USAGE_SUMMARY_MIGRATION)?;
         conn.execute_batch(SNAPSHOT_RETENTION_INDEXES_MIGRATION)?;
+        conn.execute_batch(NOTIFICATION_STATE_MIGRATION)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             connection_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -659,6 +670,86 @@ impl Storage {
                 anyhow::bail!("unknown account: {}", account_id.as_str());
             }
             transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn notification_window_state(
+        &self,
+        account_id: &AccountId,
+        window_id: &str,
+    ) -> anyhow::Result<Option<NotificationWindowState>> {
+        let account_id = account_id.clone();
+        let window_id = window_id.to_string();
+        self.with_connection(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT last_percent, reset_at, notified_mask, last_attempt_at
+                     FROM notification_window_state
+                     WHERE account_id = ?1 AND window_id = ?2",
+                    params![account_id.as_str(), window_id],
+                    |row| {
+                        let reset_at: Option<String> = row.get(1)?;
+                        let last_attempt_at: Option<String> = row.get(3)?;
+                        let notified_mask: i64 = row.get(2)?;
+                        Ok((
+                            row.get::<_, f64>(0)?,
+                            reset_at,
+                            notified_mask,
+                            last_attempt_at,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(last_percent, reset_at, notified_mask, last_attempt_at)| {
+                Ok(NotificationWindowState {
+                    last_percent,
+                    reset_at: reset_at.as_deref().map(parse_time_sql).transpose()?,
+                    notified_mask: u8::try_from(notified_mask)?,
+                    last_attempt_at: last_attempt_at.as_deref().map(parse_time_sql).transpose()?,
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    pub async fn upsert_notification_window_state(
+        &self,
+        account_id: &AccountId,
+        window_id: &str,
+        state: NotificationWindowState,
+    ) -> anyhow::Result<()> {
+        let account_id = account_id.clone();
+        let window_id = window_id.to_string();
+        self.with_connection(move |conn| {
+            conn.execute(
+                "INSERT INTO notification_window_state
+                 (account_id, window_id, last_percent, reset_at, notified_mask, last_attempt_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(account_id, window_id) DO UPDATE SET
+                   last_percent = excluded.last_percent,
+                   reset_at = excluded.reset_at,
+                   notified_mask = excluded.notified_mask,
+                   last_attempt_at = excluded.last_attempt_at",
+                params![
+                    account_id.as_str(),
+                    window_id,
+                    state.last_percent,
+                    state.reset_at.map(|value| value.to_rfc3339()),
+                    i64::from(state.notified_mask),
+                    state.last_attempt_at.map(|value| value.to_rfc3339()),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn clear_notification_window_state(&self) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            conn.execute("DELETE FROM notification_window_state", [])?;
             Ok(())
         })
         .await

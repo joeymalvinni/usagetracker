@@ -61,6 +61,13 @@ final class DaemonSupervisor {
             return URL(fileURLWithPath: override)
         }
 
+        if let bundled = Bundle.main.url(forAuxiliaryExecutable: "usage-daemon"),
+           fm.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+        let bundled = Bundle.main.bundleURL.appending(path: "Contents/MacOS/usage-daemon")
+        if fm.isExecutableFile(atPath: bundled.path) { return bundled }
+
         let roots = candidateRoots()
         for root in roots {
             let candidate = root.appending(path: "target/debug/usage-daemon")

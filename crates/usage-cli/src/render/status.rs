@@ -400,6 +400,7 @@ mod tests {
             &[health],
             &ConfigResponse {
                 poll_interval_seconds: 60,
+                notifications: Default::default(),
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
@@ -446,6 +447,7 @@ mod tests {
             &[],
             &ConfigResponse {
                 poll_interval_seconds: 60,
+                notifications: Default::default(),
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
@@ -481,6 +483,7 @@ mod tests {
             &[health],
             &ConfigResponse {
                 poll_interval_seconds: 60,
+                notifications: Default::default(),
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
@@ -534,6 +537,7 @@ mod tests {
         providers.insert("claude".to_string(), ProviderToggle { enabled: true });
         let config = ConfigResponse {
             poll_interval_seconds: 300,
+            notifications: Default::default(),
             config_path: "/tmp/config.json".to_string(),
             socket_path: "/tmp/usage.sock".to_string(),
             db_path: "/tmp/usage.sqlite3".to_string(),

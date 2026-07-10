@@ -287,6 +287,16 @@ fn render_config_dashboard(config: &ConfigResponse, theme: Theme) -> String {
         "Poll interval",
         &format!("{}s", config.poll_interval_seconds),
     );
+    push_kv(
+        &mut output,
+        theme,
+        "Notifications",
+        if config.notifications.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
     push_kv(&mut output, theme, "Config path", &config.config_path);
     push_kv(&mut output, theme, "Socket path", &config.socket_path);
     push_kv(&mut output, theme, "Database path", &config.db_path);
@@ -326,9 +336,14 @@ fn render_config_compact(config: &ConfigResponse, theme: Theme) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "{} poll={}s · providers [{}] · config {} · socket {} · db {}",
+        "{} poll={}s · notifications={} · providers [{}] · config {} · socket {} · db {}",
         theme.title("Config"),
         config.poll_interval_seconds,
+        if config.notifications.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
         providers,
         config.config_path,
         config.socket_path,
@@ -420,6 +435,7 @@ mod tests {
         let rendered = render_config(
             &ConfigResponse {
                 poll_interval_seconds: 1000,
+                notifications: Default::default(),
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),

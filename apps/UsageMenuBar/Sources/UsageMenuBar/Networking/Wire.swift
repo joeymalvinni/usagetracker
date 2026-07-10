@@ -2,7 +2,7 @@ import Foundation
 
 enum DaemonRequest: Encodable {
     case getUsage, refresh([String]?), getProviderHealth, getAccounts, getConfig
-    case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?)
+    case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notificationsEnabled: Bool?)
     case addProviderAccount(providerId: String, displayName: String?)
     case updateAccount(accountId: String, displayName: String?, hidden: Bool?, collectionEnabled: Bool?)
     case removeAccount(accountId: String)
@@ -19,10 +19,11 @@ enum DaemonRequest: Encodable {
         case .getAccounts: try c.encode("get_accounts", forKey: .method)
         case .getConfig: try c.encode("get_config", forKey: .method)
         case .refresh(let ids): try c.encode("refresh", forKey: .method); try c.encode(ids, forKey: .providers)
-        case .updateConfig(let interval, let providers):
+        case .updateConfig(let interval, let providers, let notificationsEnabled):
             try c.encode("update_config", forKey: .method)
             try c.encodeIfPresent(interval, forKey: .pollIntervalSeconds)
             try c.encodeIfPresent(providers?.mapValues { ProviderToggle(enabled: $0) }, forKey: .providers)
+            try c.encodeIfPresent(notificationsEnabled.map { NotificationConfig(enabled: $0) }, forKey: .notifications)
         case .addProviderAccount(let providerId, let displayName):
             try c.encode("add_provider_account", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
@@ -56,7 +57,7 @@ enum DaemonRequest: Encodable {
         }
     }
     enum K: String, CodingKey {
-        case method, providers, hidden
+        case method, providers, notifications, hidden
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"

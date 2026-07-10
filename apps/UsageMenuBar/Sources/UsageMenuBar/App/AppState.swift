@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UserNotifications
 
 enum DaemonState { case unknown, online, offline }
 
@@ -17,6 +18,9 @@ enum DaemonState { case unknown, online, offline }
     @Published var pendingAccountProviders = Set<String>()
     @Published var pendingAccounts = Set<String>()
     @Published var pendingInterval = false
+    @Published var pendingNotifications = false
+    @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
+    @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
     @Published var providers = [ProviderVM]()
     @Published var settingsProviders = [ProviderVM]()
@@ -106,6 +110,47 @@ enum DaemonState { case unknown, online, offline }
         } catch {
             actionError = describe(error)
         }
+    }
+
+    func setNotificationsEnabled(_ enabled: Bool) async {
+        pendingNotifications = true; defer { pendingNotifications = false }
+        if enabled && notificationAuthorization == .notDetermined {
+            await requestNotificationAuthorizationIfNeeded()
+        }
+        do {
+            config = try await client.updateConfig(
+                pollIntervalSeconds: nil,
+                providers: nil,
+                notificationsEnabled: enabled
+            )
+            if enabled && notificationAuthorization == .denied {
+                actionMessage = "Usage alerts are enabled, but notifications are blocked in macOS System Settings."
+            } else {
+                actionMessage = enabled ? "Usage alerts enabled." : "Usage alerts disabled."
+            }
+            actionError = nil
+            build()
+        } catch {
+            actionError = describe(error)
+        }
+    }
+
+    func refreshNotificationAuthorization() async {
+        guard notificationAuthorizationAvailable else { return }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        notificationAuthorization = settings.authorizationStatus
+    }
+
+    private func requestNotificationAuthorizationIfNeeded() async {
+        guard notificationAuthorizationAvailable else { return }
+        guard notificationAuthorization == .notDetermined else { return }
+        do {
+            _ = try await UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert, .sound])
+        } catch {
+            actionError = "Could not request notification permission: \(describe(error))"
+        }
+        await refreshNotificationAuthorization()
     }
 
     func addProviderAccount(_ providerId: String) async {
@@ -332,6 +377,9 @@ enum DaemonState { case unknown, online, offline }
     private static func defaultSocketPath() -> String {
         ProcessInfo.processInfo.environment["USAGE_TRACKER_SOCKET"] ?? UIPaths.socket.path
     }
+    private static var isRunningFromAppBundle: Bool {
+        Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
+    }
     private func path(from config: ConfigResponse? = nil) -> String {
         config?.socketPath ?? socketPath
     }
@@ -352,6 +400,10 @@ enum DaemonState { case unknown, online, offline }
             health = try await h; snapshots = try await u
             if !all && hasUnknownAccountReferences() { accounts = try await client.accounts() }
             daemon = .online; message = nil; build()
+            await refreshNotificationAuthorization()
+            if config?.notifications.enabled == true {
+                await requestNotificationAuthorizationIfNeeded()
+            }
         } catch {
             if allowDaemonStart, await daemonSupervisor.ensureRunning(socketPath: socketPath) {
                 await load(all: all, allowDaemonStart: false)

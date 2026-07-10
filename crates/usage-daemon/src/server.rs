@@ -201,9 +201,10 @@ impl SocketServer {
             ApiRequest::UpdateConfig {
                 poll_interval_seconds,
                 providers,
+                notifications,
             } => match self
                 .runtime
-                .update_config(poll_interval_seconds, providers)
+                .update_config(poll_interval_seconds, providers, notifications)
                 .await
             {
                 Ok(config) => ApiResponse::Config { config },
@@ -588,6 +589,7 @@ mod tests {
         let storage = crate::storage::Storage::open(&db_path).unwrap();
         let config = crate::config::Config {
             poll_interval_seconds: 30,
+            notifications: Default::default(),
             providers,
             debug_capture_raw_payloads: false,
             paths: crate::config::Paths {
@@ -746,13 +748,14 @@ mod tests {
         wait_for_socket(&env.socket_path).await;
         let response = request_line(
             &env.socket_path,
-            r#"{"method":"update_config","poll_interval_seconds":120,"providers":{"codex":{"enabled":false}}}"#,
+            r#"{"method":"update_config","poll_interval_seconds":120,"providers":{"codex":{"enabled":false}},"notifications":{"enabled":false}}"#,
         )
         .await;
 
         match response {
             ApiResponse::Config { config } => {
                 assert_eq!(config.poll_interval_seconds, 120);
+                assert!(!config.notifications.enabled);
                 assert_eq!(config.enabled_providers, Vec::<ProviderId>::new());
                 assert!(!config.providers.contains_key("codex"));
             }
@@ -762,6 +765,7 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(persisted["poll_interval_seconds"], 120);
+        assert_eq!(persisted["notifications"]["enabled"], false);
         assert_eq!(persisted["providers"]["codex"]["enabled"], false);
 
         server_task.abort();

@@ -18,6 +18,14 @@ struct ProviderPalette {
 enum ProviderBrand {
     @MainActor private static var cache = [String: NSImage?]()
 
+    private static let resources: Bundle = {
+        guard let url = Bundle.main.url(
+            forResource: "UsageMenuBar_UsageMenuBar",
+            withExtension: "bundle"
+        ) else { return .module }
+        return Bundle(url: url) ?? .module
+    }()
+
     private static let fallbackPalette = ProviderPalette(
         chart: Color(red: 0.45, green: 0.52, blue: 0.78),
         progressStart: Color(red: 0.58, green: 0.64, blue: 0.90),
@@ -52,7 +60,7 @@ enum ProviderBrand {
         }
         var image: NSImage?
         if let name,
-           let url = Bundle.module.url(forResource: name, withExtension: "svg", subdirectory: "Resources"),
+           let url = resources.url(forResource: name, withExtension: "svg", subdirectory: "Resources"),
            let loaded = NSImage(contentsOf: url) {
             loaded.isTemplate = true
             image = loaded

@@ -40,6 +40,20 @@ local ai usage reports
 
 ## Usage
 
+With [`just`](https://just.systems/) installed, the common development commands are:
+
+```sh
+just build               # Build Rust and the signed macOS app bundle
+just app                 # Build and launch the signed macOS app bundle
+just daemon              # Run the daemon in the foreground
+just cli status          # Run any CLI command
+just test                # Run all Rust tests
+just check               # Check formatting, Clippy, and tests
+just                     # List every available recipe
+```
+
+Arguments after `just daemon` or `just cli` are passed through to the underlying binary. The existing Cargo and Swift commands below remain available directly.
+
 Build everything:
 
 ```sh
@@ -62,7 +76,9 @@ The Swift menu bar app uses the same daemon socket by default and stores UI-only
 
 - `~/.usagetracker/ui/config.json`
 
-The menu bar app's Settings page can change the polling interval and enable/disable providers while the daemon is running; the daemon applies these immediately and persists them back to `config.json` through its `update_config` API.
+The menu bar app's Settings page can change the polling interval, desktop usage alerts, and providers while the daemon is running; the daemon applies these immediately and persists them back to `config.json` through its `update_config` API.
+
+Desktop alerts are enabled by default. Each account and percentage-based usage window alerts once at 50%, 25%, 10%, 5%, and exhausted, with durable state preventing repeats after a daemon restart. macOS asks for notification permission on first launch. Production macOS builds must embed `usage-daemon` in the signed `UsageMenuBar.app` bundle (the supervisor looks in `Contents/MacOS`) so Notification Center can attribute and authorize it; an unbundled development daemon logs delivery failures without affecting usage collection.
 
 On first launch, the menu app opens a setup assistant for choosing providers and connecting accounts. The same connection tools remain available under **Settings → Connections**:
 
@@ -100,6 +116,9 @@ The config file controls which providers are enabled:
 ```json
 {
   "poll_interval_seconds": 300,
+  "notifications": {
+    "enabled": true
+  },
   "providers": {
     "codex": {
       "enabled": true,

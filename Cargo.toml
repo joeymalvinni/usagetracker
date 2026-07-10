@@ -23,6 +23,7 @@ dirs = "6"
 futures-util = "0.3"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 notify = "8.0.0"
+notify-rust = { version = "4.18.0", features = ["preview-macos-un"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 regex = "1"
 pbkdf2 = "0.12"

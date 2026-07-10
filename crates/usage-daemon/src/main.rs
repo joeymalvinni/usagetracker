@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod health;
 mod local_logs;
+mod notifications;
 mod polling;
 mod providers;
 mod server;
@@ -41,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         db = %config.paths.db.display(),
         socket = %config.paths.socket.display(),
         poll_interval_seconds = config.poll_interval_seconds,
+        notifications_enabled = config.notifications.enabled,
         debug_capture_raw_payloads = config.debug_capture_raw_payloads,
         enabled_providers = ?config.enabled_provider_ids(),
         "daemon config loaded"

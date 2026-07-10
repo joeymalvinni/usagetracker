@@ -20,6 +20,8 @@ pub enum ApiRequest {
         poll_interval_seconds: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         providers: Option<BTreeMap<String, ProviderToggle>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notifications: Option<NotificationConfig>,
     },
     AddProviderAccount {
         provider_id: ProviderId,
@@ -62,6 +64,22 @@ pub enum ApiRequest {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct ProviderToggle {
     pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationConfig {
+    #[serde(default = "default_notifications_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_notifications_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +180,8 @@ pub enum ProviderRefreshStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConfigResponse {
     pub poll_interval_seconds: u64,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
     pub config_path: String,
     pub socket_path: String,
     pub db_path: String,

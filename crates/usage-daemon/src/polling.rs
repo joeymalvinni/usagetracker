@@ -8,6 +8,7 @@ use usage_core::{AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshSt
 
 use crate::{
     health,
+    notifications::NotificationManager,
     providers::{
         DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
         ProviderErrorKind,
@@ -17,14 +18,26 @@ use crate::{
 
 pub struct RefreshCoordinator {
     storage: Storage,
+    notifications: Arc<NotificationManager>,
     providers: RwLock<Vec<Arc<dyn ProviderCollector>>>,
     refresh_lock: Mutex<()>,
 }
 
 impl RefreshCoordinator {
+    #[cfg(test)]
     pub fn new(storage: Storage, providers: Vec<Arc<dyn ProviderCollector>>) -> Self {
+        let notifications = NotificationManager::new(storage.clone(), false);
+        Self::with_notifications(storage, providers, notifications)
+    }
+
+    pub fn with_notifications(
+        storage: Storage,
+        providers: Vec<Arc<dyn ProviderCollector>>,
+        notifications: Arc<NotificationManager>,
+    ) -> Self {
         Self {
             storage,
+            notifications,
             providers: RwLock::new(providers),
             refresh_lock: Mutex::new(()),
         }
@@ -33,6 +46,10 @@ impl RefreshCoordinator {
     pub async fn set_providers(&self, providers: Vec<Arc<dyn ProviderCollector>>) {
         let _guard = self.refresh_lock.lock().await;
         *self.providers.write().await = providers;
+    }
+
+    pub fn notification_manager(&self) -> Arc<NotificationManager> {
+        self.notifications.clone()
     }
 
     pub async fn provider_ids(&self) -> Vec<ProviderId> {
@@ -198,7 +215,7 @@ impl RefreshCoordinator {
                     warnings = result.warnings.len(),
                     "provider usage collection completed"
                 );
-                self.store_success(provider_id, account.id, result).await
+                self.store_success(provider_id, account, result).await
             }
             Err(err) => {
                 warn!(
@@ -218,21 +235,21 @@ impl RefreshCoordinator {
     async fn store_success(
         &self,
         provider_id: ProviderId,
-        account_id: AccountId,
+        account: usage_core::Account,
         result: ProviderCollectionResult,
     ) -> ProviderRefreshResult {
         let daily_usage_days = result.daily_usage.len();
-        let snapshot = result.usage.into_snapshot(account_id.clone());
+        let snapshot = result.usage.into_snapshot(account.id.clone());
         if snapshot.provider_id != provider_id {
             warn!(
                 provider_id = provider_id.as_str(),
                 snapshot_provider_id = snapshot.provider_id.as_str(),
-                account_id = account_id.as_str(),
+                account_id = account.id.as_str(),
                 "provider returned usage for a different provider id"
             );
             return provider_error_result(
                 provider_id,
-                Some(account_id),
+                Some(account.id),
                 ProviderError::new(
                     ProviderErrorKind::Parse,
                     "provider usage payload had a mismatched provider id",
@@ -243,7 +260,7 @@ impl RefreshCoordinator {
         let store_started = Instant::now();
         let ok_health = health::ok(
             provider_id.clone(),
-            account_id.clone(),
+            account.id.clone(),
             result.collection_mode.clone(),
         );
         if let Err(err) = self
@@ -259,21 +276,25 @@ impl RefreshCoordinator {
         {
             warn!(
                 provider_id = provider_id.as_str(),
-                account_id = account_id.as_str(),
+                account_id = account.id.as_str(),
                 error = %err,
                 "failed to atomically store provider refresh"
             );
             return storage_error_result(
                 provider_id,
-                Some(account_id),
+                Some(account.id),
                 format!("failed to store provider refresh: {err}"),
             );
         }
 
+        self.notifications
+            .process_snapshot(&account, &snapshot)
+            .await;
+
         for warning in &result.warnings {
             warn!(
                 provider_id = provider_id.as_str(),
-                account_id = account_id.as_str(),
+                account_id = account.id.as_str(),
                 warning = %warning,
                 "provider refresh warning"
             );
@@ -281,7 +302,7 @@ impl RefreshCoordinator {
 
         info!(
             provider_id = provider_id.as_str(),
-            account_id = account_id.as_str(),
+            account_id = account.id.as_str(),
             windows = snapshot.windows.len(),
             daily_usage_days,
             collection_mode = result.collection_mode.as_str(),
@@ -290,7 +311,7 @@ impl RefreshCoordinator {
         );
         ProviderRefreshResult {
             provider_id,
-            account_id: Some(account_id),
+            account_id: Some(account.id),
             status: ProviderRefreshStatus::Ok,
             collection_mode: Some(result.collection_mode),
             collected_at: Some(snapshot.collected_at),

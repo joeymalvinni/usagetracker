@@ -9,8 +9,8 @@ use std::{
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use usage_core::{
-    default_config_path, default_db_path, default_socket_path, ConfigResponse, ProviderId,
-    ProviderToggle,
+    default_config_path, default_db_path, default_socket_path, ConfigResponse, NotificationConfig,
+    ProviderId, ProviderToggle,
 };
 
 const POLL_INTERVAL_ENV: &str = "USAGE_TRACKER_POLL_INTERVAL_SECONDS";
@@ -19,6 +19,7 @@ const SUPPORTED_PROVIDER_IDS: [&str; 3] = ["codex", "claude", "opencode_go"];
 #[derive(Clone, Debug)]
 pub struct Config {
     pub poll_interval_seconds: u64,
+    pub notifications: NotificationConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub debug_capture_raw_payloads: bool,
     pub paths: Paths,
@@ -36,6 +37,8 @@ pub struct Paths {
 pub struct FileConfig {
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -131,6 +134,7 @@ impl Config {
 
         Ok(Self {
             poll_interval_seconds,
+            notifications: file_config.notifications,
             providers: file_config.providers,
             debug_capture_raw_payloads: file_config.debug_capture_raw_payloads,
             paths: Paths {
@@ -163,6 +167,7 @@ impl Config {
     ) -> ConfigResponse {
         ConfigResponse {
             poll_interval_seconds: self.poll_interval_seconds,
+            notifications: self.notifications,
             config_path: self.paths.config.display().to_string(),
             socket_path: self.paths.socket.display().to_string(),
             db_path: self.paths.db.display().to_string(),
@@ -192,6 +197,7 @@ impl Config {
         &mut self,
         poll_interval_seconds: Option<u64>,
         providers: Option<&BTreeMap<String, ProviderToggle>>,
+        notifications: Option<NotificationConfig>,
     ) -> anyhow::Result<()> {
         if let Some(interval) = poll_interval_seconds {
             if interval == 0 {
@@ -212,12 +218,16 @@ impl Config {
                     .enabled = toggle.enabled;
             }
         }
+        if let Some(notifications) = notifications {
+            self.notifications = notifications;
+        }
         Ok(())
     }
 
     pub fn persist(&self) -> anyhow::Result<()> {
         let file_config = FileConfig {
             poll_interval_seconds: self.poll_interval_seconds,
+            notifications: self.notifications,
             providers: self.providers.clone(),
             debug_capture_raw_payloads: self.debug_capture_raw_payloads,
         };
@@ -444,6 +454,7 @@ impl Default for FileConfig {
         );
         Self {
             poll_interval_seconds: default_poll_interval_seconds(),
+            notifications: NotificationConfig::default(),
             providers,
             debug_capture_raw_payloads: false,
         }
@@ -521,6 +532,14 @@ mod tests {
         let config = FileConfig::default();
         assert!(config.providers["codex"].enabled);
         assert!(!config.providers["claude"].enabled);
+        assert!(config.notifications.enabled);
+    }
+
+    #[test]
+    fn older_config_defaults_notifications_to_enabled() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"poll_interval_seconds":300,"providers":{}}"#).unwrap();
+        assert!(config.notifications.enabled);
     }
 
     #[test]

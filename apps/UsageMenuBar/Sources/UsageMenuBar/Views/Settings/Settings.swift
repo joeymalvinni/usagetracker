@@ -49,6 +49,20 @@ struct Settings: View {
 
                     sectionTitle("General")
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                        LabeledContent("Usage alerts") {
+                            if state.pendingNotifications {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Toggle("", isOn: notificationsBinding)
+                                    .labelsHidden()
+                                    .disabled(state.daemon == .offline)
+                            }
+                        }
+                        if state.config?.notifications.enabled == true {
+                            Text(notificationPermissionText)
+                                .font(Theme.Typography.micro)
+                                .foregroundStyle(state.notificationAuthorization == .denied ? .red : .secondary)
+                        }
                         LabeledContent("Refresh every") {
                             if state.pendingInterval {
                                 ProgressView().controlSize(.small)
@@ -117,6 +131,25 @@ struct Settings: View {
         let current = state.config?.pollIntervalSeconds ?? 300
         if !options.contains(current) { options.append(current); options.sort() }
         return options
+    }
+
+    private var notificationsBinding: Binding<Bool> {
+        Binding(
+            get: { state.config?.notifications.enabled ?? true },
+            set: { enabled in Task { await state.setNotificationsEnabled(enabled) } }
+        )
+    }
+
+    private var notificationPermissionText: String {
+        guard state.notificationAuthorizationAvailable else {
+            return "Native macOS permission is unavailable under swift run; use a bundled app build"
+        }
+        return switch state.notificationAuthorization {
+        case .authorized, .provisional, .ephemeral: "Allowed by macOS"
+        case .denied: "Blocked by macOS; enable Usage in System Settings → Notifications"
+        case .notDetermined: "macOS will ask for permission when alerts are enabled"
+        @unknown default: "Notification permission status unavailable"
+        }
     }
 
     private var intervalBinding: Binding<UInt64> {

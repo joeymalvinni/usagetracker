@@ -10,8 +10,8 @@ struct DaemonClient {
     func health() async throws -> [ProviderHealth] { guard case let .providerHealth(v) = try await send(.getProviderHealth, 3) else { throw DaemonError.badResponse }; return v }
     func usage() async throws -> [UsageSnapshot] { guard case let .usage(v) = try await send(.getUsage, 3) else { throw DaemonError.badResponse }; return v }
     func refresh(_ providers: [String]?) async throws -> RefreshResponse { guard case let .refresh(v) = try await send(.refresh(providers), 30) else { throw DaemonError.badResponse }; return v }
-    func updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?) async throws -> ConfigResponse {
-        guard case let .config(v) = try await send(.updateConfig(pollIntervalSeconds: pollIntervalSeconds, providers: providers), 5) else { throw DaemonError.badResponse }
+    func updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notificationsEnabled: Bool? = nil) async throws -> ConfigResponse {
+        guard case let .config(v) = try await send(.updateConfig(pollIntervalSeconds: pollIntervalSeconds, providers: providers, notificationsEnabled: notificationsEnabled), 5) else { throw DaemonError.badResponse }
         return v
     }
     func addProviderAccount(providerId: String, displayName: String?) async throws -> AddProviderAccountResponse {

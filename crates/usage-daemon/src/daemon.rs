@@ -13,13 +13,14 @@ use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 use usage_core::{
     default_app_dir, Account, AccountId, AddProviderAccountResponse, ConfigResponse,
-    ProviderActionResponse, ProviderId, ProviderProfileResponse, ProviderSetupResponse,
-    ProviderToggle,
+    NotificationConfig, ProviderActionResponse, ProviderId, ProviderProfileResponse,
+    ProviderSetupResponse, ProviderToggle,
 };
 
 use crate::{
     config::{Config, ProviderConfig, ProviderProfileConfig},
     health, local_logs,
+    notifications::NotificationManager,
     polling::RefreshCoordinator,
     providers::{
         claude::{
@@ -42,6 +43,7 @@ pub struct DaemonRuntime {
     config: RwLock<Config>,
     pub storage: Storage,
     pub refresh: Arc<RefreshCoordinator>,
+    notifications: Arc<NotificationManager>,
     poll_interval_tx: watch::Sender<u64>,
 }
 
@@ -75,7 +77,12 @@ impl Daemon {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let storage = Storage::open(&config.paths.db)?;
         let providers = build_providers(&config, &storage).await?;
-        let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), providers));
+        let notifications = NotificationManager::new(storage.clone(), config.notifications.enabled);
+        let refresh = Arc::new(RefreshCoordinator::with_notifications(
+            storage.clone(),
+            providers,
+            notifications.clone(),
+        ));
         let (runtime, poll_interval_rx) = DaemonRuntime::new(config, storage, refresh);
 
         Ok(Self {
@@ -170,11 +177,14 @@ impl DaemonRuntime {
         storage: Storage,
         refresh: Arc<RefreshCoordinator>,
     ) -> (Arc<Self>, watch::Receiver<u64>) {
+        let notifications = refresh.notification_manager();
+        notifications.set_enabled(config.notifications.enabled);
         let (poll_interval_tx, poll_interval_rx) = watch::channel(config.poll_interval_seconds);
         let runtime = Arc::new(Self {
             config: RwLock::new(config),
             storage,
             refresh,
+            notifications,
             poll_interval_tx,
         });
         (runtime, poll_interval_rx)
@@ -211,6 +221,7 @@ impl DaemonRuntime {
         &self,
         poll_interval_seconds: Option<u64>,
         providers: Option<BTreeMap<String, ProviderToggle>>,
+        notifications: Option<NotificationConfig>,
     ) -> anyhow::Result<ConfigResponse> {
         if let Some(providers) = &providers {
             for id in providers.keys() {
@@ -222,12 +233,18 @@ impl DaemonRuntime {
 
         let mut config = self.config.write().await;
         let mut updated_config = config.clone();
-        updated_config.apply_update(poll_interval_seconds, providers.as_ref())?;
+        updated_config.apply_update(poll_interval_seconds, providers.as_ref(), notifications)?;
 
         let collectors = build_providers(&updated_config, &self.storage).await?;
+        let notifications_reenabled =
+            !config.notifications.enabled && updated_config.notifications.enabled;
+        if notifications_reenabled {
+            self.storage.clear_notification_window_state().await?;
+        }
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
+        self.notifications.set_enabled(config.notifications.enabled);
         let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
 
         let poll_interval_seconds = config.poll_interval_seconds;
