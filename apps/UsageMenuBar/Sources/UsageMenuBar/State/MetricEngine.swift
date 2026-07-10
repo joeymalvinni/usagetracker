@@ -251,8 +251,9 @@ struct MetricEngine {
         }
         let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
         let hiddenAccounts = hiddenAccountIds()
-        let filtered = (filter.map { snapshots.filter($0) } ?? snapshots)
-            .filter { !hiddenAccounts.contains($0.accountId) }
+        let visibleSnapshots = snapshots.filter { !hiddenAccounts.contains($0.accountId) }
+        let filtered = filter.map { visibleSnapshots.filter($0) } ?? visibleSnapshots
+        let codexReferenceCostPerToken = codexCostPerToken(in: visibleSnapshots)
         var providerRows = [String: [String: (cost: Double, tokens: UInt64)]]()
         var activeProviderIds = Set<String>()
         var isEstimated = false
@@ -279,11 +280,15 @@ struct MetricEngine {
             let costRows = cost?["by_day"]?.array
                 ?? cost.map { synthesizedTodayRow(from: $0, todayKey: dayKeys.last) }
                 ?? []
+            var pricedDayKeys = Set<String>()
             for rowValue in costRows {
                 guard let row = rowValue.object,
                       let dateKey = row["date"]?.string,
                       dayKeys.contains(dateKey)
                 else { continue }
+                // A zero-cost row is still authoritative (for example, a
+                // no-charge model) and must not be replaced by an estimate.
+                pricedDayKeys.insert(dateKey)
                 let rowCost = row["cost_usd"]?.double ?? 0
                 if rowCost <= 0 { continue }
                 let existing = providerRows[pKey]?[dateKey] ?? (0, 0)
@@ -302,8 +307,20 @@ struct MetricEngine {
                 let rowTokens = row["tokens"]?.uint64 ?? 0
                 if rowTokens == 0 { continue }
                 let existing = providerRows[pKey]?[dateKey] ?? (0, 0)
+                let remoteCostEstimate: Double
+                if providerId == "codex",
+                   !pricedDayKeys.contains(dateKey),
+                   let codexReferenceCostPerToken
+                {
+                    remoteCostEstimate = Double(rowTokens) * codexReferenceCostPerToken
+                    isEstimated = true
+                    isPartial = true
+                    sources.insert("codex_observed_rate_estimate")
+                } else {
+                    remoteCostEstimate = 0
+                }
                 providerRows[pKey, default: [:]][dateKey] = (
-                    existing.cost,
+                    existing.cost + remoteCostEstimate,
                     existing.tokens.saturatingAdd(rowTokens)
                 )
                 activeProviderIds.insert(pKey)
@@ -340,6 +357,27 @@ struct MetricEngine {
             isPartial: isPartial,
             sourceLabel: sourceText.isEmpty ? nil : sourceText
         )
+    }
+
+    /// Codex's account-wide activity API reports aggregate tokens without a
+    /// model or input/output split. Use the visible local logs only as a
+    /// provider-wide pricing reference; activity dates and token counts still
+    /// come exclusively from each account's own snapshot.
+    private func codexCostPerToken(in snapshots: [UsageSnapshot]) -> Double? {
+        var totalCost = 0.0
+        var totalTokens: UInt64 = 0
+        for snapshot in snapshots where snapshot.providerId == "codex" {
+            guard let cost = snapshot.metadata.object?["codex_cost"]?.object,
+                  let costUsd = cost["total_cost_usd"]?.double,
+                  let tokens = cost["total_tokens"]?.uint64,
+                  costUsd > 0,
+                  tokens > 0
+            else { continue }
+            totalCost += costUsd
+            totalTokens = totalTokens.saturatingAdd(tokens)
+        }
+        guard totalCost > 0, totalTokens > 0 else { return nil }
+        return totalCost / Double(totalTokens)
     }
 
     private var knownProviderIds: [String] { ["codex", "claude", "opencode_go"] }
@@ -457,7 +495,8 @@ struct MetricEngine {
             providerName: pretty(providerId),
             absolute: nil,
             percent: nil,
-            status: status
+            status: status,
+            resetAt: expiresAt
         )
     }
 
@@ -512,6 +551,7 @@ struct MetricEngine {
     private func sourceLabel(_ source: String) -> String {
         switch source {
         case "codex_account_usage": return "Codex account history"
+        case "codex_observed_rate_estimate": return "observed local Codex rate"
         case "local_session_logs": return "local Codex logs"
         case "local_project_logs": return "local Claude logs"
         case "opencode_local_sqlite": return "local OpenCode history"
@@ -558,12 +598,13 @@ struct MetricEngine {
             id: w.id,
             label: w.label,
             value: percent.map { "\(Int($0.rounded()))% left" } ?? amount(w.remaining ?? w.used),
-            reset: w.resetAt.map { "resets \(time($0))" } ?? "",
+            reset: w.resetAt.map { "Resets \(DateFormats.expiry.string(from: $0))" } ?? "",
             providerId: providerId,
             providerName: pretty(providerId),
             absolute: absoluteText(w),
             percent: percent,
-            status: status
+            status: status,
+            resetAt: w.resetAt
         )
     }
 
@@ -688,7 +729,6 @@ struct MetricEngine {
         if id == "opencode_go" { return "bolt.horizontal" }
         return "chart.bar"
     }
-    private func time(_ d: Date) -> String { d.formatted(date: .omitted, time: .shortened) }
     private func expiryTime(_ d: Date) -> String {
         DateFormats.expiry.string(from: d)
     }

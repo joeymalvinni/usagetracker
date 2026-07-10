@@ -45,6 +45,7 @@ struct CodexProfile {
     display_name: Option<String>,
     auth_path: PathBuf,
     codex_home: PathBuf,
+    owns_default_activity: bool,
     cost_cache: Arc<Mutex<Option<CodexCostCache>>>,
 }
 
@@ -239,6 +240,24 @@ fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexP
         config.profiles
     };
 
+    let has_direct_default_owner = configured.iter().any(|profile| {
+        profile.enabled
+            && !profile.deleted
+            && profile
+                .codex_home
+                .as_ref()
+                .map(|path| expand_home_path(path.clone()))
+                .unwrap_or_else(|| local_codex_home.to_path_buf())
+                == local_codex_home
+    });
+    let default_activity_owner = (!has_direct_default_owner)
+        .then(|| {
+            configured.iter().position(|profile| {
+                profile.enabled && !profile.deleted && profile.owns_default_codex_activity
+            })
+        })
+        .flatten();
+
     configured
         .into_iter()
         .enumerate()
@@ -258,6 +277,7 @@ fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexP
                 display_name: profile.display_name,
                 auth_path,
                 codex_home,
+                owns_default_activity: default_activity_owner == Some(index),
                 cost_cache: Arc::new(Mutex::new(None)),
             }
         })
@@ -414,16 +434,14 @@ impl ProviderCollector for CodexCollector {
         let cost_cache = profile.cost_cache.clone();
         let local_codex_home = self.local_codex_home.clone();
         let profile_codex_home = profile.codex_home.clone();
-        let profile_account_id = credentials.account_id.clone();
+        let owns_default_activity = profile.owns_default_activity;
         let cost_started = Instant::now();
         debug!("codex local cost scan started");
         match tokio::task::spawn_blocking(move || {
-            let local_account_id = codex_account_id_from_auth_file(&local_codex_home);
             let cost_roots = codex_session_roots(
                 &profile_codex_home,
                 &local_codex_home,
-                local_account_id.as_deref(),
-                &profile_account_id,
+                owns_default_activity,
             );
             scan_codex_local_costs_cached(cost_cache, cost_roots)
         })
@@ -597,10 +615,7 @@ mod cost;
 mod rate_limits;
 
 use app_server::collect_usage_from_app_server;
-use cost::{
-    codex_account_id_from_auth_file, codex_session_roots, scan_codex_local_costs_cached,
-    CodexCostCache, CodexUsageCostExt,
-};
+use cost::{codex_session_roots, scan_codex_local_costs_cached, CodexCostCache, CodexUsageCostExt};
 use rate_limits::{normalize_usage, number_from_json_value};
 
 #[cfg(test)]

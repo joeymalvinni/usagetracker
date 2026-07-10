@@ -9,6 +9,9 @@ struct CostActivityChart: View {
     var providerColor: Color?
     var onSelectProvider: ((String) -> Void)?
 
+    private let axisHeight: CGFloat = 16
+    private let axisLabelWidth: CGFloat = 28
+
     private var maxValue: Double {
         max(1, days.map(total).max() ?? 1)
     }
@@ -22,31 +25,26 @@ struct CostActivityChart: View {
 
     var body: some View {
         GeometryReader { geo in
-            let chartHeight = geo.size.height - 18
-            let baselineY = chartHeight - 2
+            let chartHeight = max(0, geo.size.height - axisHeight)
+            let barSpacing: CGFloat = days.count > 7 ? 2 : 6
             VStack(spacing: 0) {
                 ZStack(alignment: .bottom) {
-                    gridlines(in: geo.size, chartHeight: chartHeight)
-                    HStack(alignment: .bottom, spacing: days.count > 7 ? 2 : 6) {
-                        ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
-                            VStack(spacing: Theme.Spacing.xs - 2) {
-                                ZStack(alignment: .bottom) {
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .fill(.quaternary.opacity(0.30))
-                                    barStack(day: day, maxHeight: chartHeight - 4)
-                                }
-                                .frame(maxWidth: .infinity)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                                Text(label(for: day.date, index: index))
-                                    .font(Theme.Typography.micro.monospacedDigit())
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                    .frame(height: 12)
+                    gridlines(chartHeight: chartHeight)
+                    HStack(alignment: .bottom, spacing: barSpacing) {
+                        ForEach(days) { day in
+                            ZStack(alignment: .bottom) {
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(.quaternary.opacity(0.30))
+                                barStack(day: day, maxHeight: chartHeight - 4)
                             }
+                            .frame(maxWidth: .infinity)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                     }
-                    baseline(at: baselineY)
+                    baseline
                 }
+                .frame(height: chartHeight)
+                axis(width: geo.size.width, barSpacing: barSpacing)
             }
             .onHover { inside in if !inside { hover = nil } }
         }
@@ -74,7 +72,7 @@ struct CostActivityChart: View {
     }
 
     @ViewBuilder
-    private func gridlines(in size: CGSize, chartHeight: CGFloat) -> some View {
+    private func gridlines(chartHeight: CGFloat) -> some View {
         VStack {
             ForEach(0..<4, id: \.self) { i in
                 Rectangle()
@@ -87,13 +85,11 @@ struct CostActivityChart: View {
         }
     }
 
-    @ViewBuilder
-    private func baseline(at y: CGFloat) -> some View {
+    private var baseline: some View {
         Rectangle()
             .fill(.quaternary.opacity(0.60))
             .frame(height: 1)
             .frame(maxWidth: .infinity)
-            .offset(y: y - (y / 2))
     }
 
     private func segmentHeight(_ provider: CostProviderDayVM, maxHeight: CGFloat) -> CGFloat {
@@ -101,13 +97,49 @@ struct CostActivityChart: View {
         return max(3, scaled)
     }
 
-    private func label(for date: Date, index: Int) -> String {
+    private func axis(width: CGFloat, barSpacing: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(Array(days.enumerated()), id: \.element.id) { index, day in
+                if shouldShowLabel(at: index) {
+                    Text(label(for: day.date))
+                        .font(Theme.Typography.micro.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .frame(width: axisLabelWidth)
+                        .position(
+                            x: labelCenter(
+                                at: index,
+                                chartWidth: width,
+                                barSpacing: barSpacing
+                            ),
+                            y: axisHeight / 2
+                        )
+                }
+            }
+        }
+        .frame(width: width, height: axisHeight, alignment: .topLeading)
+    }
+
+    private func shouldShowLabel(at index: Int) -> Bool {
         if days.count <= 7 {
-            return date.formatted(.dateTime.weekday(.narrow))
+            return true
         }
-        if index == 0 || index == days.count - 1 || index % 5 == 0 {
-            return date.formatted(.dateTime.day())
+        return index == 0 || index == days.count - 1 || index % 5 == 0
+    }
+
+    private func label(for date: Date) -> String {
+        if days.count <= 7 {
+            return date.formatted(.dateTime.weekday(.abbreviated))
         }
-        return ""
+        return date.formatted(.dateTime.day())
+    }
+
+    private func labelCenter(at index: Int, chartWidth: CGFloat, barSpacing: CGFloat) -> CGFloat {
+        guard !days.isEmpty else { return chartWidth / 2 }
+        let spacingWidth = barSpacing * CGFloat(max(0, days.count - 1))
+        let barWidth = max(0, (chartWidth - spacingWidth) / CGFloat(days.count))
+        let barCenter = CGFloat(index) * (barWidth + barSpacing) + barWidth / 2
+        let inset = axisLabelWidth / 2
+        return min(max(inset, barCenter), max(inset, chartWidth - inset))
     }
 }

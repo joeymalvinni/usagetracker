@@ -17,11 +17,16 @@ pub(super) const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const TOKEN_REFRESH_SKEW_MS: i64 = 60_000;
 
 pub(super) async fn load_credentials(
+    keychain_service: String,
     keychain_account: String,
     credentials_file_path: PathBuf,
 ) -> Result<ClaudeCredentials, ProviderError> {
     tokio::task::spawn_blocking(move || {
-        load_credentials_from_keychain_or_file(&keychain_account, credentials_file_path)
+        load_credentials_from_keychain_or_file(
+            &keychain_service,
+            &keychain_account,
+            credentials_file_path,
+        )
     })
     .await
     .map_err(|_| {
@@ -35,10 +40,11 @@ pub(super) async fn load_credentials(
 pub(super) async fn save_credentials(credentials: ClaudeCredentials) -> Result<(), ProviderError> {
     match credentials.source.clone() {
         CredentialSource::Keychain => {
+            let keychain_service = credentials.keychain_service.clone();
             let keychain_account = credentials.keychain_account.clone();
             let contents = credentials.raw.to_string();
             tokio::task::spawn_blocking(move || {
-                save_keychain_credentials(&keychain_account, &contents)
+                save_keychain_credentials(&keychain_service, &keychain_account, &contents)
             })
             .await
             .map_err(|_| {
@@ -101,20 +107,24 @@ fn save_file_credentials(path: &Path, contents: &[u8]) -> Result<(), ProviderErr
 }
 
 fn load_credentials_from_keychain_or_file(
+    keychain_service: &str,
     keychain_account: &str,
     credentials_file_path: PathBuf,
 ) -> Result<ClaudeCredentials, ProviderError> {
-    match load_keychain_credentials(keychain_account) {
+    match load_keychain_credentials(keychain_service, keychain_account) {
         Ok(credentials) => Ok(credentials),
         Err(err) if err.kind() == ProviderErrorKind::CredentialsMissing => {
-            load_file_credentials(&credentials_file_path, keychain_account)
+            load_file_credentials(&credentials_file_path, keychain_service, keychain_account)
         }
         Err(err) => Err(err),
     }
 }
 
-fn load_keychain_credentials(keychain_account: &str) -> Result<ClaudeCredentials, ProviderError> {
-    let entry = Entry::new(CLAUDE_KEYCHAIN_SERVICE, keychain_account).map_err(|_| {
+fn load_keychain_credentials(
+    keychain_service: &str,
+    keychain_account: &str,
+) -> Result<ClaudeCredentials, ProviderError> {
+    let entry = Entry::new(keychain_service, keychain_account).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::CredentialsInvalid,
             "failed to create Claude Keychain entry",
@@ -132,11 +142,20 @@ fn load_keychain_credentials(keychain_account: &str) -> Result<ClaudeCredentials
         ),
     })?;
 
-    parse_credentials(&password, keychain_account, CredentialSource::Keychain)
+    parse_credentials(
+        &password,
+        keychain_service,
+        keychain_account,
+        CredentialSource::Keychain,
+    )
 }
 
-fn save_keychain_credentials(keychain_account: &str, contents: &str) -> Result<(), ProviderError> {
-    let entry = Entry::new(CLAUDE_KEYCHAIN_SERVICE, keychain_account).map_err(|_| {
+fn save_keychain_credentials(
+    keychain_service: &str,
+    keychain_account: &str,
+    contents: &str,
+) -> Result<(), ProviderError> {
+    let entry = Entry::new(keychain_service, keychain_account).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::CredentialsInvalid,
             "failed to create Claude Keychain entry",
@@ -152,13 +171,17 @@ fn save_keychain_credentials(keychain_account: &str, contents: &str) -> Result<(
 
 fn load_file_credentials(
     path: &PathBuf,
+    keychain_service: &str,
     keychain_account: &str,
 ) -> Result<ClaudeCredentials, ProviderError> {
     let contents = std::fs::read_to_string(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             ProviderError::new(
                 ProviderErrorKind::CredentialsMissing,
-                "Claude credentials are missing from Keychain and ~/.claude/.credentials.json",
+                format!(
+                    "Claude credentials are missing from Keychain and {}",
+                    path.display()
+                ),
             )
         } else {
             ProviderError::new(
@@ -169,6 +192,7 @@ fn load_file_credentials(
     })?;
     parse_credentials(
         &contents,
+        keychain_service,
         keychain_account,
         CredentialSource::File(path.clone()),
     )
@@ -176,6 +200,7 @@ fn load_file_credentials(
 
 pub(super) fn parse_credentials(
     contents: &str,
+    keychain_service: impl Into<String>,
     keychain_account: impl Into<String>,
     source: CredentialSource,
 ) -> Result<ClaudeCredentials, ProviderError> {
@@ -206,6 +231,7 @@ pub(super) fn parse_credentials(
     }
 
     Ok(ClaudeCredentials {
+        keychain_service: keychain_service.into(),
         keychain_account: keychain_account.into(),
         source,
         access_token: oauth.access_token,
@@ -260,6 +286,7 @@ pub(super) struct TokenRefreshResponse {
 
 #[derive(Clone, Debug)]
 pub(super) struct ClaudeCredentials {
+    pub keychain_service: String,
     pub keychain_account: String,
     source: CredentialSource,
     pub access_token: String,
@@ -352,6 +379,7 @@ mod tests {
                     "rateLimitTier": "standard"
                 }
             }"#,
+            CLAUDE_KEYCHAIN_SERVICE,
             "joey",
             CredentialSource::Keychain,
         )
@@ -371,6 +399,7 @@ mod tests {
     fn rejects_keychain_credentials_without_tokens() {
         let err = parse_credentials(
             r#"{"claudeAiOauth":{"accessToken":"","refreshToken":"refresh","scopes":[]}}"#,
+            CLAUDE_KEYCHAIN_SERVICE,
             "joey",
             CredentialSource::Keychain,
         )
@@ -390,6 +419,7 @@ mod tests {
                     "subscriptionType": "team"
                 }
             }"#,
+            CLAUDE_KEYCHAIN_SERVICE,
             "joey",
             CredentialSource::Keychain,
         )

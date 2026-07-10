@@ -6,7 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use unicode_normalization::UnicodeNormalization;
 use usage_core::ProviderId;
 
 use crate::{
@@ -42,8 +44,10 @@ pub struct ClaudeCollector {
 
 struct ClaudeProfile {
     id: String,
+    keychain_service: String,
     keychain_account: String,
     credentials_file_path: PathBuf,
+    config_dir: Option<PathBuf>,
     credentials_cache: Mutex<Option<ClaudeCredentials>>,
     display_name: Option<String>,
     cli_enabled: bool,
@@ -72,6 +76,7 @@ impl ClaudeCollector {
         }
 
         let credentials = load_credentials(
+            profile.keychain_service.clone(),
             profile.keychain_account.clone(),
             profile.credentials_file_path.clone(),
         )
@@ -141,8 +146,12 @@ impl ClaudeCollector {
         Ok((usage, payload))
     }
 
-    async fn collect_usage_with_cli(&self) -> Result<cli::ClaudeCliUsage, ProviderError> {
-        tokio::task::spawn_blocking(collect_usage_from_cli)
+    async fn collect_usage_with_cli(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<cli::ClaudeCliUsage, ProviderError> {
+        let config_dir = profile.config_dir.clone();
+        tokio::task::spawn_blocking(move || collect_usage_from_cli(config_dir.as_deref()))
             .await
             .map_err(|err| {
                 ProviderError::new(
@@ -218,24 +227,54 @@ fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile
                 .credentials_file
                 .map(expand_home_path)
                 .unwrap_or_else(|| home.join(CLAUDE_CREDENTIALS_FILE));
+            let config_dir = profile.claude_config_dir.map(expand_home_path);
+            let mut project_roots = if profile.project_roots.is_empty() {
+                config_dir
+                    .as_ref()
+                    .map(|root| vec![root.join("projects")])
+                    .unwrap_or_default()
+            } else {
+                profile
+                    .project_roots
+                    .into_iter()
+                    .map(expand_home_path)
+                    .collect()
+            };
+            if profile.owns_default_claude_activity {
+                project_roots.push(home.join(".config/claude/projects"));
+                project_roots.push(home.join(".claude/projects"));
+            }
+            project_roots.sort();
+            project_roots.dedup();
+            let keychain_service = profile
+                .keychain_service
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| config_dir.as_deref().map(keychain_service_for_config_dir))
+                .unwrap_or_else(|| credentials::CLAUDE_KEYCHAIN_SERVICE.to_string());
             Arc::new(ClaudeProfile {
                 id,
+                keychain_service,
                 keychain_account,
                 credentials_file_path,
+                config_dir,
                 credentials_cache: Mutex::new(None),
                 display_name: profile.display_name,
                 cli_enabled: profile
                     .cli_enabled
                     .unwrap_or(!has_explicit_profiles || index == 0),
-                project_roots: profile
-                    .project_roots
-                    .into_iter()
-                    .map(expand_home_path)
-                    .collect(),
+                project_roots,
                 cost_cache: Arc::new(StdMutex::new(None)),
             })
         })
         .collect()
+}
+
+pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> String {
+    let normalized = config_dir.to_string_lossy().nfc().collect::<String>();
+    let digest = Sha256::digest(normalized.as_bytes());
+    let suffix = format!("{digest:x}");
+    format!("{}-{}", credentials::CLAUDE_KEYCHAIN_SERVICE, &suffix[..8])
 }
 
 fn profile_id(configured: Option<&str>, index: usize) -> String {
@@ -313,7 +352,12 @@ impl ProviderCollector for ClaudeCollector {
 
         if !accounts.is_empty() {
             let mut seen = BTreeSet::new();
-            accounts.retain(|account| seen.insert(account.external_account_id.clone()));
+            accounts.retain(|account| {
+                seen.insert((
+                    account.profile_id.clone(),
+                    account.external_account_id.clone(),
+                ))
+            });
             return Ok(accounts);
         }
         Err(failures.into_iter().next().unwrap_or_else(|| {
@@ -332,7 +376,7 @@ impl ProviderCollector for ClaudeCollector {
 
         let mut warnings = Vec::new();
         let (mut usage, collection_mode, raw_payload) = if profile.cli_enabled {
-            match self.collect_usage_with_cli().await {
+            match self.collect_usage_with_cli(&profile).await {
                 Ok(cli_usage) => (
                     cli_usage.usage,
                     CLAUDE_CLI_COLLECTION_MODE.to_string(),
@@ -416,5 +460,151 @@ impl ProviderCollector for ClaudeCollector {
             raw_payload,
             warnings,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::fs;
+
+    #[test]
+    fn matches_claude_codes_custom_config_keychain_service() {
+        assert_eq!(
+            keychain_service_for_config_dir(Path::new("/tmp/claude-profile")),
+            "Claude Code-credentials-7182514b"
+        );
+    }
+
+    #[test]
+    fn explicit_profiles_keep_independent_cli_config_directories() {
+        let home = Path::new("/Users/test");
+        let profiles = claude_profiles(
+            ProviderConfig {
+                enabled: true,
+                profiles: vec![
+                    ProviderProfileConfig {
+                        id: Some("personal".to_string()),
+                        claude_config_dir: Some(PathBuf::from("/profiles/personal")),
+                        ..ProviderProfileConfig::default()
+                    },
+                    ProviderProfileConfig {
+                        id: Some("work".to_string()),
+                        claude_config_dir: Some(PathBuf::from("/profiles/work")),
+                        cli_enabled: Some(true),
+                        ..ProviderProfileConfig::default()
+                    },
+                ],
+                ..ProviderConfig::default()
+            },
+            home,
+        );
+
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles[0].config_dir.as_deref(),
+            Some(Path::new("/profiles/personal"))
+        );
+        assert_eq!(
+            profiles[1].config_dir.as_deref(),
+            Some(Path::new("/profiles/work"))
+        );
+        assert_eq!(
+            profiles[0].project_roots,
+            vec![PathBuf::from("/profiles/personal/projects")]
+        );
+        assert_eq!(
+            profiles[1].project_roots,
+            vec![PathBuf::from("/profiles/work/projects")]
+        );
+        assert_ne!(profiles[0].keychain_service, profiles[1].keychain_service);
+    }
+
+    #[test]
+    fn local_activity_scans_do_not_cross_profile_roots() {
+        let base = std::env::temp_dir().join(format!("claude-activity-{}", uuid::Uuid::new_v4()));
+        let personal = base.join("personal/projects/workspace");
+        let work = base.join("work/projects/workspace");
+        fs::create_dir_all(&personal).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        write_usage_event(&personal.join("personal.jsonl"), "personal", 10, 1);
+        write_usage_event(&work.join("work.jsonl"), "work", 20, 2);
+
+        let personal_scan = scan_claude_local_costs_cached(
+            Arc::new(StdMutex::new(None)),
+            vec![base.join("personal/projects")],
+        )
+        .unwrap();
+        let work_scan = scan_claude_local_costs_cached(
+            Arc::new(StdMutex::new(None)),
+            vec![base.join("work/projects")],
+        )
+        .unwrap();
+        let mut personal_usage = empty_usage();
+        let mut work_usage = empty_usage();
+        merge_local_cost_report(&mut personal_usage, personal_scan.report);
+        merge_local_cost_report(&mut work_usage, work_scan.report);
+
+        assert_eq!(personal_usage.metadata["claude_cost"]["total_tokens"], 11);
+        assert_eq!(work_usage.metadata["claude_cost"]["total_tokens"], 22);
+        assert_eq!(personal_usage.metadata["claude_cost"]["files_scanned"], 1);
+        assert_eq!(work_usage.metadata["claude_cost"]["files_scanned"], 1);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn default_activity_owner_scans_legacy_and_managed_roots() {
+        let home = Path::new("/Users/test");
+        let profiles = claude_profiles(
+            ProviderConfig {
+                enabled: true,
+                profiles: vec![ProviderProfileConfig {
+                    id: Some("personal".to_string()),
+                    claude_config_dir: Some(PathBuf::from("/profiles/personal")),
+                    owns_default_claude_activity: true,
+                    ..ProviderProfileConfig::default()
+                }],
+                ..ProviderConfig::default()
+            },
+            home,
+        );
+
+        assert_eq!(
+            profiles[0].project_roots,
+            vec![
+                PathBuf::from("/Users/test/.claude/projects"),
+                PathBuf::from("/Users/test/.config/claude/projects"),
+                PathBuf::from("/profiles/personal/projects"),
+            ]
+        );
+    }
+
+    fn empty_usage() -> ProviderUsage {
+        ProviderUsage {
+            provider_id: ProviderId::new(PROVIDER_ID),
+            collected_at: Utc::now(),
+            windows: Vec::new(),
+            metadata: json!({}),
+        }
+    }
+
+    fn write_usage_event(path: &Path, id: &str, input_tokens: u64, output_tokens: u64) {
+        let event = json!({
+            "type": "assistant",
+            "timestamp": Utc::now().to_rfc3339(),
+            "requestId": format!("req-{id}"),
+            "message": {
+                "id": format!("msg-{id}"),
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": output_tokens
+                }
+            }
+        });
+        fs::write(path, format!("{event}\n")).unwrap();
     }
 }

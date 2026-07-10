@@ -21,7 +21,10 @@ struct Summary: View {
                     }
                     ForEach(state.providers) { group in
                         if let subAccounts = group.subAccounts, subAccounts.count > 1 {
-                            providerGroupSection(group: group, accounts: subAccounts)
+                            AccountCarouselRow(provider: group, accounts: subAccounts) { accountId in
+                                selection = .provider(group.id, accountId: accountId)
+                            }
+                                .transition(.scale(scale: 0.96).combined(with: .opacity))
                         } else {
                             ProviderRow(provider: group) {
                                 selection = .provider(group.id, accountId: nil)
@@ -41,31 +44,5 @@ struct Summary: View {
         if state.daemon == .offline { return .offline }
         guard let date = state.lastSuccessfulRefresh else { return .custom("waiting for first successful refresh") }
         return .custom("last refreshed \(DateFormats.relative.localizedString(for: date, relativeTo: Date()))")
-    }
-
-    @ViewBuilder
-    private func providerGroupSection(group: ProviderVM, accounts: [ProviderVM]) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            HStack(spacing: Theme.Spacing.sm) {
-                ProviderIcon(id: group.providerId, symbol: group.symbol)
-                    .frame(width: 15, height: 15)
-                Text(group.name)
-                    .font(Theme.Typography.caption.bold())
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(accounts.count) accounts")
-                    .font(Theme.Typography.micro)
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, Theme.Spacing.sm)
-            .padding(.top, Theme.Spacing.xs)
-
-            ForEach(accounts) { account in
-                ProviderRow(provider: account) {
-                    selection = .provider(group.id, accountId: account.accountId)
-                }
-                    .transition(.scale(scale: 0.96).combined(with: .opacity))
-            }
-        }
     }
 }

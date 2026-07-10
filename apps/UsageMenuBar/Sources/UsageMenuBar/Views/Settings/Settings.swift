@@ -237,14 +237,14 @@ private struct ProviderAccountCard: View {
     private var actionLabel: String {
         switch provider.providerId {
         case "codex": accounts.isEmpty ? "Connect account" : "Add account"
-        case "claude": accounts.isEmpty ? "Connect account" : "Reconnect"
+        case "claude": accounts.isEmpty ? "Connect account" : "Add account"
         default: accounts.isEmpty ? "Sign in" : "Reconnect"
         }
     }
 
     private func primaryAction() async {
-        if provider.providerId == "codex" {
-            await state.addCodexAccount()
+        if provider.providerId == "codex" || provider.providerId == "claude" {
+            await state.addProviderAccount(provider.providerId)
         } else {
             await state.repairProvider(provider.providerId, accountId: accounts.first?.id)
         }
@@ -297,6 +297,16 @@ private struct AccountSettingsRow: View {
                     }
                     .controlSize(.small)
                 }
+                if account.providerId == "claude" {
+                    Button {
+                        Task { await state.launchProviderAccount(account.id) }
+                    } label: {
+                        Image(systemName: "terminal")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(state.daemon == .offline || !account.collectionEnabled)
+                    .help("Open a Claude terminal isolated to this account")
+                }
                 Toggle("", isOn: collectionBinding)
                     .labelsHidden()
                     .toggleStyle(.switch)
@@ -340,6 +350,12 @@ private struct AccountSettingsRow: View {
 
     private var accountMenu: some View {
         Menu {
+            if account.providerId == "claude" && !isRemoved {
+                Button("Open Claude session") {
+                    Task { await state.launchProviderAccount(account.id) }
+                }
+                Divider()
+            }
             Button("Rename") {
                 draftName = title
                 showsRename = true
