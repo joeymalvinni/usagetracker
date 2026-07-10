@@ -41,12 +41,21 @@ continuing to serve the last successfully retained account-wide history.
 Local session logs are not authoritative activity because they cover only one computer and do not
 contain an account id. They remain useful for estimating model-level cost. For managed profiles,
 the daemon scans the profile's own session directory and scans the standard `~/.codex/sessions`
-directory only when its active account matches that profile.
+directory only for the profile marked as its durable default-activity owner. On migration, the
+daemon assigns that ownership once when exactly one managed profile's auth matches the default
+Codex auth, then persists it as `owns_default_codex_activity`. Later changes to the default Codex
+login do not move historical local activity between profiles.
 
 Local cost metadata is stored under `metadata.codex_cost` with `estimate=true`, `partial=true`, and
 `complete_lookback=false`. When account activity is available, local token counts are not added to
 account token counts. The Swift dashboard uses account activity for tokens and local logs only for
-estimated spend.
+directly calculated estimated spend. When a Codex account has account-wide daily tokens but no
+local cost row for a day, the dashboard applies the effective cost-per-token observed from that
+provider's visible local Codex logs. Only the scalar pricing reference is shared: dates and token
+counts always come from the selected account's own account-wide history. This gives remote-only
+profiles an approximate cost graph without pretending the account API supplied model or
+input/output details. These values remain labeled as estimated and partial, and zero-cost local
+rows are never replaced by the fallback.
 
 Codex daily buckets and local cost rollups use UTC calendar dates so server-provided `startDate`
 values and timestamped local events share one day boundary. Local events without a valid timestamp

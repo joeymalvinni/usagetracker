@@ -4,6 +4,12 @@ Claude support lives in `crates/usage-daemon/src/providers/claude/`. It is disab
 
 Claude supports multiple configured profiles. Existing configs without `providers.claude.profiles` use one legacy profile: the current `USER` Keychain account, `~/.claude/.credentials.json` as the file fallback, and Claude CLI collection enabled.
 
+Accounts added from the menu bar app use isolated directories under `~/.usagetracker/profiles/claude/<profile-id>`. The daemon launches both login and `/usage` with that profile's `CLAUDE_CONFIG_DIR`, so signing in to another account does not replace an existing Claude login.
+
+Local token and cost activity is also profile-scoped. Use **Open Claude session** from the account row in Settings (the terminal icon) to start Claude with that profile's `CLAUDE_CONFIG_DIR`. Claude then writes JSONL history beneath that profile's `projects` directory, and the daemon watches the managed profile tree for immediate refreshes. A normal `claude` command without the profile environment continues to write under `~/.claude`; only the designated default-activity owner reads that root.
+
+To preserve existing local history during migration, exactly one managed profile may own the shared default roots (`~/.claude/projects` and `~/.config/claude/projects`). When a config has one active managed Claude profile and no existing owner, daemon startup assigns that profile `owns_default_claude_activity: true` and persists the choice. If multiple profiles are active without an owner, the daemon does not guess. Default roots are never assigned to more than one profile, so activity is not duplicated.
+
 Example:
 
 ```json
@@ -18,19 +24,31 @@ Example:
     },
     {
       "id": "work",
-      "keychain_account": "joey-work",
+      "display_name": "Work",
+      "claude_config_dir": "~/.claude-work",
+      "keychain_account": "your-macos-user",
       "credentials_file": "~/.claude-work/.credentials.json",
-      "cli_enabled": false
+      "cli_enabled": true,
+      "project_roots": ["~/.claude-work/projects"],
+      "owns_default_claude_activity": false
     }
   ]
 }
 ```
 
-For explicit multi-profile configs, `cli_enabled` defaults to true only on the first profile. This avoids attributing the same local Claude CLI usage and local project log cost scan to every configured account.
+For explicit multi-profile configs, `cli_enabled` defaults to true only on the first profile. Set `claude_config_dir` and `cli_enabled: true` on each isolated profile to collect each account through its own Claude CLI login. Managed profiles created by the app configure this automatically.
+
+For a manually configured profile, start interactive sessions with the same directory:
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-work claude
+```
+
+The filesystem watcher includes enabled profiles' `project_roots` (or `<claude_config_dir>/projects` when roots are omitted). Each collector scans only its own configured roots, preventing activity from being duplicated across accounts.
 
 ## Credentials
 
-The daemon reads Claude Code OAuth credentials from macOS Keychain first. The Keychain service is hard-coded as `Claude Code-credentials`. The account name is the profile's `keychain_account`. In legacy single-profile mode this is the current `USER` environment variable, falling back to `default` if `USER` is missing.
+The daemon reads Claude Code OAuth credentials from macOS Keychain first. Legacy profiles use the `Claude Code-credentials` service. Claude Code derives a separate service named `Claude Code-credentials-<hash>` when `CLAUDE_CONFIG_DIR` is set; the daemon uses the same SHA-256-based derivation for isolated profiles. `keychain_service` can override the derived service for a manually configured profile. The Keychain item account is the profile's `keychain_account`, normally the current `USER`.
 
 If the Keychain item does not exist, the daemon falls back to the profile's `credentials_file`, defaulting to `~/.claude/.credentials.json`. Other Keychain errors do not fall back to the file because they may mean the item exists but cannot be read.
 
@@ -75,7 +93,7 @@ The `client_id` is hard-coded, and is Claude CLI's public OAuth client ID. It is
 
 The refresh response must include a non-empty `access_token`. If `refresh_token` is missing from the response, the old refresh token is kept. `expires_in` is converted to a new `expiresAt` value in milliseconds. `token_type`, when present, is written back as `tokenType`.
 
-Refreshed credentials are saved back to the same source they came from: Keychain credentials go back into the same Keychain item, and file credentials go back to `~/.claude/.credentials.json`.
+Refreshed credentials are saved back to the same source they came from: Keychain credentials go back into the same profile-specific Keychain item, and file credentials go back to the configured `credentials_file`.
 
 ## Usage Request
 
@@ -164,7 +182,7 @@ Successful OAuth API snapshots use:
 
 ```text
 collection_mode: oauth_usage_api
-keychain_service: Claude Code-credentials
+keychain_service: <legacy or profile-specific service>
 keychain_account: <USER or default>
 subscription_type
 rate_limit_tier
@@ -184,7 +202,7 @@ Claude collection defaults to a bounded Claude Code CLI usage command. It runs:
 claude -p /usage --output-format json --no-session-persistence
 ```
 
-The subprocess removes proxy environment variables so a daemon-level proxy or connectivity problem does not automatically break the local Claude Code usage lookup. The command must exit successfully and return JSON with a string `result` field.
+For an isolated profile, the subprocess receives that profile's `CLAUDE_CONFIG_DIR`. It also removes proxy environment variables so a daemon-level proxy or connectivity problem does not automatically break the local Claude Code usage lookup. The command must exit successfully and return JSON with a string `result` field.
 
 The CLI path parses usage windows from the print-mode `/usage` result. It recognizes single-line output such as:
 

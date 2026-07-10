@@ -132,7 +132,7 @@ The config file controls which providers are enabled:
 
 Codex collection reads credentials from `~/.codex/auth.json`. Claude collection defaults to the local Claude Code terminal usage command, `claude -p /usage --output-format json --no-session-persistence`. If that command fails, Claude collection falls back to Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects quota usage from Anthropic's OAuth usage API.
 
-Codex and Claude can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. For Codex, each profile should point at a separate `codex_home` or `auth_path`. For Claude, each profile can point at a separate Keychain account or credentials file. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile so local Claude CLI usage and local project log costs are not duplicated across accounts.
+Codex and Claude can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. The menu bar app's Add account action creates isolated profile directories for either provider. Use the terminal button on a Claude account row to open an interactive session in that profile; its local activity stays separate and refreshes automatically. For manual configuration, Codex profiles should use separate `codex_home` or `auth_path` values; Claude profiles should use separate `claude_config_dir` values and launch sessions with the matching `CLAUDE_CONFIG_DIR`. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile unless it is set per profile.
 
 Account labels are independent from provider identity. A configured or UI-edited `display_name` is preserved across refreshes and daemon restarts. Profiles without a name receive a short stable label such as `Codex 1`, `Claude 1`, or `OpenCode Go`; provider email addresses are stored separately and shown as secondary identity text.
 
@@ -163,12 +163,17 @@ Example multi-account config:
         {
           "id": "personal",
           "keychain_account": "your-macos-user",
+          "credentials_file": "~/.claude/.credentials.json",
           "cli_enabled": true
         },
         {
           "id": "work",
-          "keychain_account": "joey-work",
-          "cli_enabled": false
+          "display_name": "Work",
+          "keychain_account": "your-macos-user",
+          "claude_config_dir": "~/.claude-work",
+          "credentials_file": "~/.claude-work/.credentials.json",
+          "cli_enabled": true,
+          "project_roots": ["~/.claude-work/projects"]
         }
       ]
     }
@@ -177,7 +182,7 @@ Example multi-account config:
 }
 ```
 
-Quota/rate-limit usage is collected per profile. Local cost estimates are also profile-scoped when separate Codex homes or Claude project roots are configured; otherwise only the CLI-enabled Claude profile receives local log cost enrichment to avoid double-counting.
+Quota/rate-limit usage is collected per profile. Local cost estimates are also profile-scoped when separate Codex homes or Claude project roots are configured. During migration, a sole active managed Claude profile becomes the durable owner of existing `~/.claude` activity; additional profiles only scan their isolated roots, preventing duplication. For Claude's default `~/.claude` profile, omit `claude_config_dir` to retain the legacy unsuffixed Keychain service.
 
 OpenCode Go collection is disabled by default. `opencode_go` tries authenticated web console usage first, then falls back to the local OpenCode SQLite database at `~/.local/share/opencode/opencode.db` when web collection is unavailable. Zen balance is fetched as optional best-effort enrichment.
 

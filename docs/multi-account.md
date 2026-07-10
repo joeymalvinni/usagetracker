@@ -33,7 +33,7 @@
 ## Provider-specific gaps
 
 - Codex: account add/remove should continue to map to isolated profile homes.
-- Claude: add UI support for creating and editing named profiles, including `keychain_account`, credential file, CLI toggle, and project roots.
+- Claude: account creation now maps to isolated managed Claude config directories and Keychain services; advanced profile field editing remains config-file-only.
 - OpenCode Go: decide whether account-level disable should clear cached cookies, disable only collection, or support named cookie/workspace profiles.
 - All providers: expose credential/source diagnostics per account, not only per provider.
 
