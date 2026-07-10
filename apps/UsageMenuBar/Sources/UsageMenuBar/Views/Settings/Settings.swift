@@ -269,9 +269,11 @@ private struct AccountSettingsRow: View {
         HStack(spacing: Theme.Spacing.sm) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(Theme.Typography.body).lineLimit(1)
-                Text(statusText)
+                Text(account.email.map { "\($0) · \(statusText)" } ?? statusText)
                     .font(Theme.Typography.micro)
                     .foregroundStyle(needsSignIn ? .orange : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer(minLength: Theme.Spacing.sm)
 

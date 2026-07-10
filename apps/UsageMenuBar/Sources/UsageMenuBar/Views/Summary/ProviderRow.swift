@@ -7,13 +7,23 @@ struct ProviderRow: View {
     var body: some View {
         Button(action: onSelect) {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
-                    Label {
+                HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                    ProviderIcon(id: provider.providerId, symbol: provider.symbol)
+                        .padding(.top, 2)
+                    VStack(alignment: .leading, spacing: 1) {
                         Text(provider.name)
-                    } icon: {
-                        ProviderIcon(id: provider.providerId, symbol: provider.symbol)
+                            .font(Theme.Typography.headline)
+                            .lineLimit(1)
+                        if let email = provider.accountEmail,
+                           !email.isEmpty,
+                           email.localizedCaseInsensitiveCompare(provider.name) != .orderedSame {
+                            Text(email)
+                                .font(Theme.Typography.micro)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
-                    .font(Theme.Typography.headline)
                     Spacer()
                     NumText(value: provider.primary, font: Theme.Typography.metric)
                     if !provider.sparkline.isEmpty {

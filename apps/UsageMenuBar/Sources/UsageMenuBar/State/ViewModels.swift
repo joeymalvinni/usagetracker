@@ -96,6 +96,7 @@ struct ProviderVM: Identifiable, Equatable {
     var isEstimate: Bool = false
     var isPartial: Bool = false
     var repairRecommended: Bool = false
+    var accountEmail: String? = nil
 }
 
 struct MenuBarProviderVM: Identifiable, Equatable {

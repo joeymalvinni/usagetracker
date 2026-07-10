@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AccountId, ProviderId};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDisplayNameSource {
+    Provider,
+    #[default]
+    Generated,
+    User,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Account {
     pub id: AccountId,
@@ -11,6 +20,10 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub display_name_source: AccountDisplayNameSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
     #[serde(default)]
     pub hidden: bool,
     #[serde(default = "default_collection_enabled")]

@@ -775,7 +775,13 @@ mod tests {
         let env = test_env(providers);
         env.runtime
             .storage
-            .upsert_account(&ProviderId::new("codex"), "external-account", None, None)
+            .upsert_account(
+                &ProviderId::new("codex"),
+                "external-account",
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let server = SocketServer::new(env.runtime.clone());
@@ -947,6 +953,7 @@ mod tests {
                 "external",
                 Some("work"),
                 Some("Old name"),
+                None,
             )
             .await
             .unwrap();
@@ -1007,6 +1014,7 @@ mod tests {
                 "external",
                 Some("work"),
                 Some("Work"),
+                None,
             )
             .await
             .unwrap();

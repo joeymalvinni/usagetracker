@@ -276,6 +276,7 @@ impl ClaudeCredentials {
         self.keychain_account.clone()
     }
 
+    #[cfg(test)]
     pub(super) fn display_name(&self) -> String {
         match self.subscription_type.as_deref() {
             Some(subscription_type) if !subscription_type.trim().is_empty() => {

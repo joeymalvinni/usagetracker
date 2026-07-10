@@ -134,6 +134,8 @@ Codex collection reads credentials from `~/.codex/auth.json`. Claude collection 
 
 Codex and Claude can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. For Codex, each profile should point at a separate `codex_home` or `auth_path`. For Claude, each profile can point at a separate Keychain account or credentials file. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile so local Claude CLI usage and local project log costs are not duplicated across accounts.
 
+Account labels are independent from provider identity. A configured or UI-edited `display_name` is preserved across refreshes and daemon restarts. Profiles without a name receive a short stable label such as `Codex 1`, `Claude 1`, or `OpenCode Go`; provider email addresses are stored separately and shown as secondary identity text.
+
 Example multi-account config:
 
 ```json

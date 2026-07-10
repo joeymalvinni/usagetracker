@@ -67,7 +67,7 @@ pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, Provi
         },
         daily_usage: Vec::new(),
         collection_mode: "opencode_go_local_sqlite".to_string(),
-        account_display_name: Some("OpenCode Go local".to_string()),
+        account_email: None,
         raw_payload: None,
         warnings: Vec::new(),
     })

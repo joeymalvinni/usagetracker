@@ -7,6 +7,8 @@
 - Offer both reversible removal (`hidden = true`, `collection_enabled = false`) and permanent deletion.
 - Keep `GetAccounts` administrative and complete so removed accounts can be re-enabled.
 - Keep normal usage and health surfaces filtered to visible accounts.
+- Keep user labels, generated labels, and provider email addresses as separate account identity fields so refreshes cannot overwrite a rename.
+- Assign short generated labels (`Codex 1`, `Claude 1`, `OpenCode Go`) when a profile has no user label.
 
 ## Collection behavior
 
@@ -37,7 +39,6 @@
 
 ## Production hardening
 
-- Add an explicit account rename API and Settings control.
 - Add account-level refresh actions.
 - Add audit metadata such as `hidden_at`, `disabled_at`, and optional user-facing removal reason.
 - Keep irreversible purge behind a second confirmation and delete related snapshots, raw payloads, and health.

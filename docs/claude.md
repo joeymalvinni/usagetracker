@@ -51,7 +51,7 @@ The expected credential JSON shape is:
 
 `accessToken` and `refreshToken` are required and must be non-empty after trimming. `expiresAt`, `scopes`, `subscriptionType`, and `rateLimitTier` are optional. Invalid JSON, a missing `claudeAiOauth` object, or blank token fields make the provider credentials invalid.
 
-The discovered Claude account id is the profile Keychain account name, not an Anthropic account id from the payload. The display name is the configured profile `display_name` when present, otherwise `Claude <subscriptionType>` when a subscription type exists, otherwise `Claude`.
+The discovered Claude account id is the profile Keychain account name, not an Anthropic account id from the payload. A configured profile `display_name` is treated as a user label. Without one, storage assigns a stable generated label such as `Claude 1`; the subscription type remains usage metadata rather than becoming the account name.
 
 ## Token Refresh
 

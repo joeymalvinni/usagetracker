@@ -161,7 +161,7 @@ impl OpenCodeCollector {
             usage,
             daily_usage: Vec::new(),
             collection_mode: "opencode_go_web_console".to_string(),
-            account_display_name: account_email.or_else(|| Some(workspace_id.clone())),
+            account_email,
             raw_payload: self.capture_raw_payloads.then_some(json!({
                 "workspace_id": workspace_id,
                 "zen_balance_usd": zen_balance,
@@ -505,7 +505,8 @@ impl ProviderCollector for OpenCodeCollector {
         {
             return Ok(vec![DiscoveredAccount {
                 external_account_id: workspace_id.to_string(),
-                display_name: Some(workspace_id.to_string()),
+                display_name: None,
+                email: None,
                 profile_id: None,
             }]);
         }
@@ -514,7 +515,8 @@ impl ProviderCollector for OpenCodeCollector {
             if let Ok(workspace_id) = self.resolve_workspace_id(&cookie_header.value).await {
                 return Ok(vec![DiscoveredAccount {
                     external_account_id: workspace_id.clone(),
-                    display_name: Some(workspace_id),
+                    display_name: None,
+                    email: None,
                     profile_id: None,
                 }]);
             }
@@ -523,7 +525,8 @@ impl ProviderCollector for OpenCodeCollector {
         if local_go_auth_exists() {
             return Ok(vec![DiscoveredAccount {
                 external_account_id: "opencode_go_local".to_string(),
-                display_name: Some("OpenCode Go local".to_string()),
+                display_name: None,
+                email: None,
                 profile_id: None,
             }]);
         }

@@ -112,6 +112,7 @@ struct MetricEngine {
     }
 
     private func providerGroupVM(providerId: String, accounts accountVMs: [ProviderVM]) -> ProviderVM {
+        let singleAccount = accountVMs.count == 1 ? accountVMs[0] : nil
         let allWindows = accountVMs.flatMap(\.windows)
         let allCredits = accountVMs.flatMap(\.credits)
         let allSpend = accountVMs.flatMap(\.spend)
@@ -136,7 +137,7 @@ struct MetricEngine {
             id: providerId,
             providerId: providerId,
             accountId: nil,
-            name: pretty(providerId),
+            name: singleAccount?.name ?? pretty(providerId),
             short: short(providerId),
             symbol: symbol(providerId),
             primary: primary,
@@ -147,7 +148,7 @@ struct MetricEngine {
             windows: allWindows,
             credits: allCredits,
             resetCredits: allResetCredits,
-            account: nil,
+            account: singleAccount?.account,
             healthText: healthText,
             visibleInMenu: visible(providerId),
             enabled: enabled,
@@ -161,7 +162,8 @@ struct MetricEngine {
             errorDetail: worstAccount?.errorDetail,
             isEstimate: accountVMs.contains(where: \.isEstimate),
             isPartial: accountVMs.contains(where: \.isPartial),
-            repairRecommended: worstAccount?.repairRecommended ?? false
+            repairRecommended: worstAccount?.repairRecommended ?? false,
+            accountEmail: singleAccount?.accountEmail
         )
     }
 
@@ -218,7 +220,8 @@ struct MetricEngine {
             errorDetail: h?.lastErrorMessage,
             isEstimate: estimateState(latest).estimated,
             isPartial: estimateState(latest).partial,
-            repairRecommended: h.map(needsCredentialRepair) ?? false
+            repairRecommended: h.map(needsCredentialRepair) ?? false,
+            accountEmail: account?.email
         )
     }
 

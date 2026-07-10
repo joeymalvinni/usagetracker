@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   external_account_id TEXT NOT NULL,
   profile_id TEXT NOT NULL DEFAULT '',
   display_name TEXT,
+  display_name_source TEXT NOT NULL DEFAULT 'generated',
+  email TEXT,
   hidden INTEGER NOT NULL DEFAULT 0,
   collection_enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,

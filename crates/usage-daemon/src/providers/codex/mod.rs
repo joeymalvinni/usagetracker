@@ -255,13 +255,7 @@ fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexP
                 .unwrap_or_else(|| codex_home.join("auth.json"));
             CodexProfile {
                 id,
-                display_name: profile.display_name.or_else(|| {
-                    if index == 0 {
-                        None
-                    } else {
-                        Some(format!("Codex Account {}", index + 1))
-                    }
-                }),
+                display_name: profile.display_name,
                 auth_path,
                 codex_home,
                 cost_cache: Arc::new(Mutex::new(None)),
@@ -319,10 +313,8 @@ impl ProviderCollector for CodexCollector {
             match self.load_credentials(profile).await {
                 Ok(credentials) => accounts.push(DiscoveredAccount {
                     external_account_id: credentials.account_id,
-                    display_name: profile
-                        .display_name
-                        .clone()
-                        .or(credentials.account_display_name),
+                    display_name: profile.display_name.clone(),
+                    email: credentials.account_display_name,
                     profile_id: Some(profile.id.clone()),
                 }),
                 Err(err)
@@ -463,7 +455,7 @@ impl ProviderCollector for CodexCollector {
             usage: collected.usage,
             daily_usage: collected.daily_usage,
             collection_mode: collected.collection_mode,
-            account_display_name: collected.account_display_name,
+            account_email: collected.account_display_name,
             raw_payload: self.capture_raw_payloads.then_some(collected.raw_payload),
             warnings: collected.warnings,
         })

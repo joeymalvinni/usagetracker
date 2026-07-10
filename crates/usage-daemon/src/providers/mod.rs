@@ -57,6 +57,7 @@ pub async fn read_response_body(
 pub struct DiscoveredAccount {
     pub external_account_id: String,
     pub display_name: Option<String>,
+    pub email: Option<String>,
     pub profile_id: Option<String>,
 }
 
@@ -65,7 +66,7 @@ pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
     pub daily_usage: Vec<DailyUsageBucket>,
     pub collection_mode: String,
-    pub account_display_name: Option<String>,
+    pub account_email: Option<String>,
     pub raw_payload: Option<serde_json::Value>,
     pub warnings: Vec<String>,
 }

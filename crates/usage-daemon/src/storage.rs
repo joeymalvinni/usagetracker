@@ -8,7 +8,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use usage_core::{
-    Account, AccountId, ProviderHealth, ProviderHealthStatus, ProviderId, UsageSnapshot,
+    Account, AccountDisplayNameSource, AccountId, ProviderHealth, ProviderHealthStatus, ProviderId,
+    UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -20,6 +21,7 @@ const DAILY_USAGE_SUMMARY_MIGRATION: &str =
     include_str!("../migrations/0003_daily_usage_summary.sql");
 const SNAPSHOT_RETENTION_INDEXES_MIGRATION: &str =
     include_str!("../migrations/0004_snapshot_retention_indexes.sql");
+const ACCOUNT_IDENTITY_MIGRATION: &str = include_str!("../migrations/0005_account_identity.sql");
 const SNAPSHOT_RETENTION_DAYS: u64 = 90;
 const MAX_SNAPSHOTS_PER_ACCOUNT: usize = 10_000;
 const MAX_RAW_PAYLOADS_PER_ACCOUNT: usize = 100;
@@ -71,6 +73,7 @@ impl Storage {
         conn.execute_batch(INITIAL_MIGRATION)?;
         migrate_account_profile_identity(&conn)?;
         migrate_account_lifecycle_state(&conn)?;
+        migrate_account_identity(&conn)?;
         conn.execute_batch(DAILY_USAGE_MIGRATION)?;
         conn.execute_batch(DAILY_USAGE_SUMMARY_MIGRATION)?;
         conn.execute_batch(SNAPSHOT_RETENTION_INDEXES_MIGRATION)?;
@@ -86,59 +89,95 @@ impl Storage {
         external_account_id: &str,
         profile_id: Option<&str>,
         display_name: Option<&str>,
+        email: Option<&str>,
     ) -> anyhow::Result<Account> {
         let provider_id = provider_id.clone();
         let external_account_id = external_account_id.to_string();
         let profile_id = normalized_profile_id(profile_id, &external_account_id);
-        let display_name = display_name.map(ToOwned::to_owned);
+        let display_name = normalized_identity_value(display_name);
+        let email = normalized_email(email).or_else(|| {
+            display_name
+                .as_deref()
+                .filter(|value| looks_like_email(value))
+                .map(ToOwned::to_owned)
+        });
+        let display_name = display_name.filter(|value| !looks_like_email(value));
         self.with_connection(move |conn| {
             let now = Utc::now();
-            let existing: Option<(String, String, bool, bool, Option<String>)> = conn
+            let existing = conn
                 .query_row(
-                    "SELECT id, created_at, hidden, collection_enabled, display_name
-                     FROM accounts
-                     WHERE provider_id = ?1 AND profile_id = ?2",
+                    account_select_sql("WHERE provider_id = ?1 AND profile_id = ?2").as_str(),
                     params![provider_id.as_str(), profile_id.as_str()],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get::<_, i64>(2)? != 0,
-                            row.get::<_, i64>(3)? != 0,
-                            row.get(4)?,
-                        ))
-                    },
+                    account_from_row,
                 )
                 .optional()?;
 
-            let (id, created_at, hidden, collection_enabled, existing_display_name) =
-                existing.unwrap_or_else(|| {
-                    (
-                        Uuid::new_v4().to_string(),
-                        now.to_rfc3339(),
-                        false,
-                        true,
-                        None,
-                    )
-                });
-            let display_name = display_name.or(existing_display_name);
+            let (
+                id,
+                created_at,
+                hidden,
+                collection_enabled,
+                next_display_name,
+                display_name_source,
+                next_email,
+            ) = if let Some(existing) = existing {
+                let (next_display_name, display_name_source) =
+                    if existing.display_name_source == AccountDisplayNameSource::User {
+                        (existing.display_name, AccountDisplayNameSource::User)
+                    } else if let Some(display_name) = display_name {
+                        (Some(display_name), AccountDisplayNameSource::User)
+                    } else {
+                        (existing.display_name, existing.display_name_source)
+                    };
+                (
+                    existing.id.to_string(),
+                    existing.created_at,
+                    existing.hidden,
+                    existing.collection_enabled,
+                    next_display_name,
+                    display_name_source,
+                    email.or(existing.email),
+                )
+            } else {
+                let (next_display_name, display_name_source) = match display_name {
+                    Some(display_name) => (Some(display_name), AccountDisplayNameSource::User),
+                    None => (
+                        Some(generated_account_display_name(conn, provider_id.as_str())?),
+                        AccountDisplayNameSource::Generated,
+                    ),
+                };
+                (
+                    Uuid::new_v4().to_string(),
+                    now,
+                    false,
+                    true,
+                    next_display_name,
+                    display_name_source,
+                    email,
+                )
+            };
             conn.execute(
                 "INSERT INTO accounts
-                 (id, provider_id, external_account_id, profile_id, display_name, hidden, collection_enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(provider_id, profile_id) DO UPDATE SET
-                   external_account_id = excluded.external_account_id,
-                   display_name = excluded.display_name,
-                   updated_at = excluded.updated_at",
+             (id, provider_id, external_account_id, profile_id, display_name, display_name_source,
+              email, hidden, collection_enabled, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(provider_id, profile_id) DO UPDATE SET
+               external_account_id = excluded.external_account_id,
+               display_name = excluded.display_name,
+               display_name_source = excluded.display_name_source,
+               email = excluded.email,
+               updated_at = excluded.updated_at",
                 params![
                     id,
                     provider_id.as_str(),
                     external_account_id.as_str(),
                     profile_id.as_str(),
-                    display_name.as_deref(),
+                    next_display_name.as_deref(),
+                    display_name_source_sql(display_name_source),
+                    next_email.as_deref(),
                     i64::from(hidden),
                     i64::from(collection_enabled),
-                    created_at,
+                    created_at.to_rfc3339(),
                     now.to_rfc3339(),
                 ],
             )?;
@@ -148,10 +187,12 @@ impl Storage {
                 provider_id,
                 external_account_id,
                 profile_id: (!profile_id.is_empty()).then_some(profile_id),
-                display_name,
+                display_name: next_display_name,
+                display_name_source,
+                email: next_email,
                 hidden,
                 collection_enabled,
-                created_at: parse_time(&created_at)?,
+                created_at,
                 updated_at: now,
             })
         })
@@ -377,15 +418,15 @@ impl Storage {
         raw_payload: Option<&serde_json::Value>,
         daily_usage: &[DailyUsageBucket],
         health: &ProviderHealth,
-        display_name: Option<&str>,
+        email: Option<&str>,
     ) -> anyhow::Result<()> {
         let snapshot = snapshot.clone();
         let raw_payload = raw_payload.cloned();
         let daily_usage = daily_usage.to_vec();
         let health = health.clone();
-        let display_name = display_name
+        let email = email
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| looks_like_email(value))
             .map(ToOwned::to_owned);
         self.with_connection(move |conn| {
             let snapshot_id = Uuid::new_v4().to_string();
@@ -488,11 +529,11 @@ impl Storage {
                 "DELETE FROM provider_health WHERE provider_id = ?1 AND account_id = ''",
                 params![snapshot.provider_id.as_str()],
             )?;
-            if let Some(display_name) = display_name {
+            if let Some(email) = email {
                 transaction.execute(
-                    "UPDATE accounts SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE accounts SET email = ?1, updated_at = ?2 WHERE id = ?3",
                     params![
-                        display_name,
+                        email,
                         Utc::now().to_rfc3339(),
                         snapshot.account_id.as_str()
                     ],
@@ -552,18 +593,25 @@ impl Storage {
                 .optional()?
                 .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
             let next_display_name = display_name.as_deref().or(existing.display_name.as_deref());
+            let next_display_name_source = if display_name.is_some() {
+                AccountDisplayNameSource::User
+            } else {
+                existing.display_name_source
+            };
             let next_hidden = hidden.unwrap_or(existing.hidden);
             let next_collection_enabled = collection_enabled.unwrap_or(existing.collection_enabled);
             let updated_at = Utc::now();
             conn.execute(
                 "UPDATE accounts
                  SET display_name = ?1,
-                     hidden = ?2,
-                     collection_enabled = ?3,
-                     updated_at = ?4
-                 WHERE id = ?5",
+                     display_name_source = ?2,
+                     hidden = ?3,
+                     collection_enabled = ?4,
+                     updated_at = ?5
+                 WHERE id = ?6",
                 params![
                     next_display_name,
+                    display_name_source_sql(next_display_name_source),
                     i64::from(next_hidden),
                     i64::from(next_collection_enabled),
                     updated_at.to_rfc3339(),
@@ -572,6 +620,7 @@ impl Storage {
             )?;
             Ok(Account {
                 display_name: next_display_name.map(ToOwned::to_owned),
+                display_name_source: next_display_name_source,
                 hidden: next_hidden,
                 collection_enabled: next_collection_enabled,
                 updated_at,
@@ -824,16 +873,19 @@ fn usage_snapshot_from_row(row: &Row<'_>) -> rusqlite::Result<UsageSnapshot> {
 
 fn account_from_row(row: &Row<'_>) -> rusqlite::Result<Account> {
     let profile_id: String = row.get(3)?;
-    let created_at: String = row.get(7)?;
-    let updated_at: String = row.get(8)?;
+    let display_name_source: String = row.get(5)?;
+    let created_at: String = row.get(9)?;
+    let updated_at: String = row.get(10)?;
     Ok(Account {
         id: AccountId::new(row.get::<_, String>(0)?),
         provider_id: ProviderId::new(row.get::<_, String>(1)?),
         external_account_id: row.get(2)?,
         profile_id: (!profile_id.is_empty()).then_some(profile_id),
         display_name: row.get(4)?,
-        hidden: row.get::<_, i64>(5)? != 0,
-        collection_enabled: row.get::<_, i64>(6)? != 0,
+        display_name_source: display_name_source_from_sql(&display_name_source),
+        email: row.get(6)?,
+        hidden: row.get::<_, i64>(7)? != 0,
+        collection_enabled: row.get::<_, i64>(8)? != 0,
         created_at: parse_time_sql(&created_at)?,
         updated_at: parse_time_sql(&updated_at)?,
     })
@@ -842,7 +894,7 @@ fn account_from_row(row: &Row<'_>) -> rusqlite::Result<Account> {
 fn account_select_sql(suffix: &str) -> String {
     format!(
         "SELECT id, provider_id, external_account_id, profile_id, display_name,
-                hidden, collection_enabled, created_at, updated_at
+                display_name_source, email, hidden, collection_enabled, created_at, updated_at
          FROM accounts
          {suffix}"
     )
@@ -854,6 +906,118 @@ fn normalized_profile_id(profile_id: Option<&str>, external_account_id: &str) ->
         .filter(|value| !value.is_empty())
         .unwrap_or(external_account_id)
         .to_string()
+}
+
+fn normalized_identity_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalized_email(value: Option<&str>) -> Option<String> {
+    normalized_identity_value(value).filter(|value| looks_like_email(value))
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let value = value.trim();
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !value.chars().any(char::is_whitespace)
+}
+
+fn is_legacy_provider_display_name(
+    provider_id: &str,
+    external_account_id: &str,
+    display_name: &str,
+) -> bool {
+    let display_name = display_name.trim();
+    if display_name.eq_ignore_ascii_case(external_account_id.trim()) {
+        return true;
+    }
+    match provider_id {
+        "codex" => {
+            display_name.eq_ignore_ascii_case("Codex")
+                || display_name
+                    .strip_prefix("Codex Account ")
+                    .is_some_and(|suffix| suffix.parse::<u64>().is_ok())
+        }
+        "claude" => {
+            display_name.eq_ignore_ascii_case("Claude")
+                || display_name
+                    .to_ascii_lowercase()
+                    .strip_prefix("claude ")
+                    .is_some_and(|suffix| {
+                        matches!(suffix, "free" | "pro" | "max" | "team" | "enterprise")
+                    })
+        }
+        "opencode_go" => display_name.eq_ignore_ascii_case("OpenCode Go local"),
+        _ => false,
+    }
+}
+
+fn display_name_source_sql(source: AccountDisplayNameSource) -> &'static str {
+    match source {
+        AccountDisplayNameSource::Provider => "provider",
+        AccountDisplayNameSource::Generated => "generated",
+        AccountDisplayNameSource::User => "user",
+    }
+}
+
+fn display_name_source_from_sql(value: &str) -> AccountDisplayNameSource {
+    match value {
+        "user" => AccountDisplayNameSource::User,
+        "provider" => AccountDisplayNameSource::Provider,
+        _ => AccountDisplayNameSource::Generated,
+    }
+}
+
+fn generated_account_display_name(conn: &Connection, provider_id: &str) -> anyhow::Result<String> {
+    let mut stmt = conn.prepare("SELECT display_name FROM accounts WHERE provider_id = ?1")?;
+    let existing = stmt
+        .query_map(params![provider_id], |row| row.get::<_, Option<String>>(0))?
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (base, always_numbered) = match provider_id {
+        "codex" => ("Codex".to_string(), true),
+        "claude" => ("Claude".to_string(), true),
+        "opencode_go" => ("OpenCode Go".to_string(), false),
+        value => (
+            value
+                .split(['_', '-'])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            true,
+        ),
+    };
+
+    if !always_numbered && !existing.iter().any(|name| name.eq_ignore_ascii_case(&base)) {
+        return Ok(base);
+    }
+    for ordinal in 1_u64.. {
+        let candidate = format!("{base} {ordinal}");
+        if !existing
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&candidate))
+        {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("account label ordinal space is exhausted")
 }
 
 fn migrate_account_profile_identity(conn: &Connection) -> anyhow::Result<()> {
@@ -915,6 +1079,77 @@ fn migrate_account_lifecycle_state(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_account_identity(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(accounts)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let had_source = columns.iter().any(|column| column == "display_name_source");
+    let had_email = columns.iter().any(|column| column == "email");
+    if !had_source && !had_email {
+        conn.execute_batch(ACCOUNT_IDENTITY_MIGRATION)?;
+    } else {
+        if !had_source {
+            conn.execute(
+                "ALTER TABLE accounts ADD COLUMN display_name_source TEXT NOT NULL DEFAULT 'provider'",
+                [],
+            )?;
+        }
+        if !had_email {
+            conn.execute("ALTER TABLE accounts ADD COLUMN email TEXT", [])?;
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, provider_id, external_account_id, display_name, email
+         FROM accounts
+         WHERE display_name_source = 'provider'
+         ORDER BY provider_id, created_at, id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (id, provider_id, external_account_id, display_name, email) in rows {
+        let display_name = display_name.and_then(|value| normalized_identity_value(Some(&value)));
+        let legacy_email = display_name
+            .as_deref()
+            .filter(|value| looks_like_email(value))
+            .map(ToOwned::to_owned);
+        let (display_name, source) = match display_name.filter(|value| {
+            !looks_like_email(value)
+                && !is_legacy_provider_display_name(&provider_id, &external_account_id, value)
+        }) {
+            Some(display_name) => (display_name, AccountDisplayNameSource::User),
+            None => (
+                generated_account_display_name(conn, &provider_id)?,
+                AccountDisplayNameSource::Generated,
+            ),
+        };
+        conn.execute(
+            "UPDATE accounts
+             SET display_name = ?1, display_name_source = ?2, email = ?3
+             WHERE id = ?4",
+            params![
+                display_name,
+                display_name_source_sql(source),
+                email.or(legacy_email),
+                id
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn provider_health_from_row(row: &Row<'_>) -> rusqlite::Result<ProviderHealth> {
     let account_id: String = row.get(1)?;
     let last_success_at: Option<String> = row.get(4)?;
@@ -931,10 +1166,6 @@ fn provider_health_from_row(row: &Row<'_>) -> rusqlite::Result<ProviderHealth> {
         last_error_message: row.get(7)?,
         updated_at: parse_time_sql(&updated_at)?,
     })
-}
-
-fn parse_time(value: &str) -> anyhow::Result<DateTime<Utc>> {
-    Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
 fn parse_time_sql(value: &str) -> rusqlite::Result<DateTime<Utc>> {
@@ -987,7 +1218,7 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", None, Some("Codex"))
+            .upsert_account(&provider_id, "external-account", None, Some("Codex"), None)
             .await
             .unwrap();
 
@@ -1085,7 +1316,13 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", Some("personal"), None)
+            .upsert_account(
+                &provider_id,
+                "external-account",
+                Some("personal"),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let first_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 8).unwrap();
@@ -1195,7 +1432,13 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", Some("work"), Some("Work"))
+            .upsert_account(
+                &provider_id,
+                "external-account",
+                Some("work"),
+                Some("Work"),
+                None,
+            )
             .await
             .unwrap();
         storage
@@ -1238,7 +1481,7 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", None, Some("Codex"))
+            .upsert_account(&provider_id, "external-account", None, Some("Codex"), None)
             .await
             .unwrap();
 
@@ -1286,6 +1529,7 @@ mod tests {
                 "same-openai-account",
                 Some("personal"),
                 Some("Personal"),
+                None,
             )
             .await
             .unwrap();
@@ -1295,6 +1539,7 @@ mod tests {
                 "same-openai-account",
                 Some("work"),
                 Some("Work"),
+                None,
             )
             .await
             .unwrap();
@@ -1318,7 +1563,13 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", Some("work"), Some("Work"))
+            .upsert_account(
+                &provider_id,
+                "external-account",
+                Some("work"),
+                Some("Work"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1330,7 +1581,13 @@ mod tests {
         assert!(!updated.collection_enabled);
 
         let rediscovered = storage
-            .upsert_account(&provider_id, "external-account", Some("work"), None)
+            .upsert_account(
+                &provider_id,
+                "external-account",
+                Some("work"),
+                Some("Work"),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(rediscovered.id, account.id);
@@ -1344,7 +1601,7 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", None, None)
+            .upsert_account(&provider_id, "external-account", None, None, None)
             .await
             .unwrap();
         let collected_at = Utc::now();
@@ -1375,7 +1632,7 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
         let account = storage
-            .upsert_account(&provider_id, "external-account", None, None)
+            .upsert_account(&provider_id, "external-account", None, None, None)
             .await
             .unwrap();
         for version in 1..=3 {
@@ -1430,6 +1687,152 @@ mod tests {
             storage.latest_usage().await.unwrap()[0].metadata["version"],
             3
         );
+    }
+
+    #[tokio::test]
+    async fn generated_names_are_short_and_user_names_survive_provider_updates() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("codex");
+        let personal = storage
+            .upsert_account(
+                &provider_id,
+                "personal-id",
+                Some("personal"),
+                None,
+                Some("personal@example.com"),
+            )
+            .await
+            .unwrap();
+        let work = storage
+            .upsert_account(
+                &provider_id,
+                "work-id",
+                Some("work"),
+                None,
+                Some("work@example.com"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(personal.display_name.as_deref(), Some("Codex 1"));
+        assert_eq!(work.display_name.as_deref(), Some("Codex 2"));
+        assert_eq!(personal.email.as_deref(), Some("personal@example.com"));
+        assert_eq!(
+            personal.display_name_source,
+            AccountDisplayNameSource::Generated
+        );
+
+        storage
+            .update_account(&personal.id, Some("Personal"), None, None)
+            .await
+            .unwrap();
+        let rediscovered = storage
+            .upsert_account(
+                &provider_id,
+                "personal-id",
+                Some("personal"),
+                Some("provider replacement"),
+                Some("new-personal@example.com"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rediscovered.display_name.as_deref(), Some("Personal"));
+        assert_eq!(
+            rediscovered.email.as_deref(),
+            Some("new-personal@example.com")
+        );
+        assert_eq!(
+            rediscovered.display_name_source,
+            AccountDisplayNameSource::User
+        );
+    }
+
+    #[tokio::test]
+    async fn user_name_survives_database_reopen_and_rediscovery() {
+        let path = std::env::temp_dir().join(format!("usage-storage-{}.sqlite3", Uuid::new_v4()));
+        let provider_id = ProviderId::new("codex");
+        let storage = Storage::open(&path).unwrap();
+        let account = storage
+            .upsert_account(
+                &provider_id,
+                "external",
+                Some("default"),
+                None,
+                Some("first@example.com"),
+            )
+            .await
+            .unwrap();
+        storage
+            .update_account(&account.id, Some("Personal"), None, None)
+            .await
+            .unwrap();
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        let rediscovered = storage
+            .upsert_account(
+                &provider_id,
+                "external",
+                Some("default"),
+                None,
+                Some("second@example.com"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rediscovered.display_name.as_deref(), Some("Personal"));
+        assert_eq!(rediscovered.email.as_deref(), Some("second@example.com"));
+        assert_eq!(
+            rediscovered.display_name_source,
+            AccountDisplayNameSource::User
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn migrates_legacy_email_names_into_separate_identity_fields() {
+        let path = std::env::temp_dir().join(format!("usage-storage-{}.sqlite3", Uuid::new_v4()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               provider_id TEXT NOT NULL,
+               external_account_id TEXT NOT NULL,
+               profile_id TEXT NOT NULL DEFAULT '',
+               display_name TEXT,
+               hidden INTEGER NOT NULL DEFAULT 0,
+               collection_enabled INTEGER NOT NULL DEFAULT 1,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               UNIQUE(provider_id, profile_id)
+             );",
+        )
+        .unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO accounts
+             (id, provider_id, external_account_id, profile_id, display_name, created_at, updated_at)
+             VALUES ('account', 'codex', 'external', 'default', 'legacy@example.com', ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = Storage::open(&path).unwrap();
+        let account = storage
+            .account(&AccountId::new("account"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.display_name.as_deref(), Some("Codex 1"));
+        assert_eq!(account.email.as_deref(), Some("legacy@example.com"));
+        assert_eq!(
+            account.display_name_source,
+            AccountDisplayNameSource::Generated
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 
     fn test_storage() -> Storage {

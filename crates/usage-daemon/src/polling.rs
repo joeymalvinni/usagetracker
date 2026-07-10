@@ -133,6 +133,7 @@ impl RefreshCoordinator {
                 &discovered.external_account_id,
                 discovered.profile_id.as_deref(),
                 discovered.display_name.as_deref(),
+                discovered.email.as_deref(),
             )
             .await
         {
@@ -252,7 +253,7 @@ impl RefreshCoordinator {
                 result.raw_payload.as_ref(),
                 &result.daily_usage,
                 &ok_health,
-                result.account_display_name.as_deref(),
+                result.account_email.as_deref(),
             )
             .await
         {
@@ -397,7 +398,8 @@ mod tests {
         async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
             Ok(vec![DiscoveredAccount {
                 external_account_id: "external-account".to_string(),
-                display_name: Some("Claude".to_string()),
+                display_name: None,
+                email: None,
                 profile_id: None,
             }])
         }
@@ -434,7 +436,7 @@ mod tests {
                 },
                 daily_usage: Vec::new(),
                 collection_mode: "live".to_string(),
-                account_display_name: None,
+                account_email: Some("claude@example.com".to_string()),
                 raw_payload: None,
                 warnings: vec![],
             })
@@ -454,11 +456,13 @@ mod tests {
                 DiscoveredAccount {
                     external_account_id: "same-openai-account".to_string(),
                     display_name: Some("Personal".to_string()),
+                    email: Some("personal@example.com".to_string()),
                     profile_id: Some("personal".to_string()),
                 },
                 DiscoveredAccount {
                     external_account_id: "same-openai-account".to_string(),
                     display_name: Some("Work".to_string()),
+                    email: Some("work@example.com".to_string()),
                     profile_id: Some("work".to_string()),
                 },
             ])
@@ -479,7 +483,7 @@ mod tests {
                 },
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
-                account_display_name: account.display_name.clone(),
+                account_email: account.email.clone(),
                 raw_payload: None,
                 warnings: vec![],
             })
@@ -502,6 +506,7 @@ mod tests {
                 .map(|profile| DiscoveredAccount {
                     external_account_id: profile.to_string(),
                     display_name: None,
+                    email: None,
                     profile_id: Some(profile.to_string()),
                 })
                 .collect())
@@ -521,7 +526,7 @@ mod tests {
                 },
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
-                account_display_name: None,
+                account_email: None,
                 raw_payload: None,
                 warnings: Vec::new(),
             })
@@ -544,6 +549,7 @@ mod tests {
             Ok(vec![DiscoveredAccount {
                 external_account_id: self.provider_id.to_string(),
                 display_name: None,
+                email: None,
                 profile_id: Some("default".to_string()),
             }])
         }
@@ -561,7 +567,7 @@ mod tests {
                 },
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
-                account_display_name: None,
+                account_email: None,
                 raw_payload: None,
                 warnings: Vec::new(),
             })
@@ -641,7 +647,7 @@ mod tests {
         let storage = test_storage();
         let provider_id = ProviderId::new("claude");
         let account = storage
-            .upsert_account(&provider_id, "external-account", None, Some("Claude"))
+            .upsert_account(&provider_id, "external-account", None, Some("Claude"), None)
             .await
             .unwrap();
         storage
@@ -700,6 +706,28 @@ mod tests {
             .expect("provider refreshes should reach the barrier concurrently");
 
         assert_eq!(report.provider_results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_updates_email_without_clobbering_a_user_name() {
+        let storage = test_storage();
+        let coordinator = RefreshCoordinator::new(storage.clone(), vec![Arc::new(FakeProvider)]);
+        coordinator.refresh(None).await;
+        let account = storage.accounts().await.unwrap().remove(0);
+        storage
+            .update_account(&account.id, Some("My Claude"), None, None)
+            .await
+            .unwrap();
+
+        coordinator.refresh(None).await;
+
+        let account = storage.account(&account.id).await.unwrap().unwrap();
+        assert_eq!(account.display_name.as_deref(), Some("My Claude"));
+        assert_eq!(account.email.as_deref(), Some("claude@example.com"));
+        assert_eq!(
+            account.display_name_source,
+            usage_core::AccountDisplayNameSource::User
+        );
     }
 
     fn test_storage() -> Storage {

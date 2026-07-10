@@ -486,6 +486,8 @@ mod tests {
             external_account_id: "joey".to_string(),
             profile_id: None,
             display_name: Some("Claude team".to_string()),
+            display_name_source: Default::default(),
+            email: None,
             hidden: false,
             collection_enabled: true,
             created_at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),

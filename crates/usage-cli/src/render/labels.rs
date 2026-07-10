@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use usage_core::{Account, UsageSnapshot};
+use usage_core::{Account, AccountDisplayNameSource, UsageSnapshot};
 
 use crate::render::style::{format_provider_name, title_case};
 
@@ -38,19 +38,22 @@ pub(crate) fn identity_labels(
         .or_else(|| account.map(|account| account.provider_id.as_str()));
     let metadata = snapshot.map(|snapshot| &snapshot.metadata);
 
-    let account_label = metadata
-        .and_then(|metadata| metadata_str(metadata, "email"))
-        .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "account_email")))
-        .or_else(|| {
-            metadata
-                .and_then(|metadata| metadata_str(metadata, "account_display_name"))
-                .filter(|value| is_account_label(provider_id, value))
-        })
-        .map(str::to_string)
+    let account_label = account
+        .and_then(|account| account.email.clone())
         .or_else(|| {
             account
-                .and_then(|account| account.display_name.as_deref())
-                .filter(|value| is_account_label(provider_id, value))
+                .filter(|account| account.display_name_source == AccountDisplayNameSource::User)
+                .and_then(|account| account.display_name.clone())
+        })
+        .or_else(|| {
+            metadata
+                .and_then(|metadata| metadata_str(metadata, "email"))
+                .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "account_email")))
+                .or_else(|| {
+                    metadata
+                        .and_then(|metadata| metadata_str(metadata, "account_display_name"))
+                        .filter(|value| is_account_label(provider_id, value))
+                })
                 .map(str::to_string)
         })
         .or_else(|| {
@@ -73,12 +76,7 @@ pub(crate) fn identity_labels(
     let plan = metadata
         .and_then(|metadata| metadata_str(metadata, "plan_type"))
         .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "subscription_type")))
-        .map(plan_label)
-        .or_else(|| {
-            account
-                .and_then(|account| account.display_name.as_deref())
-                .and_then(|value| display_name_plan(provider_id, value))
-        });
+        .map(plan_label);
 
     let profile = nonempty(profile);
     let (identity, identity_kind) = account_label

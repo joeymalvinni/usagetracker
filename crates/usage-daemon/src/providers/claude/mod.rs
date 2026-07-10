@@ -287,10 +287,8 @@ impl ProviderCollector for ClaudeCollector {
             match self.load_credentials(profile).await {
                 Ok(credentials) => accounts.push(DiscoveredAccount {
                     external_account_id: credentials.account_id(),
-                    display_name: profile
-                        .display_name
-                        .clone()
-                        .or_else(|| Some(credentials.display_name())),
+                    display_name: profile.display_name.clone(),
+                    email: None,
                     profile_id: Some(profile.id.clone()),
                 }),
                 Err(err)
@@ -303,6 +301,7 @@ impl ProviderCollector for ClaudeCollector {
                     accounts.push(DiscoveredAccount {
                         external_account_id: profile.keychain_account.clone(),
                         display_name: profile.display_name.clone(),
+                        email: None,
                         profile_id: Some(profile.id.clone()),
                     });
                 }
@@ -413,7 +412,7 @@ impl ProviderCollector for ClaudeCollector {
             usage,
             daily_usage: Vec::new(),
             collection_mode,
-            account_display_name: None,
+            account_email: None,
             raw_payload,
             warnings,
         })
