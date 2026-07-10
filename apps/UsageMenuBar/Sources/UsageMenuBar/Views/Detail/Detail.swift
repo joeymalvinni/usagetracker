@@ -44,7 +44,7 @@ struct Detail: View {
                 if state.showsAlertBanner(activeProvider) {
                     AlertBanner(
                         provider: activeProvider,
-                        actionLabel: activeProvider.repairRecommended ? "Repair login" : "Retry",
+                        actionLabel: activeProvider.repairRecommended ? "Repair login" : "Refresh",
                         onAction: {
                             if activeProvider.repairRecommended {
                                 Task { await state.repairProvider(providerId, accountId: activeProvider.accountId) }
