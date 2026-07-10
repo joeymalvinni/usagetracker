@@ -8,8 +8,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use usage_core::{
-    Account, AccountDisplayNameSource, AccountId, ProviderHealth, ProviderHealthStatus, ProviderId,
-    UsageSnapshot,
+    Account, AccountDisplayNameSource, AccountId, PendingNotification, ProviderHealth,
+    ProviderHealthStatus, ProviderId, UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -24,6 +24,8 @@ const SNAPSHOT_RETENTION_INDEXES_MIGRATION: &str =
 const ACCOUNT_IDENTITY_MIGRATION: &str = include_str!("../migrations/0005_account_identity.sql");
 const NOTIFICATION_STATE_MIGRATION: &str =
     include_str!("../migrations/0006_notification_state.sql");
+const PENDING_NOTIFICATIONS_MIGRATION: &str =
+    include_str!("../migrations/0007_pending_notifications.sql");
 const SNAPSHOT_RETENTION_DAYS: u64 = 90;
 const MAX_SNAPSHOTS_PER_ACCOUNT: usize = 10_000;
 const MAX_RAW_PAYLOADS_PER_ACCOUNT: usize = 100;
@@ -113,6 +115,7 @@ impl Storage {
         conn.execute_batch(DAILY_USAGE_SUMMARY_MIGRATION)?;
         conn.execute_batch(SNAPSHOT_RETENTION_INDEXES_MIGRATION)?;
         conn.execute_batch(NOTIFICATION_STATE_MIGRATION)?;
+        conn.execute_batch(PENDING_NOTIFICATIONS_MIGRATION)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             connection_gate: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -821,6 +824,76 @@ impl Storage {
     pub async fn clear_notification_window_state(&self) -> anyhow::Result<()> {
         self.with_connection(|conn| {
             conn.execute("DELETE FROM notification_window_state", [])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn enqueue_notification(&self, title: &str, body: &str) -> anyhow::Result<()> {
+        let title = title.to_string();
+        let body = body.to_string();
+        self.with_connection(move |conn| {
+            conn.execute(
+                "INSERT INTO pending_notifications (title, body, created_at) VALUES (?1, ?2, ?3)",
+                params![title, body, Utc::now().to_rfc3339()],
+            )?;
+            conn.execute(
+                "DELETE FROM pending_notifications WHERE id NOT IN
+                 (SELECT id FROM pending_notifications ORDER BY id DESC LIMIT 1000)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn pending_notifications(&self) -> anyhow::Result<Vec<PendingNotification>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, title, body, created_at FROM pending_notifications
+                 ORDER BY id ASC LIMIT 100",
+            )?;
+            let notifications = stmt
+                .query_map([], |row| {
+                    let created_at: String = row.get(3)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        created_at,
+                    ))
+                })?
+                .map(|row| {
+                    let (id, title, body, created_at) = row?;
+                    Ok(PendingNotification {
+                        id,
+                        title,
+                        body,
+                        created_at: parse_time_sql(&created_at)?,
+                    })
+                })
+                .collect();
+            notifications
+        })
+        .await
+    }
+
+    pub async fn acknowledge_notifications(&self, ids: &[i64]) -> anyhow::Result<()> {
+        let ids = ids.to_vec();
+        self.with_connection(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            for id in ids {
+                transaction.execute("DELETE FROM pending_notifications WHERE id = ?1", [id])?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn clear_pending_notifications(&self) -> anyhow::Result<()> {
+        self.with_connection(|conn| {
+            conn.execute("DELETE FROM pending_notifications", [])?;
             Ok(())
         })
         .await

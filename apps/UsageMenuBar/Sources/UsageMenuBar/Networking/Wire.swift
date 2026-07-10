@@ -1,7 +1,8 @@
 import Foundation
 
 enum DaemonRequest: Encodable {
-    case getUsage, refresh([String]?), getProviderHealth, getAccounts, getConfig
+    case getUsage, refresh([String]?), getProviderHealth, getAccounts, getConfig, getPendingNotifications
+    case acknowledgeNotifications([Int64])
     case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notificationsEnabled: Bool?)
     case addProviderAccount(providerId: String, displayName: String?)
     case updateAccount(accountId: String, displayName: String?, hidden: Bool?, collectionEnabled: Bool?)
@@ -18,6 +19,10 @@ enum DaemonRequest: Encodable {
         case .getProviderHealth: try c.encode("get_provider_health", forKey: .method)
         case .getAccounts: try c.encode("get_accounts", forKey: .method)
         case .getConfig: try c.encode("get_config", forKey: .method)
+        case .getPendingNotifications: try c.encode("get_pending_notifications", forKey: .method)
+        case .acknowledgeNotifications(let ids):
+            try c.encode("acknowledge_notifications", forKey: .method)
+            try c.encode(ids, forKey: .ids)
         case .refresh(let ids): try c.encode("refresh", forKey: .method); try c.encode(ids, forKey: .providers)
         case .updateConfig(let interval, let providers, let notificationsEnabled):
             try c.encode("update_config", forKey: .method)
@@ -57,7 +62,7 @@ enum DaemonRequest: Encodable {
         }
     }
     enum K: String, CodingKey {
-        case method, providers, notifications, hidden
+        case method, providers, notifications, hidden, ids
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
@@ -80,8 +85,15 @@ struct UsageResponse: Decodable {
     private enum K: String, CodingKey { case snapshots, forecasts }
 }
 
+struct PendingNotification: Decodable {
+    let id: Int64
+    let title: String
+    let body: String
+    let createdAt: Date
+}
+
 enum DaemonResponse: Decodable {
-    case usage(UsageResponse), refresh(RefreshResponse), providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse), addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String), providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
+    case usage(UsageResponse), refresh(RefreshResponse), providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse), pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64]), addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String), providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         switch try c.decode(String.self, forKey: .type) {
@@ -90,6 +102,8 @@ enum DaemonResponse: Decodable {
         case "provider_health": self = .providerHealth(try c.decode([ProviderHealth].self, forKey: .health))
         case "accounts": self = .accounts(try c.decode([Account].self, forKey: .accounts))
         case "config": self = .config(try c.decode(ConfigResponse.self, forKey: .config))
+        case "pending_notifications": self = .pendingNotifications(try c.decode([PendingNotification].self, forKey: .notifications))
+        case "notifications_acknowledged": self = .notificationsAcknowledged(try c.decode([Int64].self, forKey: .ids))
         case "add_provider_account": self = .addProviderAccount(try c.decode(AddProviderAccountResponse.self, forKey: .account))
         case "account": self = .account(try c.decode(Account.self, forKey: .account))
         case "account_deleted": self = .accountDeleted(try c.decode(String.self, forKey: .accountId))
@@ -100,7 +114,7 @@ enum DaemonResponse: Decodable {
         }
     }
     enum K: String, CodingKey {
-        case type, snapshots, health, accounts, config, account, setup, action, error, accountId
+        case type, snapshots, health, accounts, config, notifications, ids, account, setup, action, error, accountId
     }
 }
 

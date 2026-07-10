@@ -16,7 +16,6 @@ dirs.workspace = true
 futures-util.workspace = true
 keyring.workspace = true
 notify.workspace = true
-notify-rust.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 pbkdf2.workspace = true

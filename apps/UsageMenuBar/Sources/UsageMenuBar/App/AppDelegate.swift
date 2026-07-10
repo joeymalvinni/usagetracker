@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import UserNotifications
 
 @main enum UsageMenuBar {
     static func main() {
@@ -12,7 +13,7 @@ import SwiftUI
     }
 }
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private struct ProviderMenuSelection {
         let providerId: String
         let accountId: String?
@@ -26,6 +27,7 @@ import SwiftUI
     private let menuIconSize = NSSize(width: 16, height: 16)
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        UNUserNotificationCenter.current().delegate = self
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configureStatusButton()
 
@@ -41,6 +43,14 @@ import SwiftUI
         Task { await state.bootstrap(); await state.pollLoop() }
 
         if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] == "1" { showDebugWindow() }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
     }
 
     private func configureStatusButton() {
