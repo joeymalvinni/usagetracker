@@ -15,6 +15,7 @@ struct MetricEngine {
     let accounts: [Account]
     let health: [ProviderHealth]
     let snapshots: [UsageSnapshot]
+    let forecasts: [UsageForecast]
     let ui: UIConfig
     let visible: (String) -> Bool
 
@@ -175,12 +176,12 @@ struct MetricEngine {
             .max { $0.collectedAt < $1.collectedAt }
         let h = selectedHealth(providerId: providerId, accountId: accountId)
         let snapshotWindows = latest?.windows ?? []
-        let spend = snapshotWindows.filter(isSpendWindow).map { window($0, providerId: providerId) }
-        var windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: providerId) }
+        let spend = snapshotWindows.filter(isSpendWindow).map { window($0, providerId: providerId, accountId: accountId) }
+        var windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: providerId, accountId: accountId) }
         if let latest, let resetCredits = resetCreditWindow(latest, providerId: providerId) {
             windows.append(resetCredits)
         }
-        let credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: providerId) }
+        let credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: providerId, accountId: accountId) }
         let resetCredits = latest.map(resetCreditDetails) ?? []
         let primary = windows.compactMap(\.percent).min()
         let enabled = isEnabledProvider(providerId) && (account?.collectionEnabled ?? true)
@@ -591,9 +592,12 @@ struct MetricEngine {
         }
     }
 
-    private func window(_ w: UsageWindow, providerId: String) -> WindowVM {
+    private func window(_ w: UsageWindow, providerId: String, accountId: String) -> WindowVM {
         let percent = (w.percentRemaining ?? computedPercent(w)).map { max(0, min(100, $0)) }
         let status: DisplayStatus = percent.map { $0 < 10 ? .critical : ($0 < 25 ? .warning : .normal) } ?? .normal
+        let matchingForecast = forecasts.first {
+            $0.providerId == providerId && $0.accountId == accountId && $0.windowId == w.windowId
+        }
         return WindowVM(
             id: w.id,
             label: w.label,
@@ -604,7 +608,41 @@ struct MetricEngine {
             absolute: absoluteText(w),
             percent: percent,
             status: status,
-            resetAt: w.resetAt
+            resetAt: w.resetAt,
+            forecast: matchingForecast.map(windowForecast)
+        )
+    }
+
+    private func windowForecast(_ forecast: UsageForecast) -> WindowForecastVM {
+        let projectedRemaining = forecast.projectedPercentRemainingAtReset.map {
+            max(0, min(100, $0))
+        }
+        let detail: String
+        if let projectedRemaining {
+            let rounded = Int(projectedRemaining.rounded())
+            if forecast.status == .exhausted {
+                detail = "This limit is exhausted until it resets."
+            } else if rounded == 0 {
+                detail = "At your current pace, you’re projected to have 0% remaining and may run out before this resets."
+            } else {
+                detail = "You’re on pace to have about \(rounded)% remaining when this resets."
+            }
+        } else {
+            switch forecast.status {
+            case .safe, .onPace:
+                detail = "Your usage is on pace to last until this reset. More history is needed to estimate what will remain."
+            case .atRisk:
+                detail = "Your usage is running ahead of pace and may run out before this resets."
+            case .exhausted:
+                detail = "This limit is exhausted until it resets."
+            case .insufficientData:
+                detail = "More usage history is needed to estimate what will remain when this resets."
+            }
+        }
+        return WindowForecastVM(
+            summary: forecast.status.conclusion,
+            detail: detail,
+            projectedPercentRemaining: projectedRemaining
         )
     }
 

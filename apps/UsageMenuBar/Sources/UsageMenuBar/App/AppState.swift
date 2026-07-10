@@ -10,6 +10,7 @@ enum DaemonState { case unknown, online, offline }
     @Published var accounts = [Account]()
     @Published var health = [ProviderHealth]()
     @Published var snapshots = [UsageSnapshot]()
+    @Published var forecasts = [UsageForecast]()
     @Published var refreshing = false
     @Published var message: String?
     @Published var actionMessage: String?
@@ -397,7 +398,10 @@ enum DaemonState { case unknown, online, offline }
             if all { accounts = try await client.accounts() }
             async let h = client.health()
             async let u = client.usage()
-            health = try await h; snapshots = try await u
+            health = try await h
+            let usage = try await u
+            snapshots = usage.snapshots
+            forecasts = usage.forecasts
             if !all && hasUnknownAccountReferences() { accounts = try await client.accounts() }
             daemon = .online; message = nil; build()
             await refreshNotificationAuthorization()
@@ -513,7 +517,7 @@ enum DaemonState { case unknown, online, offline }
         }
     }
     private func build() {
-        let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, ui: ui, visible: uiVisible)
+        let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, forecasts: forecasts, ui: ui, visible: uiVisible)
         providers = engine.providers
         settingsProviders = engine.settingsProviders
         cost = engine.costDashboard

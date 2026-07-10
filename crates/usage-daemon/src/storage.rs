@@ -28,6 +28,31 @@ const SNAPSHOT_RETENTION_DAYS: u64 = 90;
 const MAX_SNAPSHOTS_PER_ACCOUNT: usize = 10_000;
 const MAX_RAW_PAYLOADS_PER_ACCOUNT: usize = 100;
 
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum AccountIdentityConflict {
+    #[error(
+        "{provider_id} profile '{profile_id}' is already connected to external account \
+         '{stored_external_account_id}' and cannot be changed to '{discovered_external_account_id}'"
+    )]
+    ProfileChanged {
+        provider_id: String,
+        profile_id: String,
+        stored_external_account_id: String,
+        discovered_external_account_id: String,
+    },
+    #[error(
+        "{provider_id} external account '{external_account_id}' is already connected through \
+         profile '{existing_profile_id}' and cannot also be connected through profile \
+         '{discovered_profile_id}'"
+    )]
+    DuplicateExternalAccount {
+        provider_id: String,
+        external_account_id: String,
+        existing_profile_id: String,
+        discovered_profile_id: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredDailyUsage {
     pub provider_id: ProviderId,
@@ -122,6 +147,52 @@ impl Storage {
                     account_from_row,
                 )
                 .optional()?;
+
+            let adopting_legacy_identity = existing.as_ref().is_some_and(|existing| {
+                can_adopt_legacy_external_identity(
+                    &provider_id,
+                    &existing.external_account_id,
+                    &external_account_id,
+                )
+            });
+            if let Some(existing) = existing.as_ref() {
+                if existing.external_account_id != external_account_id && !adopting_legacy_identity
+                {
+                    return Err(AccountIdentityConflict::ProfileChanged {
+                        provider_id: provider_id.as_str().to_string(),
+                        profile_id: profile_id.clone(),
+                        stored_external_account_id: existing.external_account_id.clone(),
+                        discovered_external_account_id: external_account_id.clone(),
+                    }
+                    .into());
+                }
+            }
+            if provider_requires_unique_external_account(&provider_id)
+                && (existing.is_none() || adopting_legacy_identity)
+            {
+                let existing_profile_id = conn
+                    .query_row(
+                        "SELECT profile_id FROM accounts
+                         WHERE provider_id = ?1 AND external_account_id = ?2 AND profile_id != ?3
+                         LIMIT 1",
+                        params![
+                            provider_id.as_str(),
+                            external_account_id.as_str(),
+                            profile_id.as_str()
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(existing_profile_id) = existing_profile_id {
+                    return Err(AccountIdentityConflict::DuplicateExternalAccount {
+                        provider_id: provider_id.as_str().to_string(),
+                        external_account_id: external_account_id.clone(),
+                        existing_profile_id,
+                        discovered_profile_id: profile_id.clone(),
+                    }
+                    .into());
+                }
+            }
 
             let (
                 id,
@@ -830,6 +901,39 @@ impl Storage {
         .await
     }
 
+    pub async fn recent_usage(
+        &self,
+        provider_id: &ProviderId,
+        account_id: &AccountId,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<UsageSnapshot>> {
+        let provider_id = provider_id.clone();
+        let account_id = account_id.clone();
+        let limit = limit.min(MAX_SNAPSHOTS_PER_ACCOUNT) as i64;
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT normalized_json FROM usage_snapshots
+                 WHERE provider_id = ?1 AND account_id = ?2 AND collected_at >= ?3
+                 ORDER BY collected_at DESC, rowid DESC
+                 LIMIT ?4",
+            )?;
+            let snapshots = stmt
+                .query_map(
+                    params![
+                        provider_id.as_str(),
+                        account_id.as_str(),
+                        since.to_rfc3339(),
+                        limit,
+                    ],
+                    usage_snapshot_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(snapshots)
+        })
+        .await
+    }
+
     pub async fn accounts(&self) -> anyhow::Result<Vec<Account>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -997,6 +1101,25 @@ fn normalized_profile_id(profile_id: Option<&str>, external_account_id: &str) ->
         .filter(|value| !value.is_empty())
         .unwrap_or(external_account_id)
         .to_string()
+}
+
+fn provider_requires_unique_external_account(provider_id: &ProviderId) -> bool {
+    matches!(provider_id.as_str(), "codex" | "claude")
+}
+
+fn can_adopt_legacy_external_identity(
+    provider_id: &ProviderId,
+    stored_external_account_id: &str,
+    discovered_external_account_id: &str,
+) -> bool {
+    provider_id.as_str() == "claude"
+        && !is_canonical_uuid(stored_external_account_id)
+        && is_canonical_uuid(discovered_external_account_id)
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value)
+        .is_ok_and(|uuid| uuid.hyphenated().to_string().eq_ignore_ascii_case(value))
 }
 
 fn normalized_identity_value(value: Option<&str>) -> Option<String> {
@@ -1300,6 +1423,7 @@ fn health_status_from_sql(value: &str) -> ProviderHealthStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
@@ -1373,6 +1497,54 @@ mod tests {
         assert_eq!(health.len(), 1);
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
         assert_eq!(health[0].collection_mode.as_deref(), Some("test"));
+    }
+
+    #[tokio::test]
+    async fn recent_usage_is_bounded_filtered_and_newest_first() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("codex");
+        let account = storage
+            .upsert_account(&provider_id, "external-account", None, None, None)
+            .await
+            .unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+        let mut snapshot = UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id.clone(),
+            collected_at: start,
+            windows: Vec::new(),
+            metadata: json!({}),
+        };
+        for offset in [0, 5, 10] {
+            snapshot.collected_at = start + chrono::TimeDelta::minutes(offset);
+            storage.insert_snapshot(&snapshot, None).await.unwrap();
+        }
+
+        let recent = storage
+            .recent_usage(
+                &provider_id,
+                &account.id,
+                start + chrono::TimeDelta::minutes(4),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(
+            recent[0].collected_at,
+            start + chrono::TimeDelta::minutes(10)
+        );
+        assert_eq!(
+            recent[1].collected_at,
+            start + chrono::TimeDelta::minutes(5)
+        );
+
+        let limited = storage
+            .recent_usage(&provider_id, &account.id, start, 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].collected_at, recent[0].collected_at);
     }
 
     #[test]
@@ -1610,11 +1782,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_same_external_account_for_distinct_profiles() {
+    async fn rejects_same_codex_external_account_for_distinct_profiles() {
         let storage = test_storage();
         let provider_id = ProviderId::new("codex");
 
-        let personal = storage
+        storage
             .upsert_account(
                 &provider_id,
                 "same-openai-account",
@@ -1624,7 +1796,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let work = storage
+        let error = storage
             .upsert_account(
                 &provider_id,
                 "same-openai-account",
@@ -1633,20 +1805,156 @@ mod tests {
                 None,
             )
             .await
+            .unwrap_err();
+
+        let conflict = error.downcast_ref::<AccountIdentityConflict>().unwrap();
+        assert_eq!(
+            conflict,
+            &AccountIdentityConflict::DuplicateExternalAccount {
+                provider_id: "codex".to_string(),
+                external_account_id: "same-openai-account".to_string(),
+                existing_profile_id: "personal".to_string(),
+                discovered_profile_id: "work".to_string(),
+            }
+        );
+        let accounts = storage.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].profile_id.as_deref(), Some("personal"));
+    }
+
+    #[tokio::test]
+    async fn rejects_changing_the_external_account_for_an_existing_profile() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let first_account_id = "11111111-1111-4111-8111-111111111111";
+        let second_account_id = "22222222-2222-4222-8222-222222222222";
+        let original = storage
+            .upsert_account(
+                &provider_id,
+                first_account_id,
+                Some("personal"),
+                Some("Personal"),
+                None,
+            )
+            .await
             .unwrap();
 
-        assert_ne!(personal.id, work.id);
+        let error = storage
+            .upsert_account(
+                &provider_id,
+                second_account_id,
+                Some("personal"),
+                Some("Renamed"),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<AccountIdentityConflict>(),
+            Some(AccountIdentityConflict::ProfileChanged {
+                stored_external_account_id,
+                discovered_external_account_id,
+                ..
+            }) if stored_external_account_id == first_account_id
+                && discovered_external_account_id == second_account_id
+        ));
+        let stored = storage.account(&original.id).await.unwrap().unwrap();
+        assert_eq!(stored.external_account_id, first_account_id);
+        assert_eq!(stored.display_name.as_deref(), Some("Personal"));
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_legacy_claude_identity_to_an_account_uuid_once() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account_uuid = "11111111-1111-4111-8111-111111111111";
+        let legacy = storage
+            .upsert_account(&provider_id, "macos-user", Some("default"), None, None)
+            .await
+            .unwrap();
+
+        let upgraded = storage
+            .upsert_account(&provider_id, account_uuid, Some("default"), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(upgraded.id, legacy.id);
+        assert_eq!(upgraded.external_account_id, account_uuid);
+        assert_eq!(storage.accounts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_legacy_claude_upgrade_when_uuid_is_connected_elsewhere() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account_uuid = "11111111-1111-4111-8111-111111111111";
+        storage
+            .upsert_account(&provider_id, "macos-user", Some("default"), None, None)
+            .await
+            .unwrap();
+        storage
+            .upsert_account(&provider_id, account_uuid, Some("work"), None, None)
+            .await
+            .unwrap();
+
+        let error = storage
+            .upsert_account(&provider_id, account_uuid, Some("default"), None, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<AccountIdentityConflict>(),
+            Some(&AccountIdentityConflict::DuplicateExternalAccount {
+                provider_id: "claude".to_string(),
+                external_account_id: account_uuid.to_string(),
+                existing_profile_id: "work".to_string(),
+                discovered_profile_id: "default".to_string(),
+            })
+        );
         let accounts = storage.accounts().await.unwrap();
         assert_eq!(accounts.len(), 2);
-        assert!(accounts
-            .iter()
-            .all(|account| account.external_account_id == "same-openai-account"));
-        assert!(accounts
-            .iter()
-            .any(|account| account.profile_id.as_deref() == Some("personal")));
-        assert!(accounts
-            .iter()
-            .any(|account| account.profile_id.as_deref() == Some("work")));
+        assert!(accounts.iter().any(|account| {
+            account.profile_id.as_deref() == Some("default")
+                && account.external_account_id == "macos-user"
+        }));
+    }
+
+    #[tokio::test]
+    async fn legacy_duplicate_accounts_can_still_be_rediscovered() {
+        let storage = test_storage();
+        storage
+            .with_connection(|conn| {
+                let now = Utc::now().to_rfc3339();
+                for profile_id in ["personal", "work"] {
+                    conn.execute(
+                        "INSERT INTO accounts
+                         (id, provider_id, external_account_id, profile_id, display_name,
+                          display_name_source, email, hidden, collection_enabled, created_at,
+                          updated_at)
+                         VALUES (?1, 'codex', 'duplicate', ?2, NULL, 'generated', NULL, 0, 1,
+                                 ?3, ?3)",
+                        params![Uuid::new_v4().to_string(), profile_id, now],
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let rediscovered = storage
+            .upsert_account(
+                &ProviderId::new("codex"),
+                "duplicate",
+                Some("work"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rediscovered.profile_id.as_deref(), Some("work"));
+        assert_eq!(storage.accounts().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

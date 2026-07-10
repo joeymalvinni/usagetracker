@@ -299,8 +299,11 @@ pub(super) struct ClaudeCredentials {
 }
 
 impl ClaudeCredentials {
-    pub(super) fn account_id(&self) -> String {
-        self.keychain_account.clone()
+    pub(super) fn source_label(&self) -> &'static str {
+        match self.source {
+            CredentialSource::Keychain => "keychain",
+            CredentialSource::File(_) => "file",
+        }
     }
 
     #[cfg(test)]
@@ -385,7 +388,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(credentials.account_id(), "joey");
         assert_eq!(credentials.display_name(), "Claude max");
         assert_eq!(credentials.access_token, "access");
         assert_eq!(credentials.refresh_token, "refresh");

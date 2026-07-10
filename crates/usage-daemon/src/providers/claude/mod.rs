@@ -1,13 +1,15 @@
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
 use usage_core::ProviderId;
 
@@ -26,7 +28,7 @@ mod credentials;
 mod normalize;
 
 use cli::collect_usage_from_cli;
-use client::ClaudeApiClient;
+use client::{parse_cached_profile_identity, ClaudeAccountIdentity, ClaudeApiClient};
 use cost::{merge_local_cost_report, scan_claude_local_costs_cached, ClaudeCostCache};
 use credentials::{load_credentials, ClaudeCredentials};
 use normalize::normalize_usage;
@@ -35,6 +37,7 @@ pub const PROVIDER_ID: &str = "claude";
 const CLAUDE_CREDENTIALS_FILE: &str = ".claude/.credentials.json";
 const CLAUDE_COLLECTION_MODE: &str = "oauth_usage_api";
 const CLAUDE_CLI_COLLECTION_MODE: &str = "claude_cli_usage";
+const CLAUDE_CLI_PARSE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub struct ClaudeCollector {
     profiles: Vec<Arc<ClaudeProfile>>,
@@ -48,6 +51,7 @@ struct ClaudeProfile {
     keychain_account: String,
     credentials_file_path: PathBuf,
     config_dir: Option<PathBuf>,
+    identity_file_path: PathBuf,
     credentials_cache: Mutex<Option<ClaudeCredentials>>,
     display_name: Option<String>,
     cli_enabled: bool,
@@ -86,6 +90,20 @@ impl ClaudeCollector {
         Ok(credentials)
     }
 
+    async fn reload_credentials(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<ClaudeCredentials, ProviderError> {
+        let credentials = load_credentials(
+            profile.keychain_service.clone(),
+            profile.keychain_account.clone(),
+            profile.credentials_file_path.clone(),
+        )
+        .await?;
+        *profile.credentials_cache.lock().await = Some(credentials.clone());
+        Ok(credentials)
+    }
+
     async fn refresh_credentials(
         &self,
         profile: &ClaudeProfile,
@@ -107,6 +125,35 @@ impl ClaudeCollector {
         profile: &ClaudeProfile,
     ) -> Result<ClaudeCredentials, ProviderError> {
         let credentials = self.load_credentials(profile).await?;
+        let access_token_expired = credentials.is_expired();
+        debug!(
+            provider_id = PROVIDER_ID,
+            profile_id = profile.id,
+            credential_source = credentials.source_label(),
+            access_token_expired,
+            token_expires_at_ms = credentials.expires_at_ms,
+            "Claude OAuth credentials loaded"
+        );
+        if access_token_expired {
+            info!(
+                provider_id = PROVIDER_ID,
+                profile_id = profile.id,
+                recovery_stage = "oauth_expired_token_refresh",
+                credential_source = credentials.source_label(),
+                token_expires_at_ms = credentials.expires_at_ms,
+                "Claude OAuth access token is expired; refreshing credentials"
+            );
+            self.refresh_credentials(profile, credentials).await
+        } else {
+            Ok(credentials)
+        }
+    }
+
+    async fn reload_with_auto_refresh(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<ClaudeCredentials, ProviderError> {
+        let credentials = self.reload_credentials(profile).await?;
         if credentials.is_expired() {
             self.refresh_credentials(profile, credentials).await
         } else {
@@ -114,21 +161,60 @@ impl ClaudeCollector {
         }
     }
 
+    async fn fetch_profile_identity(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<ClaudeAccountIdentity, ProviderError> {
+        let mut credentials = self.reload_with_auto_refresh(profile).await?;
+        let fetched = match self.api.fetch_profile(&credentials).await {
+            Err(err) if err.kind() == ProviderErrorKind::Unauthorized => {
+                credentials = self.refresh_credentials(profile, credentials).await?;
+                self.api.fetch_profile(&credentials).await
+            }
+            result => result,
+        };
+
+        match fetched {
+            Ok(identity) => Ok(identity),
+            Err(primary) if !should_use_cached_identity(&credentials.scopes) => Err(primary),
+            Err(primary) => match tokio::fs::read(&profile.identity_file_path).await {
+                Ok(body) => parse_cached_profile_identity(&body).map_err(|cached| {
+                    ProviderError::new(
+                        primary.kind(),
+                        format!(
+                            "{}; cached Claude account identity was invalid ({})",
+                            primary.short_message(),
+                            cached.short_message()
+                        ),
+                    )
+                }),
+                Err(err) => Err(ProviderError::new(
+                    primary.kind(),
+                    format!(
+                        "{}; cached Claude account identity could not be read from {} ({err})",
+                        primary.short_message(),
+                        profile.identity_file_path.display()
+                    ),
+                )),
+            },
+        }
+    }
+
     async fn collect_usage_with_api(
         &self,
         profile: &ClaudeProfile,
-        account: &DiscoveredAccount,
     ) -> Result<(ProviderUsage, serde_json::Value), ProviderError> {
         let mut credentials = self.load_with_auto_refresh(profile).await?;
-        if credentials.account_id() != account.external_account_id {
-            return Err(ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "Claude account changed since discovery",
-            ));
-        }
-
         let payload = match self.api.fetch_usage(&credentials).await {
             Err(err) if err.kind() == ProviderErrorKind::Unauthorized => {
+                warn!(
+                    provider_id = PROVIDER_ID,
+                    profile_id = profile.id,
+                    recovery_stage = "oauth_usage_unauthorized_refresh",
+                    error_code = err.kind().as_str(),
+                    error = %err,
+                    "Claude OAuth usage rejected the access token; refreshing credentials and retrying"
+                );
                 credentials = self.refresh_credentials(profile, credentials).await?;
                 match self.api.fetch_usage(&credentials).await {
                     Ok(payload) => payload,
@@ -150,15 +236,74 @@ impl ClaudeCollector {
         &self,
         profile: &ClaudeProfile,
     ) -> Result<cli::ClaudeCliUsage, ProviderError> {
+        let started = Instant::now();
+        let first = self.collect_usage_with_cli_once(profile).await;
+        let Err(err) = &first else {
+            return first;
+        };
+        if err.kind() != ProviderErrorKind::Parse {
+            return first;
+        }
+
+        warn!(
+            provider_id = PROVIDER_ID,
+            profile_id = profile.id,
+            attempt = 1,
+            max_attempts = 2,
+            recovery_stage = "cli_retry_scheduled",
+            retry_delay_ms = CLAUDE_CLI_PARSE_RETRY_DELAY.as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            error_code = err.kind().as_str(),
+            error = %err,
+            "Claude CLI usage parse failed; retrying before OAuth fallback"
+        );
+        tokio::time::sleep(CLAUDE_CLI_PARSE_RETRY_DELAY).await;
+        let retry_started = Instant::now();
+        let retry = self.collect_usage_with_cli_once(profile).await;
+        match &retry {
+            Ok(usage) => info!(
+                provider_id = PROVIDER_ID,
+                profile_id = profile.id,
+                recovery_stage = "cli_retry_recovered",
+                recovered_attempt = 2,
+                windows = usage.usage.windows.len(),
+                retry_elapsed_ms = retry_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "Claude CLI usage recovered after retry"
+            ),
+            Err(retry_err) => warn!(
+                provider_id = PROVIDER_ID,
+                profile_id = profile.id,
+                recovery_stage = "cli_retry_exhausted",
+                attempts = 2,
+                retry_elapsed_ms = retry_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                initial_error_code = err.kind().as_str(),
+                initial_error = %err,
+                retry_error_code = retry_err.kind().as_str(),
+                retry_error = %retry_err,
+                "Claude CLI usage retry exhausted"
+            ),
+        }
+        retry
+    }
+
+    async fn collect_usage_with_cli_once(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<cli::ClaudeCliUsage, ProviderError> {
         let config_dir = profile.config_dir.clone();
-        tokio::task::spawn_blocking(move || collect_usage_from_cli(config_dir.as_deref()))
-            .await
-            .map_err(|err| {
-                ProviderError::new(
-                    ProviderErrorKind::ProviderUnavailable,
-                    format!("Claude CLI usage task failed: {err}"),
-                )
-            })?
+        let profile_id = profile.id.clone();
+        tokio::task::spawn_blocking(move || {
+            collect_usage_from_cli(config_dir.as_deref(), &profile_id)
+        })
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("Claude CLI usage task failed: {err}"),
+            )
+        })?
     }
 
     async fn profile_for_account(
@@ -178,16 +323,10 @@ impl ClaudeCollector {
                     )
                 });
         }
-        self.profiles
-            .iter()
-            .find(|profile| profile.keychain_account == account.external_account_id)
-            .cloned()
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::CredentialsInvalid,
-                    "Claude account changed since discovery",
-                )
-            })
+        Err(ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Claude account is missing its profile identity",
+        ))
     }
 }
 
@@ -228,6 +367,10 @@ fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile
                 .map(expand_home_path)
                 .unwrap_or_else(|| home.join(CLAUDE_CREDENTIALS_FILE));
             let config_dir = profile.claude_config_dir.map(expand_home_path);
+            let identity_file_path = config_dir
+                .as_ref()
+                .map(|root| root.join(".claude.json"))
+                .unwrap_or_else(|| home.join(".claude.json"));
             let mut project_roots = if profile.project_roots.is_empty() {
                 config_dir
                     .as_ref()
@@ -258,6 +401,7 @@ fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile
                 keychain_account,
                 credentials_file_path,
                 config_dir,
+                identity_file_path,
                 credentials_cache: Mutex::new(None),
                 display_name: profile.display_name,
                 cli_enabled: profile
@@ -306,6 +450,36 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
     path
 }
 
+fn should_use_cli_fallback(cli_enabled: bool, api_error: &ProviderError) -> bool {
+    cli_enabled && api_error.kind() != ProviderErrorKind::RateLimited
+}
+
+fn deduplicate_accounts(accounts: &mut Vec<DiscoveredAccount>) {
+    let mut canonical_profiles: BTreeMap<String, String> = BTreeMap::new();
+    accounts.retain(|account| {
+        let profile_id = account.profile_id.as_deref().unwrap_or("unknown");
+        if let Some(canonical_profile_id) = canonical_profiles.get(&account.external_account_id) {
+            warn!(
+                external_account_id = account.external_account_id.as_str(),
+                canonical_profile_id = canonical_profile_id.as_str(),
+                duplicate_profile_id = profile_id,
+                "duplicate Claude account ignored; each account can only be connected once"
+            );
+            false
+        } else {
+            canonical_profiles.insert(account.external_account_id.clone(), profile_id.to_string());
+            true
+        }
+    });
+}
+
+fn should_use_cached_identity(scopes: &[String]) -> bool {
+    !scopes
+        .iter()
+        .flat_map(|scope| scope.split_whitespace())
+        .any(|scope| scope == "user:profile")
+}
+
 #[async_trait]
 impl ProviderCollector for ClaudeCollector {
     fn provider_id(&self) -> ProviderId {
@@ -323,27 +497,13 @@ impl ProviderCollector for ClaudeCollector {
         let mut accounts = Vec::new();
         let mut failures = Vec::new();
         for profile in &self.profiles {
-            match self.load_credentials(profile).await {
-                Ok(credentials) => accounts.push(DiscoveredAccount {
-                    external_account_id: credentials.account_id(),
+            match self.fetch_profile_identity(profile).await {
+                Ok(identity) => accounts.push(DiscoveredAccount {
+                    external_account_id: identity.account_id,
                     display_name: profile.display_name.clone(),
-                    email: None,
+                    email: identity.email,
                     profile_id: Some(profile.id.clone()),
                 }),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ProviderErrorKind::CredentialsMissing
-                            | ProviderErrorKind::CredentialsInvalid
-                    ) =>
-                {
-                    accounts.push(DiscoveredAccount {
-                        external_account_id: profile.keychain_account.clone(),
-                        display_name: profile.display_name.clone(),
-                        email: None,
-                        profile_id: Some(profile.id.clone()),
-                    });
-                }
                 Err(err) => {
                     failures.push(err);
                 }
@@ -351,13 +511,7 @@ impl ProviderCollector for ClaudeCollector {
         }
 
         if !accounts.is_empty() {
-            let mut seen = BTreeSet::new();
-            accounts.retain(|account| {
-                seen.insert((
-                    account.profile_id.clone(),
-                    account.external_account_id.clone(),
-                ))
-            });
+            deduplicate_accounts(&mut accounts);
             return Ok(accounts);
         }
         Err(failures.into_iter().next().unwrap_or_else(|| {
@@ -375,47 +529,72 @@ impl ProviderCollector for ClaudeCollector {
         let profile = self.profile_for_account(account).await?;
 
         let mut warnings = Vec::new();
-        let (mut usage, collection_mode, raw_payload) = if profile.cli_enabled {
-            match self.collect_usage_with_cli(&profile).await {
-                Ok(cli_usage) => (
-                    cli_usage.usage,
-                    CLAUDE_CLI_COLLECTION_MODE.to_string(),
-                    self.capture_raw_payloads.then_some(cli_usage.raw_output),
-                ),
-                Err(cli_err) => match self.collect_usage_with_api(&profile, account).await {
-                    Ok((usage, payload)) => {
-                        warnings.push(format!(
-                            "Claude CLI usage failed; used OAuth usage API fallback: {}",
-                            cli_err.short_message()
-                        ));
-                        (
-                            usage,
-                            CLAUDE_COLLECTION_MODE.to_string(),
-                            self.capture_raw_payloads.then_some(payload),
-                        )
-                    }
-                    Err(api_err) => {
-                        return Err(ProviderError::new(
-                            cli_err.kind(),
-                            format!(
-                                "Claude CLI usage failed ({}); OAuth usage API fallback failed ({})",
-                                cli_err.short_message(),
-                                api_err.short_message()
-                            ),
-                        ));
-                    }
-                },
-            }
-        } else {
-            match self.collect_usage_with_api(&profile, account).await {
+        let (mut usage, collection_mode, raw_payload) =
+            match self.collect_usage_with_api(&profile).await {
                 Ok((usage, payload)) => (
                     usage,
                     CLAUDE_COLLECTION_MODE.to_string(),
                     self.capture_raw_payloads.then_some(payload),
                 ),
+                Err(api_err) if should_use_cli_fallback(profile.cli_enabled, &api_err) => {
+                    warn!(
+                        provider_id = PROVIDER_ID,
+                        profile_id = profile.id,
+                        credential_account = account.external_account_id,
+                        recovery_stage = "cli_fallback_started",
+                        oauth_error_code = api_err.kind().as_str(),
+                        oauth_error = %api_err,
+                        "Claude OAuth usage unavailable; starting CLI fallback"
+                    );
+                    let fallback_started = Instant::now();
+                    match self.collect_usage_with_cli(&profile).await {
+                        Ok(cli_usage) => {
+                            info!(
+                                provider_id = PROVIDER_ID,
+                                profile_id = profile.id,
+                                credential_account = account.external_account_id,
+                                recovery_stage = "cli_fallback_succeeded",
+                                windows = cli_usage.usage.windows.len(),
+                                elapsed_ms = fallback_started.elapsed().as_millis(),
+                                collection_mode = CLAUDE_CLI_COLLECTION_MODE,
+                                "Claude CLI usage fallback succeeded"
+                            );
+                            warnings.push(format!(
+                                "Claude OAuth usage API failed; used CLI fallback: {}",
+                                api_err.short_message()
+                            ));
+                            (
+                                cli_usage.usage,
+                                CLAUDE_CLI_COLLECTION_MODE.to_string(),
+                                self.capture_raw_payloads.then_some(cli_usage.raw_output),
+                            )
+                        }
+                        Err(cli_err) => {
+                            warn!(
+                                provider_id = PROVIDER_ID,
+                                profile_id = profile.id,
+                                credential_account = account.external_account_id,
+                                recovery_stage = "cli_fallback_failed",
+                                elapsed_ms = fallback_started.elapsed().as_millis(),
+                                oauth_error_code = api_err.kind().as_str(),
+                                oauth_error = %api_err,
+                                cli_error_code = cli_err.kind().as_str(),
+                                cli_error = %cli_err,
+                                "Claude OAuth usage and CLI fallback both failed"
+                            );
+                            return Err(ProviderError::new(
+                                api_err.kind(),
+                                format!(
+                                    "Claude OAuth usage API failed ({}); CLI fallback failed ({})",
+                                    api_err.short_message(),
+                                    cli_err.short_message()
+                                ),
+                            ));
+                        }
+                    }
+                }
                 Err(api_err) => return Err(api_err),
-            }
-        };
+            };
 
         if profile.cli_enabled {
             let project_roots = profile.project_roots.clone();
@@ -456,7 +635,7 @@ impl ProviderCollector for ClaudeCollector {
             usage,
             daily_usage: Vec::new(),
             collection_mode,
-            account_email: None,
+            account_email: account.email.clone(),
             raw_payload,
             warnings,
         })
@@ -475,6 +654,22 @@ mod tests {
             keychain_service_for_config_dir(Path::new("/tmp/claude-profile")),
             "Claude Code-credentials-7182514b"
         );
+    }
+
+    #[test]
+    fn rate_limits_do_not_launch_the_cli_fallback() {
+        let rate_limited = ProviderError::new(
+            ProviderErrorKind::RateLimited,
+            "usage endpoint rate limited",
+        );
+        let unavailable = ProviderError::new(
+            ProviderErrorKind::ProviderUnavailable,
+            "endpoint unavailable",
+        );
+
+        assert!(!should_use_cli_fallback(true, &rate_limited));
+        assert!(should_use_cli_fallback(true, &unavailable));
+        assert!(!should_use_cli_fallback(false, &unavailable));
     }
 
     #[test]
@@ -519,6 +714,59 @@ mod tests {
             vec![PathBuf::from("/profiles/work/projects")]
         );
         assert_ne!(profiles[0].keychain_service, profiles[1].keychain_service);
+        assert_eq!(
+            profiles[0].identity_file_path,
+            PathBuf::from("/profiles/personal/.claude.json")
+        );
+        assert_eq!(
+            profiles[1].identity_file_path,
+            PathBuf::from("/profiles/work/.claude.json")
+        );
+    }
+
+    #[test]
+    fn duplicate_account_uuid_keeps_first_configured_profile() {
+        let account_uuid = "986efbc1-2be6-407a-9bcc-2e429b8e358d";
+        let mut accounts = vec![
+            DiscoveredAccount {
+                external_account_id: account_uuid.to_string(),
+                display_name: Some("First nickname".to_string()),
+                email: Some("person@example.com".to_string()),
+                profile_id: Some("first".to_string()),
+            },
+            DiscoveredAccount {
+                external_account_id: account_uuid.to_string(),
+                display_name: Some("Different nickname".to_string()),
+                email: Some("person@example.com".to_string()),
+                profile_id: Some("second".to_string()),
+            },
+            DiscoveredAccount {
+                external_account_id: "23a6eae5-64a5-4424-bcf1-6e6527f8859d".to_string(),
+                display_name: Some("Actually distinct".to_string()),
+                email: Some("other@example.com".to_string()),
+                profile_id: Some("distinct".to_string()),
+            },
+        ];
+
+        deduplicate_accounts(&mut accounts);
+
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].profile_id.as_deref(), Some("first"));
+        assert_eq!(accounts[0].display_name.as_deref(), Some("First nickname"));
+        assert_eq!(accounts[1].profile_id.as_deref(), Some("distinct"));
+    }
+
+    #[test]
+    fn cached_identity_is_only_used_for_legacy_tokens_without_profile_scope() {
+        assert!(should_use_cached_identity(&[]));
+        assert!(should_use_cached_identity(&["user:inference".to_string()]));
+        assert!(!should_use_cached_identity(&[
+            "user:inference".to_string(),
+            " user:profile ".to_string(),
+        ]));
+        assert!(!should_use_cached_identity(&[
+            "user:inference user:profile".to_string()
+        ]));
     }
 
     #[test]

@@ -5,6 +5,13 @@ default.
 Each configured profile runs in its own `CODEX_HOME`, which lets the daemon query multiple
 ChatGPT/Codex accounts without changing the user's active terminal login.
 
+Account identity comes from the authenticated Codex `account_id`, never from the profile's display
+name. The same account id may only be connected once: when multiple profiles authenticate as the
+same account, the first enabled profile in config order is canonical and later duplicates are not
+collected. Storage enforces the same uniqueness rule and rejects a profile whose authenticated
+account changes, preventing a reconnect from merging two accounts' retained history. To replace the
+account behind a profile, permanently delete the old UsageTracker account first and add a new one.
+
 ## Collection paths
 
 The primary collection path starts `codex app-server` for the profile and requests:

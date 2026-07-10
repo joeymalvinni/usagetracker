@@ -16,6 +16,39 @@ struct UsageWindow: Decodable, Identifiable, Equatable {
     let resetAt: Date?
 }
 
+struct UsageForecast: Decodable, Equatable {
+    let providerId, accountId, windowId: String
+    let generatedAt: Date
+    let resetAt: Date?
+    let currentPercentUsed: Double
+    let expectedPercentUsed, paceDeltaPercent: Double?
+    let ratePercentPerHour, projectedPercentAtReset: Double?
+    let projectedPercentRemainingAtReset: Double?
+    let predictedExhaustionAt: Date?
+    let status: ForecastStatus
+    let sampleCount: Int
+    let confidence: ForecastConfidence
+}
+
+enum ForecastStatus: String, Decodable {
+    case insufficientData = "insufficient_data"
+    case safe
+    case onPace = "on_pace"
+    case atRisk = "at_risk"
+    case exhausted
+
+    var conclusion: String {
+        switch self {
+        case .safe, .onPace: "Lasts until reset"
+        case .atRisk: "Tight before reset"
+        case .exhausted: "Exhausted until reset"
+        case .insufficientData: "Building pace forecast"
+        }
+    }
+}
+
+enum ForecastConfidence: String, Decodable { case low, medium, high }
+
 struct UsageAmount: Decodable, Equatable { let value: Double; let unit: UsageUnit }
 
 enum UsageWindowKind: Equatable, Decodable {

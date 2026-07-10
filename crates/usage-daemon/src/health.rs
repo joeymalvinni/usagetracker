@@ -55,6 +55,25 @@ pub fn from_provider_error(
     }
 }
 
+pub fn backing_off(
+    provider_id: ProviderId,
+    account_id: AccountId,
+    last_failure_at: chrono::DateTime<Utc>,
+    message: String,
+) -> ProviderHealth {
+    ProviderHealth {
+        provider_id,
+        account_id: Some(account_id),
+        status: ProviderHealthStatus::BackingOff,
+        collection_mode: None,
+        last_success_at: None,
+        last_failure_at: Some(last_failure_at),
+        last_error_code: Some(ProviderErrorKind::RateLimited.as_str().to_string()),
+        last_error_message: Some(message),
+        updated_at: Utc::now(),
+    }
+}
+
 fn status_for_kind(kind: ProviderErrorKind) -> ProviderHealthStatus {
     match kind {
         ProviderErrorKind::CredentialsMissing => ProviderHealthStatus::CredentialsMissing,

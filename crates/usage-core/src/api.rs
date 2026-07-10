@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Account, AccountId, ProviderHealth, ProviderId, UsageSnapshot};
+use crate::{Account, AccountId, ProviderHealth, ProviderId, UsageForecast, UsageSnapshot};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
@@ -87,6 +87,8 @@ fn default_notifications_enabled() -> bool {
 pub enum ApiResponse {
     Usage {
         snapshots: Vec<UsageSnapshot>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        forecasts: Vec<UsageForecast>,
     },
     Refresh {
         started_at: DateTime<Utc>,
@@ -223,6 +225,23 @@ mod tests {
                 assert_eq!(account_id.as_str(), "account-1");
             }
             _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
+    fn decodes_usage_response_without_forecasts() {
+        let response: ApiResponse =
+            serde_json::from_str(r#"{"type":"usage","snapshots":[]}"#).unwrap();
+
+        match response {
+            ApiResponse::Usage {
+                snapshots,
+                forecasts,
+            } => {
+                assert!(snapshots.is_empty());
+                assert!(forecasts.is_empty());
+            }
+            _ => panic!("unexpected response variant"),
         }
     }
 }

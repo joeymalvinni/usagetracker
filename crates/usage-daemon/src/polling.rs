@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
@@ -16,11 +16,22 @@ use crate::{
     storage::Storage,
 };
 
+const RATE_LIMIT_BACKOFF_SECONDS: [i64; 5] = [5 * 60, 10 * 60, 20 * 60, 40 * 60, 60 * 60];
+
+#[derive(Clone, Debug)]
+struct RateLimitBackoff {
+    consecutive_failures: usize,
+    retry_at: DateTime<Utc>,
+    last_failure_at: DateTime<Utc>,
+    error_message: String,
+}
+
 pub struct RefreshCoordinator {
     storage: Storage,
     notifications: Arc<NotificationManager>,
     providers: RwLock<Vec<Arc<dyn ProviderCollector>>>,
     refresh_lock: Mutex<()>,
+    rate_limit_backoffs: Mutex<HashMap<(ProviderId, AccountId), RateLimitBackoff>>,
 }
 
 impl RefreshCoordinator {
@@ -40,12 +51,14 @@ impl RefreshCoordinator {
             notifications,
             providers: RwLock::new(providers),
             refresh_lock: Mutex::new(()),
+            rate_limit_backoffs: Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn set_providers(&self, providers: Vec<Arc<dyn ProviderCollector>>) {
         let _guard = self.refresh_lock.lock().await;
         *self.providers.write().await = providers;
+        self.rate_limit_backoffs.lock().await.clear();
     }
 
     pub fn notification_manager(&self) -> Arc<NotificationManager> {
@@ -170,6 +183,8 @@ impl RefreshCoordinator {
         };
 
         if !account.collection_enabled {
+            self.clear_rate_limit_backoff(&provider_id, &account.id)
+                .await;
             debug!(
                 provider_id = provider_id.as_str(),
                 account_id = account.id.as_str(),
@@ -198,6 +213,15 @@ impl RefreshCoordinator {
             };
         }
 
+        if let Some(backoff) = self
+            .active_rate_limit_backoff(&provider_id, &account.id, Utc::now())
+            .await
+        {
+            return self
+                .record_backing_off(provider_id, account.id, backoff)
+                .await;
+        }
+
         debug!(
             provider_id = provider_id.as_str(),
             account_id = account.id.as_str(),
@@ -207,6 +231,8 @@ impl RefreshCoordinator {
 
         match provider.collect_usage(&discovered).await {
             Ok(result) => {
+                self.clear_rate_limit_backoff(&provider_id, &account.id)
+                    .await;
                 info!(
                     provider_id = provider_id.as_str(),
                     account_id = account.id.as_str(),
@@ -218,6 +244,19 @@ impl RefreshCoordinator {
                 self.store_success(provider_id, account, result).await
             }
             Err(err) => {
+                let backoff = if err.kind() == ProviderErrorKind::RateLimited {
+                    Some(
+                        self.note_rate_limit(
+                            &provider_id,
+                            &account.id,
+                            Utc::now(),
+                            err.short_message(),
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
                 warn!(
                     provider_id = provider_id.as_str(),
                     account_id = account.id.as_str(),
@@ -226,9 +265,102 @@ impl RefreshCoordinator {
                     error = %err,
                     "provider usage collection failed"
                 );
+                if let Some(backoff) = backoff {
+                    warn!(
+                        provider_id = provider_id.as_str(),
+                        account_id = account.id.as_str(),
+                        consecutive_rate_limits = backoff.consecutive_failures,
+                        retry_at = %backoff.retry_at,
+                        "provider rate-limit backoff scheduled"
+                    );
+                }
                 self.record_failure(provider_id, Some(account.id), err)
                     .await
             }
+        }
+    }
+
+    async fn active_rate_limit_backoff(
+        &self,
+        provider_id: &ProviderId,
+        account_id: &AccountId,
+        now: DateTime<Utc>,
+    ) -> Option<RateLimitBackoff> {
+        self.rate_limit_backoffs
+            .lock()
+            .await
+            .get(&(provider_id.clone(), account_id.clone()))
+            .filter(|backoff| now < backoff.retry_at)
+            .cloned()
+    }
+
+    async fn note_rate_limit(
+        &self,
+        provider_id: &ProviderId,
+        account_id: &AccountId,
+        now: DateTime<Utc>,
+        error_message: &str,
+    ) -> RateLimitBackoff {
+        let mut backoffs = self.rate_limit_backoffs.lock().await;
+        let key = (provider_id.clone(), account_id.clone());
+        let consecutive_failures = backoffs
+            .get(&key)
+            .map(|backoff| backoff.consecutive_failures.saturating_add(1))
+            .unwrap_or(1);
+        let delay_index = consecutive_failures
+            .saturating_sub(1)
+            .min(RATE_LIMIT_BACKOFF_SECONDS.len() - 1);
+        let backoff = RateLimitBackoff {
+            consecutive_failures,
+            retry_at: now + chrono::TimeDelta::seconds(RATE_LIMIT_BACKOFF_SECONDS[delay_index]),
+            last_failure_at: now,
+            error_message: error_message.to_string(),
+        };
+        backoffs.insert(key, backoff.clone());
+        backoff
+    }
+
+    async fn clear_rate_limit_backoff(&self, provider_id: &ProviderId, account_id: &AccountId) {
+        self.rate_limit_backoffs
+            .lock()
+            .await
+            .remove(&(provider_id.clone(), account_id.clone()));
+    }
+
+    async fn record_backing_off(
+        &self,
+        provider_id: ProviderId,
+        account_id: AccountId,
+        backoff: RateLimitBackoff,
+    ) -> ProviderRefreshResult {
+        let message = format!(
+            "{}; retrying after {}",
+            backoff.error_message,
+            backoff.retry_at.to_rfc3339()
+        );
+        info!(
+            provider_id = provider_id.as_str(),
+            account_id = account_id.as_str(),
+            consecutive_rate_limits = backoff.consecutive_failures,
+            retry_at = %backoff.retry_at,
+            "skipping provider collection during rate-limit backoff"
+        );
+        let provider_health = health::backing_off(
+            provider_id.clone(),
+            account_id.clone(),
+            backoff.last_failure_at,
+            message.clone(),
+        );
+        if let Err(err) = self.storage.upsert_health(&provider_health).await {
+            warn!(error = %err, "failed to store provider backoff health");
+        }
+        ProviderRefreshResult {
+            provider_id,
+            account_id: Some(account_id),
+            status: ProviderRefreshStatus::RateLimited,
+            collection_mode: None,
+            collected_at: None,
+            message: Some(message),
         }
     }
 
@@ -399,7 +531,10 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
     use tokio::{sync::Barrier, time::timeout};
     use usage_core::{
         ProviderHealth, ProviderHealthStatus, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
@@ -559,6 +694,37 @@ mod tests {
         barrier: Arc<Barrier>,
     }
 
+    struct RateLimitedProvider {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProviderCollector for RateLimitedProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("claude")
+        }
+
+        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+            Ok(vec![DiscoveredAccount {
+                external_account_id: "rate-limited-account".to_string(),
+                display_name: None,
+                email: None,
+                profile_id: Some("default".to_string()),
+            }])
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<ProviderCollectionResult, ProviderError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::new(
+                ProviderErrorKind::RateLimited,
+                "Claude usage endpoint is rate limited",
+            ))
+        }
+    }
+
     #[async_trait]
     impl ProviderCollector for ConcurrentDiscoveryProvider {
         fn provider_id(&self) -> ProviderId {
@@ -627,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_stores_each_discovered_account() {
+    async fn refresh_rejects_duplicate_external_accounts_from_distinct_profiles() {
         let storage = test_storage();
         let coordinator =
             RefreshCoordinator::new(storage.clone(), vec![Arc::new(MultiAccountProvider)]);
@@ -635,31 +801,36 @@ mod tests {
         let report = coordinator.refresh(None).await;
 
         assert_eq!(report.provider_results.len(), 2);
-        assert!(report
+        assert_eq!(
+            report
+                .provider_results
+                .iter()
+                .filter(|result| result.status == ProviderRefreshStatus::Ok)
+                .count(),
+            1
+        );
+        let conflict = report
             .provider_results
             .iter()
-            .all(|result| result.status == ProviderRefreshStatus::Ok));
+            .find(|result| result.status == ProviderRefreshStatus::StorageError)
+            .expect("duplicate identity should be reported as a storage error");
+        assert!(conflict
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("is already connected through profile")));
 
         let accounts = storage.accounts().await.unwrap();
-        assert_eq!(accounts.len(), 2);
-        assert!(accounts
-            .iter()
-            .all(|account| account.external_account_id == "same-openai-account"));
-        assert!(accounts
-            .iter()
-            .any(|account| account.profile_id.as_deref() == Some("personal")));
-        assert!(accounts
-            .iter()
-            .any(|account| account.profile_id.as_deref() == Some("work")));
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].external_account_id, "same-openai-account");
 
         let snapshots = storage.latest_usage().await.unwrap();
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 1);
         assert_eq!(
             snapshots
                 .iter()
                 .filter(|snapshot| snapshot.provider_id.as_str() == "codex")
                 .count(),
-            2
+            1
         );
     }
 
@@ -749,6 +920,68 @@ mod tests {
             account.display_name_source,
             usage_core::AccountDisplayNameSource::User
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backoff_skips_repeated_provider_calls() {
+        let storage = test_storage();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let coordinator = RefreshCoordinator::new(
+            storage.clone(),
+            vec![Arc::new(RateLimitedProvider {
+                attempts: attempts.clone(),
+            })],
+        );
+
+        let first = coordinator.refresh(None).await;
+        let second = coordinator.refresh(None).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first.provider_results[0].status,
+            ProviderRefreshStatus::RateLimited
+        );
+        assert_eq!(
+            second.provider_results[0].status,
+            ProviderRefreshStatus::RateLimited
+        );
+        assert!(second.provider_results[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("retrying after")));
+        let health = storage.provider_health().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert!(matches!(health[0].status, ProviderHealthStatus::BackingOff));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backoff_increases_and_caps_at_one_hour() {
+        let coordinator = RefreshCoordinator::new(test_storage(), Vec::new());
+        let provider_id = ProviderId::new("claude");
+        let account_id = AccountId::new("account");
+        let now = Utc::now();
+
+        for expected_seconds in RATE_LIMIT_BACKOFF_SECONDS {
+            let backoff = coordinator
+                .note_rate_limit(&provider_id, &account_id, now, "rate limited")
+                .await;
+            assert_eq!(
+                backoff.retry_at - now,
+                chrono::TimeDelta::seconds(expected_seconds)
+            );
+        }
+        let capped = coordinator
+            .note_rate_limit(&provider_id, &account_id, now, "rate limited")
+            .await;
+        assert_eq!(capped.retry_at - now, chrono::TimeDelta::hours(1));
+
+        coordinator
+            .clear_rate_limit_backoff(&provider_id, &account_id)
+            .await;
+        let reset = coordinator
+            .note_rate_limit(&provider_id, &account_id, now, "rate limited")
+            .await;
+        assert_eq!(reset.retry_at - now, chrono::TimeDelta::minutes(5));
     }
 
     fn test_storage() -> Storage {

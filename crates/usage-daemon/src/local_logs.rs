@@ -14,8 +14,9 @@ use usage_core::ProviderId;
 
 use crate::{config::ProviderConfig, polling::RefreshCoordinator};
 
-const CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
+const CHANGE_DEBOUNCE: Duration = Duration::from_secs(30);
 const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const CLAUDE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const WATCH_EVENT_QUEUE_CAPACITY: usize = 256;
 
 pub fn spawn_change_log_loop(
@@ -58,13 +59,19 @@ pub fn spawn_change_log_loop(
                 tokio::select! {
                     event = rx.recv() => {
                         let Some(event) = event else { return };
-                        handle_watch_event(
+                        if handle_watch_event(
                             event,
                             &mut watch_state,
                             &mut watcher,
                             &targets,
                             &mut pending,
-                        );
+                        ) {
+                            refresh_at = Some(local_refresh_deadline(
+                                tokio::time::Instant::now(),
+                                last_refresh,
+                                &pending,
+                            ));
+                        }
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         if overflowed.swap(false, Ordering::AcqRel) {
@@ -81,20 +88,19 @@ pub fn spawn_change_log_loop(
                 }
             } else {
                 let Some(event) = rx.recv().await else { return };
-                handle_watch_event(
+                if handle_watch_event(
                     event,
                     &mut watch_state,
                     &mut watcher,
                     &targets,
                     &mut pending,
-                );
-            }
-
-            if refresh_at.is_none() && !pending.is_empty() {
-                refresh_at = Some(local_refresh_deadline(
-                    tokio::time::Instant::now(),
-                    last_refresh,
-                ));
+                ) {
+                    refresh_at = Some(local_refresh_deadline(
+                        tokio::time::Instant::now(),
+                        last_refresh,
+                        &pending,
+                    ));
+                }
             }
         }
     })
@@ -106,25 +112,38 @@ fn handle_watch_event(
     watcher: &mut RecommendedWatcher,
     targets: &[LocalLogTarget],
     pending: &mut BTreeSet<String>,
-) {
+) -> bool {
     match event {
         Ok(event) => {
-            pending.extend(watch_state.sync(watcher, targets));
-            if let Some(provider_id) = provider_id_for_event(targets, &event) {
+            let newly_available = watch_state.sync(watcher, targets);
+            let should_refresh = !newly_available.is_empty();
+            pending.extend(newly_available);
+            let provider_id = provider_id_for_event(targets, &event);
+            if let Some(provider_id) = provider_id {
                 pending.insert(provider_id.to_string());
             }
+            should_refresh || provider_id.is_some()
         }
-        Err(err) => warn!(error = %err, "local message log watcher error"),
+        Err(err) => {
+            warn!(error = %err, "local message log watcher error");
+            false
+        }
     }
 }
 
 fn local_refresh_deadline(
     now: tokio::time::Instant,
     last_refresh: Option<tokio::time::Instant>,
+    pending: &BTreeSet<String>,
 ) -> tokio::time::Instant {
     let debounced = now + CHANGE_DEBOUNCE;
+    let minimum_interval = if pending.contains("claude") {
+        CLAUDE_REFRESH_MIN_INTERVAL
+    } else {
+        LOCAL_REFRESH_MIN_INTERVAL
+    };
     let rate_limited = last_refresh
-        .map(|last| last + LOCAL_REFRESH_MIN_INTERVAL)
+        .map(|last| last + minimum_interval)
         .unwrap_or(now);
     debounced.max(rate_limited)
 }
@@ -454,12 +473,21 @@ mod tests {
     #[test]
     fn refresh_deadline_debounces_and_rate_limits() {
         let now = tokio::time::Instant::now();
-        assert_eq!(local_refresh_deadline(now, None), now + CHANGE_DEBOUNCE);
+        let codex = BTreeSet::from(["codex".to_string()]);
+        let claude = BTreeSet::from(["claude".to_string()]);
+        assert_eq!(
+            local_refresh_deadline(now, None, &codex),
+            now + CHANGE_DEBOUNCE
+        );
 
         let recent = now - Duration::from_secs(5);
         assert_eq!(
-            local_refresh_deadline(now, Some(recent)),
-            recent + LOCAL_REFRESH_MIN_INTERVAL
+            local_refresh_deadline(now, Some(recent), &codex),
+            now + CHANGE_DEBOUNCE
+        );
+        assert_eq!(
+            local_refresh_deadline(now, Some(recent), &claude),
+            recent + CLAUDE_REFRESH_MIN_INTERVAL
         );
     }
 

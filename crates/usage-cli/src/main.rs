@@ -113,14 +113,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let color = color_enabled(args.color);
         match (command, response) {
-            (Command::Usage, ApiResponse::Usage { snapshots }) => {
+            (
+                Command::Usage,
+                ApiResponse::Usage {
+                    snapshots,
+                    forecasts,
+                },
+            ) => {
                 let accounts = fetch_accounts(&socket_path).await?;
                 let config = fetch_config(&socket_path).await?;
                 let snapshots = default_visible_snapshots(snapshots, &config);
                 let accounts = default_visible_accounts(accounts, &config);
                 println!(
                     "{}",
-                    render::render_usage(&snapshots, &accounts, args.style, color)
+                    render::render_usage(&snapshots, &forecasts, &accounts, args.style, color)
                 );
             }
             (Command::Accounts, ApiResponse::Accounts { accounts }) => {
@@ -177,7 +183,7 @@ async fn fetch_accounts(socket_path: &PathBuf) -> anyhow::Result<Vec<Account>> {
 
 async fn fetch_usage(socket_path: &PathBuf) -> anyhow::Result<Vec<UsageSnapshot>> {
     match send_request(socket_path, &ApiRequest::GetUsage).await? {
-        ApiResponse::Usage { snapshots } => Ok(snapshots),
+        ApiResponse::Usage { snapshots, .. } => Ok(snapshots),
         ApiResponse::Error { error } => {
             bail!("daemon returned {}: {}", error.code, error.message);
         }
