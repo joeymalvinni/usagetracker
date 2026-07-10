@@ -93,25 +93,21 @@ struct WindowRow: View {
             Button {
                 withAnimation(.spring(duration: 0.28)) { resetExpanded.toggle() }
             } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: Theme.Spacing.xs) {
-                        Image(systemName: "clock")
-                        Text(relativeReset)
-                            .monospacedDigit()
-                        Spacer()
-                        Image(systemName: "chevron.down")
-                            .font(Theme.Typography.micro.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                            .rotationEffect(.degrees(resetExpanded ? 0 : -90))
-                    }
+                HStack(spacing: Theme.Spacing.xs) {
+                    Image(systemName: "clock")
+                    Text(relativeReset)
+                        .monospacedDigit()
                     if let forecast = window.forecast {
-                        HStack(spacing: Theme.Spacing.xs) {
-                            Image(systemName: "chart.line.uptrend.xyaxis")
-                            Text(forecast.summary)
-                            Spacer()
-                        }
+                        Text("·").foregroundStyle(.tertiary)
+                        Text(forecast.summary)
                     }
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(Theme.Typography.micro.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(resetExpanded ? 0 : -90))
                 }
+                .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .font(Theme.Typography.micro)
                 .foregroundStyle(.secondary)
@@ -144,7 +140,7 @@ struct WindowRow: View {
 
     private var explicitReset: String {
         guard let date = window.resetAt else { return window.reset }
-        return DateFormats.explicit.string(from: date)
+        return "Resets on \(DateFormats.explicit.string(from: date))"
     }
 
     private var resetHelp: String {
