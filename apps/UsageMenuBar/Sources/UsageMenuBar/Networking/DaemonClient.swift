@@ -41,6 +41,10 @@ struct DaemonClient {
         guard case let .providerAction(v) = try await send(.repairProvider(providerId: providerId, accountId: accountId), 10) else { throw DaemonError.badResponse }
         return v
     }
+    func launchProviderAccount(accountId: String) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(.launchProviderAccount(accountId: accountId), 10) else { throw DaemonError.badResponse }
+        return v
+    }
 
     private func send(_ request: DaemonRequest, _ seconds: Double) async throws -> DaemonResponse {
         try Task.checkCancellation()

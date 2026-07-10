@@ -63,7 +63,7 @@ struct Detail: View {
                         ProviderActivityCard(provider: activeProvider, dashboard: activeProvider.costDashboard)
                         if !limitWindows(activeProvider).isEmpty {
                             ProviderSection(title: "Limits") {
-                                ForEach(limitWindows(activeProvider)) { WindowRow(window: $0) }
+                                ForEach(limitWindows(activeProvider)) { WindowRow(window: $0, resetExpandable: true) }
                             }
                         }
                         if activeProvider.providerId == "codex", !activeProvider.resetCredits.isEmpty {
@@ -239,61 +239,118 @@ private struct AlertBanner: View {
     }
 }
 
+/// The "Resets" section on the Codex detail page. Codex hands out a pool of
+/// rate-limit *reset credits* that each expire; this collapses them to a
+/// one-line summary (count + soonest expiry, relative) and reveals the full
+/// per-credit list on tap. The whole header toggles — not just the caret —
+/// and the body is roomy enough to grow a pace estimate later.
 private struct ResetCreditDisclosure: View {
     let provider: ProviderVM
     @State private var expanded = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                ForEach(provider.resetCredits) { credit in
-                    HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(credit.title)
-                                .lineLimit(1)
-                            Text(credit.status.capitalized)
-                                .font(Theme.Typography.micro)
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer(minLength: Theme.Spacing.sm)
-                        Text(credit.expiresText)
-                            .monospacedDigit()
-                            .foregroundStyle(credit.expiresAt.map { $0 <= Date() } == true ? .red : .secondary)
-                            .lineLimit(1)
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.spring(duration: 0.28)) { expanded.toggle() }
+            } label: {
+                header
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                VStack(spacing: Theme.Spacing.xs) {
+                    ForEach(provider.resetCredits) { credit in
+                        Divider().opacity(0.35)
+                        creditRow(credit)
                     }
-                    .font(Theme.Typography.caption)
                 }
+                .padding(.top, Theme.Spacing.sm)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
-            .padding(.top, Theme.Spacing.xs)
-        } label: {
-            HStack(spacing: Theme.Spacing.sm) {
-                Label {
-                    Text(summaryText)
-                } icon: {
-                    Image(systemName: "clock.arrow.circlepath")
-                }
-                .lineLimit(1)
-                Spacer(minLength: Theme.Spacing.sm)
-                Text("\(provider.resetCredits.count)")
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            .font(Theme.Typography.caption.weight(.medium))
         }
-        .buttonStyle(.plain)
         .surfaceInset()
-        .help(summaryText)
+        .help(headerHelp)
     }
 
-    private var summaryText: String {
-        guard let resetWindow else { return "\(provider.resetCredits.count) resets available" }
-        let value = resetWindow.value.replacingOccurrences(of: " available", with: "")
-        let noun = value == "1" ? "reset" : "resets"
-        return "\(value) \(noun) available · \(resetWindow.reset)"
+    private var header: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(.secondary)
+            Text(countText)
+                .fontWeight(.medium)
+            if let nextExpiry {
+                Text("·").foregroundStyle(.tertiary)
+                Text(nextExpiry.text)
+                    .foregroundStyle(nextExpiry.tint)
+                    .monospacedDigit()
+            }
+            Spacer(minLength: Theme.Spacing.sm)
+            Image(systemName: "chevron.down")
+                .font(Theme.Typography.micro.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .rotationEffect(.degrees(expanded ? 0 : -90))
+        }
+        .font(Theme.Typography.caption)
+        .lineLimit(1)
+        .contentShape(Rectangle())
     }
 
-    private var resetWindow: WindowVM? {
-        provider.windows.first { $0.id == "\(provider.providerId)_rate_limit_resets" }
+    private func creditRow(_ credit: ResetCreditVM) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Spacing.sm) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(credit.title)
+                    .lineLimit(1)
+                Text(credit.status.capitalized)
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: Theme.Spacing.sm)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(relativeExpiry(credit.expiresAt))
+                    .monospacedDigit()
+                    .foregroundStyle(expiryTint(credit.expiresAt))
+                Text(credit.expiresText)
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.tertiary)
+            }
+            .lineLimit(1)
+        }
+        .font(Theme.Typography.caption)
+    }
+
+    private var countText: String {
+        let count = provider.resetCredits.count
+        return "\(count) credit\(count == 1 ? "" : "s")"
+    }
+
+    /// Soonest-expiring credit, rendered relative ("expires in 2 days") with a
+    /// tint that escalates as the deadline nears. `resetCredits` is sorted
+    /// earliest-first upstream, so `.first` is the soonest boundary.
+    private var nextExpiry: (text: String, tint: Color)? {
+        guard let date = provider.resetCredits.first?.expiresAt else { return nil }
+        let expired = date <= Date()
+        let text = expired ? "expired \(relative(date))" : "expires \(relative(date))"
+        return (text, expiryTint(date))
+    }
+
+    private func relativeExpiry(_ date: Date?) -> String {
+        guard let date else { return "expiry unknown" }
+        return date <= Date() ? "expired" : relative(date)
+    }
+
+    private func relative(_ date: Date) -> String {
+        DateFormats.resetRelativeString(for: date)
+    }
+
+    private func expiryTint(_ date: Date?) -> Color {
+        guard let date else { return .secondary }
+        if date <= Date() { return .red }
+        return date.timeIntervalSinceNow < 24 * 60 * 60 ? .orange : .secondary
+    }
+
+    private var headerHelp: String {
+        guard let next = provider.resetCredits.first else { return countText }
+        return "\(countText) · next \(next.expiresText)"
     }
 }
 
@@ -387,7 +444,6 @@ private struct ProviderActivityCard: View {
                             .lineLimit(1)
                     }
                     Spacer(minLength: Theme.Spacing.sm)
-                        DataQualityLabel(dashboard: dashboard, metric: metric)
                 }
                 HStack(spacing: Theme.Spacing.xs) {
                     Spacer()

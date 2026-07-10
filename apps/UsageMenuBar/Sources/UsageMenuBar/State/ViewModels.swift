@@ -113,6 +113,9 @@ struct WindowVM: Identifiable, Equatable {
     let absolute: String?
     let percent: Double?
     let status: DisplayStatus
+    /// Raw reset/expiry instant, when known. Powers relative countdowns and
+    /// the explicit-date disclosure; `reset` is its pre-rendered short form.
+    var resetAt: Date? = nil
 }
 
 struct ResetCreditVM: Identifiable, Equatable {

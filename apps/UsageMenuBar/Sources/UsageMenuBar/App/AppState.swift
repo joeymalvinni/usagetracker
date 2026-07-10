@@ -108,14 +108,14 @@ enum DaemonState { case unknown, online, offline }
         }
     }
 
-    func addCodexAccount() async {
-        pendingAccountProviders.insert("codex")
-        defer { pendingAccountProviders.remove("codex") }
+    func addProviderAccount(_ providerId: String) async {
+        pendingAccountProviders.insert(providerId)
+        defer { pendingAccountProviders.remove(providerId) }
         do {
-            let response = try await client.addProviderAccount(providerId: "codex", displayName: nil)
+            let response = try await client.addProviderAccount(providerId: providerId, displayName: nil)
             actionError = nil
-            actionMessage = "Finish signing in to Codex in your browser. This account will appear automatically."
-            await waitForCodexAccount(profileId: response.profileId)
+            actionMessage = "Finish signing in to \(providerName(providerId)) in your browser. This account will appear automatically."
+            await waitForProviderAccount(providerId: providerId, profileId: response.profileId)
         } catch {
             actionMessage = nil
             actionError = describe(error)
@@ -296,6 +296,19 @@ enum DaemonState { case unknown, online, offline }
         }
     }
 
+    func launchProviderAccount(_ accountId: String) async {
+        pendingAccounts.insert(accountId)
+        defer { pendingAccounts.remove(accountId) }
+        do {
+            let response = try await client.launchProviderAccount(accountId: accountId)
+            actionError = nil
+            actionMessage = response.message
+        } catch {
+            actionMessage = nil
+            actionError = describe(error)
+        }
+    }
+
     func completeOnboarding() {
         ui.onboardingCompleted = true
         actionError = nil
@@ -352,15 +365,17 @@ enum DaemonState { case unknown, online, offline }
         let referenced = Set(snapshots.map(\.accountId) + health.compactMap(\.accountId))
         return referenced.contains { !known.contains($0) }
     }
-    private func waitForCodexAccount(profileId: String) async {
+    private func waitForProviderAccount(providerId: String, profileId: String) async {
         for _ in 0..<600 {
             guard !Task.isCancelled else { return }
             do {
                 let discovered = try await client.accounts()
-                if discovered.contains(where: { $0.providerId == "codex" && $0.profileId == profileId }) {
+                if discovered.contains(where: { $0.providerId == providerId && $0.profileId == profileId }) {
                     accounts = discovered
                     actionError = nil
-                    actionMessage = "Codex account connected."
+                    actionMessage = providerId == "claude"
+                        ? "Claude account connected. Use its terminal button in Settings for profile-scoped activity."
+                        : "\(providerName(providerId)) account connected."
                     await load(all: true)
                     return
                 }
@@ -369,7 +384,7 @@ enum DaemonState { case unknown, online, offline }
             }
             try? await Task.sleep(for: .seconds(1))
         }
-        actionMessage = "Codex sign-in is still pending. You can retry from Settings."
+        actionMessage = "\(providerName(providerId)) sign-in is still pending. You can retry from Settings."
     }
     private func waitForProviderRepair(providerId: String, accountId: String?, startedAt: Date) async {
         for _ in 0..<600 {

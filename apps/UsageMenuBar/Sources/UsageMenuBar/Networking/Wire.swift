@@ -10,6 +10,7 @@ enum DaemonRequest: Encodable {
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, workspaceId: String?)
     case repairProvider(providerId: String, accountId: String?)
+    case launchProviderAccount(accountId: String)
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: K.self)
         switch self {
@@ -49,6 +50,9 @@ enum DaemonRequest: Encodable {
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(accountId, forKey: .accountId)
+        case .launchProviderAccount(let accountId):
+            try c.encode("launch_provider_account", forKey: .method)
+            try c.encode(accountId, forKey: .accountId)
         }
     }
     enum K: String, CodingKey {
@@ -104,5 +108,27 @@ enum DateFormats {
     static let whole: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
     static let dayKey: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"; return f }()
     static let expiry: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEE, MMM d 'at' h:mm a"; return f }()
+    /// Fully spelled-out instant — weekday, month, day, year, time, zone — for
+    /// the reset dropdown where an exact, unambiguous date is wanted.
+    static let explicit: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = .autoupdatingCurrent; f.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"; return f }()
     static let relative: RelativeDateTimeFormatter = { let f = RelativeDateTimeFormatter(); f.unitsStyle = .full; return f }()
+
+    /// Relative wording for future reset/expiry deadlines. Foundation truncates
+    /// a 45-hour interval to "in 1 day", which conflicts with an explicit date
+    /// two calendar days ahead (for example, Thursday to Saturday).
+    static func resetRelativeString(
+        for date: Date,
+        relativeTo referenceDate: Date = Date(),
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> String {
+        if date > referenceDate {
+            let referenceDay = calendar.startOfDay(for: referenceDate)
+            let targetDay = calendar.startOfDay(for: date)
+            let calendarDays = calendar.dateComponents([.day], from: referenceDay, to: targetDay).day ?? 0
+            if calendarDays >= 2 {
+                return relative.localizedString(from: DateComponents(day: calendarDays))
+            }
+        }
+        return relative.localizedString(for: date, relativeTo: referenceDate)
+    }
 }

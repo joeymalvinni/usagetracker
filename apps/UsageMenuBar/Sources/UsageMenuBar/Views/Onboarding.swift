@@ -113,8 +113,8 @@ struct ProviderSetupControls: View {
                 }
                 .disabled(busy || state.daemon == .offline)
 
-                if providerId == "codex", !accounts.isEmpty {
-                    Button("Add another account") { Task { await state.addCodexAccount() } }
+                if (providerId == "codex" || providerId == "claude"), !accounts.isEmpty {
+                    Button("Add another account") { Task { await state.addProviderAccount(providerId) } }
                         .disabled(busy)
                 }
                 if providerId == "opencode_go" {
@@ -156,8 +156,8 @@ struct ProviderSetupControls: View {
     }
 
     private func repair() async {
-        if providerId == "codex", accounts.isEmpty {
-            await state.addCodexAccount()
+        if (providerId == "codex" || providerId == "claude"), accounts.isEmpty {
+            await state.addProviderAccount(providerId)
         } else {
             await state.repairProvider(providerId, accountId: accounts.first?.id)
         }
@@ -182,7 +182,7 @@ struct ProviderSetupControls: View {
     private var helpText: String {
         switch providerId {
         case "codex": "Each account uses an isolated Codex profile. Finish the browser sign-in; the account appears automatically."
-        case "claude": "Finish the browser sign-in; UsageTracker refreshes Claude automatically."
+        case "claude": "Each account uses an isolated Claude profile. After sign-in, open its profile terminal from Settings to keep activity separate."
         default: "Sign in at opencode.ai, then discover and choose the workspace to track."
         }
     }
