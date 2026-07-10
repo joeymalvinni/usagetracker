@@ -13,6 +13,11 @@ import SwiftUI
 }
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct ProviderMenuSelection {
+        let providerId: String
+        let accountId: String?
+    }
+
     private let state = AppState()
     private let popover = NSPopover()
     private var item: NSStatusItem!
@@ -128,12 +133,7 @@ import SwiftUI
             menu.addItem(empty)
         } else {
             for provider in providers {
-                let item = NSMenuItem(title: providerMenuTitle(provider), action: #selector(openProviderFromMenu(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = provider.id
-                item.image = menuIcon(ProviderBrand.image(provider.providerId) ?? symbolImage(provider.symbol))
-                item.toolTip = provider.detail
-                menu.addItem(item)
+                menu.addItem(providerMenuItem(provider))
             }
         }
 
@@ -172,7 +172,7 @@ import SwiftUI
         }
     }
 
-    private func providerMenuTitle(_ provider: ProviderVM) -> String {
+    private func providerMenuTitle(_ provider: ProviderVM, name: String? = nil) -> String {
         let value: String
         if let percent = provider.percent {
             let displayed = max(0, min(100, state.ui.menuMetric == .used ? 100 - percent : percent))
@@ -180,7 +180,57 @@ import SwiftUI
         } else {
             value = provider.primary
         }
-        return "\(provider.name): \(value) · \(provider.status.label)"
+        return "\(name ?? provider.name): \(value) · \(provider.status.label)"
+    }
+
+    private func providerMenuItem(_ provider: ProviderVM) -> NSMenuItem {
+        let item = NSMenuItem(title: providerMenuTitle(provider), action: nil, keyEquivalent: "")
+        item.image = menuIcon(ProviderBrand.image(provider.providerId) ?? symbolImage(provider.symbol))
+        item.toolTip = provider.detail
+
+        guard let accounts = provider.subAccounts, accounts.count > 1 else {
+            item.action = #selector(openProviderFromMenu(_:))
+            item.target = self
+            item.representedObject = ProviderMenuSelection(providerId: provider.id, accountId: nil)
+            return item
+        }
+
+        let submenu = NSMenu(title: provider.name)
+        submenu.autoenablesItems = false
+        for account in accounts {
+            let accountItem = NSMenuItem(
+                title: providerMenuTitle(account, name: accountMenuName(account, among: accounts)),
+                action: #selector(openProviderFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            accountItem.target = self
+            accountItem.representedObject = ProviderMenuSelection(
+                providerId: provider.id,
+                accountId: account.accountId
+            )
+            accountItem.image = menuIcon(symbolImage("person.crop.circle"))
+            accountItem.toolTip = account.errorDetail ?? account.detail
+            submenu.addItem(accountItem)
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    private func accountMenuName(_ account: ProviderVM, among accounts: [ProviderVM]) -> String {
+        let duplicates = accounts.filter {
+            $0.name.localizedCaseInsensitiveCompare(account.name) == .orderedSame
+        }
+        guard duplicates.count > 1 else { return account.name }
+
+        if let email = account.accountEmail,
+           !email.isEmpty,
+           duplicates.filter({ $0.accountEmail == email }).count == 1 {
+            return "\(account.name) (\(email))"
+        }
+        if let accountId = account.accountId {
+            return "\(account.name) (\(accountId.suffix(6)))"
+        }
+        return account.name
     }
 
     private func menuBarSettingsItem() -> NSMenuItem {
@@ -262,8 +312,8 @@ import SwiftUI
     }
 
     @objc private func openProviderFromMenu(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        showPopover(selection: .provider(id, accountId: nil))
+        guard let selection = sender.representedObject as? ProviderMenuSelection else { return }
+        showPopover(selection: .provider(selection.providerId, accountId: selection.accountId))
     }
 
     @objc private func refreshFromMenu() {
