@@ -54,7 +54,13 @@ struct CostActivityChart: View {
     private func barStack(day: CostDayVM, maxHeight: CGFloat) -> some View {
         VStack(spacing: 1) {
             Spacer(minLength: 0)
-            ForEach(Array(day.providers.reversed().enumerated()), id: \.element.id) { index, provider in
+            // Identify each segment by its stacking position, not by
+            // `providerId`. The provider list is built in the same order for
+            // every day, so position is a stable identity — and it stays stable
+            // when a provider page switches accounts (where `providerId` carries
+            // the account and would otherwise change). That lets SwiftUI morph a
+            // bar's height between accounts instead of removing and re-inserting.
+            ForEach(Array(day.providers.reversed().enumerated()), id: \.offset) { index, provider in
                 let visible = value(provider) > 0
                 if visible {
                     RoundedRectangle(cornerRadius: index == 0 ? 4 : 1)
@@ -66,6 +72,7 @@ struct CostActivityChart: View {
                         }
                         .onHover { inside in if inside { hover = provider } }
                         .help("\(provider.providerName) \(shortDate(provider.date)): \(metric == .cost ? formatUsd(provider.cost) : formatTokens(provider.tokens))")
+                        .transition(.barGrow)
                 }
             }
         }
@@ -141,5 +148,24 @@ struct CostActivityChart: View {
         let barCenter = CGFloat(index) * (barWidth + barSpacing) + barWidth / 2
         let inset = axisLabelWidth / 2
         return min(max(inset, barCenter), max(inset, chartWidth - inset))
+    }
+}
+
+/// Bars belong to a `providerId:accountId` series, so switching the account on a
+/// provider page swaps every segment's identity rather than morphing its height.
+/// This grows the incoming bars up from the baseline (and fades the outgoing
+/// ones) so the swap reads as the chart redrawing rather than snapping.
+private extension AnyTransition {
+    static var barGrow: AnyTransition {
+        .modifier(active: BarGrowModifier(scale: 0), identity: BarGrowModifier(scale: 1))
+    }
+}
+
+private struct BarGrowModifier: ViewModifier {
+    let scale: CGFloat
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(x: 1, y: scale, anchor: .bottom)
+            .opacity(scale)
     }
 }

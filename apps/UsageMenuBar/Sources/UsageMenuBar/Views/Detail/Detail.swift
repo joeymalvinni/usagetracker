@@ -117,7 +117,9 @@ struct Detail: View {
             HStack(spacing: Theme.Spacing.xs) {
                 ForEach(accounts, id: \.accountId) { account in
                     Button {
-                        selectedAccountId = account.accountId
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
+                            selectedAccountId = account.accountId
+                        }
                     } label: {
                         HStack(spacing: Theme.Spacing.xs) {
                             if account.hasUnseenAlert {
@@ -483,6 +485,7 @@ private struct ProviderActivityCard: View {
         .surfaceCard()
         .animation(.spring(duration: 0.3), value: range)
         .animation(.spring(duration: 0.3), value: metric)
+        .animation(.spring(response: 0.4, dampingFraction: 0.82), value: provider.id)
     }
 
     private var activitySubtitle: String {
