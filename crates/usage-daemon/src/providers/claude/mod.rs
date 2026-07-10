@@ -2,13 +2,14 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
 use usage_core::ProviderId;
 
@@ -36,6 +37,7 @@ pub const PROVIDER_ID: &str = "claude";
 const CLAUDE_CREDENTIALS_FILE: &str = ".claude/.credentials.json";
 const CLAUDE_COLLECTION_MODE: &str = "oauth_usage_api";
 const CLAUDE_CLI_COLLECTION_MODE: &str = "claude_cli_usage";
+const CLAUDE_CLI_PARSE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub struct ClaudeCollector {
     profiles: Vec<Arc<ClaudeProfile>>,
@@ -123,7 +125,24 @@ impl ClaudeCollector {
         profile: &ClaudeProfile,
     ) -> Result<ClaudeCredentials, ProviderError> {
         let credentials = self.load_credentials(profile).await?;
-        if credentials.is_expired() {
+        let access_token_expired = credentials.is_expired();
+        debug!(
+            provider_id = PROVIDER_ID,
+            profile_id = profile.id,
+            credential_source = credentials.source_label(),
+            access_token_expired,
+            token_expires_at_ms = credentials.expires_at_ms,
+            "Claude OAuth credentials loaded"
+        );
+        if access_token_expired {
+            info!(
+                provider_id = PROVIDER_ID,
+                profile_id = profile.id,
+                recovery_stage = "oauth_expired_token_refresh",
+                credential_source = credentials.source_label(),
+                token_expires_at_ms = credentials.expires_at_ms,
+                "Claude OAuth access token is expired; refreshing credentials"
+            );
             self.refresh_credentials(profile, credentials).await
         } else {
             Ok(credentials)
@@ -188,6 +207,14 @@ impl ClaudeCollector {
         let mut credentials = self.load_with_auto_refresh(profile).await?;
         let payload = match self.api.fetch_usage(&credentials).await {
             Err(err) if err.kind() == ProviderErrorKind::Unauthorized => {
+                warn!(
+                    provider_id = PROVIDER_ID,
+                    profile_id = profile.id,
+                    recovery_stage = "oauth_usage_unauthorized_refresh",
+                    error_code = err.kind().as_str(),
+                    error = %err,
+                    "Claude OAuth usage rejected the access token; refreshing credentials and retrying"
+                );
                 credentials = self.refresh_credentials(profile, credentials).await?;
                 match self.api.fetch_usage(&credentials).await {
                     Ok(payload) => payload,
@@ -209,15 +236,74 @@ impl ClaudeCollector {
         &self,
         profile: &ClaudeProfile,
     ) -> Result<cli::ClaudeCliUsage, ProviderError> {
+        let started = Instant::now();
+        let first = self.collect_usage_with_cli_once(profile).await;
+        let Err(err) = &first else {
+            return first;
+        };
+        if err.kind() != ProviderErrorKind::Parse {
+            return first;
+        }
+
+        warn!(
+            provider_id = PROVIDER_ID,
+            profile_id = profile.id,
+            attempt = 1,
+            max_attempts = 2,
+            recovery_stage = "cli_retry_scheduled",
+            retry_delay_ms = CLAUDE_CLI_PARSE_RETRY_DELAY.as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            error_code = err.kind().as_str(),
+            error = %err,
+            "Claude CLI usage parse failed; retrying before OAuth fallback"
+        );
+        tokio::time::sleep(CLAUDE_CLI_PARSE_RETRY_DELAY).await;
+        let retry_started = Instant::now();
+        let retry = self.collect_usage_with_cli_once(profile).await;
+        match &retry {
+            Ok(usage) => info!(
+                provider_id = PROVIDER_ID,
+                profile_id = profile.id,
+                recovery_stage = "cli_retry_recovered",
+                recovered_attempt = 2,
+                windows = usage.usage.windows.len(),
+                retry_elapsed_ms = retry_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                "Claude CLI usage recovered after retry"
+            ),
+            Err(retry_err) => warn!(
+                provider_id = PROVIDER_ID,
+                profile_id = profile.id,
+                recovery_stage = "cli_retry_exhausted",
+                attempts = 2,
+                retry_elapsed_ms = retry_started.elapsed().as_millis(),
+                total_elapsed_ms = started.elapsed().as_millis(),
+                initial_error_code = err.kind().as_str(),
+                initial_error = %err,
+                retry_error_code = retry_err.kind().as_str(),
+                retry_error = %retry_err,
+                "Claude CLI usage retry exhausted"
+            ),
+        }
+        retry
+    }
+
+    async fn collect_usage_with_cli_once(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<cli::ClaudeCliUsage, ProviderError> {
         let config_dir = profile.config_dir.clone();
-        tokio::task::spawn_blocking(move || collect_usage_from_cli(config_dir.as_deref()))
-            .await
-            .map_err(|err| {
-                ProviderError::new(
-                    ProviderErrorKind::ProviderUnavailable,
-                    format!("Claude CLI usage task failed: {err}"),
-                )
-            })?
+        let profile_id = profile.id.clone();
+        tokio::task::spawn_blocking(move || {
+            collect_usage_from_cli(config_dir.as_deref(), &profile_id)
+        })
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("Claude CLI usage task failed: {err}"),
+            )
+        })?
     }
 
     async fn profile_for_account(
@@ -451,8 +537,28 @@ impl ProviderCollector for ClaudeCollector {
                     self.capture_raw_payloads.then_some(payload),
                 ),
                 Err(api_err) if should_use_cli_fallback(profile.cli_enabled, &api_err) => {
+                    warn!(
+                        provider_id = PROVIDER_ID,
+                        profile_id = profile.id,
+                        credential_account = account.external_account_id,
+                        recovery_stage = "cli_fallback_started",
+                        oauth_error_code = api_err.kind().as_str(),
+                        oauth_error = %api_err,
+                        "Claude OAuth usage unavailable; starting CLI fallback"
+                    );
+                    let fallback_started = Instant::now();
                     match self.collect_usage_with_cli(&profile).await {
                         Ok(cli_usage) => {
+                            info!(
+                                provider_id = PROVIDER_ID,
+                                profile_id = profile.id,
+                                credential_account = account.external_account_id,
+                                recovery_stage = "cli_fallback_succeeded",
+                                windows = cli_usage.usage.windows.len(),
+                                elapsed_ms = fallback_started.elapsed().as_millis(),
+                                collection_mode = CLAUDE_CLI_COLLECTION_MODE,
+                                "Claude CLI usage fallback succeeded"
+                            );
                             warnings.push(format!(
                                 "Claude OAuth usage API failed; used CLI fallback: {}",
                                 api_err.short_message()
@@ -464,6 +570,18 @@ impl ProviderCollector for ClaudeCollector {
                             )
                         }
                         Err(cli_err) => {
+                            warn!(
+                                provider_id = PROVIDER_ID,
+                                profile_id = profile.id,
+                                credential_account = account.external_account_id,
+                                recovery_stage = "cli_fallback_failed",
+                                elapsed_ms = fallback_started.elapsed().as_millis(),
+                                oauth_error_code = api_err.kind().as_str(),
+                                oauth_error = %api_err,
+                                cli_error_code = cli_err.kind().as_str(),
+                                cli_error = %cli_err,
+                                "Claude OAuth usage and CLI fallback both failed"
+                            );
                             return Err(ProviderError::new(
                                 api_err.kind(),
                                 format!(

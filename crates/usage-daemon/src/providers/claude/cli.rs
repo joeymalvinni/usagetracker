@@ -4,13 +4,15 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Datelike, Days, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use tracing::{debug, warn};
 use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 use wait_timeout::ChildExt;
 
@@ -30,29 +32,67 @@ pub(super) struct ClaudeCliUsage {
 
 pub(super) fn collect_usage_from_cli(
     config_dir: Option<&Path>,
+    profile_id: &str,
 ) -> Result<ClaudeCliUsage, ProviderError> {
-    let raw_output = run_claude_usage_cli(config_dir).map_err(|err| {
+    let raw_output = run_claude_usage_cli(config_dir, profile_id).map_err(|err| {
         ProviderError::new(
             ProviderErrorKind::ProviderUnavailable,
             format!("Claude CLI usage fallback failed: {err}"),
         )
     })?;
-    let response: ClaudePrintResponse = serde_json::from_str(&raw_output).map_err(|err| {
-        ProviderError::new(
-            ProviderErrorKind::Parse,
-            format!("Claude CLI usage fallback returned invalid JSON: {err}"),
-        )
-    })?;
+    let response: ClaudePrintResponse = match serde_json::from_str(&raw_output) {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(
+                provider_id = PROVIDER_ID,
+                profile_id,
+                collection_mode = CLAUDE_CLI_COLLECTION_MODE,
+                failure_stage = "cli_json_decode",
+                stdout_bytes = raw_output.len(),
+                stdout_fingerprint = output_fingerprint(&raw_output),
+                parse_error = %err,
+                "Claude CLI usage returned invalid JSON"
+            );
+            return Err(ProviderError::new(
+                ProviderErrorKind::Parse,
+                format!("Claude CLI usage fallback returned invalid JSON: {err}"),
+            ));
+        }
+    };
 
     let raw_payload = serde_json::from_str(&raw_output).unwrap_or_else(|_| json!({}));
-    let usage = parse_usage_text(&response.result, Utc::now())?;
+    let usage = match parse_usage_text(&response.result, Utc::now()) {
+        Ok(usage) => usage,
+        Err(err) => {
+            let diagnostics = usage_text_diagnostics(&response.result);
+            warn!(
+                provider_id = PROVIDER_ID,
+                profile_id,
+                collection_mode = CLAUDE_CLI_COLLECTION_MODE,
+                failure_stage = "cli_usage_text_parse",
+                error_code = err.kind().as_str(),
+                error = %err,
+                result_bytes = diagnostics.bytes,
+                result_lines = diagnostics.lines,
+                non_empty_lines = diagnostics.non_empty_lines,
+                current_heading_candidates = diagnostics.current_heading_candidates,
+                percent_used_markers = diagnostics.percent_used_markers,
+                reset_markers = diagnostics.reset_markers,
+                output_category = diagnostics.category,
+                result_fingerprint = diagnostics.fingerprint,
+                "Claude CLI usage result contained no parseable usage windows"
+            );
+            return Err(err);
+        }
+    };
     Ok(ClaudeCliUsage {
         usage,
         raw_output: raw_payload,
     })
 }
 
-fn run_claude_usage_cli(config_dir: Option<&Path>) -> anyhow::Result<String> {
+fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::Result<String> {
+    let started = Instant::now();
     let mut command = Command::new("claude");
     command
         .arg("-p")
@@ -126,6 +166,18 @@ fn run_claude_usage_cli(config_dir: Option<&Path>) -> anyhow::Result<String> {
     let stdout = String::from_utf8(stdout)?;
     let stderr = String::from_utf8_lossy(&stderr);
 
+    debug!(
+        provider_id = PROVIDER_ID,
+        profile_id,
+        collection_mode = CLAUDE_CLI_COLLECTION_MODE,
+        status = status.code(),
+        success = status.success(),
+        elapsed_ms = started.elapsed().as_millis(),
+        stdout_bytes = stdout.len(),
+        stderr_bytes = stderr.len(),
+        "Claude CLI usage command completed"
+    );
+
     if !status.success() {
         anyhow::bail!(
             "claude -p /usage exited with status {status}; stderr: {}",
@@ -139,6 +191,58 @@ fn run_claude_usage_cli(config_dir: Option<&Path>) -> anyhow::Result<String> {
 #[derive(Debug, Deserialize)]
 struct ClaudePrintResponse {
     result: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UsageTextDiagnostics {
+    bytes: usize,
+    lines: usize,
+    non_empty_lines: usize,
+    current_heading_candidates: usize,
+    percent_used_markers: usize,
+    reset_markers: usize,
+    category: &'static str,
+    fingerprint: String,
+}
+
+fn usage_text_diagnostics(text: &str) -> UsageTextDiagnostics {
+    let lines = text.lines().collect::<Vec<_>>();
+    let lowercase = text.to_ascii_lowercase();
+    UsageTextDiagnostics {
+        bytes: text.len(),
+        lines: lines.len(),
+        non_empty_lines: lines.iter().filter(|line| !line.trim().is_empty()).count(),
+        current_heading_candidates: lines
+            .iter()
+            .filter(|line| usage_heading(line).is_some())
+            .count(),
+        percent_used_markers: lowercase.matches("% used").count(),
+        reset_markers: lowercase.matches("reset").count(),
+        category: usage_output_category(&lowercase),
+        fingerprint: output_fingerprint(text),
+    }
+}
+
+fn usage_output_category(lowercase: &str) -> &'static str {
+    if lowercase.trim().is_empty() {
+        "empty"
+    } else if lowercase.contains("login")
+        || lowercase.contains("log in")
+        || lowercase.contains("authenticate")
+    {
+        "authentication_prompt"
+    } else if lowercase.contains("error") || lowercase.contains("failed") {
+        "error_text"
+    } else if lowercase.contains("usage") || lowercase.contains("current session") {
+        "usage_text_without_windows"
+    } else {
+        "unrecognized_text"
+    }
+}
+
+fn output_fingerprint(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    format!("{digest:x}")[..12].to_string()
 }
 
 fn parse_usage_text(
@@ -492,6 +596,22 @@ fn stable_window_fragment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarizes_unparseable_usage_without_logging_raw_text() {
+        let text =
+            "Please log in to Claude Code\nCurrent session\nUsage is temporarily unavailable";
+        let diagnostics = usage_text_diagnostics(text);
+
+        assert_eq!(diagnostics.bytes, text.len());
+        assert_eq!(diagnostics.lines, 3);
+        assert_eq!(diagnostics.non_empty_lines, 3);
+        assert_eq!(diagnostics.current_heading_candidates, 1);
+        assert_eq!(diagnostics.percent_used_markers, 0);
+        assert_eq!(diagnostics.reset_markers, 0);
+        assert_eq!(diagnostics.category, "authentication_prompt");
+        assert_eq!(diagnostics.fingerprint.len(), 12);
+    }
 
     #[test]
     fn parses_claude_usage_print_windows() {

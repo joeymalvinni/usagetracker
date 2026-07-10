@@ -299,6 +299,13 @@ pub(super) struct ClaudeCredentials {
 }
 
 impl ClaudeCredentials {
+    pub(super) fn source_label(&self) -> &'static str {
+        match self.source {
+            CredentialSource::Keychain => "keychain",
+            CredentialSource::File(_) => "file",
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn display_name(&self) -> String {
         match self.subscription_type.as_deref() {

@@ -242,10 +242,14 @@ Missing Keychain credentials and a missing fallback file are reported as missing
 
 Keychain access errors, invalid JSON, missing OAuth data, blank tokens, and failed credential writes are reported as invalid credentials.
 
-Refresh and OAuth usage request transport failures are network errors. HTTP 401 or 403 means unauthorized, HTTP 429 means rate limited, and other non-success statuses mean the provider is unavailable.
+Refresh and OAuth usage request transport failures are network errors. HTTP 401 or 403 means unauthorized, HTTP 429 means rate limited, and other non-success statuses mean the provider is unavailable. A token-refresh HTTP 400 carrying the standard `invalid_grant` code is classified as unauthorized because it indicates a rejected or rotated refresh token.
 
 After a 429, the daemon suppresses more collection attempts for that account with exponential backoff: 5, 10, 20, 40, then at most 60 minutes. Suppressed refreshes report `backing_off` health without calling the provider. A successful collection or provider configuration rebuild clears the backoff.
 
 Usage responses that are not valid JSON, are not objects, or contain no usable windows are parse errors.
 
 The CLI path is provider-unavailable when the `claude` command cannot be spawned, exits unsuccessfully, or times out. CLI output that is invalid JSON or contains no recognizable `/usage` windows is a parse error. If both collection paths fail, the reported error includes both failure messages.
+
+CLI parse failures are retried once after a short delay before the fallback is considered failed.
+
+The daemon logs each stage of this recovery path with structured fields: CLI attempt counts and timings, safe output-shape counters, an output fingerprint, credential source and expiry state, OAuth endpoint/status/error code, and the independent OAuth and CLI error kinds. Raw CLI result text, OAuth response descriptions, access tokens, and refresh tokens are not logged.
