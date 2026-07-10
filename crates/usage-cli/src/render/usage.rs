@@ -507,9 +507,7 @@ fn expected_window_duration(window: &UsageWindow) -> Option<TimeDelta> {
         window.window_id.to_ascii_lowercase(),
         window.label.to_ascii_lowercase()
     );
-    if name.contains("five_hour") || name.contains("five hour") {
-        Some(TimeDelta::hours(5))
-    } else if name.contains("session") {
+    if name.contains("five_hour") || name.contains("five hour") || name.contains("session") {
         Some(TimeDelta::hours(5))
     } else if name.contains("seven_day") || name.contains("seven day") || name.contains("weekly") {
         Some(TimeDelta::days(7))

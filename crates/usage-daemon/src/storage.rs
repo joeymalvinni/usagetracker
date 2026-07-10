@@ -1,6 +1,8 @@
 use std::{
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -14,6 +16,13 @@ use crate::providers::DailyUsageBucket;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
 const DAILY_USAGE_MIGRATION: &str = include_str!("../migrations/0002_provider_daily_usage.sql");
+const DAILY_USAGE_SUMMARY_MIGRATION: &str =
+    include_str!("../migrations/0003_daily_usage_summary.sql");
+const SNAPSHOT_RETENTION_INDEXES_MIGRATION: &str =
+    include_str!("../migrations/0004_snapshot_retention_indexes.sql");
+const SNAPSHOT_RETENTION_DAYS: u64 = 90;
+const MAX_SNAPSHOTS_PER_ACCOUNT: usize = 10_000;
+const MAX_RAW_PAYLOADS_PER_ACCOUNT: usize = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredDailyUsage {
@@ -25,9 +34,19 @@ pub struct StoredDailyUsage {
     pub source: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredDailyUsageHistory {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    pub bucket_count: usize,
+    pub total_tokens: u64,
+    pub recent: Vec<StoredDailyUsage>,
+}
+
 #[derive(Clone)]
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
+    connection_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl Storage {
@@ -39,14 +58,25 @@ impl Storage {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -8_192_i64)?;
+        conn.pragma_update(None, "journal_size_limit", 4_i64 * 1024 * 1024)?;
         conn.execute_batch(INITIAL_MIGRATION)?;
         migrate_account_profile_identity(&conn)?;
         migrate_account_lifecycle_state(&conn)?;
         conn.execute_batch(DAILY_USAGE_MIGRATION)?;
+        conn.execute_batch(DAILY_USAGE_SUMMARY_MIGRATION)?;
+        conn.execute_batch(SNAPSHOT_RETENTION_INDEXES_MIGRATION)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            connection_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -62,62 +92,73 @@ impl Storage {
         let profile_id = normalized_profile_id(profile_id, &external_account_id);
         let display_name = display_name.map(ToOwned::to_owned);
         self.with_connection(move |conn| {
-        let now = Utc::now();
-        let existing: Option<(String, String, bool, bool)> = conn
-            .query_row(
-                "SELECT id, created_at, hidden, collection_enabled
-                 FROM accounts
-                 WHERE provider_id = ?1 AND profile_id = ?2",
-                params![provider_id.as_str(), profile_id.as_str()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
-                    ))
-                },
-            )
-            .optional()?;
+            let now = Utc::now();
+            let existing: Option<(String, String, bool, bool, Option<String>)> = conn
+                .query_row(
+                    "SELECT id, created_at, hidden, collection_enabled, display_name
+                     FROM accounts
+                     WHERE provider_id = ?1 AND profile_id = ?2",
+                    params![provider_id.as_str(), profile_id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, i64>(3)? != 0,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
 
-        let (id, created_at, hidden, collection_enabled) = existing
-            .unwrap_or_else(|| (Uuid::new_v4().to_string(), now.to_rfc3339(), false, true));
-        conn.execute(
-            "INSERT INTO accounts
-             (id, provider_id, external_account_id, profile_id, display_name, hidden, collection_enabled, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(provider_id, profile_id) DO UPDATE SET
-               external_account_id = excluded.external_account_id,
-               display_name = excluded.display_name,
-               updated_at = excluded.updated_at",
-            params![
-                id,
-                provider_id.as_str(),
-                external_account_id.as_str(),
-                profile_id.as_str(),
-                display_name.as_deref(),
-                i64::from(hidden),
-                i64::from(collection_enabled),
-                created_at,
-                now.to_rfc3339(),
-            ],
-        )?;
+            let (id, created_at, hidden, collection_enabled, existing_display_name) =
+                existing.unwrap_or_else(|| {
+                    (
+                        Uuid::new_v4().to_string(),
+                        now.to_rfc3339(),
+                        false,
+                        true,
+                        None,
+                    )
+                });
+            let display_name = display_name.or(existing_display_name);
+            conn.execute(
+                "INSERT INTO accounts
+                 (id, provider_id, external_account_id, profile_id, display_name, hidden, collection_enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(provider_id, profile_id) DO UPDATE SET
+                   external_account_id = excluded.external_account_id,
+                   display_name = excluded.display_name,
+                   updated_at = excluded.updated_at",
+                params![
+                    id,
+                    provider_id.as_str(),
+                    external_account_id.as_str(),
+                    profile_id.as_str(),
+                    display_name.as_deref(),
+                    i64::from(hidden),
+                    i64::from(collection_enabled),
+                    created_at,
+                    now.to_rfc3339(),
+                ],
+            )?;
 
-        Ok(Account {
-            id: AccountId::new(id),
-            provider_id,
-            external_account_id,
-            profile_id: (!profile_id.is_empty()).then_some(profile_id),
-            display_name,
-            hidden,
-            collection_enabled,
-            created_at: parse_time(&created_at)?,
-            updated_at: now,
-        })
+            Ok(Account {
+                id: AccountId::new(id),
+                provider_id,
+                external_account_id,
+                profile_id: (!profile_id.is_empty()).then_some(profile_id),
+                display_name,
+                hidden,
+                collection_enabled,
+                created_at: parse_time(&created_at)?,
+                updated_at: now,
+            })
         })
         .await
     }
 
+    #[cfg(test)]
     pub async fn insert_snapshot(
         &self,
         snapshot: &UsageSnapshot,
@@ -163,6 +204,7 @@ impl Storage {
         .await
     }
 
+    #[cfg(test)]
     pub async fn upsert_daily_usage(
         &self,
         provider_id: &ProviderId,
@@ -208,6 +250,7 @@ impl Storage {
         .await
     }
 
+    #[cfg(test)]
     pub async fn daily_usage_history(&self) -> anyhow::Result<Vec<StoredDailyUsage>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -248,21 +291,226 @@ impl Storage {
         .await
     }
 
-    pub async fn update_account_display_name(
+    pub async fn daily_usage_dashboard(
         &self,
-        account_id: &AccountId,
-        display_name: &str,
-    ) -> anyhow::Result<()> {
-        let account_id = account_id.clone();
-        let display_name = display_name.trim().to_string();
+        recent_since: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<StoredDailyUsageHistory>> {
         self.with_connection(move |conn| {
-            if display_name.is_empty() {
-                return Ok(());
-            }
-            conn.execute(
-                "UPDATE accounts SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
-                params![display_name, Utc::now().to_rfc3339(), account_id.as_str()],
+            let mut stmt = conn.prepare(
+                "SELECT totals.provider_id, totals.account_id, totals.bucket_count,
+                        totals.total_tokens, recent.usage_date, recent.tokens,
+                        recent.cost_usd, recent.source
+                 FROM provider_daily_usage_summary AS totals
+                 LEFT JOIN provider_daily_usage AS recent
+                   ON recent.provider_id = totals.provider_id
+                  AND recent.account_id = totals.account_id
+                  AND recent.usage_date >= ?1
+                 ORDER BY totals.provider_id, totals.account_id, recent.usage_date",
             )?;
+            let rows = stmt.query_map(params![recent_since.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<f64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })?;
+
+            let mut histories = Vec::<StoredDailyUsageHistory>::new();
+            for row in rows {
+                let (
+                    provider_id,
+                    account_id,
+                    bucket_count,
+                    total_tokens,
+                    date,
+                    tokens,
+                    cost_usd,
+                    source,
+                ) = row?;
+                let is_new_history = histories.last().is_none_or(|history| {
+                    history.provider_id.as_str() != provider_id
+                        || history.account_id.as_str() != account_id
+                });
+                if is_new_history {
+                    histories.push(StoredDailyUsageHistory {
+                        provider_id: ProviderId::new(provider_id.clone()),
+                        account_id: AccountId::new(account_id.clone()),
+                        bucket_count: usize::try_from(bucket_count).map_err(|err| {
+                            anyhow::anyhow!("daily usage bucket count was invalid: {err}")
+                        })?,
+                        total_tokens: u64::try_from(total_tokens).map_err(|err| {
+                            anyhow::anyhow!("daily usage total was invalid: {err}")
+                        })?,
+                        recent: Vec::new(),
+                    });
+                }
+
+                if let (Some(date), Some(tokens), Some(source)) = (date, tokens, source) {
+                    let history = histories.last_mut().ok_or_else(|| {
+                        anyhow::anyhow!("daily usage history was not initialized")
+                    })?;
+                    history.recent.push(StoredDailyUsage {
+                        provider_id: ProviderId::new(provider_id),
+                        account_id: AccountId::new(account_id),
+                        date: chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?,
+                        tokens: u64::try_from(tokens).map_err(|err| {
+                            anyhow::anyhow!("daily usage tokens were invalid: {err}")
+                        })?,
+                        cost_usd,
+                        source,
+                    });
+                }
+            }
+            Ok(histories)
+        })
+        .await
+    }
+
+    pub async fn record_success(
+        &self,
+        snapshot: &UsageSnapshot,
+        raw_payload: Option<&serde_json::Value>,
+        daily_usage: &[DailyUsageBucket],
+        health: &ProviderHealth,
+        display_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let snapshot = snapshot.clone();
+        let raw_payload = raw_payload.cloned();
+        let daily_usage = daily_usage.to_vec();
+        let health = health.clone();
+        let display_name = display_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        self.with_connection(move |conn| {
+            let snapshot_id = Uuid::new_v4().to_string();
+            let normalized_json = serde_json::to_string(&snapshot)?;
+            let metadata_json = serde_json::to_string(&snapshot.metadata)?;
+            let raw_payload_json = raw_payload
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let collected_at = snapshot.collected_at.to_rfc3339();
+            let transaction = conn.unchecked_transaction()?;
+
+            for bucket in daily_usage {
+                let tokens = i64::try_from(bucket.tokens).map_err(|_| {
+                    anyhow::anyhow!(
+                        "daily usage tokens exceed SQLite integer range for {}",
+                        bucket.date
+                    )
+                })?;
+                transaction.execute(
+                    "INSERT INTO provider_daily_usage
+                     (provider_id, account_id, usage_date, tokens, cost_usd, source, collected_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(provider_id, account_id, usage_date) DO UPDATE SET
+                       tokens = excluded.tokens,
+                       cost_usd = COALESCE(excluded.cost_usd, provider_daily_usage.cost_usd),
+                       source = excluded.source,
+                       collected_at = excluded.collected_at",
+                    params![
+                        snapshot.provider_id.as_str(),
+                        snapshot.account_id.as_str(),
+                        bucket.date.to_string(),
+                        tokens,
+                        bucket.cost_usd,
+                        bucket.source,
+                        collected_at,
+                    ],
+                )?;
+            }
+
+            transaction.execute(
+                "INSERT INTO usage_snapshots
+                 (id, provider_id, account_id, collected_at, normalized_json, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    snapshot_id,
+                    snapshot.provider_id.as_str(),
+                    snapshot.account_id.as_str(),
+                    collected_at,
+                    normalized_json,
+                    metadata_json,
+                ],
+            )?;
+            if let Some(payload_json) = raw_payload_json {
+                transaction.execute(
+                    "INSERT INTO raw_payloads
+                     (id, snapshot_id, provider_id, collected_at, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        snapshot_id,
+                        snapshot.provider_id.as_str(),
+                        collected_at,
+                        payload_json,
+                    ],
+                )?;
+            }
+
+            let health_account_id = health
+                .account_id
+                .as_ref()
+                .map(AccountId::as_str)
+                .unwrap_or("");
+            transaction.execute(
+                "INSERT INTO provider_health
+                 (provider_id, account_id, status, collection_mode, last_success_at, last_failure_at,
+                  last_error_code, last_error_message, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(provider_id, account_id) DO UPDATE SET
+                   status = excluded.status,
+                   collection_mode = COALESCE(excluded.collection_mode, provider_health.collection_mode),
+                   last_success_at = COALESCE(excluded.last_success_at, provider_health.last_success_at),
+                   last_failure_at = COALESCE(excluded.last_failure_at, provider_health.last_failure_at),
+                   last_error_code = excluded.last_error_code,
+                   last_error_message = excluded.last_error_message,
+                   updated_at = excluded.updated_at",
+                params![
+                    health.provider_id.as_str(),
+                    health_account_id,
+                    health_status_to_sql(&health.status),
+                    health.collection_mode.as_deref(),
+                    health.last_success_at.map(|time| time.to_rfc3339()),
+                    health.last_failure_at.map(|time| time.to_rfc3339()),
+                    health.last_error_code.as_deref(),
+                    health.last_error_message.as_deref(),
+                    health.updated_at.to_rfc3339(),
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM provider_health WHERE provider_id = ?1 AND account_id = ''",
+                params![snapshot.provider_id.as_str()],
+            )?;
+            if let Some(display_name) = display_name {
+                transaction.execute(
+                    "UPDATE accounts SET display_name = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![
+                        display_name,
+                        Utc::now().to_rfc3339(),
+                        snapshot.account_id.as_str()
+                    ],
+                )?;
+            }
+            let retention_cutoff = Utc::now()
+                .checked_sub_days(chrono::Days::new(SNAPSHOT_RETENTION_DAYS))
+                .unwrap_or_else(Utc::now);
+            prune_account_history(
+                &transaction,
+                &snapshot.provider_id,
+                &snapshot.account_id,
+                retention_cutoff,
+                MAX_SNAPSHOTS_PER_ACCOUNT,
+                MAX_RAW_PAYLOADS_PER_ACCOUNT,
+            )?;
+
+            transaction.commit()?;
             Ok(())
         })
         .await
@@ -370,41 +618,42 @@ impl Storage {
     pub async fn upsert_health(&self, health: &ProviderHealth) -> anyhow::Result<()> {
         let health = health.clone();
         self.with_connection(move |conn| {
-        let account_id = health
-            .account_id
-            .as_ref()
-            .map(AccountId::as_str)
-            .unwrap_or("");
-        conn.execute(
-            "INSERT INTO provider_health
-             (provider_id, account_id, status, collection_mode, last_success_at, last_failure_at,
-              last_error_code, last_error_message, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(provider_id, account_id) DO UPDATE SET
-               status = excluded.status,
-               collection_mode = COALESCE(excluded.collection_mode, provider_health.collection_mode),
-               last_success_at = COALESCE(excluded.last_success_at, provider_health.last_success_at),
-               last_failure_at = COALESCE(excluded.last_failure_at, provider_health.last_failure_at),
-               last_error_code = excluded.last_error_code,
-               last_error_message = excluded.last_error_message,
-               updated_at = excluded.updated_at",
-            params![
-                health.provider_id.as_str(),
-                account_id,
-                health_status_to_sql(&health.status),
-                health.collection_mode.as_deref(),
-                health.last_success_at.map(|time| time.to_rfc3339()),
-                health.last_failure_at.map(|time| time.to_rfc3339()),
-                health.last_error_code.as_deref(),
-                health.last_error_message.as_deref(),
-                health.updated_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+            let account_id = health
+                .account_id
+                .as_ref()
+                .map(AccountId::as_str)
+                .unwrap_or("");
+            conn.execute(
+                "INSERT INTO provider_health
+                 (provider_id, account_id, status, collection_mode, last_success_at, last_failure_at,
+                  last_error_code, last_error_message, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(provider_id, account_id) DO UPDATE SET
+                   status = excluded.status,
+                   collection_mode = COALESCE(excluded.collection_mode, provider_health.collection_mode),
+                   last_success_at = COALESCE(excluded.last_success_at, provider_health.last_success_at),
+                   last_failure_at = COALESCE(excluded.last_failure_at, provider_health.last_failure_at),
+                   last_error_code = excluded.last_error_code,
+                   last_error_message = excluded.last_error_message,
+                   updated_at = excluded.updated_at",
+                params![
+                    health.provider_id.as_str(),
+                    account_id,
+                    health_status_to_sql(&health.status),
+                    health.collection_mode.as_deref(),
+                    health.last_success_at.map(|time| time.to_rfc3339()),
+                    health.last_failure_at.map(|time| time.to_rfc3339()),
+                    health.last_error_code.as_deref(),
+                    health.last_error_message.as_deref(),
+                    health.updated_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
         })
         .await
     }
 
+    #[cfg(test)]
     pub async fn delete_provider_level_health(
         &self,
         provider_id: &ProviderId,
@@ -423,12 +672,15 @@ impl Storage {
     pub async fn latest_usage(&self) -> anyhow::Result<Vec<UsageSnapshot>> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT normalized_json FROM usage_snapshots s
-             WHERE collected_at = (
-               SELECT MAX(collected_at) FROM usage_snapshots
-               WHERE provider_id = s.provider_id AND account_id = s.account_id
+                "SELECT latest.normalized_json
+             FROM accounts AS account
+             JOIN usage_snapshots AS latest ON latest.rowid = (
+               SELECT rowid FROM usage_snapshots
+               WHERE provider_id = account.provider_id AND account_id = account.id
+               ORDER BY collected_at DESC, rowid DESC
+               LIMIT 1
              )
-             ORDER BY provider_id, account_id",
+             ORDER BY account.provider_id, account.id",
             )?;
             let snapshots = stmt
                 .query_map([], usage_snapshot_from_row)?
@@ -491,8 +743,15 @@ impl Storage {
     where
         T: Send + 'static,
     {
+        let permit = self
+            .connection_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("sqlite connection gate closed"))?;
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = conn
                 .lock()
                 .map_err(|_| anyhow::anyhow!("sqlite connection mutex poisoned"))?;
@@ -500,6 +759,60 @@ impl Storage {
         })
         .await?
     }
+}
+
+fn prune_account_history(
+    conn: &Connection,
+    provider_id: &ProviderId,
+    account_id: &AccountId,
+    retention_cutoff: DateTime<Utc>,
+    max_snapshots: usize,
+    max_raw_payloads: usize,
+) -> anyhow::Result<()> {
+    let max_snapshots = i64::try_from(max_snapshots)?;
+    let max_raw_payloads = i64::try_from(max_raw_payloads)?;
+    conn.execute(
+        "DELETE FROM raw_payloads
+         WHERE id IN (
+           SELECT raw.id
+           FROM raw_payloads AS raw
+           JOIN usage_snapshots AS snapshot ON snapshot.id = raw.snapshot_id
+           WHERE snapshot.provider_id = ?1 AND snapshot.account_id = ?2
+           ORDER BY raw.collected_at DESC, raw.rowid DESC
+           LIMIT -1 OFFSET ?3
+         )",
+        params![provider_id.as_str(), account_id.as_str(), max_raw_payloads],
+    )?;
+    let old_snapshot_ids = "SELECT id FROM usage_snapshots
+         WHERE provider_id = ?1 AND account_id = ?2
+           AND (
+             collected_at < ?3
+             OR id IN (
+               SELECT id FROM usage_snapshots
+               WHERE provider_id = ?1 AND account_id = ?2
+               ORDER BY collected_at DESC, rowid DESC
+               LIMIT -1 OFFSET ?4
+             )
+           )";
+    conn.execute(
+        &format!("DELETE FROM raw_payloads WHERE snapshot_id IN ({old_snapshot_ids})"),
+        params![
+            provider_id.as_str(),
+            account_id.as_str(),
+            retention_cutoff.to_rfc3339(),
+            max_snapshots,
+        ],
+    )?;
+    conn.execute(
+        &format!("DELETE FROM usage_snapshots WHERE id IN ({old_snapshot_ids})"),
+        params![
+            provider_id.as_str(),
+            account_id.as_str(),
+            retention_cutoff.to_rfc3339(),
+            max_snapshots,
+        ],
+    )?;
+    Ok(())
 }
 
 fn usage_snapshot_from_row(row: &Row<'_>) -> rusqlite::Result<UsageSnapshot> {
@@ -666,6 +979,7 @@ fn health_status_from_sql(value: &str) -> ProviderHealthStatus {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
     use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 
     #[tokio::test]
@@ -739,6 +1053,33 @@ mod tests {
         assert_eq!(health[0].collection_mode.as_deref(), Some("test"));
     }
 
+    #[test]
+    fn creates_private_database_files() {
+        let path = std::env::temp_dir().join(format!("usage-storage-{}.sqlite3", Uuid::new_v4()));
+
+        let storage = Storage::open(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        for sidecar in [
+            path.with_extension("sqlite3-shm"),
+            path.with_extension("sqlite3-wal"),
+        ] {
+            if sidecar.exists() {
+                assert_eq!(
+                    std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite3-wal"));
+    }
+
     #[tokio::test]
     async fn upserts_and_retains_daily_usage_by_account_and_date() {
         let storage = test_storage();
@@ -791,6 +1132,13 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].tokens, 10);
         assert_eq!(rows[1].tokens, 25);
+
+        let dashboard = storage.daily_usage_dashboard(second_date).await.unwrap();
+        assert_eq!(dashboard.len(), 1);
+        assert_eq!(dashboard[0].bucket_count, 2);
+        assert_eq!(dashboard[0].total_tokens, 35);
+        assert_eq!(dashboard[0].recent.len(), 1);
+        assert_eq!(dashboard[0].recent[0].tokens, 25);
 
         storage.delete_account(&account.id).await.unwrap();
         assert!(storage.daily_usage_history().await.unwrap().is_empty());
@@ -975,19 +1323,113 @@ mod tests {
             .unwrap();
 
         let updated = storage
-            .update_account(&account.id, None, Some(true), Some(false))
+            .update_account(&account.id, Some("Renamed"), Some(true), Some(false))
             .await
             .unwrap();
         assert!(updated.hidden);
         assert!(!updated.collection_enabled);
 
         let rediscovered = storage
-            .upsert_account(&provider_id, "external-account", Some("work"), Some("Work"))
+            .upsert_account(&provider_id, "external-account", Some("work"), None)
             .await
             .unwrap();
         assert_eq!(rediscovered.id, account.id);
         assert!(rediscovered.hidden);
         assert!(!rediscovered.collection_enabled);
+        assert_eq!(rediscovered.display_name.as_deref(), Some("Renamed"));
+    }
+
+    #[tokio::test]
+    async fn latest_usage_breaks_timestamp_ties_deterministically() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("codex");
+        let account = storage
+            .upsert_account(&provider_id, "external-account", None, None)
+            .await
+            .unwrap();
+        let collected_at = Utc::now();
+        for version in [1, 2] {
+            storage
+                .insert_snapshot(
+                    &UsageSnapshot {
+                        provider_id: provider_id.clone(),
+                        account_id: account.id.clone(),
+                        collected_at,
+                        windows: Vec::new(),
+                        metadata: json!({"version": version}),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let snapshots = storage.latest_usage().await.unwrap();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].metadata["version"], 2);
+    }
+
+    #[tokio::test]
+    async fn prunes_bounded_snapshot_and_raw_payload_history() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("codex");
+        let account = storage
+            .upsert_account(&provider_id, "external-account", None, None)
+            .await
+            .unwrap();
+        for version in 1..=3 {
+            storage
+                .insert_snapshot(
+                    &UsageSnapshot {
+                        provider_id: provider_id.clone(),
+                        account_id: account.id.clone(),
+                        collected_at: Utc::now(),
+                        windows: Vec::new(),
+                        metadata: json!({"version": version}),
+                    },
+                    Some(&json!({"version": version})),
+                )
+                .await
+                .unwrap();
+        }
+
+        let prune_provider_id = provider_id.clone();
+        let prune_account_id = account.id.clone();
+        storage
+            .with_connection(move |conn| {
+                prune_account_history(
+                    conn,
+                    &prune_provider_id,
+                    &prune_account_id,
+                    Utc::now() - chrono::TimeDelta::days(90),
+                    2,
+                    1,
+                )
+            })
+            .await
+            .unwrap();
+
+        let account_id = account.id.clone();
+        let (snapshots, raw_payloads) = storage
+            .with_connection(move |conn| {
+                let snapshots: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM usage_snapshots WHERE account_id = ?1",
+                    params![account_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                let raw_payloads: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM raw_payloads", [], |row| row.get(0))?;
+                Ok((snapshots, raw_payloads))
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshots, 2);
+        assert_eq!(raw_payloads, 1);
+        assert_eq!(
+            storage.latest_usage().await.unwrap()[0].metadata["version"],
+            3
+        );
     }
 
     fn test_storage() -> Storage {

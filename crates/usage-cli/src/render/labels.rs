@@ -12,9 +12,9 @@ pub(crate) struct IdentityLabels {
     pub plan: Option<String>,
 }
 
-pub(crate) fn latest_snapshots_by_account<'a>(
-    snapshots: &'a [UsageSnapshot],
-) -> HashMap<String, &'a UsageSnapshot> {
+pub(crate) fn latest_snapshots_by_account(
+    snapshots: &[UsageSnapshot],
+) -> HashMap<String, &UsageSnapshot> {
     let mut latest = HashMap::new();
     for snapshot in snapshots {
         latest

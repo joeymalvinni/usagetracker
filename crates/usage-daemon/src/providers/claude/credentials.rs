@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
 
 use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
@@ -50,14 +55,49 @@ pub(super) async fn save_credentials(credentials: ClaudeCredentials) -> Result<(
                     "failed to serialize refreshed Claude credentials",
                 )
             })?;
-            tokio::fs::write(path, contents).await.map_err(|_| {
-                ProviderError::new(
-                    ProviderErrorKind::CredentialsInvalid,
-                    "failed to save refreshed Claude credentials file",
-                )
-            })
+            tokio::task::spawn_blocking(move || save_file_credentials(&path, &contents))
+                .await
+                .map_err(|_| {
+                    ProviderError::new(
+                        ProviderErrorKind::CredentialsInvalid,
+                        "Claude credential file save task failed",
+                    )
+                })?
         }
     }
+}
+
+fn save_file_credentials(path: &Path, contents: &[u8]) -> Result<(), ProviderError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".credentials.json");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        if let Ok(directory) = std::fs::File::open(parent) {
+            directory.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result.map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "failed to atomically save refreshed Claude credentials file",
+        )
+    })
 }
 
 fn load_credentials_from_keychain_or_file(
@@ -296,6 +336,7 @@ fn update_oauth_field(raw: &mut Value, field: &str, value: Value) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn parses_keychain_oauth_credentials() {
@@ -371,5 +412,25 @@ mod tests {
         );
         assert_eq!(refreshed.raw["claudeAiOauth"]["tokenType"], "bearer");
         assert!(refreshed.expires_at_ms.unwrap() > Utc::now().timestamp_millis());
+    }
+
+    #[test]
+    fn saves_file_credentials_atomically_and_privately() {
+        let root =
+            std::env::temp_dir().join(format!("claude-credentials-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".credentials.json");
+
+        save_file_credentials(&path, br#"{"token":"secret"}"#).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"token\":\"secret\"}\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

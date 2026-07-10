@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use usage_core::{AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus};
@@ -30,6 +31,7 @@ impl RefreshCoordinator {
     }
 
     pub async fn set_providers(&self, providers: Vec<Arc<dyn ProviderCollector>>) {
+        let _guard = self.refresh_lock.lock().await;
         *self.providers.write().await = providers;
     }
 
@@ -58,19 +60,23 @@ impl RefreshCoordinator {
             "refresh started"
         );
 
-        let mut provider_results = Vec::new();
-        for provider in &providers {
+        let refreshes = providers.into_iter().filter_map(|provider| {
             let provider_id = provider.provider_id();
-            if !should_refresh_provider(&provider_id, filter) {
+            if should_refresh_provider(&provider_id, filter) {
+                Some(self.refresh_provider(provider, provider_id))
+            } else {
                 debug!(
                     provider_id = provider_id.as_str(),
                     "skipping provider outside refresh filter"
                 );
-                continue;
+                None
             }
-
-            provider_results.extend(self.refresh_provider(provider.as_ref(), provider_id).await);
-        }
+        });
+        let provider_results = join_all(refreshes)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         let finished_at = Utc::now();
         info!(
@@ -87,7 +93,7 @@ impl RefreshCoordinator {
 
     async fn refresh_provider(
         &self,
-        provider: &dyn ProviderCollector,
+        provider: Arc<dyn ProviderCollector>,
         provider_id: ProviderId,
     ) -> Vec<ProviderRefreshResult> {
         debug!(
@@ -108,14 +114,10 @@ impl RefreshCoordinator {
             "provider account discovery completed"
         );
 
-        let mut results = Vec::with_capacity(accounts.len());
-        for discovered in accounts {
-            results.push(
-                self.refresh_account(provider, provider_id.clone(), discovered)
-                    .await,
-            );
-        }
-        results
+        join_all(accounts.into_iter().map(|discovered| {
+            self.refresh_account(provider.as_ref(), provider_id.clone(), discovered)
+        }))
+        .await
     }
 
     async fn refresh_account(
@@ -218,30 +220,6 @@ impl RefreshCoordinator {
         account_id: AccountId,
         result: ProviderCollectionResult,
     ) -> ProviderRefreshResult {
-        if !result.daily_usage.is_empty() {
-            if let Err(err) = self
-                .storage
-                .upsert_daily_usage(
-                    &provider_id,
-                    &account_id,
-                    &result.daily_usage,
-                    result.usage.collected_at,
-                )
-                .await
-            {
-                warn!(
-                    provider_id = provider_id.as_str(),
-                    account_id = account_id.as_str(),
-                    error = %err,
-                    "failed to store provider daily usage"
-                );
-                return storage_error_result(
-                    provider_id,
-                    Some(account_id),
-                    format!("failed to store daily usage: {err}"),
-                );
-            }
-        }
         let daily_usage_days = result.daily_usage.len();
         let snapshot = result.usage.into_snapshot(account_id.clone());
         if snapshot.provider_id != provider_id {
@@ -262,60 +240,33 @@ impl RefreshCoordinator {
         }
 
         let store_started = Instant::now();
+        let ok_health = health::ok(
+            provider_id.clone(),
+            account_id.clone(),
+            result.collection_mode.clone(),
+        );
         if let Err(err) = self
             .storage
-            .insert_snapshot(&snapshot, result.raw_payload.as_ref())
+            .record_success(
+                &snapshot,
+                result.raw_payload.as_ref(),
+                &result.daily_usage,
+                &ok_health,
+                result.account_display_name.as_deref(),
+            )
             .await
         {
             warn!(
                 provider_id = provider_id.as_str(),
                 account_id = account_id.as_str(),
                 error = %err,
-                "failed to store usage snapshot"
+                "failed to atomically store provider refresh"
             );
             return storage_error_result(
                 provider_id,
                 Some(account_id),
-                format!("failed to store snapshot: {err}"),
+                format!("failed to store provider refresh: {err}"),
             );
-        }
-
-        let ok_health = health::ok(
-            provider_id.clone(),
-            account_id.clone(),
-            result.collection_mode.clone(),
-        );
-        if let Err(err) = self.storage.upsert_health(&ok_health).await {
-            warn!(
-                provider_id = provider_id.as_str(),
-                error = %err,
-                "failed to store provider health"
-            );
-        }
-        if let Err(err) = self
-            .storage
-            .delete_provider_level_health(&provider_id)
-            .await
-        {
-            warn!(
-                provider_id = provider_id.as_str(),
-                error = %err,
-                "failed to clear provider-level health"
-            );
-        }
-        if let Some(display_name) = result.account_display_name.as_deref() {
-            if let Err(err) = self
-                .storage
-                .update_account_display_name(&account_id, display_name)
-                .await
-            {
-                warn!(
-                    provider_id = provider_id.as_str(),
-                    account_id = account_id.as_str(),
-                    error = %err,
-                    "failed to update account display name"
-                );
-            }
         }
 
         for warning in &result.warnings {
@@ -426,6 +377,8 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::{sync::Barrier, time::timeout};
     use usage_core::{
         ProviderHealth, ProviderHealthStatus, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
     };
@@ -533,6 +486,88 @@ mod tests {
         }
     }
 
+    struct ConcurrentAccountProvider {
+        barrier: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl ProviderCollector for ConcurrentAccountProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("codex")
+        }
+
+        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+            Ok(["personal", "work"]
+                .into_iter()
+                .map(|profile| DiscoveredAccount {
+                    external_account_id: profile.to_string(),
+                    display_name: None,
+                    profile_id: Some(profile.to_string()),
+                })
+                .collect())
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<ProviderCollectionResult, ProviderError> {
+            self.barrier.wait().await;
+            Ok(ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new("codex"),
+                    collected_at: Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({}),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "test".to_string(),
+                account_display_name: None,
+                raw_payload: None,
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    struct ConcurrentDiscoveryProvider {
+        provider_id: &'static str,
+        barrier: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl ProviderCollector for ConcurrentDiscoveryProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new(self.provider_id)
+        }
+
+        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+            self.barrier.wait().await;
+            Ok(vec![DiscoveredAccount {
+                external_account_id: self.provider_id.to_string(),
+                display_name: None,
+                profile_id: Some("default".to_string()),
+            }])
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<ProviderCollectionResult, ProviderError> {
+            Ok(ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new(self.provider_id),
+                    collected_at: Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({}),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "test".to_string(),
+                account_display_name: None,
+                raw_payload: None,
+                warnings: Vec::new(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn successful_refresh_clears_stale_provider_level_health() {
         let storage = test_storage();
@@ -623,6 +658,48 @@ mod tests {
             ProviderRefreshStatus::Disabled
         );
         assert!(storage.latest_usage().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refreshes_accounts_concurrently() {
+        let storage = test_storage();
+        let coordinator = RefreshCoordinator::new(
+            storage,
+            vec![Arc::new(ConcurrentAccountProvider {
+                barrier: Arc::new(Barrier::new(2)),
+            })],
+        );
+
+        let report = timeout(Duration::from_secs(1), coordinator.refresh(None))
+            .await
+            .expect("account refreshes should reach the barrier concurrently");
+
+        assert_eq!(report.provider_results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refreshes_providers_concurrently() {
+        let storage = test_storage();
+        let barrier = Arc::new(Barrier::new(2));
+        let coordinator = RefreshCoordinator::new(
+            storage,
+            vec![
+                Arc::new(ConcurrentDiscoveryProvider {
+                    provider_id: "codex",
+                    barrier: barrier.clone(),
+                }),
+                Arc::new(ConcurrentDiscoveryProvider {
+                    provider_id: "claude",
+                    barrier,
+                }),
+            ],
+        );
+
+        let report = timeout(Duration::from_secs(1), coordinator.refresh(None))
+            .await
+            .expect("provider refreshes should reach the barrier concurrently");
+
+        assert_eq!(report.provider_results.len(), 2);
     }
 
     fn test_storage() -> Storage {

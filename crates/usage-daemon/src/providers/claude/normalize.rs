@@ -91,8 +91,8 @@ enum NumberLike {
 impl NumberLike {
     fn value(&self) -> Option<f64> {
         match self {
-            Self::Number(value) => Some(*value),
-            Self::String(value) => value.parse().ok(),
+            Self::Number(value) => value.is_finite().then_some(*value),
+            Self::String(value) => value.parse().ok().filter(|value: &f64| value.is_finite()),
         }
     }
 }

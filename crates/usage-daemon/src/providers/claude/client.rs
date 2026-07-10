@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::Value;
 
-use crate::providers::{ProviderError, ProviderErrorKind};
+use crate::providers::{read_response_body, ProviderError, ProviderErrorKind};
 
 use super::credentials::{save_credentials, ClaudeCredentials, TokenRefreshResponse};
 
@@ -57,7 +57,8 @@ impl ClaudeApiClient {
             })?;
 
         map_refresh_error(response.status())?;
-        let refresh: TokenRefreshResponse = response.json().await.map_err(|err| {
+        let body = read_response_body(response, "Claude token refresh response").await?;
+        let refresh: TokenRefreshResponse = serde_json::from_slice(&body).map_err(|err| {
             ProviderError::new(
                 ProviderErrorKind::Parse,
                 format!("Claude token refresh JSON was invalid: {err}"),
@@ -96,7 +97,8 @@ impl ClaudeApiClient {
             })?;
 
         map_usage_error(response.status())?;
-        response.json().await.map_err(|err| {
+        let body = read_response_body(response, "Claude usage response").await?;
+        serde_json::from_slice(&body).map_err(|err| {
             ProviderError::new(
                 ProviderErrorKind::Parse,
                 format!("Claude usage JSON was invalid: {err}"),

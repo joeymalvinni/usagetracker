@@ -79,32 +79,68 @@ impl Daemon {
         prepare_socket_path(&socket_path)?;
 
         let server = SocketServer::new(self.runtime.clone());
-        let server_task = {
+        let listener = SocketServer::bind(&socket_path)?;
+        let mut server_task = {
             let socket_path = socket_path.clone();
-            tokio::spawn(async move { server.run(&socket_path).await })
+            tokio::spawn(async move { server.serve(listener, &socket_path).await })
         };
 
-        let initial_refresh = self.runtime.refresh.refresh(None).await;
-        info!(
-            results = initial_refresh.provider_results.len(),
-            "initial refresh completed"
-        );
+        let initial_refresh = self.runtime.refresh.clone();
+        let initial_refresh_task = tokio::spawn(async move {
+            let report = initial_refresh.refresh(None).await;
+            info!(
+                results = report.provider_results.len(),
+                elapsed_ms = (report.finished_at - report.started_at).num_milliseconds(),
+                "initial refresh completed"
+            );
+        });
 
-        let poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
+        let mut poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
         let local_log_task = local_logs::spawn_change_log_loop(self.runtime.refresh.clone());
 
-        tokio::signal::ctrl_c().await?;
-        info!("shutdown signal received");
+        let outcome = tokio::select! {
+            signal = shutdown_signal() => {
+                signal?;
+                info!("shutdown signal received");
+                Ok(())
+            }
+            result = &mut server_task => {
+                match result {
+                    Ok(Ok(())) => Err(anyhow::anyhow!("daemon socket server stopped unexpectedly")),
+                    Ok(Err(err)) => Err(err.context("daemon socket server failed")),
+                    Err(err) => Err(anyhow::anyhow!("daemon socket server task failed: {err}")),
+                }
+            }
+            result = &mut poll_task => {
+                match result {
+                    Ok(()) => Err(anyhow::anyhow!("daemon polling loop stopped unexpectedly")),
+                    Err(err) => Err(anyhow::anyhow!("daemon polling task failed: {err}")),
+                }
+            }
+        };
 
         server_task.abort();
         poll_task.abort();
         local_log_task.abort();
+        initial_refresh_task.abort();
+        let _ = server_task.await;
+        let _ = poll_task.await;
+        let _ = local_log_task.await;
+        let _ = initial_refresh_task.await;
         if let Err(err) = std::fs::remove_file(&socket_path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(error = %err, "failed to remove socket file");
             }
         }
-        Ok(())
+        outcome
+    }
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
     }
 }
 
@@ -304,6 +340,9 @@ impl DaemonRuntime {
         &self,
         account: &Account,
     ) -> anyhow::Result<Option<PathBuf>> {
+        if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
+            clear_cached_cookie_cache().await?;
+        }
         let mut config = self.config.write().await;
         let mut updated_config = config.clone();
         let provider = updated_config
@@ -316,7 +355,6 @@ impl DaemonRuntime {
             provider.enabled = false;
             provider.workspace_id = None;
             provider.cookie_header = None;
-            clear_cached_cookie_cache();
         } else if let Some(profile_id) = account.profile_id.as_deref() {
             if let Some(profile) = provider
                 .profiles
@@ -577,7 +615,7 @@ impl DaemonRuntime {
                     .to_string()
             }
             OPENCODE_GO_PROVIDER_ID => {
-                clear_cached_cookie_cache();
+                clear_cached_cookie_cache().await?;
                 open_url("https://opencode.ai")?;
                 "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
                     .to_string()

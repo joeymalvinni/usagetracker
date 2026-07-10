@@ -13,6 +13,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 clap.workspace = true
 dirs.workspace = true
+futures-util.workspace = true
 keyring.workspace = true
 notify.workspace = true
 reqwest.workspace = true

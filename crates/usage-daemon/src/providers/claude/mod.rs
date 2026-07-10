@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ mod normalize;
 
 use cli::collect_usage_from_cli;
 use client::ClaudeApiClient;
-use cost::{merge_local_cost_report, scan_claude_local_costs_from_roots};
+use cost::{merge_local_cost_report, scan_claude_local_costs_cached, ClaudeCostCache};
 use credentials::{load_credentials, ClaudeCredentials};
 use normalize::normalize_usage;
 
@@ -48,6 +48,7 @@ struct ClaudeProfile {
     display_name: Option<String>,
     cli_enabled: bool,
     project_roots: Vec<PathBuf>,
+    cost_cache: Arc<StdMutex<Option<ClaudeCostCache>>>,
 }
 
 impl ClaudeCollector {
@@ -85,7 +86,13 @@ impl ClaudeCollector {
         profile: &ClaudeProfile,
         credentials: ClaudeCredentials,
     ) -> Result<ClaudeCredentials, ProviderError> {
-        let refreshed = self.api.refresh_credentials(credentials).await?;
+        let refreshed = match self.api.refresh_credentials(credentials).await {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                *profile.credentials_cache.lock().await = None;
+                return Err(err);
+            }
+        };
         *profile.credentials_cache.lock().await = Some(refreshed.clone());
         Ok(refreshed)
     }
@@ -118,7 +125,15 @@ impl ClaudeCollector {
         let payload = match self.api.fetch_usage(&credentials).await {
             Err(err) if err.kind() == ProviderErrorKind::Unauthorized => {
                 credentials = self.refresh_credentials(profile, credentials).await?;
-                self.api.fetch_usage(&credentials).await?
+                match self.api.fetch_usage(&credentials).await {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        if err.kind() == ProviderErrorKind::Unauthorized {
+                            *profile.credentials_cache.lock().await = None;
+                        }
+                        return Err(err);
+                    }
+                }
             }
             result => result?,
         };
@@ -217,6 +232,7 @@ fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile
                     .into_iter()
                     .map(expand_home_path)
                     .collect(),
+                cost_cache: Arc::new(StdMutex::new(None)),
             })
         })
         .collect()
@@ -360,12 +376,17 @@ impl ProviderCollector for ClaudeCollector {
 
         if profile.cli_enabled {
             let project_roots = profile.project_roots.clone();
+            let cost_cache = profile.cost_cache.clone();
             match tokio::task::spawn_blocking(move || {
-                scan_claude_local_costs_from_roots(project_roots)
+                scan_claude_local_costs_cached(cost_cache, project_roots)
             })
             .await
             {
-                Ok(Ok(report)) => merge_local_cost_report(&mut usage, report),
+                Ok(Ok(scan)) => {
+                    let cache_status = scan.cache_status;
+                    merge_local_cost_report(&mut usage, scan.report);
+                    usage.metadata["claude_cost"]["scan_cache"] = json!(cache_status);
+                }
                 Ok(Err(err)) => warnings.push(format!("Claude local cost scan failed: {err}")),
                 Err(err) => warnings.push(format!("Claude local cost scan task failed: {err}")),
             }
