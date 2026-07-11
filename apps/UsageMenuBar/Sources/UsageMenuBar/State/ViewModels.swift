@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum DisplayStatus {
+enum DisplayStatus: Equatable, Sendable {
     case normal, warning, critical, stale, error, disabled, offline
 
     var tint: Color {

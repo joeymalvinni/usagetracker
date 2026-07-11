@@ -12,7 +12,7 @@ import SwiftUI
     }
 }
 
-@MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     private struct ProviderMenuSelection {
         let providerId: String
         let accountId: String?
@@ -20,8 +20,20 @@ import SwiftUI
 
     private let state = AppState()
     private let popover = NSPopover()
+    private let navigation = PopoverNavigation()
+    private lazy var popoverController = makePopoverController()
     private var item: NSStatusItem!
-    private var contextMenu: NSMenu?
+    private let contextMenu = NSMenu()
+    private var statusMenuItem: NSMenuItem!
+    private var refreshMenuItem: NSMenuItem!
+    private var providerMenuItems = [NSMenuItem]()
+    private var providerLabelsMenuItem: NSMenuItem!
+    private var remainingMetricMenuItem: NSMenuItem!
+    private var usedMetricMenuItem: NSMenuItem!
+    private var oneProviderMenuItem: NSMenuItem!
+    private var twoProvidersMenuItem: NSMenuItem!
+    private var iconCache = [String: NSImage]()
+    private var providerMenuSignature = ""
     private var bag = Set<AnyCancellable>()
     private let menuIconSize = NSSize(width: 16, height: 16)
 
@@ -31,14 +43,29 @@ import SwiftUI
 
         popover.behavior = .transient
         popover.contentSize = NSSize(width: Theme.Popover.width, height: Theme.Popover.height)
-        popover.contentViewController = makePopoverController(selection: .summary)
+        popover.contentViewController = popoverController
+        makeStatusMenu()
 
-        state.$menuPreview.receive(on: RunLoop.main).sink { [weak self] preview in self?.item.button?.toolTip = preview.isEmpty ? "Usage" : preview }.store(in: &bag)
-        Publishers.CombineLatest(state.$menuStatus, state.$menuBars)
+        state.$derived.map(\.menuPreview).removeDuplicates().receive(on: RunLoop.main).sink { [weak self] preview in self?.item.button?.toolTip = preview.isEmpty ? "Usage" : preview }.store(in: &bag)
+        state.$derived.map { ($0.menuStatus, $0.menuBars) }
             .receive(on: RunLoop.main)
-            .sink { [weak self] status, bars in self?.updateMenuIcon(for: status, bars: bars) }
+            .sink { [weak self] value in self?.updateMenuIcon(for: value.0, bars: value.1) }
+            .store(in: &bag)
+        state.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.updateStatusMenu() }
+            }
             .store(in: &bag)
         Task { await state.bootstrap(); await state.pollLoop() }
+
+        // Force the retained SwiftUI/AppKit tree to load and lay itself out after
+        // launch, before the user's first click.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            _ = self.popoverController.view
+            self.popoverController.view.layoutSubtreeIfNeeded()
+        }
 
         if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] == "1" { showDebugWindow() }
     }
@@ -47,7 +74,7 @@ import SwiftUI
         item.button?.imagePosition = .imageOnly
         item.button?.target = self
         item.button?.action = #selector(statusItemClicked(_:))
-        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        item.button?.sendAction(on: [.leftMouseDown, .rightMouseDown])
         item.button?.toolTip = "Usage"
         item.button?.title = ""
         item.button?.attributedTitle = NSAttributedString(string: "")
@@ -62,8 +89,8 @@ import SwiftUI
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        if isContextClick(NSApp.currentEvent) {
-            showContextMenu()
+        if let event = NSApp.currentEvent, isContextClick(event) {
+            showContextMenu(with: event, relativeTo: sender)
         } else {
             togglePopover()
         }
@@ -71,7 +98,7 @@ import SwiftUI
 
     private func isContextClick(_ event: NSEvent?) -> Bool {
         guard let event else { return false }
-        return event.type == .rightMouseUp || event.modifierFlags.contains(.control)
+        return event.type == .rightMouseDown || event.modifierFlags.contains(.control)
     }
 
     private func togglePopover() {
@@ -81,14 +108,14 @@ import SwiftUI
 
     private func showPopover(selection: Selection, relativeTo button: NSStatusBarButton? = nil) {
         guard let button = button ?? item.button else { return }
-        popover.contentViewController = makePopoverController(selection: selection)
+        navigation.selection = selection
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         configurePopoverWindow()
         Task { await state.refreshForPopoverOpen() }
     }
 
-    private func makePopoverController(selection: Selection) -> NSViewController {
-        GlassPopoverHostingController(rootView: Popover(initialSelection: selection).environmentObject(state))
+    private func makePopoverController() -> NSViewController {
+        GlassPopoverHostingController(rootView: Popover(navigation: navigation).environmentObject(state))
     }
 
     private func configurePopoverWindow() {
@@ -97,71 +124,95 @@ import SwiftUI
         window.backgroundColor = .clear
     }
 
-    private func showContextMenu() {
+    private func showContextMenu(with event: NSEvent, relativeTo button: NSStatusBarButton) {
         popover.performClose(nil)
-        let menu = makeStatusMenu()
-        menu.delegate = self
-        contextMenu = menu
-        item.menu = menu
-        item.button?.performClick(nil)
+        NSMenu.popUpContextMenu(contextMenu, with: event, for: button)
     }
 
-    func menuDidClose(_ menu: NSMenu) {
-        guard menu === contextMenu else { return }
-        item.menu = nil
-        contextMenu = nil
-    }
-
-    private func makeStatusMenu() -> NSMenu {
-        let menu = NSMenu()
+    private func makeStatusMenu() {
+        let menu = contextMenu
         menu.autoenablesItems = false
 
         let title = NSMenuItem(title: "UsageTracker-beta", action: nil, keyEquivalent: "")
         title.isEnabled = false
-        title.image = menuIcon(symbolImage("chart.bar.fill"))
+        title.image = menuIcon(symbolImage("chart.bar.fill"), cacheKey: "title")
         menu.addItem(title)
 
-        let status = NSMenuItem(title: statusSummary, action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        menu.addItem(status)
+        statusMenuItem = NSMenuItem(title: statusSummary, action: nil, keyEquivalent: "")
+        statusMenuItem.isEnabled = false
+        menu.addItem(statusMenuItem)
         menu.addItem(.separator())
-
-        let providers = state.providers.filter(\.enabled)
-        if providers.isEmpty {
-            let empty = NSMenuItem(title: "Waiting for usage data", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            menu.addItem(empty)
-        } else {
-            for provider in providers {
-                menu.addItem(providerMenuItem(provider))
-            }
-        }
-
         menu.addItem(.separator())
         let summary = NSMenuItem(title: "Open Summary", action: #selector(openSummaryFromMenu), keyEquivalent: "")
         summary.target = self
-        summary.image = menuIcon(symbolImage("rectangle.grid.1x2"))
+        summary.image = menuIcon(symbolImage("rectangle.grid.1x2"), cacheKey: "summary")
         menu.addItem(summary)
 
         let settings = NSMenuItem(title: "Settings", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
         settings.target = self
-        settings.image = menuIcon(symbolImage("gearshape"))
+        settings.image = menuIcon(symbolImage("gearshape"), cacheKey: "settings")
         menu.addItem(settings)
         menu.addItem(menuBarSettingsItem())
         menu.addItem(.separator())
 
-        let refresh = NSMenuItem(title: state.refreshing ? "Refreshing..." : "Refresh", action: #selector(refreshFromMenu), keyEquivalent: "r")
-        refresh.target = self
-        refresh.isEnabled = !state.refreshing
-        refresh.image = menuIcon(symbolImage("arrow.clockwise"))
-        menu.addItem(refresh)
+        refreshMenuItem = NSMenuItem(title: "Refresh", action: #selector(refreshFromMenu), keyEquivalent: "r")
+        refreshMenuItem.target = self
+        refreshMenuItem.image = menuIcon(symbolImage("arrow.clockwise"), cacheKey: "refresh")
+        menu.addItem(refreshMenuItem)
 
         let quit = NSMenuItem(title: "Quit UsageTracker", action: #selector(quitFromMenu), keyEquivalent: "q")
         quit.target = self
-        quit.image = menuIcon(symbolImage("power"))
+        quit.image = menuIcon(symbolImage("power"), cacheKey: "quit")
         menu.addItem(quit)
+        updateStatusMenu()
+    }
 
-        return menu
+    private func updateStatusMenu() {
+        guard statusMenuItem != nil else { return }
+        statusMenuItem.title = statusSummary
+        refreshMenuItem.title = state.refreshing ? "Refreshing..." : "Refresh"
+        refreshMenuItem.isEnabled = !state.refreshing
+        providerLabelsMenuItem.state = state.ui.showProviderLabels ? .on : .off
+        remainingMetricMenuItem.state = state.ui.menuMetric == .remaining ? .on : .off
+        usedMetricMenuItem.state = state.ui.menuMetric == .used ? .on : .off
+        oneProviderMenuItem.state = state.ui.maxMenuProviders == 1 ? .on : .off
+        twoProvidersMenuItem.state = state.ui.maxMenuProviders == 2 ? .on : .off
+
+        let providers = state.providers.filter(\.enabled)
+        let signature = makeProviderMenuSignature(providers)
+        guard signature != providerMenuSignature else { return }
+        providerMenuSignature = signature
+
+        providerMenuItems.forEach(menuRemoveItem)
+        if providers.isEmpty {
+            let empty = NSMenuItem(title: "Waiting for usage data", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            providerMenuItems = [empty]
+        } else {
+            providerMenuItems = providers.map(providerMenuItem)
+        }
+        for (offset, providerItem) in providerMenuItems.enumerated() {
+            contextMenu.insertItem(providerItem, at: 3 + offset)
+        }
+    }
+
+    private func makeProviderMenuSignature(_ providers: [ProviderVM]) -> String {
+        var rows = [String]()
+        for provider in providers {
+            for item in [provider] + (provider.subAccounts ?? []) {
+                let percent = item.percent.map { String($0) } ?? ""
+                rows.append([
+                    item.id, item.name, item.primary, percent, item.status.code,
+                    item.detail, item.errorDetail ?? "",
+                ].joined(separator: "\u{1F}"))
+            }
+        }
+        rows.append(state.ui.menuMetric.rawValue)
+        return rows.joined(separator: "\u{1E}")
+    }
+
+    private func menuRemoveItem(_ menuItem: NSMenuItem) {
+        contextMenu.removeItem(menuItem)
     }
 
     private var statusSummary: String {
@@ -185,7 +236,7 @@ import SwiftUI
 
     private func providerMenuItem(_ provider: ProviderVM) -> NSMenuItem {
         let item = NSMenuItem(title: providerMenuTitle(provider), action: nil, keyEquivalent: "")
-        item.image = menuIcon(ProviderBrand.image(provider.providerId) ?? symbolImage(provider.symbol))
+        item.image = menuIcon(ProviderBrand.image(provider.providerId) ?? symbolImage(provider.symbol), cacheKey: "provider:\(provider.providerId)")
         item.toolTip = provider.detail
 
         guard let accounts = provider.subAccounts, accounts.count > 1 else {
@@ -208,7 +259,7 @@ import SwiftUI
                 providerId: provider.id,
                 accountId: account.accountId
             )
-            accountItem.image = menuIcon(symbolImage("person.crop.circle"))
+            accountItem.image = menuIcon(symbolImage("person.crop.circle"), cacheKey: "account")
             accountItem.toolTip = account.errorDetail ?? account.detail
             submenu.addItem(accountItem)
         }
@@ -235,21 +286,26 @@ import SwiftUI
 
     private func menuBarSettingsItem() -> NSMenuItem {
         let item = NSMenuItem(title: "Menu Bar", action: nil, keyEquivalent: "")
-        item.image = menuIcon(symbolImage("menubar.rectangle"))
+        item.image = menuIcon(symbolImage("menubar.rectangle"), cacheKey: "menubar")
 
         let submenu = NSMenu(title: "Menu Bar")
         submenu.autoenablesItems = false
-        submenu.addItem(toggleItem(
+        providerLabelsMenuItem = toggleItem(
             title: "Show Provider Labels",
             state: state.ui.showProviderLabels,
             action: #selector(toggleProviderLabelsFromMenu)
-        ))
+        )
+        submenu.addItem(providerLabelsMenuItem)
         submenu.addItem(.separator())
-        submenu.addItem(metricItem(title: "% Left", metric: .remaining))
-        submenu.addItem(metricItem(title: "% Used", metric: .used))
+        remainingMetricMenuItem = metricItem(title: "% Left", metric: .remaining)
+        usedMetricMenuItem = metricItem(title: "% Used", metric: .used)
+        submenu.addItem(remainingMetricMenuItem)
+        submenu.addItem(usedMetricMenuItem)
         submenu.addItem(.separator())
-        submenu.addItem(maxProvidersItem(count: 1))
-        submenu.addItem(maxProvidersItem(count: 2))
+        oneProviderMenuItem = maxProvidersItem(count: 1)
+        twoProvidersMenuItem = maxProvidersItem(count: 2)
+        submenu.addItem(oneProviderMenuItem)
+        submenu.addItem(twoProvidersMenuItem)
         item.submenu = submenu
         return item
     }
@@ -281,7 +337,8 @@ import SwiftUI
         NSImage(systemSymbolName: name, accessibilityDescription: nil)
     }
 
-    private func menuIcon(_ image: NSImage?) -> NSImage? {
+    private func menuIcon(_ image: NSImage?, cacheKey: String) -> NSImage? {
+        if let cached = iconCache[cacheKey] { return cached }
         guard let image else { return nil }
         let sourceSize = image.size
         guard sourceSize.width > 0, sourceSize.height > 0 else { return image }
@@ -300,6 +357,7 @@ import SwiftUI
         image.draw(in: drawRect, from: .zero, operation: .sourceOver, fraction: 1)
         icon.unlockFocus()
         icon.isTemplate = image.isTemplate
+        iconCache[cacheKey] = icon
         return icon
     }
 
@@ -349,7 +407,7 @@ import SwiftUI
         window.isOpaque = false
         window.backgroundColor = .clear
         window.level = .floating
-        window.contentViewController = GlassPopoverHostingController(rootView: Popover().environmentObject(state))
+        window.contentViewController = GlassPopoverHostingController(rootView: Popover(navigation: navigation).environmentObject(state))
         if let screen = NSScreen.main {
             window.setFrameTopLeftPoint(NSPoint(x: 60, y: screen.frame.maxY - 60))
         }

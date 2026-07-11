@@ -2,7 +2,21 @@ import Combine
 import Foundation
 import UserNotifications
 
-enum DaemonState { case unknown, online, offline }
+enum DaemonState: Equatable, Sendable { case unknown, online, offline }
+
+struct DerivedState: Equatable {
+    static let empty = DerivedState(
+        providers: [], settingsProviders: [], cost: .empty,
+        menuPreview: "Usage", menuStatus: .stale, menuBars: []
+    )
+
+    let providers: [ProviderVM]
+    let settingsProviders: [ProviderVM]
+    let cost: CostDashboardVM
+    let menuPreview: String
+    let menuStatus: DisplayStatus
+    let menuBars: [MenuBarProviderVM]
+}
 
 @MainActor final class AppState: ObservableObject {
     @Published var daemon: DaemonState = .unknown
@@ -23,14 +37,19 @@ enum DaemonState { case unknown, online, offline }
     @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
     @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
-    @Published var providers = [ProviderVM]()
-    @Published var settingsProviders = [ProviderVM]()
-    @Published var cost = CostDashboardVM.empty
-    @Published var menuPreview = "Usage"
-    @Published var menuStatus = DisplayStatus.stale
-    @Published var menuBars = [MenuBarProviderVM]()
+    @Published private(set) var derived = DerivedState.empty
+    var providers: [ProviderVM] { derived.providers }
+    var settingsProviders: [ProviderVM] { derived.settingsProviders }
+    var cost: CostDashboardVM { derived.cost }
+    var menuPreview: String { derived.menuPreview }
+    var menuStatus: DisplayStatus { derived.menuStatus }
+    var menuBars: [MenuBarProviderVM] { derived.menuBars }
     @Published var ui = UIConfig.load() {
-        didSet { ui.save(); build() }
+        didSet {
+            guard ui != oldValue else { return }
+            scheduleUIConfigPersistence()
+            build()
+        }
     }
 
     private var socketPath: String {
@@ -40,6 +59,14 @@ enum DaemonState { case unknown, online, offline }
     }
     private var client: DaemonClient
     private let daemonSupervisor = DaemonSupervisor()
+    private let uiConfigStore = UIConfigStore()
+    private var uiPersistenceTask: Task<Void, Never>?
+    private var buildTask: Task<Void, Never>?
+    private var buildRevision = 0
+    private var loadTask: Task<Void, Never>?
+    private var inFlightIncludesAccounts = false
+    private var lastLoadCompletedAt: Date?
+    private let popoverFreshness: TimeInterval = 30
 
     init() {
         let socketPath = AppState.defaultSocketPath()
@@ -59,7 +86,11 @@ enum DaemonState { case unknown, online, offline }
         _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
         await load(all: true)
     }
-    func refreshForPopoverOpen() async { await load(all: false) }
+    func refreshForPopoverOpen() async {
+        if let lastLoadCompletedAt,
+           Date().timeIntervalSince(lastLoadCompletedAt) < popoverFreshness { return }
+        await load(all: false)
+    }
     func pollLoop() async {
         while !Task.isCancelled {
             let seconds = max(15, Int(config?.pollIntervalSeconds ?? 60))
@@ -438,25 +469,52 @@ enum DaemonState { case unknown, online, offline }
         await load(all: all, allowDaemonStart: true)
     }
     private func load(all: Bool, allowDaemonStart: Bool) async {
+        if let current = loadTask {
+            let satisfiesRequest = !all || inFlightIncludesAccounts
+            await current.value
+            if !satisfiesRequest { await load(all: true, allowDaemonStart: allowDaemonStart) }
+            return
+        }
+
+        inFlightIncludesAccounts = all
+        let task = Task {
+            await performLoad(all: all, allowDaemonStart: allowDaemonStart)
+            loadTask = nil
+            inFlightIncludesAccounts = false
+        }
+        loadTask = task
+        await task.value
+    }
+
+    private func performLoad(all: Bool, allowDaemonStart: Bool) async {
         do {
-            config = try await client.config()
-            updateSocketPath(from: config)
-            if all { accounts = try await client.accounts() }
+            let latestConfig = try await client.config()
+            if config != latestConfig { config = latestConfig }
+            updateSocketPath(from: latestConfig)
+            if all {
+                let latestAccounts = try await client.accounts()
+                if accounts != latestAccounts { accounts = latestAccounts }
+            }
             async let h = client.health()
             async let u = client.usage()
-            health = try await h
+            let latestHealth = try await h
             let usage = try await u
-            snapshots = usage.snapshots
-            forecasts = usage.forecasts
-            if !all && hasUnknownAccountReferences() { accounts = try await client.accounts() }
+            if health != latestHealth { health = latestHealth }
+            if snapshots != usage.snapshots { snapshots = usage.snapshots }
+            if forecasts != usage.forecasts { forecasts = usage.forecasts }
+            if !all && hasUnknownAccountReferences() {
+                let latestAccounts = try await client.accounts()
+                if accounts != latestAccounts { accounts = latestAccounts }
+            }
             daemon = .online; message = nil; build()
+            lastLoadCompletedAt = Date()
             await refreshNotificationAuthorization()
             if config?.notifications.enabled == true {
                 await requestNotificationAuthorizationIfNeeded()
             }
         } catch {
             if allowDaemonStart, await daemonSupervisor.ensureRunning(socketPath: socketPath) {
-                await load(all: all, allowDaemonStart: false)
+                await performLoad(all: all, allowDaemonStart: false)
             } else {
                 fail(error); build()
             }
@@ -563,15 +621,60 @@ enum DaemonState { case unknown, online, offline }
         }
     }
     private func build() {
-        let engine = MetricEngine(config: config, accounts: accounts, health: health, snapshots: snapshots, forecasts: forecasts, ui: ui, visible: uiVisible)
-        providers = engine.providers
-        settingsProviders = engine.settingsProviders
-        cost = engine.costDashboard
-        let (preview, status, bars) = menuContent()
-        menuPreview = preview
-        menuStatus = status
-        menuBars = bars
-        pruneStaleAcknowledgements()
+        buildRevision += 1
+        let revision = buildRevision
+        let config = config
+        let accounts = accounts
+        let health = health
+        let snapshots = snapshots
+        let forecasts = forecasts
+        let ui = ui
+        let daemon = daemon
+
+        buildTask?.cancel()
+        buildTask = Task { [weak self] in
+            let next = await Task.detached(priority: .userInitiated) {
+                let engine = MetricEngine(
+                    config: config,
+                    accounts: accounts,
+                    health: health,
+                    snapshots: snapshots,
+                    forecasts: forecasts,
+                    ui: ui,
+                    visible: { !ui.hiddenProviders.contains($0) }
+                )
+                return Self.derive(from: engine.build(), daemon: daemon, ui: ui)
+            }.value
+            guard let self, !Task.isCancelled, revision == self.buildRevision else { return }
+            if self.derived != next { self.derived = next }
+            self.pruneStaleAcknowledgements()
+        }
+    }
+
+    nonisolated private static func derive(
+        from output: MetricEngine.Output,
+        daemon: DaemonState,
+        ui: UIConfig
+    ) -> DerivedState {
+        let menu = menuContent(providers: output.providers, daemon: daemon, ui: ui)
+        return DerivedState(
+            providers: output.providers,
+            settingsProviders: output.settingsProviders,
+            cost: output.costDashboard,
+            menuPreview: menu.preview,
+            menuStatus: menu.status,
+            menuBars: menu.bars
+        )
+    }
+
+    private func scheduleUIConfigPersistence() {
+        let config = ui
+        uiPersistenceTask?.cancel()
+        uiPersistenceTask = Task { [uiConfigStore] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await uiConfigStore.save(config)
+        }
     }
 
     /// Drop acknowledgements whose exact alert signature is no longer active, so that a
@@ -612,7 +715,6 @@ enum DaemonState { case unknown, online, offline }
         guard let sig = vm.alertSignature else { return false }
         return !ui.dismissedAlerts.contains(sig)
     }
-
     func dismissPricingNotice(_ dashboard: CostDashboardVM) {
         guard let noticeId = dashboard.pricingNoticeId else { return }
         ui.dismissedPricingNotices.insert(noticeId)
@@ -622,7 +724,12 @@ enum DaemonState { case unknown, online, offline }
         guard let noticeId = dashboard.pricingNoticeId else { return false }
         return !ui.dismissedPricingNotices.contains(noticeId)
     }
-    private func menuContent() -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
+
+    nonisolated private static func menuContent(
+        providers: [ProviderVM],
+        daemon: DaemonState,
+        ui: UIConfig
+    ) -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
         guard daemon != .offline else { return ("Usage offline", .offline, []) }
         var preview = ""
         let eligible = providers.filter { $0.enabled && $0.visibleInMenu }
@@ -647,11 +754,11 @@ enum DaemonState { case unknown, online, offline }
         return (preview, menuStatus(for: shown), bars)
     }
 
-    private func menuStatus(for providers: [ProviderVM]) -> DisplayStatus {
+    nonisolated private static func menuStatus(for providers: [ProviderVM]) -> DisplayStatus {
         providers.map(\.status).max { severity($0) < severity($1) } ?? .stale
     }
 
-    private func severity(_ status: DisplayStatus) -> Int {
+    nonisolated private static func severity(_ status: DisplayStatus) -> Int {
         switch status {
         case .normal: 0
         case .disabled: 1
