@@ -1,26 +1,38 @@
 set shell := ["zsh", "-cu"]
 
 app_dir := "apps/UsageMenuBar"
-app_bundle := app_dir + "/.build/UsageMenuBar.app"
+dev_app_bundle := app_dir + "/.build/UsageMenuBar-dev.app"
+release_app_bundle := app_dir + "/.build/UsageMenuBar.app"
 
 # Show the available commands.
 default:
     @just --list
 
-# Build the Rust workspace and the signed macOS app bundle.
-build: build-rust build-app
+# Build the Rust workspace and the development macOS app bundle.
+build: build-rust build-app-dev
 
 # Build all Rust crates.
 build-rust:
     cargo build
 
-# Build and ad-hoc sign the macOS app bundle, including the daemon.
-build-app:
-    ./{{app_dir}}/package-dev-app.sh
+# Build and ad-hoc sign a development macOS app bundle, including the daemon.
+build-app-dev:
+    ./{{app_dir}}/package-dev-app.sh debug
 
-# Build and launch the signed macOS app bundle.
-app: build-app
-    open -n {{app_bundle}}
+# Build and ad-hoc sign an optimized macOS app bundle, including the daemon.
+build-app-release:
+    ./{{app_dir}}/package-dev-app.sh release
+
+# Build and launch the development macOS app bundle.
+app: app-dev
+
+# Build and launch the development macOS app bundle.
+app-dev: build-app-dev
+    open -n {{dev_app_bundle}}
+
+# Build and launch the optimized macOS app bundle.
+app-release: build-app-release
+    open -n {{release_app_bundle}}
 
 # Run the daemon in the foreground; pass daemon flags after the recipe name.
 daemon *args:

@@ -45,8 +45,10 @@ each panel; the box width follows your terminal.
 With [`just`](https://just.systems/) installed, the common development commands are:
 
 ```sh
-just build               # Build Rust and the signed macOS app bundle
-just app                 # Build and launch the signed macOS app bundle
+just build               # Build Rust and the development macOS app bundle
+just app                 # Build and launch the development macOS app bundle
+just app-dev             # Explicit development build and launch
+just app-release         # Optimized release build and launch
 just daemon              # Run the daemon in the foreground
 just cli status          # Run any CLI command
 just test                # Run all Rust tests
