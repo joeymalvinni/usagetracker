@@ -58,6 +58,19 @@ struct ClaudeLoginTarget {
     config_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ConfigUpdateChanges {
+    poll_interval: bool,
+    providers: bool,
+    notifications: bool,
+}
+
+impl ConfigUpdateChanges {
+    fn any(self) -> bool {
+        self.poll_interval || self.providers || self.notifications
+    }
+}
+
 const PROVIDER_REGISTRY: &[ProviderRegistration] = &[
     ProviderRegistration {
         id: CODEX_PROVIDER_ID,
@@ -102,16 +115,6 @@ impl Daemon {
             tokio::spawn(async move { server.serve(listener, &socket_path).await })
         };
 
-        let initial_refresh = self.runtime.refresh.clone();
-        let initial_refresh_task = tokio::spawn(async move {
-            let report = initial_refresh.refresh(None).await;
-            info!(
-                results = report.provider_results.len(),
-                elapsed_ms = (report.finished_at - report.started_at).num_milliseconds(),
-                "initial refresh completed"
-            );
-        });
-
         let mut poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
         let claude_config = self
             .runtime
@@ -149,11 +152,9 @@ impl Daemon {
         server_task.abort();
         poll_task.abort();
         local_log_task.abort();
-        initial_refresh_task.abort();
         let _ = server_task.await;
         let _ = poll_task.await;
         let _ = local_log_task.await;
-        let _ = initial_refresh_task.await;
         if let Err(err) = std::fs::remove_file(&socket_path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(error = %err, "failed to remove socket file");
@@ -232,10 +233,25 @@ impl DaemonRuntime {
         }
 
         let mut config = self.config.write().await;
+        let changes = config_update_changes(
+            &config,
+            poll_interval_seconds,
+            providers.as_ref(),
+            notifications,
+        );
+        if !changes.any() {
+            drop(config);
+            return self.config_response().await;
+        }
+
         let mut updated_config = config.clone();
         updated_config.apply_update(poll_interval_seconds, providers.as_ref(), notifications)?;
 
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = if changes.providers {
+            Some(build_providers(&updated_config, &self.storage).await?)
+        } else {
+            None
+        };
         let notifications_reenabled =
             !config.notifications.enabled && updated_config.notifications.enabled;
         let notifications_disabled =
@@ -248,9 +264,22 @@ impl DaemonRuntime {
         }
         updated_config.persist()?;
         *config = updated_config;
-        self.refresh.set_providers(collectors).await;
-        self.notifications.set_enabled(config.notifications.enabled);
-        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
+        if let Some(collectors) = collectors {
+            self.refresh.set_providers(collectors).await;
+        }
+        if changes.notifications {
+            self.notifications.set_enabled(config.notifications.enabled);
+        }
+        if changes.poll_interval {
+            self.poll_interval_tx.send_if_modified(|current| {
+                if *current == config.poll_interval_seconds {
+                    false
+                } else {
+                    *current = config.poll_interval_seconds;
+                    true
+                }
+            });
+        }
 
         let poll_interval_seconds = config.poll_interval_seconds;
         let enabled_providers = config.enabled_provider_ids();
@@ -313,7 +342,6 @@ impl DaemonRuntime {
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
-        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
         drop(config);
 
         let child = launch_codex_login(&profile_path)?;
@@ -370,7 +398,6 @@ impl DaemonRuntime {
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
-        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
         drop(config);
 
         let profile_path = target
@@ -519,7 +546,6 @@ impl DaemonRuntime {
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
-        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
         Ok(managed_profile_path)
     }
 
@@ -578,7 +604,6 @@ impl DaemonRuntime {
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
-        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
         Ok(())
     }
 
@@ -830,8 +855,26 @@ impl DaemonRuntime {
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
-        let _ = self.poll_interval_tx.send(config.poll_interval_seconds);
         Ok(target)
+    }
+}
+
+fn config_update_changes(
+    config: &Config,
+    poll_interval_seconds: Option<u64>,
+    providers: Option<&BTreeMap<String, ProviderToggle>>,
+    notifications: Option<NotificationConfig>,
+) -> ConfigUpdateChanges {
+    ConfigUpdateChanges {
+        poll_interval: poll_interval_seconds
+            .is_some_and(|seconds| seconds != config.poll_interval_seconds),
+        providers: providers.is_some_and(|providers| {
+            providers
+                .iter()
+                .any(|(id, toggle)| config.provider_enabled(id) != toggle.enabled)
+        }),
+        notifications: notifications
+            .is_some_and(|notifications| notifications != config.notifications),
     }
 }
 
@@ -1323,14 +1366,29 @@ fn build_opencode_go_provider(config: &Config) -> anyhow::Result<Arc<dyn Provide
 }
 
 fn spawn_polling_loop(
-    mut interval_rx: watch::Receiver<u64>,
+    interval_rx: watch::Receiver<u64>,
     refresh: Arc<RefreshCoordinator>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_polling_loop_with_delay(interval_rx, refresh, Duration::from_secs)
+}
+
+fn spawn_polling_loop_with_delay(
+    mut interval_rx: watch::Receiver<u64>,
+    refresh: Arc<RefreshCoordinator>,
+    poll_delay: fn(u64) -> Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let report = refresh.refresh(None).await;
+        info!(
+            results = report.provider_results.len(),
+            elapsed_ms = (report.finished_at - report.started_at).num_milliseconds(),
+            "initial refresh completed"
+        );
+
         loop {
             let seconds = *interval_rx.borrow_and_update();
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(seconds)) => {
+                _ = tokio::time::sleep(poll_delay(seconds)) => {
                     let report = refresh.refresh(None).await;
                     info!(
                         results = report.provider_results.len(),
@@ -1387,6 +1445,210 @@ fn prepare_socket_path(socket_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::{sync::Notify, time::timeout};
+
+    #[derive(Default)]
+    struct BlockingDiscoveryProvider {
+        attempts: AtomicUsize,
+        first_started: Notify,
+        release_first: Notify,
+        first_finished: Notify,
+    }
+
+    #[async_trait]
+    impl ProviderCollector for BlockingDiscoveryProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new(CODEX_PROVIDER_ID)
+        }
+
+        async fn discover_accounts(
+            &self,
+        ) -> Result<Vec<crate::providers::DiscoveredAccount>, crate::providers::ProviderError>
+        {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+                self.first_finished.notify_one();
+            }
+            Ok(Vec::new())
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &crate::providers::DiscoveredAccount,
+        ) -> Result<crate::providers::ProviderCollectionResult, crate::providers::ProviderError>
+        {
+            unreachable!("the blocking test provider discovers no accounts")
+        }
+    }
+
+    fn test_config(root: &Path) -> Config {
+        let providers = BTreeMap::from([
+            (
+                CODEX_PROVIDER_ID.to_string(),
+                ProviderConfig {
+                    enabled: true,
+                    ..ProviderConfig::default()
+                },
+            ),
+            (CLAUDE_PROVIDER_ID.to_string(), ProviderConfig::default()),
+            (
+                OPENCODE_GO_PROVIDER_ID.to_string(),
+                ProviderConfig::default(),
+            ),
+        ]);
+        Config {
+            poll_interval_seconds: 300,
+            notifications: NotificationConfig::default(),
+            providers,
+            debug_capture_raw_payloads: false,
+            paths: crate::config::Paths {
+                config: root.join("config.json"),
+                db: root.join("usage.sqlite3"),
+                socket: root.join("usage.sock"),
+            },
+        }
+    }
+
+    fn test_storage_at(root: &Path) -> Storage {
+        std::fs::create_dir_all(root).unwrap();
+        Storage::open(&root.join("usage.sqlite3")).unwrap()
+    }
+
+    #[test]
+    fn classifies_config_updates_by_actual_side_effects() {
+        let config = test_config(Path::new("/tmp/unused-usage-config"));
+        let unchanged_providers = BTreeMap::from([(
+            CODEX_PROVIDER_ID.to_string(),
+            ProviderToggle { enabled: true },
+        )]);
+
+        assert_eq!(
+            config_update_changes(
+                &config,
+                Some(config.poll_interval_seconds),
+                Some(&unchanged_providers),
+                Some(config.notifications),
+            ),
+            ConfigUpdateChanges::default()
+        );
+        assert_eq!(
+            config_update_changes(&config, Some(60), None, None),
+            ConfigUpdateChanges {
+                poll_interval: true,
+                ..ConfigUpdateChanges::default()
+            }
+        );
+        assert_eq!(
+            config_update_changes(
+                &config,
+                None,
+                None,
+                Some(NotificationConfig { enabled: false }),
+            ),
+            ConfigUpdateChanges {
+                notifications: true,
+                ..ConfigUpdateChanges::default()
+            }
+        );
+        let changed_providers = BTreeMap::from([(
+            CLAUDE_PROVIDER_ID.to_string(),
+            ProviderToggle { enabled: true },
+        )]);
+        assert_eq!(
+            config_update_changes(&config, None, Some(&changed_providers), None),
+            ConfigUpdateChanges {
+                providers: true,
+                ..ConfigUpdateChanges::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn interval_only_update_does_not_wait_for_an_active_refresh() {
+        let root = std::env::temp_dir().join(format!(
+            "usage-runtime-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = test_storage_at(&root);
+        let provider = Arc::new(BlockingDiscoveryProvider::default());
+        let refresh = Arc::new(RefreshCoordinator::new(
+            storage.clone(),
+            vec![provider.clone()],
+        ));
+        let (runtime, mut interval_rx) =
+            DaemonRuntime::new(test_config(&root), storage.clone(), refresh.clone());
+        let refresh_task = {
+            let refresh = refresh.clone();
+            tokio::spawn(async move { refresh.refresh(None).await })
+        };
+        timeout(Duration::from_secs(1), provider.first_started.notified())
+            .await
+            .expect("the active refresh should start");
+
+        let update = timeout(
+            Duration::from_secs(1),
+            runtime.update_config(Some(301), None, None),
+        )
+        .await;
+        provider.release_first.notify_one();
+        refresh_task.await.unwrap();
+
+        let response = update
+            .expect("an interval-only update must not wait for the refresh lock")
+            .unwrap();
+        assert_eq!(response.poll_interval_seconds, 301);
+        assert!(interval_rx.has_changed().unwrap());
+        assert_eq!(*interval_rx.borrow_and_update(), 301);
+
+        drop(runtime);
+        drop(refresh);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_poll_delay_begins_after_initial_refresh_finishes() {
+        let root =
+            std::env::temp_dir().join(format!("usage-poll-schedule-test-{}", uuid::Uuid::new_v4()));
+        let storage = test_storage_at(&root);
+        let provider = Arc::new(BlockingDiscoveryProvider::default());
+        let refresh = Arc::new(RefreshCoordinator::new(
+            storage.clone(),
+            vec![provider.clone()],
+        ));
+        let (_interval_tx, interval_rx) = watch::channel(30);
+        let poll_task =
+            spawn_polling_loop_with_delay(interval_rx, refresh.clone(), Duration::from_millis);
+        timeout(Duration::from_secs(1), provider.first_started.notified())
+            .await
+            .expect("the initial refresh should start");
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+
+        provider.release_first.notify_one();
+        timeout(Duration::from_secs(1), provider.first_finished.notified())
+            .await
+            .expect("the initial refresh should finish");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+        timeout(Duration::from_secs(1), async {
+            while provider.attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first periodic refresh should run after the full delay");
+
+        poll_task.abort();
+        let _ = poll_task.await;
+        drop(refresh);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn profile_id_generation_uses_label_and_avoids_existing_profiles() {

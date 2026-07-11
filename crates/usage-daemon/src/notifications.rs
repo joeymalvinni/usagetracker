@@ -71,7 +71,7 @@ impl NotificationManager {
             .storage
             .notification_window_state(&account.id, &window.window_id)
             .await?;
-        let mut state = existing.unwrap_or(NotificationWindowState {
+        let mut state = existing.clone().unwrap_or(NotificationWindowState {
             last_percent: percent,
             reset_at: window.reset_at,
             notified_mask: 0,
@@ -107,11 +107,27 @@ impl NotificationManager {
             );
         }
 
-        state.last_percent = percent;
         state.reset_at = window.reset_at;
+        if !notification_decision_state_changed(existing.as_ref(), &state) {
+            return Ok(());
+        }
         self.storage
             .upsert_notification_window_state(&account.id, &window.window_id, state)
             .await
+    }
+}
+
+fn notification_decision_state_changed(
+    existing: Option<&NotificationWindowState>,
+    state: &NotificationWindowState,
+) -> bool {
+    match existing {
+        Some(existing) => {
+            existing.reset_at != state.reset_at
+                || existing.notified_mask != state.notified_mask
+                || existing.last_attempt_at != state.last_attempt_at
+        }
+        None => state.notified_mask != 0 || state.last_attempt_at.is_some(),
     }
 }
 
@@ -230,6 +246,77 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0].title.contains("usage is low"));
         assert!(notifications[0].body.contains("4% remaining"));
+    }
+
+    #[tokio::test]
+    async fn first_high_sample_does_not_initialize_notification_state() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(storage.clone(), true);
+
+        manager
+            .process_snapshot(
+                &account,
+                &test_snapshot(90.0, Utc::now() + TimeDelta::hours(2)),
+            )
+            .await;
+
+        assert!(storage.pending_notifications().await.unwrap().is_empty());
+        assert!(storage
+            .notification_window_state(&account.id, "weekly")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_notification_decision_state_is_not_rewritten() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(storage.clone(), true);
+        let reset_at = Utc::now() + TimeDelta::hours(2);
+
+        manager
+            .process_snapshot(&account, &test_snapshot(10.0, reset_at))
+            .await;
+        let first = storage
+            .notification_window_state(&account.id, "weekly")
+            .await
+            .unwrap()
+            .unwrap();
+
+        manager
+            .process_snapshot(&account, &test_snapshot(9.0, reset_at))
+            .await;
+        let second = storage
+            .notification_window_state(&account.id, "weekly")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn usage_recovery_persists_rearmed_thresholds() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(storage.clone(), true);
+        let reset_at = Utc::now() + TimeDelta::hours(2);
+
+        manager
+            .process_snapshot(&account, &test_snapshot(10.0, reset_at))
+            .await;
+        manager
+            .process_snapshot(&account, &test_snapshot(12.0, reset_at))
+            .await;
+
+        let state = storage
+            .notification_window_state(&account.id, "weekly")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.notified_mask & 4, 0);
     }
 
     #[tokio::test]

@@ -12,15 +12,20 @@ use crate::{
     render::{
         labels::{identity_labels, metadata_str, plan_label},
         style::{
-            collapse_spaces, format_collection_mode, format_provider_name, truncate, visible_len,
-            Theme,
+            collapse_spaces, format_collection_mode, format_provider_name, relative_time, truncate,
+            visible_len, Theme,
         },
     },
     OutputStyle,
 };
 
-const DASHBOARD_WIDTH: usize = 62;
-const BAR_WIDTH: usize = 12;
+/// Fixed label column shared by the rows inside a provider panel.
+const LABEL_WIDTH: usize = 8;
+/// Clamp for the drawn bar so it stays legible across terminal widths.
+const BAR_MIN: usize = 10;
+const BAR_MAX: usize = 28;
+
+type ForecastIndex<'a> = HashMap<(&'a str, &'a str, &'a str), &'a UsageForecast>;
 
 pub fn render_usage(
     snapshots: &[UsageSnapshot],
@@ -28,11 +33,13 @@ pub fn render_usage(
     accounts: &[Account],
     style: OutputStyle,
     color: bool,
+    width: usize,
+    details: bool,
 ) -> String {
     let dashboard = Dashboard::from_snapshots(snapshots, forecasts, accounts);
     let theme = Theme::new(color);
     match style {
-        OutputStyle::Dashboard => render_dashboard(&dashboard, theme),
+        OutputStyle::Dashboard => render_dashboard(&dashboard, theme, width, details),
         OutputStyle::Compact => render_compact(&dashboard, theme),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
@@ -48,6 +55,7 @@ struct Dashboard {
 #[derive(Debug, Default)]
 struct Overview {
     lifetime_tokens: u64,
+    spend_usd: f64,
     peak_tokens: u64,
     current_streak_days: usize,
     longest_streak_days: usize,
@@ -61,15 +69,20 @@ struct ActivityDay {
 
 #[derive(Debug)]
 struct ProviderPanel {
-    title: String,
+    provider: String,
+    mode: Option<String>,
+    plan: Option<String>,
+    identity: Option<String>,
     session: Option<WindowLine>,
     weekly: Option<WindowLine>,
     monthly: Option<WindowLine>,
+    usage: Vec<String>,
     pace: Option<PaceLine>,
-    forecast: Option<String>,
+    forecast: Option<ForecastStatus>,
     credits: Option<String>,
     reset_credits: Option<String>,
-    identity: Option<String>,
+    extra: Vec<String>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -94,11 +107,22 @@ impl Dashboard {
     ) -> Self {
         let account_by_id = accounts
             .iter()
-            .map(|account| (account.id.as_str().to_string(), account))
+            .map(|account| (account.id.as_str(), account))
             .collect::<HashMap<_, _>>();
+        let mut forecast_by_window = ForecastIndex::with_capacity(forecasts.len());
+        for forecast in forecasts {
+            forecast_by_window
+                .entry((
+                    forecast.provider_id.as_str(),
+                    forecast.account_id.as_str(),
+                    forecast.window_id.as_str(),
+                ))
+                .or_insert(forecast);
+        }
         let daily_tokens = aggregate_daily_tokens(snapshots);
         let overview = Overview {
             lifetime_tokens: lifetime_tokens(snapshots),
+            spend_usd: total_cost(snapshots),
             peak_tokens: daily_tokens.values().copied().max().unwrap_or_default(),
             current_streak_days: current_streak_days(&daily_tokens),
             longest_streak_days: longest_streak_days(&daily_tokens),
@@ -109,7 +133,7 @@ impl Dashboard {
             .map(|snapshot| {
                 ProviderPanel::from_snapshot(
                     snapshot,
-                    forecasts,
+                    &forecast_by_window,
                     account_by_id.get(snapshot.account_id.as_str()).copied(),
                 )
             })
@@ -126,7 +150,7 @@ impl Dashboard {
 impl ProviderPanel {
     fn from_snapshot(
         snapshot: &UsageSnapshot,
-        forecasts: &[UsageForecast],
+        forecast_by_window: &ForecastIndex<'_>,
         account: Option<&Account>,
     ) -> Self {
         let session_window = select_window(snapshot, WindowRole::Session);
@@ -134,56 +158,88 @@ impl ProviderPanel {
         let monthly_window = select_window(snapshot, WindowRole::Monthly);
         let pace_window = weekly_window.or(session_window);
         let daemon_forecast = pace_window.and_then(|window| {
-            forecasts.iter().find(|forecast| {
-                forecast.provider_id == snapshot.provider_id
-                    && forecast.account_id == snapshot.account_id
-                    && forecast.window_id == window.window_id
-            })
+            forecast_by_window
+                .get(&(
+                    snapshot.provider_id.as_str(),
+                    snapshot.account_id.as_str(),
+                    window.window_id.as_str(),
+                ))
+                .copied()
         });
         let pace = daemon_forecast.and_then(pace_line);
-        let forecast = daemon_forecast.map(|forecast| match forecast.status {
-            ForecastStatus::Safe | ForecastStatus::OnPace => "lasts      until reset".to_string(),
-            ForecastStatus::AtRisk => "tight       before reset".to_string(),
-            ForecastStatus::Exhausted => "exhausted   until reset".to_string(),
-            ForecastStatus::InsufficientData => "insufficient data".to_string(),
-        });
+        let forecast = daemon_forecast.map(|forecast| forecast.status);
 
         let labels = identity_labels(account, Some(snapshot));
+        let selected_ids = [session_window, weekly_window, monthly_window]
+            .into_iter()
+            .flatten()
+            .map(|window| window.window_id.as_str())
+            .collect::<BTreeSet<_>>();
         Self {
-            title: provider_title(snapshot, labels.plan.as_deref()),
+            provider: format_provider_name(snapshot.provider_id.as_str()),
+            mode: metadata_str(&snapshot.metadata, "collection_mode")
+                .map(|mode| collection_mode_label(snapshot.provider_id.as_str(), mode)),
+            plan: panel_plan(snapshot, labels.plan.as_deref()),
+            identity: labels.identity,
             session: session_window.map(|window| window_line("Session", window)),
             weekly: weekly_window.map(|window| window_line("Weekly", window)),
             monthly: monthly_window.map(|window| window_line("Monthly", window)),
+            usage: usage_summary(snapshot),
             pace,
             forecast,
             credits: credits_line(snapshot),
             reset_credits: reset_credits_line(snapshot),
-            identity: labels.identity,
+            extra: snapshot
+                .windows
+                .iter()
+                .filter(|window| !selected_ids.contains(window.window_id.as_str()))
+                .filter(|window| !matches!(window.kind, UsageWindowKind::Credits))
+                .filter(|window| !is_token_counter(window))
+                .filter_map(detail_window_line)
+                .collect(),
+            updated_at: snapshot.collected_at,
         }
+    }
+
+    fn header_title(&self) -> String {
+        let mut parts = vec![self.provider.clone()];
+        if let Some(mode) = &self.mode {
+            parts.push(mode.clone());
+        }
+        if let Some(plan) = &self.plan {
+            parts.push(plan.clone());
+        }
+        parts.join(" · ")
     }
 }
 
-fn render_dashboard(dashboard: &Dashboard, theme: Theme) -> String {
+fn render_dashboard(dashboard: &Dashboard, theme: Theme, width: usize, details: bool) -> String {
     let mut output = String::new();
     push_box(
         &mut output,
+        width,
         "Overview",
+        None,
         &overview_lines(&dashboard.overview, theme),
         theme,
     );
     output.push('\n');
     push_box(
         &mut output,
+        width,
         "Activity · last 7 days",
-        &activity_lines(&dashboard.activity, theme),
+        None,
+        &activity_lines(&dashboard.activity, theme, width),
         theme,
     );
     for provider in &dashboard.providers {
         output.push('\n');
         push_box(
             &mut output,
-            &provider.title,
-            &provider_lines(provider, theme),
+            width,
+            &provider.header_title(),
+            provider.identity.as_deref(),
+            &provider_lines(provider, theme, width, details),
             theme,
         );
     }
@@ -216,34 +272,24 @@ fn render_compact(dashboard: &Dashboard, theme: Theme) -> String {
     let _ = writeln!(output, "{} {activity}", theme.label("Activity"));
 
     for provider in &dashboard.providers {
+        let mut head = theme.title(&provider.provider);
+        if let Some(plan) = &provider.plan {
+            head.push_str(&theme.muted(&format!("/{plan}")));
+        }
+        if let Some(identity) = &provider.identity {
+            head.push(' ');
+            head.push_str(&theme.muted(identity));
+        }
+
         let mut parts = Vec::new();
-        if let Some(session) = &provider.session {
-            parts.push(compact_window(session));
+        for window in [&provider.session, &provider.weekly, &provider.monthly]
+            .into_iter()
+            .flatten()
+        {
+            parts.push(compact_window(window, theme));
         }
-        if let Some(weekly) = &provider.weekly {
-            parts.push(compact_window(weekly));
-        }
-        if let Some(monthly) = &provider.monthly {
-            parts.push(compact_window(monthly));
-        }
-        if let Some(credits) = &provider.credits {
-            parts.push(format!("credits {}", collapse_spaces(credits)));
-        }
-        if let Some(reset_credits) = &provider.reset_credits {
-            parts.push(format!("resets {}", collapse_spaces(reset_credits)));
-        }
-        let identity = provider
-            .identity
-            .as_ref()
-            .map(|identity| format!(" · {identity}"))
-            .unwrap_or_default();
-        let _ = writeln!(
-            output,
-            "{}: {}{}",
-            theme.title(&provider.title),
-            parts.join(", "),
-            identity
-        );
+        parts.extend(provider.usage.iter().map(|value| collapse_spaces(value)));
+        let _ = writeln!(output, "{head}  {}", parts.join(" · "));
     }
 
     output.trim_end().to_string()
@@ -260,8 +306,8 @@ fn overview_lines(overview: &Overview, theme: Theme) -> Vec<String> {
         ),
         format!(
             "{} {} {} {}",
-            pad_right(theme.label("Longest task"), 16),
-            pad_right(theme.muted("n/a"), 10),
+            pad_right(theme.label("Tracked spend"), 16),
+            pad_right(theme.value(&format!("${:.2}", overview.spend_usd)), 10),
             pad_right(theme.label("Current streak"), 14),
             theme.value(&format_days(overview.current_streak_days))
         ),
@@ -273,12 +319,13 @@ fn overview_lines(overview: &Overview, theme: Theme) -> Vec<String> {
     ]
 }
 
-fn activity_lines(activity: &[ActivityDay], theme: Theme) -> Vec<String> {
+fn activity_lines(activity: &[ActivityDay], theme: Theme, width: usize) -> Vec<String> {
     let peak = activity
         .iter()
         .map(|day| day.tokens)
         .max()
         .unwrap_or_default();
+    let bar_width = bar_width_for(width, 3 + 1 + 7 + 2);
     activity
         .iter()
         .map(|day| {
@@ -286,86 +333,175 @@ fn activity_lines(activity: &[ActivityDay], theme: Theme) -> Vec<String> {
                 "{} {}  {}",
                 pad_right(theme.label(&day.date.format("%a").to_string()), 3),
                 pad_left(theme.value(&format_tokens(day.tokens)), 7),
-                token_bar(day.tokens, peak, BAR_WIDTH, theme)
+                token_bar(day.tokens, peak, bar_width, theme)
             )
         })
         .collect()
 }
 
-fn provider_lines(provider: &ProviderPanel, theme: Theme) -> Vec<String> {
+fn provider_lines(
+    provider: &ProviderPanel,
+    theme: Theme,
+    width: usize,
+    details: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    if let Some(session) = &provider.session {
-        lines.push(window_row(session, theme));
-    }
-    if let Some(weekly) = &provider.weekly {
-        lines.push(window_row(weekly, theme));
-    }
-    if let Some(monthly) = &provider.monthly {
-        lines.push(window_row(monthly, theme));
-    }
-    if let Some(reset_credits) = &provider.reset_credits {
-        lines.push(format!(
-            "{} {}",
-            pad_right(theme.label("Resets"), 8),
-            theme.good(reset_credits)
-        ));
+    let content_width = content_width(width);
+
+    let windows = [&provider.session, &provider.weekly, &provider.monthly]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    lines.extend(window_rows(&windows, theme, content_width));
+
+    if !provider.usage.is_empty() {
+        let usage = provider
+            .usage
+            .iter()
+            .map(|part| theme.value(part))
+            .collect::<Vec<_>>()
+            .join(&theme.muted(" · "));
+        lines.push(body_line(theme, "Usage", &usage));
     }
     if let Some(pace) = &provider.pace {
-        lines.push(format!(
-            "{} {} {} {} {} {}",
-            pad_right(theme.label("Pace"), 8),
-            pad_right(theme.pace(pace.status), 10),
-            pad_left(theme.value(&format!("{:.0}%", pace.percent_used)), 4),
-            theme.muted("used vs"),
-            pad_left(theme.value(&format!("{:.0}%", pace.percent_expected)), 4),
-            theme.muted("expected")
-        ));
+        lines.push(body_line(theme, "Pace", &pace_text(pace, theme)));
     }
-    if let Some(forecast) = &provider.forecast {
-        lines.push(format!(
-            "{} {}",
-            pad_right(theme.label("Forecast"), 8),
-            forecast_text(forecast, theme)
-        ));
+
+    if details {
+        for detail in &provider.extra {
+            lines.push(body_line(theme, "Detail", &theme.value(detail)));
+        }
+        if let Some(credits) = &provider.credits {
+            lines.push(body_line(theme, "Credits", &credits_text(credits, theme)));
+        }
+        if let Some(reset_credits) = &provider.reset_credits {
+            lines.push(body_line(theme, "Resets", &theme.good(reset_credits)));
+        }
+        if let Some(forecast) = &provider.forecast {
+            lines.push(body_line(
+                theme,
+                "Forecast",
+                &forecast_text(*forecast, theme),
+            ));
+        }
+        if let Some(identity) = &provider.identity {
+            lines.push(body_line(theme, "Identity", &theme.muted(identity)));
+        }
     }
-    if let Some(credits) = &provider.credits {
-        lines.push(format!(
-            "{} {}",
-            pad_right(theme.label("Credits"), 8),
-            credits_text(credits, theme)
-        ));
-    }
-    if let Some(identity) = &provider.identity {
-        lines.push(format!(
-            "{} {}",
-            pad_right(theme.label("Identity"), 8),
-            theme.muted(identity)
-        ));
-    }
+
+    lines.push(body_line(
+        theme,
+        "Updated",
+        &theme.muted(&relative_time(provider.updated_at)),
+    ));
     lines
 }
 
-fn push_box(output: &mut String, title: &str, lines: &[String], theme: Theme) {
-    push_top_border(output, title, theme);
-    for line in lines {
-        push_content_line(output, line, theme);
-    }
-    push_bottom_border(output, theme);
+/// `label`-padded key/value row used throughout a provider panel body.
+fn body_line(theme: Theme, label: &str, value: &str) -> String {
+    format!("{}  {value}", pad_right(theme.label(label), LABEL_WIDTH))
 }
 
-fn push_top_border(output: &mut String, title: &str, theme: Theme) {
-    let title = truncate(title, DASHBOARD_WIDTH.saturating_sub(5));
-    let fill = DASHBOARD_WIDTH.saturating_sub(visible_len(&title) + 5);
-    output.push_str(&theme.border("┌─ "));
+/// Render the session/weekly/monthly rows with a shared bar width and a
+/// right-padded reset column so every row lines up inside the panel.
+fn window_rows(windows: &[&WindowLine], theme: Theme, content_width: usize) -> Vec<String> {
+    let resets = windows
+        .iter()
+        .map(|window| {
+            window
+                .reset_at
+                .map(reset_label)
+                .unwrap_or_else(|| "reset unknown".to_string())
+        })
+        .collect::<Vec<_>>();
+    let reset_col = resets.iter().map(|reset| reset.len()).max().unwrap_or(0);
+    // label + "  " + bar + "  " + pct(4) + "  ·  " + reset
+    let fixed = LABEL_WIDTH + 2 + 2 + 4 + 5;
+    let bar_width = content_width
+        .saturating_sub(fixed + reset_col)
+        .clamp(BAR_MIN, BAR_MAX);
+
+    windows
+        .iter()
+        .zip(resets)
+        .map(|(window, reset)| {
+            let percent = window
+                .percent_remaining
+                .map(format_percent)
+                .unwrap_or_else(|| "?".to_string());
+            let percent = window
+                .percent_remaining
+                .map(|value| theme.quota(value, &percent))
+                .unwrap_or_else(|| theme.muted(&percent));
+            let bar = window
+                .percent_remaining
+                .map(|value| percent_bar(value, bar_width, theme))
+                .unwrap_or_else(|| theme.muted(&"░".repeat(bar_width)));
+            format!(
+                "{}  {}  {}  {}  {}",
+                pad_right(theme.label(window.label), LABEL_WIDTH),
+                bar,
+                pad_left(percent, 4),
+                theme.muted("·"),
+                theme.muted(&reset)
+            )
+        })
+        .collect()
+}
+
+fn push_box(
+    output: &mut String,
+    width: usize,
+    title: &str,
+    identity: Option<&str>,
+    lines: &[String],
+    theme: Theme,
+) {
+    push_top_border(output, width, title, identity, theme);
+    for line in lines {
+        push_content_line(output, width, line, theme);
+    }
+    push_bottom_border(output, width, theme);
+}
+
+fn push_top_border(
+    output: &mut String,
+    width: usize,
+    title: &str,
+    identity: Option<&str>,
+    theme: Theme,
+) {
+    // ╭─ {title} ──…── {identity} ─╮   (identity optional, right-aligned)
+    let identity = identity
+        .map(|identity| truncate(identity, width.saturating_sub(20)))
+        .filter(|identity| !identity.is_empty());
+    let identity_len = identity
+        .as_ref()
+        .map(|identity| visible_len(identity) + 3)
+        .unwrap_or(1);
+    let max_title = width.saturating_sub(2 + 3 + identity_len + 1);
+    let title = truncate(title, max_title);
+    let fill = width
+        .saturating_sub(2 + 3 + visible_len(&title) + identity_len)
+        .max(1);
+
+    output.push_str(&theme.border("╭─ "));
     output.push_str(&theme.title(&title));
-    output.push_str(&theme.border(" "));
+    output.push(' ');
     output.push_str(&theme.border(&"─".repeat(fill)));
-    output.push_str(&theme.border("┐"));
+    match identity {
+        Some(identity) => {
+            output.push_str(&theme.border(" "));
+            output.push_str(&theme.muted(&identity));
+            output.push_str(&theme.border(" ─╮"));
+        }
+        None => output.push_str(&theme.border("─╮")),
+    }
     output.push('\n');
 }
 
-fn push_content_line(output: &mut String, content: &str, theme: Theme) {
-    let inner_width = DASHBOARD_WIDTH - 4;
+fn push_content_line(output: &mut String, width: usize, content: &str, theme: Theme) {
+    let inner_width = width - 4;
     let content = truncate(content, inner_width);
     let padding = inner_width.saturating_sub(visible_len(&content));
     let _ = writeln!(
@@ -377,44 +513,42 @@ fn push_content_line(output: &mut String, content: &str, theme: Theme) {
     );
 }
 
-fn push_bottom_border(output: &mut String, theme: Theme) {
-    output.push_str(&theme.border("└"));
-    output.push_str(&theme.border(&"─".repeat(DASHBOARD_WIDTH - 2)));
-    output.push_str(&theme.border("┘"));
+fn push_bottom_border(output: &mut String, width: usize, theme: Theme) {
+    output.push_str(&theme.border("╰"));
+    output.push_str(&theme.border(&"─".repeat(width - 2)));
+    output.push_str(&theme.border("╯"));
     output.push('\n');
 }
 
-fn compact_window(window: &WindowLine) -> String {
+/// Visible width available inside a box (between the `│ ` … ` │` frame).
+fn content_width(width: usize) -> usize {
+    width.saturating_sub(4)
+}
+
+/// Bar width that fills the space left after `reserved` fixed columns, clamped
+/// to a legible range.
+fn bar_width_for(width: usize, reserved: usize) -> usize {
+    content_width(width)
+        .saturating_sub(reserved)
+        .clamp(BAR_MIN, BAR_MAX)
+}
+
+fn compact_window(window: &WindowLine, theme: Theme) -> String {
     let remaining = window
         .percent_remaining
         .map(format_percent)
         .unwrap_or_else(|| "?".to_string());
-    format!("{} {remaining} left", window.label.to_ascii_lowercase())
-}
-
-fn window_row(line: &WindowLine, theme: Theme) -> String {
-    let percent = line
+    let remaining = window
         .percent_remaining
-        .map(format_percent)
-        .unwrap_or_else(|| "?".to_string());
-    let percent = line
-        .percent_remaining
-        .map(|value| theme.quota(value, &percent))
-        .unwrap_or_else(|| theme.muted(&percent));
-    let bar = line
-        .percent_remaining
-        .map(|value| percent_bar(value, BAR_WIDTH, theme))
-        .unwrap_or_else(|| theme.muted(&"░".repeat(BAR_WIDTH)));
-    let reset = line
+        .map(|value| theme.quota(value, &remaining))
+        .unwrap_or_else(|| theme.muted(&remaining));
+    let reset = window
         .reset_at
-        .map(reset_label)
-        .unwrap_or_else(|| "reset unknown".to_string());
+        .map(|reset| format!(" ({})", compact_reset(reset)))
+        .unwrap_or_default();
     format!(
-        "{} {} {}  {}  {}",
-        pad_right(theme.label(line.label), 8),
-        pad_left(percent, 4),
-        theme.muted("left"),
-        bar,
+        "{} {remaining}{}",
+        window.label.to_ascii_lowercase(),
         theme.muted(&reset)
     )
 }
@@ -424,6 +558,47 @@ fn window_line(label: &'static str, window: &UsageWindow) -> WindowLine {
         label,
         percent_remaining: percent_remaining(window),
         reset_at: window.reset_at,
+    }
+}
+
+/// Token counters (today / 30-day / lifetime) condensed into one line.
+fn usage_summary(snapshot: &UsageSnapshot) -> Vec<String> {
+    snapshot
+        .windows
+        .iter()
+        .filter(|window| is_token_counter(window))
+        .filter_map(|window| {
+            let amount = window.used.as_ref().or(window.remaining.as_ref())?;
+            Some(format!(
+                "{} {}",
+                format_amount(amount),
+                token_period(&window.label)
+            ))
+        })
+        .collect()
+}
+
+fn is_token_counter(window: &UsageWindow) -> bool {
+    window.used.is_some()
+        && window.percent_remaining.is_none()
+        && window.percent_used.is_none()
+        && window.label.to_ascii_lowercase().contains("token")
+}
+
+fn token_period(label: &str) -> String {
+    let lower = label.to_ascii_lowercase();
+    if lower.contains("today") {
+        "today".to_string()
+    } else if lower.contains("lifetime") {
+        "lifetime".to_string()
+    } else if lower.contains("30") || lower.contains("month") {
+        "30d".to_string()
+    } else {
+        label
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_ascii_lowercase()
     }
 }
 
@@ -507,6 +682,16 @@ fn pace_line(forecast: &UsageForecast) -> Option<PaceLine> {
     })
 }
 
+fn pace_text(pace: &PaceLine, theme: Theme) -> String {
+    format!(
+        "{} {} {} used vs {} expected",
+        theme.pace(pace.status),
+        theme.muted("·"),
+        theme.value(&format!("{:.0}%", pace.percent_used)),
+        theme.value(&format!("{:.0}%", pace.percent_expected))
+    )
+}
+
 #[derive(Clone, Copy)]
 enum WindowRole {
     Session,
@@ -518,6 +703,7 @@ fn select_window(snapshot: &UsageSnapshot, role: WindowRole) -> Option<&UsageWin
     snapshot
         .windows
         .iter()
+        .filter(|window| percent_remaining(window).is_some())
         .filter(|window| role_matches(window, role))
         .min_by_key(|window| {
             if window.window_id.contains("additional") {
@@ -556,20 +742,32 @@ fn role_matches(window: &UsageWindow, role: WindowRole) -> bool {
     }
 }
 
-fn provider_title(snapshot: &UsageSnapshot, fallback_plan: Option<&str>) -> String {
-    let provider = format_provider_name(snapshot.provider_id.as_str());
-    let mut parts = vec![provider];
-    if let Some(mode) = metadata_str(&snapshot.metadata, "collection_mode") {
-        parts.push(collection_mode_label(snapshot.provider_id.as_str(), mode));
-    }
-    if let Some(plan) = metadata_str(&snapshot.metadata, "plan_type")
+/// Plan label for the panel header, preferring snapshot metadata over the
+/// account-derived fallback.
+fn panel_plan(snapshot: &UsageSnapshot, fallback_plan: Option<&str>) -> Option<String> {
+    metadata_str(&snapshot.metadata, "plan_type")
         .or_else(|| metadata_str(&snapshot.metadata, "subscription_type"))
-    {
-        parts.push(plan_label(plan));
-    } else if let Some(plan) = fallback_plan {
-        parts.push(plan.to_string());
-    }
-    parts.join(" · ")
+        .map(plan_label)
+        .or_else(|| fallback_plan.map(str::to_string))
+}
+
+fn detail_window_line(window: &UsageWindow) -> Option<String> {
+    let value = if let Some(remaining) = &window.remaining {
+        format!("{} remaining", format_amount(remaining))
+    } else if let (Some(used), Some(limit)) = (&window.used, &window.limit) {
+        format!("{} / {} used", format_amount(used), format_amount(limit))
+    } else if let Some(used) = &window.used {
+        format!("{} used", format_amount(used))
+    } else if let Some(percent) = percent_remaining(window) {
+        format!("{} left", format_percent(percent))
+    } else {
+        return None;
+    };
+    let reset = window
+        .reset_at
+        .map(|reset| format!(" · {}", reset_label(reset)))
+        .unwrap_or_default();
+    Some(format!("{}: {value}{reset}", window.label))
 }
 
 fn collection_mode_label(provider_id: &str, mode: &str) -> String {
@@ -589,15 +787,33 @@ fn aggregate_daily_tokens(snapshots: &[UsageSnapshot]) -> BTreeMap<NaiveDate, u6
 fn lifetime_tokens(snapshots: &[UsageSnapshot]) -> u64 {
     snapshots
         .iter()
+        .filter_map(activity_metadata)
+        .filter_map(|activity| {
+            u64_field(activity, "lifetime_tokens")
+                .or_else(|| u64_field(activity, "total_tokens"))
+                .or_else(|| u64_field(activity, "lookback_tokens"))
+        })
+        .sum()
+}
+
+fn total_cost(snapshots: &[UsageSnapshot]) -> f64 {
+    snapshots
+        .iter()
         .filter_map(cost_metadata)
         .filter_map(|cost| {
-            u64_field(cost, "total_tokens").or_else(|| u64_field(cost, "lookback_tokens"))
+            cost.get("total_cost_usd").and_then(f64_value).or_else(|| {
+                cost.get("by_day").and_then(Value::as_array).map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.get("cost_usd").and_then(f64_value))
+                        .sum()
+                })
+            })
         })
         .sum()
 }
 
 fn daily_rows(snapshot: &UsageSnapshot) -> Vec<(NaiveDate, u64)> {
-    let Some(cost) = cost_metadata(snapshot) else {
+    let Some(cost) = activity_metadata(snapshot) else {
         return Vec::new();
     };
     cost.get("by_day")
@@ -623,6 +839,14 @@ fn cost_metadata(snapshot: &UsageSnapshot) -> Option<&Value> {
             .values()
             .find(|value| value.get("by_day").is_some() && value.get("total_tokens").is_some())
     })
+}
+
+fn activity_metadata(snapshot: &UsageSnapshot) -> Option<&Value> {
+    let provider_key = format!("{}_activity", snapshot.provider_id.as_str());
+    snapshot
+        .metadata
+        .get(&provider_key)
+        .or_else(|| cost_metadata(snapshot))
 }
 
 fn last_seven_days(daily_tokens: &BTreeMap<NaiveDate, u64>) -> Vec<ActivityDay> {
@@ -718,6 +942,28 @@ fn reset_label(reset_at: DateTime<Utc>) -> String {
     format!("resets {}", reset_at.with_timezone(&Local).format("%b %-d"))
 }
 
+/// Terse reset delta for compact rows: "40m", "2h", "4d3h".
+fn compact_reset(reset_at: DateTime<Utc>) -> String {
+    let now = Utc::now();
+    if reset_at <= now {
+        return "now".to_string();
+    }
+    let delta = reset_at - now;
+    if delta.num_hours() < 1 {
+        return format!("{}m", delta.num_minutes().max(1));
+    }
+    if delta.num_hours() < 24 {
+        return format!("{}h", delta.num_hours());
+    }
+    let days = delta.num_days();
+    let hours = (delta - TimeDelta::days(days)).num_hours();
+    if hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d{hours}h")
+    }
+}
+
 fn reset_credit_expiry_label(expires_at: DateTime<Utc>) -> String {
     let now = Utc::now();
     if expires_at <= now {
@@ -764,13 +1010,12 @@ fn bar_segments(
     )
 }
 
-fn forecast_text(forecast: &str, theme: Theme) -> String {
-    if forecast.contains("exhausted") {
-        theme.danger(forecast)
-    } else if forecast.contains("tight") {
-        theme.warn(forecast)
-    } else {
-        theme.good(forecast)
+fn forecast_text(status: ForecastStatus, theme: Theme) -> String {
+    match status {
+        ForecastStatus::Safe | ForecastStatus::OnPace => theme.good("on track to last until reset"),
+        ForecastStatus::AtRisk => theme.warn("at risk before reset"),
+        ForecastStatus::Exhausted => theme.danger("exhausted before reset"),
+        ForecastStatus::InsufficientData => theme.muted("insufficient data"),
     }
 }
 
@@ -864,20 +1109,61 @@ mod tests {
     use serde_json::json;
     use usage_core::{AccountId, ForecastConfidence, ProviderId};
 
+    const TEST_WIDTH: usize = 80;
+
     #[test]
     fn renders_dashboard_sections() {
         let (snapshot, account) = sample_dashboard();
 
-        let rendered = render_usage(&[snapshot], &[], &[account], OutputStyle::Dashboard, false);
+        let rendered = render_usage(
+            &[snapshot],
+            &[],
+            &[account],
+            OutputStyle::Dashboard,
+            false,
+            TEST_WIDTH,
+            false,
+        );
 
         assert!(rendered.contains("Overview"));
         assert!(rendered.contains("Activity · last 7 days"));
         assert!(rendered.contains("Codex · openai-web · Pro Lite"));
+        assert!(rendered.contains("Session"));
         assert!(rendered.contains("Monthly"));
-        assert!(rendered.contains("Resets"));
-        assert!(rendered.contains("2 resets available"));
-        assert!(rendered.contains("Identity user@example.com"));
+        assert!(rendered.contains("Updated"));
         assert!(!rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn details_flag_reveals_extra_rows() {
+        let (snapshot, account) = sample_dashboard();
+
+        let focused = render_usage(
+            std::slice::from_ref(&snapshot),
+            &[],
+            std::slice::from_ref(&account),
+            OutputStyle::Dashboard,
+            false,
+            TEST_WIDTH,
+            false,
+        );
+        // Identity moves to the panel header; there is no body "Identity" row
+        // and no reset-credits line in the focused view.
+        assert!(!focused.contains("Identity"));
+        assert!(!focused.contains("Resets"));
+
+        let detailed = render_usage(
+            &[snapshot],
+            &[],
+            &[account],
+            OutputStyle::Dashboard,
+            false,
+            TEST_WIDTH,
+            true,
+        );
+        assert!(detailed.contains("Identity"));
+        assert!(detailed.contains("user@example.com"));
+        assert!(detailed.contains("2 resets available"));
     }
 
     #[test]
@@ -886,12 +1172,22 @@ mod tests {
         snapshot.windows[0].percent_used = Some(92.0);
         snapshot.windows[0].percent_remaining = Some(8.0);
 
-        let rendered = render_usage(&[snapshot], &[], &[account], OutputStyle::Dashboard, true);
+        for width in [62, 100] {
+            let rendered = render_usage(
+                std::slice::from_ref(&snapshot),
+                &[],
+                std::slice::from_ref(&account),
+                OutputStyle::Dashboard,
+                true,
+                width,
+                true,
+            );
 
-        assert!(rendered.contains("\x1b["));
-        assert!(strip_ansi(&rendered).contains("Codex · openai-web · Pro Lite"));
-        for line in rendered.lines().filter(|line| !line.is_empty()) {
-            assert_eq!(visible_len(line), DASHBOARD_WIDTH);
+            assert!(rendered.contains("\x1b["));
+            assert!(strip_ansi(&rendered).contains("Codex · openai-web · Pro Lite"));
+            for line in rendered.lines().filter(|line| !line.is_empty()) {
+                assert_eq!(visible_len(line), width, "line: {line:?}");
+            }
         }
     }
 
@@ -922,11 +1218,50 @@ mod tests {
             &[account],
             OutputStyle::Dashboard,
             false,
+            TEST_WIDTH,
+            true,
         );
 
         assert!(rendered.contains("Pace"));
         assert!(rendered.contains("over"));
-        assert!(rendered.contains("tight       before reset"));
+        assert!(rendered.contains("at risk before reset"));
+    }
+
+    #[test]
+    fn duplicate_forecast_keys_keep_the_first_forecast() {
+        let (snapshot, account) = sample_dashboard();
+        let first = UsageForecast {
+            provider_id: snapshot.provider_id.clone(),
+            account_id: snapshot.account_id.clone(),
+            window_id: "codex_weekly".to_string(),
+            generated_at: Utc::now(),
+            reset_at: snapshot.windows[1].reset_at,
+            current_percent_used: 40.0,
+            expected_percent_used: Some(40.0),
+            pace_delta_percent: Some(0.0),
+            rate_percent_per_hour: Some(1.0),
+            projected_percent_at_reset: Some(80.0),
+            projected_percent_remaining_at_reset: Some(20.0),
+            predicted_exhaustion_at: None,
+            status: ForecastStatus::Safe,
+            sample_count: 12,
+            confidence: ForecastConfidence::High,
+        };
+        let mut duplicate = first.clone();
+        duplicate.pace_delta_percent = Some(50.0);
+        duplicate.status = ForecastStatus::AtRisk;
+
+        let dashboard = Dashboard::from_snapshots(
+            std::slice::from_ref(&snapshot),
+            &[first, duplicate],
+            std::slice::from_ref(&account),
+        );
+
+        assert_eq!(dashboard.providers[0].forecast, Some(ForecastStatus::Safe));
+        assert_eq!(
+            dashboard.providers[0].pace.as_ref().map(|pace| pace.status),
+            Some("on track")
+        );
     }
 
     #[test]

@@ -40,8 +40,11 @@ pub(super) fn collect_usage_from_cli(
             format!("Claude CLI usage fallback failed: {err}"),
         )
     })?;
-    let response: ClaudePrintResponse = match serde_json::from_str(&raw_output) {
-        Ok(response) => response,
+    let decoded = serde_json::from_str::<serde_json::Value>(&raw_output).and_then(|raw_payload| {
+        ClaudePrintResponse::deserialize(&raw_payload).map(|response| (raw_payload, response))
+    });
+    let (raw_payload, response) = match decoded {
+        Ok(decoded) => decoded,
         Err(err) => {
             warn!(
                 provider_id = PROVIDER_ID,
@@ -60,7 +63,6 @@ pub(super) fn collect_usage_from_cli(
         }
     };
 
-    let raw_payload = serde_json::from_str(&raw_output).unwrap_or_else(|_| json!({}));
     let usage = match parse_usage_text(&response.result, Utc::now()) {
         Ok(usage) => usage,
         Err(err) => {
