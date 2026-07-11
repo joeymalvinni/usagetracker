@@ -134,8 +134,8 @@ extension JSONDecoder {
 enum DateFormats {
     static let fractional: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
     static let whole: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
-    static let dayKey: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.timeZone = TimeZone(secondsFromGMT: 0); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"; return f }()
-    static let shortDay: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.timeZone = TimeZone(secondsFromGMT: 0); f.locale = .autoupdatingCurrent; f.setLocalizedDateFormatFromTemplate("MMM d"); return f }()
+    static let dayKey: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.timeZone = .autoupdatingCurrent; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"; return f }()
+    static let shortDay: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.timeZone = .autoupdatingCurrent; f.locale = .autoupdatingCurrent; f.setLocalizedDateFormatFromTemplate("MMM d"); return f }()
     static let expiry: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEE, MMM d 'at' h:mm a"; return f }()
     /// Fully spelled-out instant — weekday, month, day, year, time, zone — for
     /// the reset dropdown where an exact, unambiguous date is wanted.

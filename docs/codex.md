@@ -69,9 +69,10 @@ include priced and unpriced token coverage plus unpriced model names. The menu b
 dismissible notice when recent chart data includes a model without pricing instead of treating
 those tokens as zero-cost usage.
 
-Codex daily buckets and local cost rollups use UTC calendar dates so server-provided `startDate`
-values and timestamped local events share one day boundary. Local events without a valid timestamp
-remain in lifetime and model totals but are excluded from today, lookback, and per-day totals.
+Codex daily buckets and local cost rollups use the user's local calendar date. The provider's
+date-only `startDate` values follow that calendar boundary, so timestamped local events are converted
+to the same timezone before aggregation. Local events without a valid timestamp remain in lifetime
+and model totals but are excluded from today, lookback, and per-day totals.
 
 ## Persistence
 

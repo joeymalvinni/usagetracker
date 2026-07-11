@@ -78,6 +78,25 @@ impl NotificationManager {
             last_attempt_at: None,
         });
 
+        let reset_completed = existing.as_ref().is_some_and(|state| {
+            state.reset_at.is_some_and(|reset_at| reset_at <= now)
+                && window
+                    .reset_at
+                    .is_some_and(|reset_at| Some(reset_at) != state.reset_at && reset_at > now)
+        });
+        if reset_completed {
+            let notification = reset_notification_content(account, snapshot, window);
+            self.storage
+                .enqueue_notification(&notification.title, &notification.body)
+                .await?;
+            debug!(
+                provider_id = snapshot.provider_id.as_str(),
+                account_id = account.id.as_str(),
+                window_id = window.window_id,
+                "limit reset notification queued"
+            );
+        }
+
         if window.reset_at.is_some() && state.reset_at != window.reset_at {
             state.notified_mask = 0;
             state.last_attempt_at = None;
@@ -127,7 +146,28 @@ fn notification_decision_state_changed(
                 || existing.notified_mask != state.notified_mask
                 || existing.last_attempt_at != state.last_attempt_at
         }
-        None => state.notified_mask != 0 || state.last_attempt_at.is_some(),
+        // The first observation establishes the reset cycle. Without it, an
+        // account that has never crossed a low-usage threshold could not be
+        // notified when that cycle completes.
+        None => true,
+    }
+}
+
+fn reset_notification_content(
+    account: &Account,
+    snapshot: &UsageSnapshot,
+    window: &UsageWindow,
+) -> DesktopNotification {
+    let provider = provider_name(snapshot.provider_id.as_str());
+    let window_name = window.label.trim().to_ascii_lowercase();
+    let account_name = account
+        .display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&account.external_account_id);
+    DesktopNotification {
+        title: format!("{provider} {window_name} limit reset"),
+        body: format!("{account_name} · Usage is available again"),
     }
 }
 
@@ -249,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_high_sample_does_not_initialize_notification_state() {
+    async fn first_high_sample_initializes_reset_state_without_alerting() {
         let storage = test_storage();
         let account = insert_account(&storage, &test_account()).await;
         let manager = NotificationManager::new(storage.clone(), true);
@@ -262,11 +302,12 @@ mod tests {
             .await;
 
         assert!(storage.pending_notifications().await.unwrap().is_empty());
-        assert!(storage
+        let state = storage
             .notification_window_state(&account.id, "weekly")
             .await
             .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(state.notified_mask, 0);
     }
 
     #[tokio::test]
@@ -341,6 +382,53 @@ mod tests {
             )
             .await;
         assert_eq!(storage.pending_notifications().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn completed_reset_queues_one_notification_and_restart_deduplicates() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(storage.clone(), true);
+        let previous_reset = Utc::now() - TimeDelta::minutes(1);
+        let next_reset = Utc::now() + TimeDelta::days(7);
+
+        manager
+            .process_snapshot(&account, &test_snapshot(90.0, previous_reset))
+            .await;
+        manager
+            .process_snapshot(&account, &test_snapshot(100.0, next_reset))
+            .await;
+        let restarted = NotificationManager::new(storage.clone(), true);
+        restarted
+            .process_snapshot(&account, &test_snapshot(100.0, next_reset))
+            .await;
+
+        let notifications = storage.pending_notifications().await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].title, "Codex weekly limit reset");
+        assert_eq!(notifications[0].body, "Personal · Usage is available again");
+    }
+
+    #[tokio::test]
+    async fn future_reset_time_correction_does_not_claim_limit_reset() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(storage.clone(), true);
+
+        manager
+            .process_snapshot(
+                &account,
+                &test_snapshot(90.0, Utc::now() + TimeDelta::hours(2)),
+            )
+            .await;
+        manager
+            .process_snapshot(
+                &account,
+                &test_snapshot(90.0, Utc::now() + TimeDelta::hours(3)),
+            )
+            .await;
+
+        assert!(storage.pending_notifications().await.unwrap().is_empty());
     }
 
     #[tokio::test]

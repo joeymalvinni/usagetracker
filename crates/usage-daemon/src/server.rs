@@ -148,7 +148,7 @@ impl SocketServer {
         match request {
             ApiRequest::GetUsage => {
                 let generated_at = chrono::Utc::now();
-                let today = generated_at.date_naive();
+                let today = generated_at.with_timezone(&chrono::Local).date_naive();
                 let recent_since = today
                     .checked_sub_days(chrono::Days::new(DASHBOARD_HISTORY_DAYS - 1))
                     .unwrap_or(today);
@@ -463,7 +463,7 @@ fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredD
 }
 
 fn replace_codex_activity_windows(snapshot: &mut UsageSnapshot, history: &StoredDailyUsageHistory) {
-    let today = chrono::Utc::now().date_naive();
+    let today = chrono::Local::now().date_naive();
     let lookback_start = today
         .checked_sub_days(chrono::Days::new(29))
         .unwrap_or(today);
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn merges_retained_daily_usage_and_replaces_local_token_windows() {
-        let today = chrono::Utc::now().date_naive();
+        let today = chrono::Local::now().date_naive();
         let account_id = usage_core::AccountId::new("account");
         let provider_id = ProviderId::new("codex");
         let mut snapshots = vec![UsageSnapshot {

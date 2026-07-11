@@ -591,7 +591,7 @@ fn scan_codex_session_file_all_days(
         let model = current_model.as_deref().unwrap_or("unknown");
         let cost = codex_cost_usd_for_normalized_model(pricing, model, delta);
         let tokens = delta.total();
-        let date = codex_event_date_in_timezone(&event, &Utc);
+        let date = codex_event_date_in_timezone(&event, &Local);
 
         report.total_tokens = report.total_tokens.saturating_add(tokens);
         if let Some(cost) = cost {

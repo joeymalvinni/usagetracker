@@ -16,9 +16,9 @@ private struct LocalCostCoverage {
     var pricedTokens: UInt64
 }
 
-private var utcCalendar: Calendar {
+private var dayCalendar: Calendar {
     var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    calendar.timeZone = .autoupdatingCurrent
     return calendar
 }
 
@@ -303,7 +303,7 @@ struct MetricEngine {
     }
 
     private func buildCostDashboard(filter: ((UsageSnapshot) -> Bool)?) -> CostDashboardVM {
-        let calendar = utcCalendar
+        let calendar = dayCalendar
         let today = calendar.startOfDay(for: Date())
         let dayStarts = (0..<30).compactMap { offset in
             calendar.date(byAdding: .day, value: offset - 29, to: today)
@@ -785,7 +785,7 @@ struct MetricEngine {
     }
 
     private func dailyTokens(providerId: String, accountId: String?) -> (sparkline: [Double], total: UInt64) {
-        let calendar = utcCalendar
+        let calendar = dayCalendar
         let today = calendar.startOfDay(for: Date())
         let dayKeys = (0..<30).compactMap { offset in
             calendar.date(byAdding: .day, value: offset - 29, to: today)

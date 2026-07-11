@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{Days, FixedOffset, NaiveDate, Utc};
+use chrono::{Days, FixedOffset, Local, NaiveDate, Utc};
 use serde_json::json;
 use usage_core::{AccountId, ProviderId, UsageWindow, UsageWindowKind};
 
@@ -47,7 +47,7 @@ fn does_not_duplicate_standard_codex_session_root() {
 
 #[test]
 fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() {
-    let today = Utc::now().date_naive();
+    let today = Local::now().date_naive();
     let yesterday = today.checked_sub_days(Days::new(1)).unwrap();
     let activity = normalize_account_token_usage(&json!({
         "summary": {
@@ -651,7 +651,7 @@ fn keeps_undated_codex_usage_out_of_today_and_lookback() {
     .collect::<Vec<_>>()
     .join("\n");
     std::fs::write(&path, contents).unwrap();
-    let today = Utc::now().date_naive();
+    let today = Local::now().date_naive();
     let mut report = CodexCostReport::default();
 
     scan_codex_session_file(
@@ -742,7 +742,7 @@ fn records_unknown_model_tokens_as_unpriced_daily_usage() {
         "usagetracker-codex-unpriced-{}.jsonl",
         uuid::Uuid::new_v4()
     ));
-    let today = Utc::now().date_naive();
+    let today = Local::now().date_naive();
     let timestamp = format!("{}T12:00:00Z", today);
     let contents = [
         json!({"type": "turn_context", "payload": {"model": "gpt-future"}}),
