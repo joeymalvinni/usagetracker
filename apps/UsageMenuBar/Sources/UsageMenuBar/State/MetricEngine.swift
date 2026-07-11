@@ -10,7 +10,19 @@ private struct ProviderAccountKey: Hashable {
     }
 }
 
+private struct ForecastKey: Hashable {
+    let providerId: String
+    let accountId: String
+    let windowId: String
+}
+
 struct MetricEngine {
+    struct Output {
+        let providers: [ProviderVM]
+        let settingsProviders: [ProviderVM]
+        let costDashboard: CostDashboardVM
+    }
+
     let config: ConfigResponse?
     let accounts: [Account]
     let health: [ProviderHealth]
@@ -18,13 +30,55 @@ struct MetricEngine {
     let forecasts: [UsageForecast]
     let ui: UIConfig
     let visible: (String) -> Bool
+    private let accountsById: [String: Account]
+    private let healthByProvider: [String: [ProviderHealth]]
+    private let snapshotsByProvider: [String: [UsageSnapshot]]
+    private let snapshotsByAccount: [ProviderAccountKey: [UsageSnapshot]]
+    private let forecastsByWindow: [ForecastKey: UsageForecast]
+    private let hiddenAccountIdSet: Set<String>
 
-    var providers: [ProviderVM] {
-        let accountVMs = buildAccountVMs()
-        return buildProviderGroups(from: accountVMs)
+    init(
+        config: ConfigResponse?,
+        accounts: [Account],
+        health: [ProviderHealth],
+        snapshots: [UsageSnapshot],
+        forecasts: [UsageForecast],
+        ui: UIConfig,
+        visible: @escaping (String) -> Bool
+    ) {
+        self.config = config
+        self.accounts = accounts
+        self.health = health
+        self.snapshots = snapshots
+        self.forecasts = forecasts
+        self.ui = ui
+        self.visible = visible
+        accountsById = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
+        hiddenAccountIdSet = Set(accounts.lazy.filter(\.hidden).map(\.id))
+        healthByProvider = Dictionary(grouping: health, by: \.providerId)
+        snapshotsByProvider = Dictionary(grouping: snapshots, by: \.providerId)
+        snapshotsByAccount = Dictionary(grouping: snapshots) {
+            ProviderAccountKey(providerId: $0.providerId, accountId: $0.accountId)
+        }
+        forecastsByWindow = Dictionary(
+            forecasts.map {
+                (ForecastKey(providerId: $0.providerId, accountId: $0.accountId, windowId: $0.windowId), $0)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
     }
 
-    var settingsProviders: [ProviderVM] {
+    func build() -> Output {
+        let accountVMs = buildAccountVMs()
+        let providers = buildProviderGroups(from: accountVMs)
+        return Output(
+            providers: providers,
+            settingsProviders: buildSettingsProviders(from: providers),
+            costDashboard: buildCostDashboard(filter: nil)
+        )
+    }
+
+    private func buildSettingsProviders(from providers: [ProviderVM]) -> [ProviderVM] {
         let ids = ordered(Array(providerIds(includeKnownProviders: true)))
         return ids.map { providerId in
             if let existing = providers.first(where: { $0.providerId == providerId }) {
@@ -54,10 +108,6 @@ struct MetricEngine {
                 subAccounts: nil
             )
         }
-    }
-
-    var costDashboard: CostDashboardVM {
-        buildCostDashboard(filter: nil)
     }
 
     private func buildAccountVMs() -> [ProviderVM] {
@@ -125,10 +175,7 @@ struct MetricEngine {
         let worstAccount = accountVMs.max { severity($0.status) < severity($1.status) }
         let totalTokens = aggregatedSparkline.reduce(UInt64(0)) { $0.saturatingAdd(UInt64($1.rounded())) }
         let primary = worstPercent.map { "\(Int($0.rounded()))%" } ?? allWindows.compactMap { $0.percent != nil ? nil : ($0.value.isEmpty ? nil : $0.value) }.first ?? accountVMs.first?.primary ?? "No data"
-        let latestCollected = snapshots
-            .filter { $0.providerId == providerId }
-            .map(\.collectedAt)
-            .max()
+        let latestCollected = snapshotsByProvider[providerId]?.map(\.collectedAt).max()
         let detail = latestCollected.map { "updated \(relative($0))" } ?? "waiting for data"
         let enabled = isEnabledProvider(providerId)
         let healthText = worstHealthText(providerId: providerId)
@@ -169,10 +216,9 @@ struct MetricEngine {
     }
 
     private func accountVM(providerId: String, accountId: String) -> ProviderVM? {
-        let account = accounts.first { $0.id == accountId }
+        let account = accountsById[accountId]
         if account?.hidden == true { return nil }
-        let latest = snapshots
-            .filter { $0.providerId == providerId && $0.accountId == accountId }
+        let latest = snapshotsByAccount[ProviderAccountKey(providerId: providerId, accountId: accountId)]?
             .max { $0.collectedAt < $1.collectedAt }
         let h = selectedHealth(providerId: providerId, accountId: accountId)
         let snapshotWindows = latest?.windows ?? []
@@ -428,7 +474,7 @@ struct MetricEngine {
     }
 
     private func hiddenAccountIds() -> Set<String> {
-        Set(accounts.filter(\.hidden).map(\.id))
+        hiddenAccountIdSet
     }
 
     private func ordered(_ ids: [String]) -> [String] {
@@ -536,7 +582,7 @@ struct MetricEngine {
     }
 
     private func selectedHealth(providerId: String, accountId: String?) -> ProviderHealth? {
-        let providerHealth = health.filter { $0.providerId == providerId }
+        let providerHealth = healthByProvider[providerId] ?? []
         if let accountId, let accountHealth = providerHealth.first(where: { $0.accountId == accountId }) {
             return accountHealth
         }
@@ -566,7 +612,7 @@ struct MetricEngine {
     }
 
     private func worstHealthText(providerId: String) -> String {
-        let providerHealth = health.filter { $0.providerId == providerId }
+        let providerHealth = healthByProvider[providerId] ?? []
         let accountHealth = providerHealth.filter { $0.accountId != nil }
         let relevant = accountHealth.isEmpty ? providerHealth : accountHealth
         let worst = relevant.max {
@@ -599,9 +645,9 @@ struct MetricEngine {
     private func window(_ w: UsageWindow, providerId: String, accountId: String) -> WindowVM {
         let percent = (w.percentRemaining ?? computedPercent(w)).map { max(0, min(100, $0)) }
         let status: DisplayStatus = percent.map { $0 < 10 ? .critical : ($0 < 25 ? .warning : .normal) } ?? .normal
-        let matchingForecast = forecasts.first {
-            $0.providerId == providerId && $0.accountId == accountId && $0.windowId == w.windowId
-        }
+        let matchingForecast = forecastsByWindow[
+            ForecastKey(providerId: providerId, accountId: accountId, windowId: w.windowId)
+        ]
         return WindowVM(
             id: w.id,
             label: w.label,
@@ -700,7 +746,10 @@ struct MetricEngine {
 
         var perDay = [String: UInt64]()
         let hiddenAccounts = hiddenAccountIds()
-        for snapshot in snapshots where snapshot.providerId == providerId && (accountId == nil || snapshot.accountId == accountId) && !hiddenAccounts.contains(snapshot.accountId) {
+        let indexedSnapshots = accountId.map {
+            snapshotsByAccount[ProviderAccountKey(providerId: providerId, accountId: $0)] ?? []
+        } ?? (snapshotsByProvider[providerId] ?? [])
+        for snapshot in indexedSnapshots where !hiddenAccounts.contains(snapshot.accountId) {
             let metadata = snapshot.metadata.object
             let activity = metadata?["\(providerId)_activity"]?.object
             let cost = metadata?["\(providerId)_cost"]?.object
@@ -762,7 +811,7 @@ struct MetricEngine {
 
     private func accountLabel(_ key: ProviderAccountKey) -> String {
         guard let accountId = key.accountId else { return "" }
-        return accounts.first { $0.id == accountId }.flatMap { $0.displayName ?? $0.externalAccountId } ?? accountId
+        return accountsById[accountId].flatMap { $0.displayName ?? $0.externalAccountId } ?? accountId
     }
 
     private func symbol(_ id: String) -> String {

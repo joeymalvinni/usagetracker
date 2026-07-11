@@ -2,10 +2,10 @@ import SwiftUI
 
 struct Popover: View {
     @EnvironmentObject var state: AppState
-    @State private var selection: Selection
+    @ObservedObject var navigation: PopoverNavigation
 
-    init(initialSelection: Selection? = nil) {
-        _selection = State(initialValue: initialSelection ?? Self.debugSelection())
+    init(navigation: PopoverNavigation) {
+        self.navigation = navigation
     }
 
     var body: some View {
@@ -21,13 +21,13 @@ struct Popover: View {
 
     private var mainContent: some View {
         HStack(spacing: 0) {
-            Rail(selection: $selection)
+            Rail(selection: $navigation.selection)
             Rectangle()
                 .fill(Color(nsColor: .separatorColor))
                 .frame(width: 0.5)
             Group {
-                switch selection {
-                case .summary: Summary(selection: $selection)
+                switch navigation.selection {
+                case .summary: Summary(selection: $navigation.selection)
                 case .provider(let id, let accountId): Detail(providerId: id, initialAccountId: accountId)
                 case .settings: Settings()
                 }
@@ -41,10 +41,10 @@ struct Popover: View {
         .onKeyPress(phases: .down) { keyPress in
             guard keyPress.modifiers == .command else { return .ignored }
             switch keyPress.key {
-            case "1": selection = .summary
-            case "2": selection = .settings
+            case "1": navigation.selection = .summary
+            case "2": navigation.selection = .settings
             case "3":
-                selection = state.providers.first.map { .provider($0.id, accountId: nil) } ?? .summary
+                navigation.selection = state.providers.first.map { .provider($0.id, accountId: nil) } ?? .summary
             default: return .ignored
             }
             return .handled
@@ -54,11 +54,11 @@ struct Popover: View {
     private func moveSelection(_ delta: Int) {
         let entries = railEntries()
         guard !entries.isEmpty else { return }
-        if let index = entries.firstIndex(where: { $0.matches(selection) }) {
+        if let index = entries.firstIndex(where: { $0.matches(navigation.selection) }) {
             let next = min(max(index + delta, 0), entries.count - 1)
-            selection = entries[next].selection
+            navigation.selection = entries[next].selection
         } else {
-            selection = entries[0].selection
+            navigation.selection = entries[0].selection
         }
     }
 
@@ -69,12 +69,22 @@ struct Popover: View {
         return entries
     }
 
-    private static func debugSelection() -> Selection {
+}
+
+@MainActor final class PopoverNavigation: ObservableObject {
+    @Published var selection: Selection
+
+    init() {
         switch ProcessInfo.processInfo.environment["USAGE_DEBUG_PAGE"] {
-        case "settings": .settings
-        case let page? where page.hasPrefix("provider:"): .provider(String(page.dropFirst("provider:".count)), accountId: nil)
-        default: .summary
+        case "settings": selection = .settings
+        case let page? where page.hasPrefix("provider:"):
+            selection = .provider(String(page.dropFirst("provider:".count)), accountId: nil)
+        default: selection = .summary
         }
+    }
+
+    init(selection: Selection) {
+        self.selection = selection
     }
 }
 

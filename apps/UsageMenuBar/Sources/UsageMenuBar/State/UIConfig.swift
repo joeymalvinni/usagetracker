@@ -44,7 +44,7 @@ struct UIConfig: Codable, Equatable {
     static func load() -> Self {
         guard let data = try? Data(contentsOf: UIPaths.config),
               let config = try? JSONDecoder().decode(Self.self, from: data)
-        else { let config = Self(); config.save(); return config }
+        else { return Self() }
         return config
     }
 
@@ -60,5 +60,11 @@ struct UIConfig: Codable, Equatable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(self) { try? data.write(to: UIPaths.config, options: .atomic) }
+    }
+}
+
+actor UIConfigStore {
+    func save(_ config: UIConfig) {
+        config.save()
     }
 }
