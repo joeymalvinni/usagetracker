@@ -14,11 +14,12 @@ use tokio::{
 };
 use tracing::{debug, trace, warn};
 use usage_core::{
-    Account, ApiRequest, ApiResponse, ProviderHealth, UsageAmount, UsageSnapshot, UsageUnit,
-    UsageWindow, UsageWindowKind,
+    Account, AccountId, ApiErrorCode, ApiRequest, ApiResponse, ProviderHealth, RequestEnvelope,
+    ResponseEnvelope, ServerInfo, UsageAmount, UsageSnapshot, UsageUnit, UsageWindow,
+    UsageWindowKind, API_VERSION,
 };
 
-use crate::{daemon::DaemonRuntime, forecast, storage::StoredDailyUsageHistory};
+use crate::{daemon::DaemonRuntime, dashboard, forecast, storage::StoredDailyUsageHistory};
 
 const MAX_CLIENT_CONNECTIONS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -104,8 +105,8 @@ impl SocketServer {
             };
             let RequestFrame::Line(line) = frame else {
                 if frame == RequestFrame::TooLarge {
-                    let response = ApiResponse::error(
-                        "request_too_large",
+                    let response = ResponseEnvelope::error(
+                        ApiErrorCode::RequestTooLarge,
                         format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
                     );
                     response_bytes.clear();
@@ -119,7 +120,7 @@ impl SocketServer {
                 continue;
             }
 
-            let response = match serde_json::from_slice::<ApiRequest>(line) {
+            let response = match decode_request(line) {
                 Ok(request) => {
                     debug!(request = ?request, "daemon request received");
                     let started = Instant::now();
@@ -130,11 +131,11 @@ impl SocketServer {
                         "daemon request completed"
                     );
                     trace!(response = ?response, "daemon response body");
-                    response
+                    ResponseEnvelope::new(response)
                 }
-                Err(err) => {
-                    warn!(error = %err, "invalid daemon request JSON");
-                    ApiResponse::error("invalid_json", format!("invalid request JSON: {err}"))
+                Err(response) => {
+                    warn!(response = ?response, "invalid daemon request");
+                    ResponseEnvelope::new(response)
                 }
             };
             response_bytes.clear();
@@ -146,6 +147,9 @@ impl SocketServer {
 
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
         match request {
+            ApiRequest::GetServerInfo => ApiResponse::ServerInfo {
+                server: ServerInfo::current(),
+            },
             ApiRequest::GetUsage => {
                 let generated_at = chrono::Utc::now();
                 let today = generated_at.with_timezone(&chrono::Local).date_naive();
@@ -179,20 +183,47 @@ impl SocketServer {
                                 forecast::forecast_snapshot(snapshot, history, generated_at)
                             })
                             .collect();
+                        let window_provenance = snapshots
+                            .iter()
+                            .flat_map(|snapshot| {
+                                snapshot
+                                    .windows
+                                    .iter()
+                                    .map(|window| snapshot.window_provenance(window))
+                            })
+                            .collect();
+                        let dashboard = dashboard::build_usage_dashboard(&snapshots);
                         ApiResponse::Usage {
                             snapshots,
+                            dashboard,
                             forecasts,
+                            window_provenance,
                         }
                     }
                     Err(err) => storage_error(err),
                 }
             }
-            ApiRequest::Refresh { providers } => {
-                let report = self.runtime.refresh.refresh(providers.as_deref()).await;
-                ApiResponse::Refresh {
-                    started_at: report.started_at,
-                    finished_at: report.finished_at,
-                    provider_results: report.provider_results,
+            ApiRequest::Refresh { providers } => match validated_refresh_scope(providers) {
+                Ok(providers) => {
+                    let started = self
+                        .runtime
+                        .refresh
+                        .start_refresh(providers, usage_core::RefreshTrigger::Manual)
+                        .await;
+                    ApiResponse::RefreshStarted {
+                        job: started.job,
+                        coalesced: started.coalesced,
+                    }
+                }
+                Err(error) => error,
+            },
+            ApiRequest::GetRefreshJob { job_id } => {
+                match self.runtime.refresh.get_refresh_job(&job_id).await {
+                    Some(job) => ApiResponse::RefreshJob { job },
+                    None => ApiResponse::error(
+                        ApiErrorCode::UnknownRefreshJob,
+                        format!("unknown refresh job: {job_id}"),
+                    ),
                 }
             }
             ApiRequest::GetProviderHealth => {
@@ -247,101 +278,223 @@ impl SocketServer {
                 Ok(config) => ApiResponse::Config { config },
                 Err(err) => {
                     warn!(error = %err, "config update failed");
-                    ApiResponse::error("invalid_config", err.to_string())
+                    ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
                 }
             },
             ApiRequest::AddProviderAccount {
                 provider_id,
                 display_name,
-            } => match self
-                .runtime
-                .add_provider_account(provider_id, display_name)
-                .await
-            {
-                Ok(account) => ApiResponse::AddProviderAccount { account },
-                Err(err) => {
-                    warn!(error = %err, "add provider account failed");
-                    ApiResponse::error("add_provider_account_failed", err.to_string())
+            } => {
+                if let Some(error) = provider_validation_error(&provider_id) {
+                    error
+                } else if provider_id.as_str() == "opencode_go" {
+                    ApiResponse::error(
+                        ApiErrorCode::UnsupportedOperation,
+                        "adding accounts is not supported for OpenCode Go",
+                    )
+                } else {
+                    match self
+                        .runtime
+                        .add_provider_account(provider_id, display_name)
+                        .await
+                    {
+                        Ok(account) => ApiResponse::AddProviderAccount { account },
+                        Err(err) => {
+                            warn!(error = %err, "add provider account failed");
+                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                        }
+                    }
                 }
-            },
+            }
             ApiRequest::UpdateAccount {
                 account_id,
                 display_name,
                 hidden,
                 collection_enabled,
-            } => match self
-                .runtime
-                .update_account(account_id, display_name, hidden, collection_enabled)
-                .await
-            {
-                Ok(account) => ApiResponse::Account { account },
-                Err(err) => {
-                    warn!(error = %err, "account update failed");
-                    ApiResponse::error("account_update_failed", err.to_string())
+            } => {
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    match self
+                        .runtime
+                        .update_account(account_id, display_name, hidden, collection_enabled)
+                        .await
+                    {
+                        Ok(account) => ApiResponse::Account { account },
+                        Err(err) => {
+                            warn!(error = %err, "account update failed");
+                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                        }
+                    }
                 }
-            },
+            }
             ApiRequest::RemoveAccount { account_id } => {
-                match self.runtime.remove_account(account_id).await {
-                    Ok(account) => ApiResponse::Account { account },
-                    Err(err) => {
-                        warn!(error = %err, "account remove failed");
-                        ApiResponse::error("account_remove_failed", err.to_string())
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    match self.runtime.remove_account(account_id).await {
+                        Ok(account) => ApiResponse::Account { account },
+                        Err(err) => {
+                            warn!(error = %err, "account remove failed");
+                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                        }
                     }
                 }
             }
             ApiRequest::DeleteAccount { account_id } => {
-                match self.runtime.delete_account(account_id).await {
-                    Ok(account_id) => ApiResponse::AccountDeleted { account_id },
-                    Err(err) => {
-                        warn!(error = %err, "account delete failed");
-                        ApiResponse::error("account_delete_failed", err.to_string())
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    match self.runtime.delete_account(account_id).await {
+                        Ok(account_id) => ApiResponse::AccountDeleted { account_id },
+                        Err(err) => {
+                            warn!(error = %err, "account delete failed");
+                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                        }
                     }
                 }
             }
             ApiRequest::GetProviderSetup { provider_id } => {
-                match self.runtime.provider_setup(provider_id).await {
-                    Ok(setup) => ApiResponse::ProviderSetup { setup },
-                    Err(err) => {
-                        warn!(error = %err, "provider setup lookup failed");
-                        ApiResponse::error("provider_setup_failed", err.to_string())
+                if let Some(error) = provider_validation_error(&provider_id) {
+                    error
+                } else {
+                    match self.runtime.provider_setup(provider_id).await {
+                        Ok(setup) => ApiResponse::ProviderSetup { setup },
+                        Err(err) => {
+                            warn!(error = %err, "provider setup lookup failed");
+                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                        }
                     }
                 }
             }
             ApiRequest::UpdateProviderSetup {
                 provider_id,
                 workspace_id,
-            } => match self
-                .runtime
-                .update_provider_setup(provider_id, workspace_id)
-                .await
-            {
-                Ok(setup) => ApiResponse::ProviderSetup { setup },
-                Err(err) => {
-                    warn!(error = %err, "provider setup update failed");
-                    ApiResponse::error("provider_setup_update_failed", err.to_string())
+            } => {
+                if let Some(error) = provider_validation_error(&provider_id) {
+                    error
+                } else if provider_id.as_str() != "opencode_go" {
+                    ApiResponse::error(
+                        ApiErrorCode::UnsupportedOperation,
+                        "workspace selection is only supported for OpenCode Go",
+                    )
+                } else {
+                    match self
+                        .runtime
+                        .update_provider_setup(provider_id, workspace_id)
+                        .await
+                    {
+                        Ok(setup) => ApiResponse::ProviderSetup { setup },
+                        Err(err) => {
+                            warn!(error = %err, "provider setup update failed");
+                            ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
+                        }
+                    }
                 }
-            },
+            }
             ApiRequest::RepairProvider {
                 provider_id,
                 account_id,
-            } => match self.runtime.repair_provider(provider_id, account_id).await {
-                Ok(action) => ApiResponse::ProviderAction { action },
-                Err(err) => {
-                    warn!(error = %err, "provider repair failed");
-                    ApiResponse::error("provider_repair_failed", err.to_string())
+            } => {
+                let account_error = match account_id.as_ref() {
+                    Some(account_id) => self.account_validation_error(account_id).await,
+                    None => None,
+                };
+                if let Some(error) = provider_validation_error(&provider_id) {
+                    error
+                } else if let Some(error) = account_error {
+                    error
+                } else {
+                    match self.runtime.repair_provider(provider_id, account_id).await {
+                        Ok(action) => ApiResponse::ProviderAction { action },
+                        Err(err) => {
+                            warn!(error = %err, "provider repair failed");
+                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                        }
+                    }
                 }
-            },
+            }
             ApiRequest::LaunchProviderAccount { account_id } => {
-                match self.runtime.launch_provider_account(account_id).await {
-                    Ok(action) => ApiResponse::ProviderAction { action },
-                    Err(err) => {
-                        warn!(error = %err, "provider account launch failed");
-                        ApiResponse::error("provider_account_launch_failed", err.to_string())
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    match self.runtime.launch_provider_account(account_id).await {
+                        Ok(action) => ApiResponse::ProviderAction { action },
+                        Err(err) => {
+                            warn!(error = %err, "provider account launch failed");
+                            ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+                        }
                     }
                 }
             }
         }
     }
+
+    async fn account_validation_error(&self, account_id: &AccountId) -> Option<ApiResponse> {
+        match self.runtime.storage.account(account_id).await {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(ApiResponse::error(
+                ApiErrorCode::UnknownAccount,
+                format!("unknown account: {account_id}"),
+            )),
+            Err(err) => Some(storage_error(err)),
+        }
+    }
+}
+
+fn decode_request(line: &[u8]) -> Result<ApiRequest, ApiResponse> {
+    let value: serde_json::Value = serde_json::from_slice(line).map_err(|err| {
+        ApiResponse::error(
+            ApiErrorCode::InvalidJson,
+            format!("invalid request JSON: {err}"),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        ApiResponse::error(
+            ApiErrorCode::InvalidRequest,
+            "request must be a JSON object",
+        )
+    })?;
+    let version = object
+        .get("api_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ApiResponse::error(
+                ApiErrorCode::IncompatibleProtocol,
+                format!("request must declare api_version {API_VERSION}"),
+            )
+        })?;
+    if version != u64::from(API_VERSION) {
+        return Err(ApiResponse::error(
+            ApiErrorCode::IncompatibleProtocol,
+            format!("unsupported api_version {version}; server requires {API_VERSION}"),
+        ));
+    }
+    let method = object
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ApiResponse::error(
+                ApiErrorCode::InvalidRequest,
+                "request method must be a string",
+            )
+        })?
+        .to_string();
+    if !ApiRequest::supports_method(&method) {
+        return Err(ApiResponse::error(
+            ApiErrorCode::UnsupportedMethod,
+            format!("unsupported method: {method}"),
+        ));
+    }
+
+    serde_json::from_value::<RequestEnvelope>(value)
+        .map(|envelope| envelope.request)
+        .map_err(|err| {
+            ApiResponse::error(
+                ApiErrorCode::InvalidRequest,
+                format!("invalid {method} request: {err}"),
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -570,6 +723,37 @@ fn is_supported_provider(provider_id: &str) -> bool {
     matches!(provider_id, "codex" | "claude" | "opencode_go")
 }
 
+fn provider_validation_error(provider_id: &usage_core::ProviderId) -> Option<ApiResponse> {
+    (!is_supported_provider(provider_id.as_str())).then(|| {
+        ApiResponse::error(
+            ApiErrorCode::UnknownProvider,
+            format!("unknown provider: {provider_id}"),
+        )
+    })
+}
+
+fn validated_refresh_scope(
+    providers: Option<Vec<usage_core::ProviderId>>,
+) -> Result<Option<Vec<usage_core::ProviderId>>, ApiResponse> {
+    let Some(providers) = providers else {
+        return Ok(None);
+    };
+    if providers.is_empty() {
+        return Err(ApiResponse::error(
+            ApiErrorCode::InvalidArgument,
+            "refresh providers must not be empty; omit providers to refresh all",
+        ));
+    }
+    if let Some(provider_id) = providers
+        .iter()
+        .find(|provider_id| !is_supported_provider(provider_id.as_str()))
+    {
+        return Err(provider_validation_error(provider_id)
+            .expect("unsupported provider must produce a validation error"));
+    }
+    Ok(usage_core::RefreshScope::providers(providers).providers)
+}
+
 fn hidden_account_ids(accounts: &[Account]) -> BTreeSet<&str> {
     accounts
         .iter()
@@ -580,13 +764,15 @@ fn hidden_account_ids(accounts: &[Account]) -> BTreeSet<&str> {
 
 fn storage_error(err: anyhow::Error) -> ApiResponse {
     warn!(error = %err, "storage request failed");
-    ApiResponse::error("storage_error", err.to_string())
+    ApiResponse::error(ApiErrorCode::StorageUnavailable, err.to_string())
 }
 
 fn response_summary(response: &ApiResponse) -> &'static str {
     match response {
+        ApiResponse::ServerInfo { .. } => "server_info",
         ApiResponse::Usage { .. } => "usage",
-        ApiResponse::Refresh { .. } => "refresh",
+        ApiResponse::RefreshStarted { .. } => "refresh_started",
+        ApiResponse::RefreshJob { .. } => "refresh_job",
         ApiResponse::ProviderHealth { .. } => "provider_health",
         ApiResponse::Accounts { .. } => "accounts",
         ApiResponse::Config { .. } => "config",
@@ -703,8 +889,20 @@ mod tests {
     }
 
     async fn request_line(socket_path: &Path, request: &str) -> ApiResponse {
+        let mut request_value: serde_json::Value = serde_json::from_str(request).unwrap();
+        request_value["api_version"] = serde_json::json!(API_VERSION);
+        request_value_line(socket_path, request_value).await
+    }
+
+    async fn request_value_line(
+        socket_path: &Path,
+        request_value: serde_json::Value,
+    ) -> ApiResponse {
         let mut stream = UnixStream::connect(socket_path).await.unwrap();
-        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+            .write_all(&serde_json::to_vec(&request_value).unwrap())
+            .await
+            .unwrap();
         stream.write_all(b"\n").await.unwrap();
 
         let mut lines = BufReader::new(stream).lines();
@@ -713,7 +911,44 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        serde_json::from_str(&response).unwrap()
+        serde_json::from_str::<ResponseEnvelope>(&response)
+            .unwrap()
+            .response
+    }
+
+    #[tokio::test]
+    async fn returns_typed_protocol_and_method_errors() {
+        let env = test_env(BTreeMap::new());
+        let server = SocketServer::new(env.runtime.clone());
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+        wait_for_socket(&env.socket_path).await;
+
+        let unsupported = request_value_line(
+            &env.socket_path,
+            serde_json::json!({"api_version": API_VERSION, "method": "old_refresh"}),
+        )
+        .await;
+        let ApiResponse::Error { error } = unsupported else {
+            panic!("unexpected unsupported-method response")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedMethod);
+
+        let incompatible = request_value_line(
+            &env.socket_path,
+            serde_json::json!({"api_version": 1, "method": "get_config"}),
+        )
+        .await;
+        let ApiResponse::Error { error } = incompatible else {
+            panic!("unexpected incompatible-protocol response")
+        };
+        assert_eq!(error.code, ApiErrorCode::IncompatibleProtocol);
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
     }
 
     #[tokio::test]
@@ -764,6 +999,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_unknown_and_empty_explicit_refresh_scopes() {
+        let env = test_env(BTreeMap::new());
+        let server = SocketServer::new(env.runtime.clone());
+
+        let unknown = server
+            .handle_request(ApiRequest::Refresh {
+                providers: Some(vec![ProviderId::new("definitely_unknown")]),
+            })
+            .await;
+        let ApiResponse::Error { error } = unknown else {
+            panic!("unexpected response: {unknown:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnknownProvider);
+
+        let empty = server
+            .handle_request(ApiRequest::Refresh {
+                providers: Some(Vec::new()),
+            })
+            .await;
+        let ApiResponse::Error { error } = empty else {
+            panic!("unexpected response: {empty:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
     async fn serves_fixture_accounts_usage_and_notifications_over_socket() {
         let env = test_env(BTreeMap::new());
         crate::fixtures::seed(
@@ -789,6 +1052,7 @@ mod tests {
         let ApiResponse::Usage {
             snapshots,
             forecasts,
+            ..
         } = usage
         else {
             panic!("unexpected usage response")
@@ -1031,7 +1295,9 @@ mod tests {
         .await;
 
         match response {
-            ApiResponse::Error { error } => assert_eq!(error.code, "invalid_config"),
+            ApiResponse::Error { error } => {
+                assert_eq!(error.code, ApiErrorCode::InvalidArgument)
+            }
             other => panic!("unexpected response: {other:?}"),
         }
 
@@ -1085,7 +1351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_rename_updates_profile_config() {
+    async fn account_rename_is_owned_by_the_database() {
         let mut providers = BTreeMap::new();
         providers.insert(
             "codex".to_string(),
@@ -1132,13 +1398,19 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        let persisted: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(env.root.join("config.json")).unwrap())
-                .unwrap();
+        let persisted = env
+            .runtime
+            .storage
+            .account(&account.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.display_name.as_deref(), Some("New name"));
         assert_eq!(
-            persisted["providers"]["codex"]["profiles"][0]["display_name"],
-            "New name"
+            persisted.display_name_source,
+            usage_core::AccountDisplayNameSource::User
         );
+        assert!(!env.root.join("config.json").exists());
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);

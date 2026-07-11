@@ -1,0 +1,9 @@
+{
+  "api_version": 2,
+  "type": "error",
+  "error": {
+    "code": "unsupported_method",
+    "message": "unsupported method: old_refresh",
+    "retryable": false
+  }
+}

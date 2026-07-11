@@ -94,7 +94,7 @@ async fn seed_account(
     let session_reset = now + TimeDelta::hours(3);
     let weekly_reset = now + TimeDelta::days(5);
     let daily_usage = daily_usage(fixture.provider_id, account_index, now);
-    let metadata = fixture_metadata(fixture.provider_id, &daily_usage);
+    let metadata = fixture_metadata(fixture.provider_id, &daily_usage, now);
     let mut latest = None;
 
     for sample in 0..6 {
@@ -220,7 +220,11 @@ fn daily_usage(
         .collect()
 }
 
-fn fixture_metadata(provider_id: &str, daily_usage: &[DailyUsageBucket]) -> serde_json::Value {
+fn fixture_metadata(
+    provider_id: &str,
+    daily_usage: &[DailyUsageBucket],
+    now: DateTime<Utc>,
+) -> serde_json::Value {
     let rows = daily_usage
         .iter()
         .map(|bucket| {
@@ -232,7 +236,7 @@ fn fixture_metadata(provider_id: &str, daily_usage: &[DailyUsageBucket]) -> serd
             })
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
+    let mut metadata = serde_json::json!({
         format!("{provider_id}_cost"): {
             "source": "development_fixture",
             "estimate": true,
@@ -241,6 +245,42 @@ fn fixture_metadata(provider_id: &str, daily_usage: &[DailyUsageBucket]) -> serd
             "by_day": rows,
         },
         "fixture": true,
+    });
+    // Codex is the only provider that exposes rate-limit reset credits, so seed
+    // a small pool here to exercise the "N resets" summary and Resets detail.
+    if provider_id == "codex" {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "rate_limit_reset_credits".to_string(),
+                fixture_reset_credits(now),
+            );
+        }
+    }
+    metadata
+}
+
+fn fixture_reset_credits(now: DateTime<Utc>) -> serde_json::Value {
+    let credits = [
+        ("Session reset", TimeDelta::hours(20)),
+        ("Weekly reset", TimeDelta::days(2)),
+        ("Weekly reset", TimeDelta::days(6)),
+    ];
+    let credit_rows = credits
+        .iter()
+        .enumerate()
+        .map(|(index, (title, delta))| {
+            serde_json::json!({
+                "id": format!("fixture-reset-{index}"),
+                "title": title,
+                "status": "available",
+                "expires_at": (now + *delta).timestamp(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "available_count": credit_rows.len(),
+        "next_expires_at": (now + credits[0].1).timestamp(),
+        "credits": credit_rows,
     })
 }
 

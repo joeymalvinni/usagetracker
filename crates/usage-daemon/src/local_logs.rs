@@ -12,19 +12,38 @@ use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, W
 use tracing::{debug, info, warn};
 use usage_core::ProviderId;
 
-use crate::{config::ProviderConfig, polling::RefreshCoordinator};
+use crate::{
+    config::{Config, ProviderConfig},
+    polling::RefreshCoordinator,
+    providers::paths::expand_home_path,
+};
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_secs(30);
 const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const CLAUDE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const WATCH_EVENT_QUEUE_CAPACITY: usize = 256;
 
+#[derive(Clone, Debug, Default)]
+pub struct LocalLogConfig {
+    codex: ProviderConfig,
+    claude: ProviderConfig,
+}
+
+impl LocalLogConfig {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            codex: config.providers.get("codex").cloned().unwrap_or_default(),
+            claude: config.providers.get("claude").cloned().unwrap_or_default(),
+        }
+    }
+}
+
 pub fn spawn_change_log_loop(
     refresh: Arc<RefreshCoordinator>,
-    claude_config: ProviderConfig,
+    mut configs: tokio::sync::watch::Receiver<LocalLogConfig>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let targets = local_log_targets(&claude_config);
+        let mut targets = local_log_targets(&configs.borrow().clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel(WATCH_EVENT_QUEUE_CAPACITY);
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflowed = overflowed.clone();
@@ -51,59 +70,85 @@ pub fn spawn_change_log_loop(
             "local message log watcher started"
         );
 
-        let mut pending = BTreeSet::new();
+        let mut pending = BTreeSet::<String>::new();
         let mut refresh_at = None;
         let mut last_refresh = None;
         loop {
-            if let Some(deadline) = refresh_at {
-                tokio::select! {
-                    event = rx.recv() => {
-                        let Some(event) = event else { return };
-                        if handle_watch_event(
-                            event,
-                            &mut watch_state,
-                            &mut watcher,
-                            &targets,
-                            &mut pending,
-                        ) {
-                            refresh_at = Some(local_refresh_deadline(
-                                tokio::time::Instant::now(),
-                                last_refresh,
-                                &pending,
-                            ));
-                        }
+            let deadline = refresh_at;
+            tokio::select! {
+                changed = configs.changed() => {
+                    if changed.is_err() {
+                        return;
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        if overflowed.swap(false, Ordering::AcqRel) {
-                            pending.extend(targets.iter().map(|target| target.provider_id.to_string()));
-                            warn!(
-                                queue_capacity = WATCH_EVENT_QUEUE_CAPACITY,
-                                "local message log watcher queue overflowed; refreshing all local providers"
-                            );
-                        }
-                        refresh_local_usage(&refresh, std::mem::take(&mut pending)).await;
-                        last_refresh = Some(tokio::time::Instant::now());
-                        refresh_at = None;
-                    }
-                }
-            } else {
-                let Some(event) = rx.recv().await else { return };
-                if handle_watch_event(
-                    event,
-                    &mut watch_state,
-                    &mut watcher,
-                    &targets,
-                    &mut pending,
-                ) {
-                    refresh_at = Some(local_refresh_deadline(
+                    targets = local_log_targets(&configs.borrow().clone());
+                    watch_state.reset(&mut watcher);
+                    let newly_available = watch_state.sync(&mut watcher, &targets);
+                    let active = targets
+                        .iter()
+                        .map(|target| target.provider_id)
+                        .collect::<BTreeSet<_>>();
+                    pending.retain(|provider| active.contains(provider.as_str()));
+                    pending.extend(newly_available);
+                    refresh_at = (!pending.is_empty()).then(|| local_refresh_deadline(
                         tokio::time::Instant::now(),
                         last_refresh,
                         &pending,
                     ));
+                    info!(
+                        watched_roots = watch_state.watched_roots.len(),
+                        targets = ?target_roots(&targets),
+                        "local message log watcher targets updated"
+                    );
+                }
+                event = rx.recv() => {
+                    let Some(event) = event else { return };
+                    if handle_watch_event(
+                        event,
+                        &mut watch_state,
+                        &mut watcher,
+                        &targets,
+                        &mut pending,
+                    ) {
+                        refresh_at = Some(local_refresh_deadline(
+                            tokio::time::Instant::now(),
+                            last_refresh,
+                            &pending,
+                        ));
+                    }
+                }
+                _ = wait_for_deadline(deadline) => {
+                    if overflowed.swap(false, Ordering::AcqRel) {
+                        pending.extend(targets.iter().map(|target| target.provider_id.to_string()));
+                        warn!(
+                            queue_capacity = WATCH_EVENT_QUEUE_CAPACITY,
+                            "local message log watcher queue overflowed; refreshing all local providers"
+                        );
+                    }
+                    refresh_local_usage(&refresh, std::mem::take(&mut pending)).await;
+                    last_refresh = Some(tokio::time::Instant::now());
+                    refresh_at = None;
                 }
             }
         }
     })
+}
+
+async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+impl LocalLogWatchState {
+    fn reset(&mut self, watcher: &mut RecommendedWatcher) {
+        for path in std::mem::take(&mut self.watched_paths) {
+            if let Err(err) = watcher.unwatch(&path) {
+                debug!(path = %path.display(), error = %err, "failed to remove obsolete local log watch");
+            }
+        }
+        self.watched_roots.clear();
+    }
 }
 
 fn handle_watch_event(
@@ -294,20 +339,24 @@ async fn refresh_local_usage(refresh: &RefreshCoordinator, pending: BTreeSet<Str
     );
 }
 
-fn local_log_targets(claude_config: &ProviderConfig) -> Vec<LocalLogTarget> {
-    vec![
-        LocalLogTarget {
+fn local_log_targets(config: &LocalLogConfig) -> Vec<LocalLogTarget> {
+    let mut targets = Vec::new();
+    if config.codex.enabled {
+        targets.push(LocalLogTarget {
             provider_id: "codex",
-            roots: codex_session_roots(),
-        },
-        LocalLogTarget {
+            roots: codex_session_roots(&config.codex),
+        });
+    }
+    if config.claude.enabled {
+        targets.push(LocalLogTarget {
             provider_id: "claude",
-            roots: claude_project_roots(claude_config),
-        },
-    ]
+            roots: claude_project_roots(&config.claude),
+        });
+    }
+    targets
 }
 
-fn codex_session_roots() -> Vec<PathBuf> {
+fn codex_session_roots(config: &ProviderConfig) -> Vec<PathBuf> {
     let codex_home = match std::env::var("CODEX_HOME") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => match dirs::home_dir() {
@@ -315,7 +364,19 @@ fn codex_session_roots() -> Vec<PathBuf> {
             None => return Vec::new(),
         },
     };
-    vec![codex_home.join("sessions")]
+    let mut roots = vec![codex_home.join("sessions")];
+    roots.extend(
+        config
+            .profiles
+            .iter()
+            .filter(|profile| profile.enabled && !profile.deleted)
+            .filter_map(|profile| profile.codex_home.as_deref())
+            .map(expand_home_path)
+            .map(|home| home.join("sessions")),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 fn claude_project_roots(config: &ProviderConfig) -> Vec<PathBuf> {
@@ -370,21 +431,6 @@ fn claude_project_roots(config: &ProviderConfig) -> Vec<PathBuf> {
     roots.sort();
     roots.dedup();
     roots
-}
-
-fn expand_home_path(path: PathBuf) -> PathBuf {
-    let Some(value) = path.to_str() else {
-        return path;
-    };
-    if value == "~" {
-        return dirs::home_dir().unwrap_or(path);
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    path
 }
 
 fn jsonl_paths(paths: &[PathBuf]) -> Vec<PathBuf> {

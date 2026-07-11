@@ -1,9 +1,14 @@
 import Foundation
 
+enum DaemonWireProtocol {
+    static let currentVersion = 2
+}
+
 enum DaemonRequest: Encodable {
-    case getUsage, refresh([String]?), getProviderHealth, getAccounts, getConfig, getPendingNotifications
+    case getServerInfo, getUsage, refresh([String]?), getRefreshJob(String)
+    case getProviderHealth, getAccounts, getConfig, getPendingNotifications
     case acknowledgeNotifications([Int64])
-    case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notificationsEnabled: Bool?)
+    case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notifications: NotificationConfig?)
     case addProviderAccount(providerId: String, displayName: String?)
     case updateAccount(accountId: String, displayName: String?, hidden: Bool?, collectionEnabled: Bool?)
     case removeAccount(accountId: String)
@@ -14,7 +19,9 @@ enum DaemonRequest: Encodable {
     case launchProviderAccount(accountId: String)
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: K.self)
+        try c.encode(DaemonWireProtocol.currentVersion, forKey: .apiVersion)
         switch self {
+        case .getServerInfo: try c.encode("get_server_info", forKey: .method)
         case .getUsage: try c.encode("get_usage", forKey: .method)
         case .getProviderHealth: try c.encode("get_provider_health", forKey: .method)
         case .getAccounts: try c.encode("get_accounts", forKey: .method)
@@ -24,11 +31,14 @@ enum DaemonRequest: Encodable {
             try c.encode("acknowledge_notifications", forKey: .method)
             try c.encode(ids, forKey: .ids)
         case .refresh(let ids): try c.encode("refresh", forKey: .method); try c.encode(ids, forKey: .providers)
-        case .updateConfig(let interval, let providers, let notificationsEnabled):
+        case .getRefreshJob(let jobId):
+            try c.encode("get_refresh_job", forKey: .method)
+            try c.encode(jobId, forKey: .jobId)
+        case .updateConfig(let interval, let providers, let notifications):
             try c.encode("update_config", forKey: .method)
             try c.encodeIfPresent(interval, forKey: .pollIntervalSeconds)
             try c.encodeIfPresent(providers?.mapValues { ProviderToggle(enabled: $0) }, forKey: .providers)
-            try c.encodeIfPresent(notificationsEnabled.map { NotificationConfig(enabled: $0) }, forKey: .notifications)
+            try c.encodeIfPresent(notifications, forKey: .notifications)
         case .addProviderAccount(let providerId, let displayName):
             try c.encode("add_provider_account", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
@@ -62,10 +72,12 @@ enum DaemonRequest: Encodable {
         }
     }
     enum K: String, CodingKey {
+        case apiVersion = "api_version"
         case method, providers, notifications, hidden, ids
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
+        case jobId = "job_id"
         case displayName = "display_name"
         case collectionEnabled = "collection_enabled"
         case workspaceId = "workspace_id"
@@ -75,30 +87,63 @@ enum DaemonRequest: Encodable {
 struct UsageResponse: Decodable {
     let snapshots: [UsageSnapshot]
     let forecasts: [UsageForecast]
+    let dashboard: UsageDashboardSummary
+    let windowProvenance: [UsageWindowProvenance]
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         snapshots = try c.decode([UsageSnapshot].self, forKey: .snapshots)
         forecasts = try c.decodeIfPresent([UsageForecast].self, forKey: .forecasts) ?? []
+        dashboard = try c.decode(UsageDashboardSummary.self, forKey: .dashboard)
+        windowProvenance = try c.decodeIfPresent([UsageWindowProvenance].self, forKey: .windowProvenance) ?? []
     }
 
-    private enum K: String, CodingKey { case snapshots, forecasts }
+    private enum K: String, CodingKey { case snapshots, forecasts, dashboard, windowProvenance }
 }
 
-struct PendingNotification: Decodable {
+struct PendingNotification: Decodable, Sendable {
     let id: Int64
     let title: String
     let body: String
     let createdAt: Date
 }
 
+struct ServerInfo: Decodable, Equatable, Sendable {
+    let apiVersion, minimumClientApiVersion: Int
+    let capabilities: [String]
+    let providers: [ServerProviderDescriptor]
+}
+
+struct ServerProviderDescriptor: Decodable, Equatable, Sendable {
+    let id, displayName: String
+    let minimumRefreshIntervalSeconds: UInt64
+}
+
 enum DaemonResponse: Decodable {
-    case usage(UsageResponse), refresh(RefreshResponse), providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse), pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64]), addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String), providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
+    case serverInfo(ServerInfo), usage(UsageResponse)
+    case refreshStarted(job: RefreshJob, coalesced: Bool), refreshJob(RefreshJob)
+    case providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse)
+    case pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64])
+    case addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String)
+    case providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
+        let version = try c.decodeIfPresent(Int.self, forKey: .apiVersion)
+        guard version == DaemonWireProtocol.currentVersion else {
+            let received = version.map(String.init) ?? "missing"
+            throw DaemonError.api(
+                code: "incompatible_protocol",
+                message: "Daemon protocol version \(received) is incompatible with version \(DaemonWireProtocol.currentVersion)"
+            )
+        }
         switch try c.decode(String.self, forKey: .type) {
+        case "server_info": self = .serverInfo(try c.decode(ServerInfo.self, forKey: .server))
         case "usage": self = .usage(try UsageResponse(from: decoder))
-        case "refresh": self = .refresh(try RefreshResponse(from: decoder))
+        case "refresh_started": self = .refreshStarted(
+            job: try c.decode(RefreshJob.self, forKey: .job),
+            coalesced: try c.decode(Bool.self, forKey: .coalesced)
+        )
+        case "refresh_job": self = .refreshJob(try c.decode(RefreshJob.self, forKey: .job))
         case "provider_health": self = .providerHealth(try c.decode([ProviderHealth].self, forKey: .health))
         case "accounts": self = .accounts(try c.decode([Account].self, forKey: .accounts))
         case "config": self = .config(try c.decode(ConfigResponse.self, forKey: .config))
@@ -114,7 +159,8 @@ enum DaemonResponse: Decodable {
         }
     }
     enum K: String, CodingKey {
-        case type, snapshots, health, accounts, config, notifications, ids, account, setup, action, error, accountId
+        case apiVersion, type, snapshots, health, accounts, config, notifications, ids
+        case server, job, coalesced, account, setup, action, error, accountId
     }
 }
 
@@ -131,16 +177,101 @@ extension JSONDecoder {
     }
 }
 
+extension JSONEncoder {
+    static var usage: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+}
+
+final class LockedISO8601DateFormatter: @unchecked Sendable {
+    private let formatter: ISO8601DateFormatter
+    private let lock = NSLock()
+
+    init(configure: (ISO8601DateFormatter) -> Void) {
+        let formatter = ISO8601DateFormatter()
+        configure(formatter)
+        self.formatter = formatter
+    }
+
+    func date(from value: String) -> Date? {
+        lock.withLock { formatter.date(from: value) }
+    }
+}
+
+final class LockedDateFormatter: @unchecked Sendable {
+    private let formatter: DateFormatter
+    private let lock = NSLock()
+
+    init(configure: (DateFormatter) -> Void) {
+        let formatter = DateFormatter()
+        configure(formatter)
+        self.formatter = formatter
+    }
+
+    func string(from date: Date) -> String {
+        lock.withLock { formatter.string(from: date) }
+    }
+
+    func date(from value: String) -> Date? {
+        lock.withLock { formatter.date(from: value) }
+    }
+}
+
+final class LockedRelativeDateTimeFormatter: @unchecked Sendable {
+    private let formatter: RelativeDateTimeFormatter
+    private let lock = NSLock()
+
+    init(configure: (RelativeDateTimeFormatter) -> Void) {
+        let formatter = RelativeDateTimeFormatter()
+        configure(formatter)
+        self.formatter = formatter
+    }
+
+    func localizedString(for date: Date, relativeTo referenceDate: Date) -> String {
+        lock.withLock { formatter.localizedString(for: date, relativeTo: referenceDate) }
+    }
+
+    func localizedString(from components: DateComponents) -> String {
+        lock.withLock { formatter.localizedString(from: components) }
+    }
+}
+
 enum DateFormats {
-    static let fractional: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
-    static let whole: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
-    static let dayKey: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.timeZone = .autoupdatingCurrent; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"; return f }()
-    static let shortDay: DateFormatter = { let f = DateFormatter(); f.calendar = Calendar(identifier: .gregorian); f.timeZone = .autoupdatingCurrent; f.locale = .autoupdatingCurrent; f.setLocalizedDateFormatFromTemplate("MMM d"); return f }()
-    static let expiry: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "EEE, MMM d 'at' h:mm a"; return f }()
+    static let fractional = LockedISO8601DateFormatter {
+        $0.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+    static let whole = LockedISO8601DateFormatter {
+        $0.formatOptions = [.withInternetDateTime]
+    }
+    static let dayKey = LockedDateFormatter {
+        $0.calendar = Calendar(identifier: .gregorian)
+        $0.timeZone = .autoupdatingCurrent
+        $0.locale = Locale(identifier: "en_US_POSIX")
+        $0.dateFormat = "yyyy-MM-dd"
+    }
+    static let shortDay = LockedDateFormatter {
+        $0.calendar = Calendar(identifier: .gregorian)
+        $0.timeZone = .autoupdatingCurrent
+        $0.locale = .autoupdatingCurrent
+        $0.setLocalizedDateFormatFromTemplate("MMM d")
+    }
+    static let expiry = LockedDateFormatter {
+        $0.calendar = .current
+        $0.locale = Locale(identifier: "en_US_POSIX")
+        $0.dateFormat = "EEE, MMM d 'at' h:mm a"
+    }
     /// Fully spelled-out instant — weekday, month, day, year, time, zone — for
     /// the reset dropdown where an exact, unambiguous date is wanted.
-    static let explicit: DateFormatter = { let f = DateFormatter(); f.calendar = .current; f.locale = .autoupdatingCurrent; f.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"; return f }()
-    static let relative: RelativeDateTimeFormatter = { let f = RelativeDateTimeFormatter(); f.unitsStyle = .full; return f }()
+    static let explicit = LockedDateFormatter {
+        $0.calendar = .current
+        $0.locale = .autoupdatingCurrent
+        $0.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"
+    }
+    static let relative = LockedRelativeDateTimeFormatter {
+        $0.unitsStyle = .full
+    }
 
     /// Relative wording for future reset/expiry deadlines. Foundation truncates
     /// a 45-hour interval to "in 1 day", which conflicts with an explicit date

@@ -16,8 +16,9 @@ use usage_core::ProviderId;
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
-        DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-        ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        paths::expand_home_path, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
+        ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -26,6 +27,7 @@ mod client;
 mod cost;
 mod credentials;
 mod normalize;
+mod pricing;
 
 use cli::collect_usage_from_cli;
 use client::{parse_cached_profile_identity, ClaudeAccountIdentity, ClaudeApiClient};
@@ -435,21 +437,6 @@ fn profile_id(configured: Option<&str>, index: usize) -> String {
         })
 }
 
-fn expand_home_path(path: PathBuf) -> PathBuf {
-    let Some(value) = path.to_str() else {
-        return path;
-    };
-    if value == "~" {
-        return dirs::home_dir().unwrap_or(path);
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    path
-}
-
 fn should_use_cli_fallback(cli_enabled: bool, api_error: &ProviderError) -> bool {
     cli_enabled && api_error.kind() != ProviderErrorKind::RateLimited
 }
@@ -605,7 +592,7 @@ impl ProviderCollector for ClaudeCollector {
             .await
             {
                 Ok(Ok(scan)) => {
-                    let cache_status = scan.cache_status;
+                    let cache_status = scan.cache_status.as_str();
                     merge_local_cost_report(&mut usage, scan.report);
                     usage.metadata["claude_cost"]["scan_cache"] = json!(cache_status);
                 }

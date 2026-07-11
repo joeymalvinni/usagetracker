@@ -93,8 +93,6 @@ struct ProviderVM: Identifiable, Equatable {
     var hasUnseenAlert: Bool = false
     var lastSuccessAt: Date? = nil
     var errorDetail: String? = nil
-    var isEstimate: Bool = false
-    var isPartial: Bool = false
     var repairRecommended: Bool = false
     var accountEmail: String? = nil
 }
@@ -137,10 +135,6 @@ struct CostDashboardVM: Equatable {
     static let empty = CostDashboardVM(days: [], providers: [])
     let days: [CostDayVM]
     let providers: [CostProviderVM]
-    var isEstimated: Bool = false
-    var isPartial: Bool = false
-    var sourceLabel: String? = nil
-    var pricingNoticeId: String? = nil
 
     var hasData: Bool { days.contains { $0.totalCost > 0 || $0.totalTokens > 0 } }
     var todayCost: Double { days.last?.totalCost ?? 0 }

@@ -17,9 +17,9 @@ use usage_core::ProviderId;
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
-        read_response_body, DailyUsageBucket, DiscoveredAccount, ProviderCollectionResult,
-        ProviderCollector, ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
-        HTTP_REQUEST_TIMEOUT,
+        paths::expand_home_path, read_response_body, DailyUsageBucket, DiscoveredAccount,
+        ProviderCollectionResult, ProviderCollector, ProviderError, ProviderErrorKind,
+        ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -187,7 +187,8 @@ impl CodexCollector {
             return Err(ProviderError::new(
                 ProviderErrorKind::RateLimited,
                 "Codex usage endpoint is rate limited",
-            ));
+            )
+            .with_retry_at(super::retry_after_deadline(response.headers())));
         }
         if !status.is_success() {
             return Err(ProviderError::new(
@@ -315,21 +316,6 @@ fn profile_id(configured: Option<&str>, index: usize) -> String {
                 format!("profile-{}", index + 1)
             }
         })
-}
-
-fn expand_home_path(path: PathBuf) -> PathBuf {
-    let Some(value) = path.to_str() else {
-        return path;
-    };
-    if value == "~" {
-        return dirs::home_dir().unwrap_or(path);
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    path
 }
 
 #[async_trait]

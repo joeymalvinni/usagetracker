@@ -53,7 +53,7 @@ test *args:
 
 # Run Clippy for every Rust target.
 clippy:
-    cargo clippy --all-targets
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Format Rust sources.
 fmt:
@@ -63,8 +63,24 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-# Run the full local verification suite.
-check: fmt-check clippy test
+# Run Rust checks with the same flags as CI.
+check-rust: fmt-check clippy
+    cargo test --workspace --all-features
+
+# Build and test Swift with CI's strict-concurrency setting.
+check-swift:
+    swift build --package-path {{app_dir}} -Xswiftc -strict-concurrency=complete
+    swift test --package-path {{app_dir}} -Xswiftc -strict-concurrency=complete
+
+# Check dependencies against the RustSec advisory database.
+audit:
+    cargo audit
+
+# Run the full local verification suite (both CI jobs).
+check: check-rust check-swift audit
+
+# Explicit alias for callers that distinguish Rust-only and full checks.
+check-all: check
 
 # Remove Rust and Swift build artifacts.
 clean:

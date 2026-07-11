@@ -1,8 +1,8 @@
-//! Small parsing, calendar, and SQLite helpers shared across OpenCode modules.
+//! Small parsing and SQLite helpers shared across OpenCode modules.
 
 use std::{collections::BTreeSet, sync::LazyLock};
 
-use chrono::{DateTime, Datelike, TimeDelta, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -83,68 +83,6 @@ pub(super) fn local_db_error(err: rusqlite::Error) -> ProviderError {
         ProviderErrorKind::ProviderUnavailable,
         format!("OpenCode Go local database query failed: {err}"),
     )
-}
-
-pub(super) fn utc_week_start(now: DateTime<Utc>) -> DateTime<Utc> {
-    let days = now.weekday().num_days_from_monday() as i64;
-    let date = now.date_naive() - TimeDelta::days(days);
-    Utc.with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
-        .single()
-        .unwrap_or(now)
-}
-
-pub(super) fn monthly_window_start(anchor: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
-    let candidate = anchor_in_month(anchor, now.year(), now.month());
-    if candidate <= now {
-        candidate
-    } else {
-        let (year, month) = previous_month(now.year(), now.month());
-        anchor_in_month(anchor, year, month)
-    }
-}
-
-pub(super) fn next_monthly_anchor(anchor: DateTime<Utc>, start: DateTime<Utc>) -> DateTime<Utc> {
-    let (year, month) = next_month(start.year(), start.month());
-    anchor_in_month(anchor, year, month)
-}
-
-fn anchor_in_month(anchor: DateTime<Utc>, year: i32, month: u32) -> DateTime<Utc> {
-    let day = anchor.day().min(days_in_month(year, month));
-    Utc.with_ymd_and_hms(
-        year,
-        month,
-        day,
-        anchor.hour(),
-        anchor.minute(),
-        anchor.second(),
-    )
-    .single()
-    .unwrap_or(anchor)
-}
-
-fn previous_month(year: i32, month: u32) -> (i32, u32) {
-    if month == 1 {
-        (year - 1, 12)
-    } else {
-        (year, month - 1)
-    }
-}
-
-fn next_month(year: i32, month: u32) -> (i32, u32) {
-    if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    }
-}
-
-fn days_in_month(year: i32, month: u32) -> u32 {
-    let (next_year, next_month) = next_month(year, month);
-    let next_first = Utc
-        .with_ymd_and_hms(next_year, next_month, 1, 0, 0, 0)
-        .single()
-        .unwrap();
-    (next_first - TimeDelta::days(1)).day()
 }
 
 pub(super) fn provider_display_name(provider_id: &str) -> &'static str {

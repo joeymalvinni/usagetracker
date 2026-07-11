@@ -20,6 +20,7 @@ const OPENAI_PRICING_URL: &str = "https://developers.openai.com/api/docs/pricing
 const PRICING_REFRESH_INTERVAL: TimeDelta = TimeDelta::hours(24);
 const PRICING_RETRY_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const LONG_CONTEXT_THRESHOLD: u64 = 272_000;
+const BUNDLED_CATALOG_EFFECTIVE_FROM: &str = "2026-07-11";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub(super) struct CodexTokenRates {
@@ -161,6 +162,24 @@ impl CodexPricingCatalog {
             .unwrap_or_default()
             .hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub(super) fn version(&self) -> String {
+        if let Some(fetched_at) = self.fetched_at {
+            format!(
+                "openai-{}-{:016x}",
+                fetched_at.date_naive(),
+                self.revision()
+            )
+        } else {
+            format!("bundled-{BUNDLED_CATALOG_EFFECTIVE_FROM}")
+        }
+    }
+
+    pub(super) fn effective_from(&self) -> String {
+        self.fetched_at
+            .map(|fetched_at| fetched_at.date_naive().to_string())
+            .unwrap_or_else(|| BUNDLED_CATALOG_EFFECTIVE_FROM.to_string())
     }
 
     fn is_fresh(&self, now: DateTime<Utc>) -> bool {

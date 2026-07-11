@@ -10,12 +10,6 @@ private struct ProviderAccountKey: Hashable {
     }
 }
 
-private struct LocalCostCoverage {
-    var cost: Double
-    var tokens: UInt64
-    var pricedTokens: UInt64
-}
-
 private var dayCalendar: Calendar {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = .autoupdatingCurrent
@@ -28,7 +22,13 @@ private struct ForecastKey: Hashable {
     let windowId: String
 }
 
-struct MetricEngine {
+private struct WindowProvenanceKey: Hashable {
+    let providerId: String
+    let accountId: String
+    let windowId: String
+}
+
+struct DashboardBuilder {
     struct Output {
         let providers: [ProviderVM]
         let settingsProviders: [ProviderVM]
@@ -40,6 +40,8 @@ struct MetricEngine {
     let health: [ProviderHealth]
     let snapshots: [UsageSnapshot]
     let forecasts: [UsageForecast]
+    let dashboard: UsageDashboardSummary
+    let windowProvenance: [UsageWindowProvenance]
     let ui: UIConfig
     let visible: (String) -> Bool
     private let accountsById: [String: Account]
@@ -47,6 +49,8 @@ struct MetricEngine {
     private let snapshotsByProvider: [String: [UsageSnapshot]]
     private let snapshotsByAccount: [ProviderAccountKey: [UsageSnapshot]]
     private let forecastsByWindow: [ForecastKey: UsageForecast]
+    private let dashboardByAccount: [ProviderAccountKey: AccountUsageSummary]
+    private let provenanceByWindow: [WindowProvenanceKey: UsageWindowProvenance]
     private let hiddenAccountIdSet: Set<String>
 
     init(
@@ -55,6 +59,8 @@ struct MetricEngine {
         health: [ProviderHealth],
         snapshots: [UsageSnapshot],
         forecasts: [UsageForecast],
+        dashboard: UsageDashboardSummary,
+        windowProvenance: [UsageWindowProvenance],
         ui: UIConfig,
         visible: @escaping (String) -> Bool
     ) {
@@ -63,6 +69,8 @@ struct MetricEngine {
         self.health = health
         self.snapshots = snapshots
         self.forecasts = forecasts
+        self.dashboard = dashboard
+        self.windowProvenance = windowProvenance
         self.ui = ui
         self.visible = visible
         accountsById = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
@@ -75,6 +83,18 @@ struct MetricEngine {
         forecastsByWindow = Dictionary(
             forecasts.map {
                 (ForecastKey(providerId: $0.providerId, accountId: $0.accountId, windowId: $0.windowId), $0)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        dashboardByAccount = Dictionary(
+            dashboard.accounts.map {
+                (ProviderAccountKey(providerId: $0.providerId, accountId: $0.accountId), $0)
+            },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        provenanceByWindow = Dictionary(
+            windowProvenance.map {
+                (WindowProvenanceKey(providerId: $0.providerId, accountId: $0.accountId, windowId: $0.windowId), $0)
             },
             uniquingKeysWith: { _, latest in latest }
         )
@@ -220,8 +240,6 @@ struct MetricEngine {
             hasUnseenAlert: accountVMs.contains(where: \.hasUnseenAlert),
             lastSuccessAt: accountVMs.compactMap(\.lastSuccessAt).max(),
             errorDetail: worstAccount?.errorDetail,
-            isEstimate: accountVMs.contains(where: \.isEstimate),
-            isPartial: accountVMs.contains(where: \.isPartial),
             repairRecommended: worstAccount?.repairRecommended ?? false,
             accountEmail: singleAccount?.accountEmail
         )
@@ -233,13 +251,23 @@ struct MetricEngine {
         let latest = snapshotsByAccount[ProviderAccountKey(providerId: providerId, accountId: accountId)]?
             .max { $0.collectedAt < $1.collectedAt }
         let h = selectedHealth(providerId: providerId, accountId: accountId)
-        let snapshotWindows = latest?.windows ?? []
+        let snapshotWindows = latest?.windows.filter {
+            let provenance = provenanceByWindow[
+                WindowProvenanceKey(providerId: providerId, accountId: accountId, windowId: $0.windowId)
+            ]
+            return provenance?.quotaLike != true || provenance?.authoritative == true
+        } ?? []
         let spend = snapshotWindows.filter(isSpendWindow).map { window($0, providerId: providerId, accountId: accountId) }
         var windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: providerId, accountId: accountId) }
         if let latest, let resetCredits = resetCreditWindow(latest, providerId: providerId) {
             windows.append(resetCredits)
         }
-        let credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: providerId, accountId: accountId) }
+        var credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: providerId, accountId: accountId) }
+        // Drop user-hidden progress bars before they reach any view model, so the
+        // provider's headline percent, status, and menu-bar number recompute
+        // without them.
+        windows.removeAll { ui.hiddenWindows[AppState.windowKey(providerId, $0.id)] != nil }
+        credits.removeAll { ui.hiddenWindows[AppState.windowKey(providerId, $0.id)] != nil }
         let resetCredits = latest.map(resetCreditDetails) ?? []
         let primary = windows.compactMap(\.percent).min()
         let enabled = isEnabledProvider(providerId) && (account?.collectionEnabled ?? true)
@@ -247,14 +275,13 @@ struct MetricEngine {
         let (sparkline, sparklineTotal) = dailyTokens(providerId: providerId, accountId: accountId)
         let secondary = secondaryMetric(sparklineTotal: sparklineTotal, windows: windows)
         let displayName = friendlyAccountName(displayName: account?.displayName, externalId: account?.externalAccountId)
-        let rowNameValue = accountName(providerId: providerId, accountName: displayName)
         let signature = alertSignature(providerId: providerId, accountId: accountId, status: status)
 
         return ProviderVM(
             id: "\(providerId):\(accountId)",
             providerId: providerId,
             accountId: accountId,
-            name: rowNameValue,
+            name: displayName,
             short: short(providerId),
             symbol: symbol(providerId),
             primary: primary.map { "\(Int($0.rounded()))%" } ?? windows.first?.value ?? "No data",
@@ -277,8 +304,6 @@ struct MetricEngine {
             hasUnseenAlert: signature.map { !ui.seenAlerts.contains($0) } ?? false,
             lastSuccessAt: h?.lastSuccessAt,
             errorDetail: h?.lastErrorMessage,
-            isEstimate: estimateState(latest).estimated,
-            isPartial: estimateState(latest).partial,
             repairRecommended: h.map(needsCredentialRepair) ?? false,
             accountEmail: account?.email
         )
@@ -293,15 +318,6 @@ struct MetricEngine {
         return "\(prefix)...\(suffix)"
     }
 
-    private func accountName(providerId: String, accountName: String) -> String {
-        let lowerAccount = accountName.lowercased()
-        let lowerProvider = pretty(providerId).lowercased()
-        if lowerAccount.contains(lowerProvider) || lowerAccount == lowerProvider {
-            return accountName
-        }
-        return accountName
-    }
-
     private func buildCostDashboard(filter: ((UsageSnapshot) -> Bool)?) -> CostDashboardVM {
         let calendar = dayCalendar
         let today = calendar.startOfDay(for: Date())
@@ -309,134 +325,81 @@ struct MetricEngine {
             calendar.date(byAdding: .day, value: offset - 29, to: today)
         }
         let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
-        let hiddenAccounts = hiddenAccountIds()
-        let visibleSnapshots = snapshots.filter { !hiddenAccounts.contains($0.accountId) }
-        let filtered = filter.map { visibleSnapshots.filter($0) } ?? visibleSnapshots
-        let codexReferenceCostPerToken = codexCostPerToken(in: visibleSnapshots)
-        var providerRows = [String: [String: (cost: Double, tokens: UInt64)]]()
-        var localCostCoverage = [String: [String: LocalCostCoverage]]()
-        var activeProviderIds = Set<String>()
-        var unpricedModels = Set<String>()
-        var isEstimated = false
-        var isPartial = false
-        var sources = Set<String>()
-
-        let scalarKey: (UsageSnapshot) -> String = { snap in
-            filter == nil ? snap.providerId : "\(snap.providerId):\(snap.accountId)"
+        let allowedAccounts: Set<ProviderAccountKey>? = filter.map { predicate in
+            Set(snapshots.filter(predicate).map {
+                ProviderAccountKey(providerId: $0.providerId, accountId: $0.accountId)
+            })
+        }
+        let summaries = dashboard.accounts.filter { summary in
+            guard !hiddenAccountIdSet.contains(summary.accountId) else { return false }
+            return allowedAccounts?.contains(
+                ProviderAccountKey(providerId: summary.providerId, accountId: summary.accountId)
+            ) ?? true
         }
 
-        for snapshot in filtered {
-            let providerId = snapshot.providerId
-            let metadata = snapshot.metadata.object
-            let cost = metadata?["\(providerId)_cost"]?.object
-            let activity = metadata?["\(providerId)_activity"]?.object
-            guard cost != nil || activity != nil else { continue }
-            if let cost {
-                isEstimated = isEstimated || (cost["estimate"]?.bool ?? false)
-                isPartial = isPartial || (cost["partial"]?.bool ?? false) || !(cost["complete_lookback"]?.bool ?? true)
-                if let source = cost["source"]?.string { sources.insert(source) }
-            }
-            if let source = activity?["source"]?.string { sources.insert(source) }
-            let pKey = scalarKey(snapshot)
-            let coverageKey = "\(providerId):\(snapshot.accountId)"
-            let costRows = cost?["by_day"]?.array
-                ?? cost.map { synthesizedTodayRow(from: $0, todayKey: dayKeys.last) }
-                ?? []
-            for rowValue in costRows {
-                guard let row = rowValue.object,
-                      let dateKey = row["date"]?.string,
-                      dayKeys.contains(dateKey)
-                else { continue }
-                let rowCost = row["cost_usd"]?.double ?? 0
-                let rowTokens = row["tokens"]?.uint64 ?? 0
-                let rowUnpricedTokens = row["unpriced_tokens"]?.uint64 ?? 0
-                let rowPricedTokens = row["priced_tokens"]?.uint64
-                    ?? rowTokens.saturatingSubtract(rowUnpricedTokens)
-                localCostCoverage[coverageKey, default: [:]][dateKey] = LocalCostCoverage(
-                    cost: rowCost,
-                    tokens: rowTokens,
-                    pricedTokens: rowPricedTokens
-                )
-                if rowUnpricedTokens > 0 {
-                    let models = row["unpriced_models"]?.array ?? []
-                    let names = models.compactMap { $0.object?["model"]?.string }
-                    if names.isEmpty { unpricedModels.insert("unknown") }
-                    else { unpricedModels.formUnion(names) }
+        var rows = [String: [String: (cost: Double, tokens: UInt64)]]()
+        var active = Set<String>()
+
+        for summary in summaries {
+            let rowId = filter == nil
+                ? summary.providerId
+                : "\(summary.providerId):\(summary.accountId)"
+            if let activity = summary.activity {
+                for point in activity.days where dayKeys.contains(point.dateKey) {
+                    let current = rows[rowId]?[point.dateKey] ?? (0, 0)
+                    rows[rowId, default: [:]][point.dateKey] = (
+                        current.cost,
+                        current.tokens.saturatingAdd(point.tokens)
+                    )
+                    if point.tokens > 0 { active.insert(rowId) }
                 }
-                guard rowCost > 0 else { continue }
-                if providerId == "codex" { continue }
-                let existing = providerRows[pKey]?[dateKey] ?? (0, 0)
-                providerRows[pKey, default: [:]][dateKey] = (
-                    existing.cost + rowCost,
-                    existing.tokens
-                )
-                activeProviderIds.insert(pKey)
             }
-            let tokenRows = activity?["by_day"]?.array ?? costRows
-            for rowValue in tokenRows {
-                guard let row = rowValue.object,
-                      let dateKey = row["date"]?.string,
-                      dayKeys.contains(dateKey)
-                else { continue }
-                let rowTokens = row["tokens"]?.uint64 ?? 0
-                if rowTokens == 0 { continue }
-                let existing = providerRows[pKey]?[dateKey] ?? (0, 0)
-                let costEstimate: Double
-                if providerId == "codex" {
-                    if let local = localCostCoverage[coverageKey]?[dateKey],
-                       local.cost > 0,
-                       local.tokens > 0,
-                       local.pricedTokens > 0
-                    {
-                        if rowTokens < local.tokens {
-                            costEstimate = local.cost * Double(rowTokens) / Double(local.tokens)
-                        } else {
-                            let remoteTokens = rowTokens.saturatingSubtract(local.tokens)
-                            costEstimate = local.cost
-                                + Double(remoteTokens) * local.cost / Double(local.pricedTokens)
-                        }
-                        if rowTokens != local.tokens {
-                            sources.insert("codex_observed_rate_estimate")
-                        }
-                    } else if localCostCoverage[coverageKey]?[dateKey] == nil,
-                              let codexReferenceCostPerToken
-                    {
-                        costEstimate = Double(rowTokens) * codexReferenceCostPerToken
-                        sources.insert("codex_observed_rate_estimate")
-                    } else {
-                        costEstimate = 0
-                    }
-                } else {
-                    costEstimate = 0
+            if let cost = summary.cost {
+                for point in cost.days where dayKeys.contains(point.dateKey) {
+                    let current = rows[rowId]?[point.dateKey] ?? (0, 0)
+                    rows[rowId, default: [:]][point.dateKey] = (
+                        current.cost + (point.costUsd ?? 0),
+                        summary.activity == nil
+                            ? current.tokens.saturatingAdd(point.tokens)
+                            : current.tokens
+                    )
+                    if point.costUsd ?? 0 > 0 { active.insert(rowId) }
                 }
-                providerRows[pKey, default: [:]][dateKey] = (
-                    existing.cost + costEstimate,
-                    existing.tokens.saturatingAdd(rowTokens)
-                )
-                activeProviderIds.insert(pKey)
             }
         }
 
-        // The overview chart is another provider summary surface, so its stack and
-        // hover order should follow the same preference as the rail and cards. A
-        // provider detail dashboard uses account-qualified IDs and keeps its existing
-        // stable account ordering instead.
         let activeIds = filter == nil
-            ? ordered(Array(activeProviderIds))
-            : Array(activeProviderIds).sorted()
-        let providers = activeIds.map { pid in
-            CostProviderVM(id: pid, name: filter == nil ? pretty(pid) : pid, symbol: symbol(filter == nil ? pid : String(pid.split(separator: ":").first ?? "")))
+            ? ordered(Array(active))
+            : Array(active).sorted()
+        let providers = activeIds.map { id in
+            let providerId = String(id.split(separator: ":").first ?? "")
+            return CostProviderVM(
+                id: id,
+                name: filter == nil ? pretty(id) : accountLabel(
+                    ProviderAccountKey(
+                        providerId: providerId,
+                        accountId: String(id.split(separator: ":").dropFirst().joined(separator: ":"))
+                    )
+                ),
+                symbol: symbol(providerId)
+            )
         }
         let days = zip(dayStarts, dayKeys).map { date, key in
             CostDayVM(
                 id: key,
                 date: date,
-                providers: activeIds.map { pid in
-                    let value = providerRows[pid]?[key] ?? (0, 0)
+                providers: activeIds.map { id in
+                    let providerId = String(id.split(separator: ":").first ?? "")
+                    let value = rows[id]?[key] ?? (0, 0)
                     return CostProviderDayVM(
-                        providerId: pid,
-                        providerName: filter == nil ? pretty(pid) : pid,
-                        symbol: symbol(filter == nil ? pid : String(pid.split(separator: ":").first ?? "")),
+                        providerId: id,
+                        providerName: filter == nil ? pretty(id) : accountLabel(
+                            ProviderAccountKey(
+                                providerId: providerId,
+                                accountId: String(id.split(separator: ":").dropFirst().joined(separator: ":"))
+                            )
+                        ),
+                        symbol: symbol(providerId),
                         date: date,
                         dateKey: key,
                         cost: value.cost,
@@ -445,42 +408,10 @@ struct MetricEngine {
                 }
             )
         }
-        let sourceText = sources.sorted().map(sourceLabel).joined(separator: " + ")
-        let pricingNoticeId = unpricedModels.isEmpty
-            ? nil
-            : "unpriced-models:\(unpricedModels.sorted().joined(separator: ","))"
-        return CostDashboardVM(
-            days: days,
-            providers: providers,
-            isEstimated: isEstimated,
-            isPartial: isPartial,
-            sourceLabel: sourceText.isEmpty ? nil : sourceText,
-            pricingNoticeId: pricingNoticeId
-        )
+        return CostDashboardVM(days: days, providers: providers)
     }
 
-    /// Codex's account-wide activity API reports aggregate tokens without a
-    /// model or input/output split. Use the visible local logs only as a
-    /// provider-wide pricing reference; activity dates and token counts still
-    /// come exclusively from each account's own snapshot.
-    private func codexCostPerToken(in snapshots: [UsageSnapshot]) -> Double? {
-        var totalCost = 0.0
-        var totalTokens: UInt64 = 0
-        for snapshot in snapshots where snapshot.providerId == "codex" {
-            guard let cost = snapshot.metadata.object?["codex_cost"]?.object,
-                  let costUsd = cost["total_cost_usd"]?.double,
-                  let tokens = cost["priced_tokens"]?.uint64 ?? cost["total_tokens"]?.uint64,
-                  costUsd > 0,
-                  tokens > 0
-            else { continue }
-            totalCost += costUsd
-            totalTokens = totalTokens.saturatingAdd(tokens)
-        }
-        guard totalCost > 0, totalTokens > 0 else { return nil }
-        return totalCost / Double(totalTokens)
-    }
-
-    private var knownProviderIds: [String] { ["codex", "claude", "opencode_go"] }
+    private var knownProviderIds: [String] { ProviderCatalog.supportedIDs }
 
     private func orderedAccountKeys() -> [ProviderAccountKey] {
         var keys = Set<ProviderAccountKey>()
@@ -545,7 +476,7 @@ struct MetricEngine {
         return "\(providerId)|\(accountId)|\(status.code)"
     }
 
-    private func isSupportedProvider(_ id: String) -> Bool { id != "opencode" }
+    private func isSupportedProvider(_ id: String) -> Bool { ProviderCatalog.supports(id) }
 
     private func isDefaultVisibleProvider(_ id: String) -> Bool {
         guard isEnabledProvider(id) else { return false }
@@ -567,13 +498,12 @@ struct MetricEngine {
     }
 
     private func resetCreditWindow(_ snapshot: UsageSnapshot, providerId: String) -> WindowVM? {
-        guard let root = snapshot.metadata.object else { return nil }
-        let metadata = root["rate_limit_reset_credits"]?.object
-        let available = metadata?["available_count"]?.double ?? root["rate_limit_reset_credits_available_count"]?.double
-        guard let available, available > 0 else { return nil }
+        guard let summary = dashboardByAccount[
+            ProviderAccountKey(providerId: snapshot.providerId, accountId: snapshot.accountId)
+        ]?.resetCredits, summary.availableCount > 0 else { return nil }
 
-        let count = Int(available.rounded())
-        let expiresAt = metadata?["next_expires_at"]?.double.map { Date(timeIntervalSince1970: $0) }
+        let count = Int(summary.availableCount)
+        let expiresAt = summary.nextExpiresAt
         let reset = expiresAt.map { "expires \(expiryTime($0))" } ?? "expiry unknown"
         let status: DisplayStatus
         if let expiresAt, expiresAt <= Date() {
@@ -600,22 +530,18 @@ struct MetricEngine {
 
     private func resetCreditDetails(_ snapshot: UsageSnapshot) -> [ResetCreditVM] {
         guard snapshot.providerId == "codex",
-              let root = snapshot.metadata.object,
-              let credits = root["rate_limit_reset_credits"]?.object?["credits"]?.array
+              let credits = dashboardByAccount[
+                ProviderAccountKey(providerId: snapshot.providerId, accountId: snapshot.accountId)
+              ]?.resetCredits?.credits
         else { return [] }
 
-        return credits.enumerated().compactMap { index, value in
-            guard let credit = value.object else { return nil }
-            let expiresAt = credit["expires_at"]?.double.map { Date(timeIntervalSince1970: $0) }
-            let status = credit["status"]?.string ?? "unknown"
-            let title = credit["title"]?.string ?? credit["reset_type"]?.string ?? "Reset credit"
-            let id = credit["id"]?.string ?? "\(snapshot.id):reset_credit:\(index)"
+        return credits.map { credit in
             return ResetCreditVM(
-                id: id,
-                title: title,
-                status: status,
-                expiresAt: expiresAt,
-                expiresText: expiresAt.map(expiryTime) ?? "expiry unknown"
+                id: credit.id,
+                title: credit.title,
+                status: credit.status,
+                expiresAt: credit.expiresAt,
+                expiresText: credit.expiresAt.map(expiryTime) ?? "expiry unknown"
             )
         }
         .sorted {
@@ -634,28 +560,6 @@ struct MetricEngine {
             return accountHealth
         }
         return providerHealth.max { $0.updatedAt < $1.updatedAt }
-    }
-
-    private func estimateState(_ snapshot: UsageSnapshot?) -> (estimated: Bool, partial: Bool) {
-        guard let snapshot,
-              let cost = snapshot.metadata.object?["\(snapshot.providerId)_cost"]?.object
-        else { return (false, false) }
-        return (
-            cost["estimate"]?.bool ?? false,
-            (cost["partial"]?.bool ?? false) || !(cost["complete_lookback"]?.bool ?? true)
-        )
-    }
-
-    private func sourceLabel(_ source: String) -> String {
-        switch source {
-        case "codex_account_usage": return "Codex account history"
-        case "codex_observed_rate_estimate": return "observed local Codex rate"
-        case "local_session_logs": return "local Codex logs"
-        case "local_project_logs": return "local Claude logs"
-        case "opencode_local_sqlite": return "local OpenCode history"
-        case "opencode_usage_page": return "OpenCode usage history"
-        default: return source.replacingOccurrences(of: "_", with: " ")
-        }
     }
 
     private func worstHealthText(providerId: String) -> String {
@@ -749,7 +653,7 @@ struct MetricEngine {
     }
 
     private func absoluteText(_ w: UsageWindow) -> String? {
-        guard let used = w.used, let limit = w.limit, same(used.unit, limit.unit), limit.value > 0 else { return nil }
+        guard let used = w.used, let limit = w.limit, used.unit == limit.unit, limit.value > 0 else { return nil }
         return "\(compact(used.value)) / \(compact(limit.value))"
     }
 
@@ -771,11 +675,9 @@ struct MetricEngine {
     }
 
     private func computedPercent(_ w: UsageWindow) -> Double? {
-        guard let used = w.used, let limit = w.limit, same(used.unit, limit.unit), limit.value > 0 else { return nil }
+        guard let used = w.used, let limit = w.limit, used.unit == limit.unit, limit.value > 0 else { return nil }
         return max(0, min(100, 100 - used.value / limit.value * 100))
     }
-
-    private func same(_ a: UsageUnit, _ b: UsageUnit) -> Bool { String(describing: a) == String(describing: b) }
 
     private func amount(_ a: UsageAmount?) -> String {
         guard let a else { return "No data" }
@@ -792,23 +694,16 @@ struct MetricEngine {
         }.map { DateFormats.dayKey.string(from: $0) }
 
         var perDay = [String: UInt64]()
-        let hiddenAccounts = hiddenAccountIds()
-        let indexedSnapshots = accountId.map {
-            snapshotsByAccount[ProviderAccountKey(providerId: providerId, accountId: $0)] ?? []
-        } ?? (snapshotsByProvider[providerId] ?? [])
-        for snapshot in indexedSnapshots where !hiddenAccounts.contains(snapshot.accountId) {
-            let metadata = snapshot.metadata.object
-            let activity = metadata?["\(providerId)_activity"]?.object
-            let cost = metadata?["\(providerId)_cost"]?.object
-            guard activity != nil || cost != nil else { continue }
-            let rows = activity?["by_day"]?.array
-                ?? cost?["by_day"]?.array
-                ?? cost.map { synthesizedTodayRow(from: $0, todayKey: dayKeys.last) }
-                ?? []
-            for rowValue in rows {
-                guard let row = rowValue.object, let dateKey = row["date"]?.string, dayKeys.contains(dateKey) else { continue }
-                let tokens = row["tokens"]?.uint64 ?? 0
-                perDay[dateKey, default: 0] = perDay[dateKey, default: 0].saturatingAdd(tokens)
+        let summaries = dashboard.accounts.filter {
+            $0.providerId == providerId
+                && !hiddenAccountIdSet.contains($0.accountId)
+                && (accountId == nil || $0.accountId == accountId)
+        }
+        for summary in summaries {
+            let points = summary.activity?.days ?? summary.cost?.days ?? []
+            for point in points where dayKeys.contains(point.dateKey) {
+                perDay[point.dateKey, default: 0] = perDay[point.dateKey, default: 0]
+                    .saturatingAdd(point.tokens)
             }
         }
         let values = dayKeys.map { Double(perDay[$0] ?? 0) }
@@ -830,30 +725,12 @@ struct MetricEngine {
         return "no activity"
     }
 
-    private func synthesizedTodayRow(from cost: [String: JSONValue], todayKey: String?) -> [JSONValue] {
-        guard let todayKey,
-              let tokens = cost["today_tokens"]?.uint64,
-              tokens > 0
-        else { return [] }
-        return [.object([
-            "date": .string(todayKey),
-            "cost_usd": .number(cost["today_cost_usd"]?.double ?? 0),
-            "tokens": .number(Double(tokens)),
-        ])]
-    }
-
     private func pretty(_ id: String) -> String {
-        if id == "codex" { return "Codex" }
-        if id == "claude" { return "Claude" }
-        if id == "opencode_go" { return "OpenCode Go" }
-        return id.capitalized
+        ProviderCatalog.name(for: id)
     }
 
     private func short(_ id: String) -> String {
-        if id == "codex" { return "Cdx" }
-        if id == "claude" { return "Clde" }
-        if id == "opencode_go" { return "Go" }
-        return String(pretty(id).prefix(4))
+        ProviderCatalog.shortName(for: id)
     }
 
     private func accountLabel(_ key: ProviderAccountKey) -> String {
@@ -862,10 +739,7 @@ struct MetricEngine {
     }
 
     private func symbol(_ id: String) -> String {
-        if id == "codex" { return "terminal" }
-        if id == "claude" { return "sparkles" }
-        if id == "opencode_go" { return "bolt.horizontal" }
-        return "chart.bar"
+        ProviderCatalog.symbol(for: id)
     }
     private func expiryTime(_ d: Date) -> String {
         DateFormats.expiry.string(from: d)

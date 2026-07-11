@@ -31,6 +31,7 @@ pub fn forecast_snapshot(
     current
         .windows
         .iter()
+        .filter(|window| current.window_is_authoritative_quota(window))
         .filter(|window| {
             !matches!(
                 window.kind,
@@ -225,7 +226,7 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    Some(if values.len().is_multiple_of(2) {
+    Some(if values.len() % 2 == 0 {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]
@@ -421,6 +422,19 @@ mod tests {
 
         assert_eq!(forecast.status, ForecastStatus::InsufficientData);
         assert!(forecast.expected_percent_used.is_none());
+    }
+
+    #[test]
+    fn synthetic_local_window_is_not_forecast() {
+        let now = time(2026, 7, 10, 12, 0);
+        let mut current = snapshot(now, now + TimeDelta::hours(2), 95.0);
+        current.provider_id = ProviderId::new("opencode_go");
+        current.metadata = json!({
+            "estimate": true,
+            "web_authoritative": false,
+        });
+
+        assert!(forecast_from_snapshots(&current, &[], now).is_empty());
     }
 
     fn forecast_from_snapshots(

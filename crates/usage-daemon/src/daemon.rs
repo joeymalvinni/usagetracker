@@ -1,64 +1,92 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::OpenOptions,
-    io::Write,
-    os::unix::{fs::OpenOptionsExt, net::UnixStream as StdUnixStream},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
+    os::unix::net::UnixStream as StdUnixStream,
+    path::Path,
     sync::Arc,
     time::Duration,
 };
 
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{info, warn};
 use usage_core::{
-    default_app_dir, Account, AccountId, AddProviderAccountResponse, ConfigResponse,
-    NotificationConfig, ProviderActionResponse, ProviderId, ProviderProfileResponse,
-    ProviderSetupResponse, ProviderToggle,
+    Account, AccountId, AddProviderAccountResponse, ConfigResponse, NotificationConfig,
+    ProviderActionResponse, ProviderId, ProviderProfileResponse, ProviderSetupResponse,
+    ProviderToggle,
 };
+
+#[cfg(test)]
+use usage_core::default_app_dir;
 
 use crate::{
     config::{Config, ProviderConfig, ProviderProfileConfig},
     fixtures::{self, FixtureScenario},
-    health, local_logs,
+    local_logs,
     notifications::NotificationManager,
     polling::RefreshCoordinator,
     providers::{
-        claude::{
-            keychain_service_for_config_dir, ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID,
-        },
-        codex::{CodexCollector, PROVIDER_ID as CODEX_PROVIDER_ID},
+        claude::PROVIDER_ID as CLAUDE_PROVIDER_ID,
+        codex::PROVIDER_ID as CODEX_PROVIDER_ID,
         opencode::{clear_cached_cookie_cache, OpenCodeCollector, OPENCODE_GO_PROVIDER_ID},
+        paths::expand_home_path,
         ProviderCollector,
     },
+    runtime::{launchers, managed_profiles, profile_service, provider_registry},
     server::SocketServer,
     storage::Storage,
 };
 
 pub struct Daemon {
     runtime: Arc<DaemonRuntime>,
-    poll_interval_rx: watch::Receiver<u64>,
+    poll_schedule_rx: watch::Receiver<PollSchedule>,
 }
 
 pub struct DaemonRuntime {
     config: RwLock<Config>,
+    config_mutation: Mutex<()>,
     pub storage: Storage,
     pub refresh: Arc<RefreshCoordinator>,
     notifications: Arc<NotificationManager>,
-    poll_interval_tx: watch::Sender<u64>,
+    poll_schedule_tx: watch::Sender<PollSchedule>,
+    local_log_config_tx: watch::Sender<local_logs::LocalLogConfig>,
     fixture_mode: bool,
 }
 
-struct ProviderRegistration {
-    id: &'static str,
-    build: fn(&Config) -> anyhow::Result<Arc<dyn ProviderCollector>>,
+const HIDDEN_PROVIDER_POLL_SECONDS: u64 = 30 * 60;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PollSchedule {
+    visible: Vec<ProviderId>,
+    hidden: Vec<ProviderId>,
+    visible_interval_seconds: u64,
 }
 
-struct ClaudeLoginTarget {
-    profile_id: String,
-    display_name: Option<String>,
-    config_dir: Option<PathBuf>,
+impl PollSchedule {
+    fn from_config(config: &Config) -> Self {
+        let visible = config.enabled_provider_ids();
+        let visible_ids = visible
+            .iter()
+            .map(ProviderId::as_str)
+            .collect::<BTreeSet<_>>();
+        let hidden = config
+            .providers
+            .keys()
+            .filter(|id| provider_registry::is_supported(id))
+            .filter(|id| !visible_ids.contains(id.as_str()))
+            .map(|id| ProviderId::new(id.clone()))
+            .collect();
+        Self {
+            visible,
+            hidden,
+            visible_interval_seconds: config.poll_interval_seconds,
+        }
+    }
 }
+
+use profile_service::{
+    codex_profile_home, create_managed_claude_profile, default_codex_profile,
+    ensure_claude_login_profile, pending_claude_profile, pending_codex_profile, unique_profile_id,
+    ClaudeLoginTarget,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ConfigUpdateChanges {
@@ -73,36 +101,21 @@ impl ConfigUpdateChanges {
     }
 }
 
-const PROVIDER_REGISTRY: &[ProviderRegistration] = &[
-    ProviderRegistration {
-        id: CODEX_PROVIDER_ID,
-        build: build_codex_provider,
-    },
-    ProviderRegistration {
-        id: CLAUDE_PROVIDER_ID,
-        build: build_claude_provider,
-    },
-    ProviderRegistration {
-        id: OPENCODE_GO_PROVIDER_ID,
-        build: build_opencode_go_provider,
-    },
-];
-
 impl Daemon {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let storage = Storage::open(&config.paths.db)?;
-        let providers = build_providers(&config, &storage).await?;
-        let notifications = NotificationManager::new(storage.clone(), config.notifications.enabled);
+        let providers = provider_registry::build_enabled(&config, &storage).await?;
+        let notifications = NotificationManager::new(storage.clone(), config.notifications.clone());
         let refresh = Arc::new(RefreshCoordinator::with_notifications(
             storage.clone(),
             providers,
             notifications.clone(),
         ));
-        let (runtime, poll_interval_rx) = DaemonRuntime::new(config, storage, refresh);
+        let (runtime, poll_schedule_rx) = DaemonRuntime::new(config, storage, refresh);
 
         Ok(Self {
             runtime,
-            poll_interval_rx,
+            poll_schedule_rx,
         })
     }
 
@@ -115,11 +128,11 @@ impl Daemon {
             Vec::new(),
             notifications,
         ));
-        let (runtime, poll_interval_rx) =
+        let (runtime, poll_schedule_rx) =
             DaemonRuntime::new_with_fixture_mode(config, storage, refresh, true);
         Ok(Self {
             runtime,
-            poll_interval_rx,
+            poll_schedule_rx,
         })
     }
 
@@ -134,22 +147,13 @@ impl Daemon {
             tokio::spawn(async move { server.serve(listener, &socket_path).await })
         };
 
-        let mut poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
+        let mut poll_task = spawn_polling_loop(self.poll_schedule_rx, self.runtime.refresh.clone());
         let local_log_task = if self.runtime.fixture_mode {
             None
         } else {
-            let claude_config = self
-                .runtime
-                .config
-                .read()
-                .await
-                .providers
-                .get(CLAUDE_PROVIDER_ID)
-                .cloned()
-                .unwrap_or_default();
             Some(local_logs::spawn_change_log_loop(
                 self.runtime.refresh.clone(),
-                claude_config,
+                self.runtime.local_log_config_tx.subscribe(),
             ))
         };
 
@@ -206,7 +210,7 @@ impl DaemonRuntime {
         config: Config,
         storage: Storage,
         refresh: Arc<RefreshCoordinator>,
-    ) -> (Arc<Self>, watch::Receiver<u64>) {
+    ) -> (Arc<Self>, watch::Receiver<PollSchedule>) {
         Self::new_with_fixture_mode(config, storage, refresh, false)
     }
 
@@ -215,19 +219,24 @@ impl DaemonRuntime {
         storage: Storage,
         refresh: Arc<RefreshCoordinator>,
         fixture_mode: bool,
-    ) -> (Arc<Self>, watch::Receiver<u64>) {
+    ) -> (Arc<Self>, watch::Receiver<PollSchedule>) {
         let notifications = refresh.notification_manager();
-        notifications.set_enabled(config.notifications.enabled);
-        let (poll_interval_tx, poll_interval_rx) = watch::channel(config.poll_interval_seconds);
+        notifications.set_config(config.notifications.clone());
+        let (poll_schedule_tx, poll_schedule_rx) =
+            watch::channel(PollSchedule::from_config(&config));
+        let (local_log_config_tx, _) =
+            watch::channel(local_logs::LocalLogConfig::from_config(&config));
         let runtime = Arc::new(Self {
             config: RwLock::new(config),
+            config_mutation: Mutex::new(()),
             storage,
             refresh,
             notifications,
-            poll_interval_tx,
+            poll_schedule_tx,
+            local_log_config_tx,
             fixture_mode,
         });
-        (runtime, poll_interval_rx)
+        (runtime, poll_schedule_rx)
     }
 
     pub async fn config_response(&self) -> anyhow::Result<ConfigResponse> {
@@ -248,9 +257,10 @@ impl DaemonRuntime {
             .map(|id| id.as_str().to_string())
             .collect::<BTreeSet<_>>();
         providers.extend(
-            self.refresh
-                .provider_ids()
+            self.config
+                .read()
                 .await
+                .enabled_provider_ids()
                 .into_iter()
                 .map(|id| id.as_str().to_string()),
         );
@@ -264,7 +274,7 @@ impl DaemonRuntime {
         if self.fixture_mode {
             Ok(Vec::new())
         } else {
-            build_providers(config, &self.storage).await
+            provider_registry::build_enabled(config, &self.storage).await
         }
     }
 
@@ -276,21 +286,22 @@ impl DaemonRuntime {
     ) -> anyhow::Result<ConfigResponse> {
         if let Some(providers) = &providers {
             for id in providers.keys() {
-                if !PROVIDER_REGISTRY.iter().any(|r| r.id == id) {
+                if !provider_registry::is_supported(id) {
                     anyhow::bail!("unknown provider: {id}");
                 }
             }
         }
 
-        let mut config = self.config.write().await;
+        let mutation = self.config_mutation.lock().await;
+        let config = self.config.read().await.clone();
         let changes = config_update_changes(
             &config,
             poll_interval_seconds,
             providers.as_ref(),
-            notifications,
+            notifications.as_ref(),
         );
         if !changes.any() {
-            drop(config);
+            drop(mutation);
             return self.config_response().await;
         }
 
@@ -306,39 +317,46 @@ impl DaemonRuntime {
             !config.notifications.enabled && updated_config.notifications.enabled;
         let notifications_disabled =
             config.notifications.enabled && !updated_config.notifications.enabled;
-        if notifications_reenabled {
+        let threshold_policy_changed = notification_threshold_policy_changed(
+            &config.notifications,
+            &updated_config.notifications,
+        );
+        updated_config.persist()?;
+        *self.config.write().await = updated_config.clone();
+        self.publish_local_log_config(&updated_config);
+        if let Some(collectors) = collectors {
+            self.refresh.set_providers(collectors).await;
+        }
+        if notifications_reenabled || threshold_policy_changed {
             self.storage.clear_notification_window_state().await?;
         }
         if notifications_disabled {
             self.storage.clear_pending_notifications().await?;
         }
-        updated_config.persist()?;
-        *config = updated_config;
-        if let Some(collectors) = collectors {
-            self.refresh.set_providers(collectors).await;
-        }
         if changes.notifications {
-            self.notifications.set_enabled(config.notifications.enabled);
+            self.notifications
+                .set_config(updated_config.notifications.clone());
         }
-        if changes.poll_interval {
-            self.poll_interval_tx.send_if_modified(|current| {
-                if *current == config.poll_interval_seconds {
+        if changes.poll_interval || changes.providers {
+            let schedule = PollSchedule::from_config(&updated_config);
+            self.poll_schedule_tx.send_if_modified(|current| {
+                if *current == schedule {
                     false
                 } else {
-                    *current = config.poll_interval_seconds;
+                    *current = schedule;
                     true
                 }
             });
         }
 
-        let poll_interval_seconds = config.poll_interval_seconds;
-        let enabled_providers = config.enabled_provider_ids();
+        let poll_interval_seconds = updated_config.poll_interval_seconds;
+        let enabled_providers = updated_config.enabled_provider_ids();
         info!(
             poll_interval_seconds,
             enabled_providers = ?enabled_providers,
             "daemon config updated"
         );
-        drop(config);
+        drop(mutation);
         self.config_response().await
     }
 
@@ -365,8 +383,8 @@ impl DaemonRuntime {
         provider_id: ProviderId,
         display_name: Option<String>,
     ) -> anyhow::Result<AddProviderAccountResponse> {
-        let mut config = self.config.write().await;
-        let mut updated_config = config.clone();
+        let mutation = self.config_mutation.lock().await;
+        let mut updated_config = self.config.read().await.clone();
         let provider = updated_config
             .providers
             .entry(CODEX_PROVIDER_ID.to_string())
@@ -393,12 +411,13 @@ impl DaemonRuntime {
 
         let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
-        *config = updated_config;
+        self.publish_local_log_config(&updated_config);
+        *self.config.write().await = updated_config;
         self.refresh.set_providers(collectors).await;
-        drop(config);
+        drop(mutation);
 
-        let child = launch_codex_login(&profile_path)?;
-        monitor_provider_login(
+        let child = launchers::launch_codex_login(&profile_path)?;
+        launchers::monitor_login(
             child,
             self.refresh.clone(),
             CODEX_PROVIDER_ID,
@@ -434,8 +453,8 @@ impl DaemonRuntime {
             .filter_map(|account| account.profile_id)
             .collect::<BTreeSet<_>>();
 
-        let mut config = self.config.write().await;
-        let mut updated_config = config.clone();
+        let mutation = self.config_mutation.lock().await;
+        let mut updated_config = self.config.read().await.clone();
         let provider = updated_config
             .providers
             .entry(CLAUDE_PROVIDER_ID.to_string())
@@ -449,16 +468,17 @@ impl DaemonRuntime {
 
         let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
-        *config = updated_config;
+        self.publish_local_log_config(&updated_config);
+        *self.config.write().await = updated_config;
         self.refresh.set_providers(collectors).await;
-        drop(config);
+        drop(mutation);
 
         let profile_path = target
             .config_dir
             .clone()
             .ok_or_else(|| anyhow::anyhow!("managed Claude profile is missing its config path"))?;
-        let child = launch_claude_login(Some(&profile_path))?;
-        monitor_provider_login(
+        let child = launchers::launch_claude_login(Some(&profile_path))?;
+        launchers::monitor_login(
             child,
             self.refresh.clone(),
             CLAUDE_PROVIDER_ID,
@@ -487,13 +507,6 @@ impl DaemonRuntime {
         hidden: Option<bool>,
         collection_enabled: Option<bool>,
     ) -> anyhow::Result<Account> {
-        let account = self
-            .storage
-            .account(&account_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
-        self.apply_account_profile_updates(&account, display_name.as_deref(), collection_enabled)
-            .await?;
         self.storage
             .update_account(
                 &account_id,
@@ -515,149 +528,40 @@ impl DaemonRuntime {
             .account(&account_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
-        let managed_profile_path = self.mark_account_connection_deleted(&account).await?;
-        self.storage.delete_account(&account_id).await?;
-        if let Some(path) = managed_profile_path {
-            if let Err(err) = std::fs::remove_dir_all(&path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    warn!(path = %path.display(), error = %err, "failed to remove deleted account profile");
-                }
-            }
-        }
-        Ok(account_id)
-    }
-
-    async fn mark_account_connection_deleted(
-        &self,
-        account: &Account,
-    ) -> anyhow::Result<Option<PathBuf>> {
         if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
             clear_cached_cookie_cache().await?;
         }
-        let mut config = self.config.write().await;
-        let mut updated_config = config.clone();
-        let provider = updated_config
-            .providers
-            .entry(account.provider_id.as_str().to_string())
-            .or_default();
-        let mut managed_profile_path = None;
 
-        if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
-            provider.enabled = false;
-            provider.workspace_id = None;
-            provider.cookie_header = None;
-        } else if let Some(profile_id) = account.profile_id.as_deref() {
-            if let Some(profile) = provider
-                .profiles
-                .iter_mut()
-                .find(|profile| profile.id.as_deref() == Some(profile_id))
-            {
-                if account.provider_id.as_str() == CODEX_PROVIDER_ID {
-                    managed_profile_path = profile
-                        .codex_home
-                        .as_ref()
-                        .map(|path| expand_home_path(path.clone()))
-                        .filter(|path| is_managed_codex_profile(path));
-                } else if account.provider_id.as_str() == CLAUDE_PROVIDER_ID {
-                    managed_profile_path = profile
-                        .claude_config_dir
-                        .as_ref()
-                        .map(|path| expand_home_path(path.clone()))
-                        .filter(|path| is_managed_claude_profile(path));
-                }
-                profile.enabled = false;
-                profile.deleted = true;
-                profile.display_name = None;
-                profile.auth_path = None;
-                profile.codex_home = None;
-                profile.keychain_account = None;
-                profile.keychain_service = None;
-                profile.credentials_file = None;
-                profile.claude_config_dir = None;
-                profile.cli_enabled = None;
-                profile.project_roots.clear();
-                profile.owns_default_codex_activity = false;
-                profile.owns_default_claude_activity = false;
-            } else {
-                provider.profiles.push(ProviderProfileConfig {
-                    id: Some(profile_id.to_string()),
-                    enabled: false,
-                    deleted: true,
-                    ..ProviderProfileConfig::default()
-                });
-            }
-            if !provider
-                .profiles
-                .iter()
-                .any(|profile| profile.enabled && !profile.deleted)
-            {
-                provider.enabled = false;
-            }
-        }
+        let mutation = self.config_mutation.lock().await;
+        let previous_config = self.config.read().await.clone();
+        let plan = crate::runtime::account_service::plan_deletion(&previous_config, &account)?;
+        let previous_collectors = self.collectors_for_config(&previous_config).await?;
+        let next_collectors = self.collectors_for_config(&plan.config).await?;
 
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        *config = updated_config;
-        self.refresh.set_providers(collectors).await;
-        Ok(managed_profile_path)
-    }
+        plan.config.persist()?;
+        *self.config.write().await = plan.config.clone();
+        self.publish_local_log_config(&plan.config);
+        self.refresh.set_providers(next_collectors).await;
 
-    async fn apply_account_profile_updates(
-        &self,
-        account: &Account,
-        display_name: Option<&str>,
-        collection_enabled: Option<bool>,
-    ) -> anyhow::Result<()> {
-        let display_name = display_name
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if display_name.is_none() && collection_enabled.is_none() {
-            return Ok(());
+        if let Err(delete_error) = self.storage.delete_account(&account_id).await {
+            let rollback_result = previous_config.persist();
+            self.publish_local_log_config(&previous_config);
+            *self.config.write().await = previous_config;
+            self.refresh.set_providers(previous_collectors).await;
+            drop(mutation);
+            if let Err(rollback_error) = rollback_result {
+                return Err(delete_error.context(format!(
+                    "database deletion failed and config rollback also failed: {rollback_error}"
+                )));
+            }
+            return Err(delete_error.context("database deletion failed; config was rolled back"));
         }
-        let Some(profile_id) = account.profile_id.as_deref() else {
-            return Ok(());
-        };
+        drop(mutation);
 
-        let mut config = self.config.write().await;
-        let mut updated_config = config.clone();
-        let Some(provider) = updated_config
-            .providers
-            .get_mut(account.provider_id.as_str())
-        else {
-            return Ok(());
-        };
-        let Some(profile) = provider
-            .profiles
-            .iter_mut()
-            .find(|profile| !profile.deleted && profile.id.as_deref() == Some(profile_id))
-        else {
-            return Ok(());
-        };
-        let mut changed = false;
-        if let Some(display_name) = display_name {
-            if profile.display_name.as_deref() != Some(display_name) {
-                profile.display_name = Some(display_name.to_string());
-                changed = true;
-            }
+        if let Some(path) = plan.managed_profile_path {
+            managed_profiles::quarantine_and_remove(&path)?;
         }
-        if let Some(collection_enabled) = collection_enabled {
-            if profile.enabled != collection_enabled {
-                profile.enabled = collection_enabled;
-                changed = true;
-            }
-            if collection_enabled && !provider.enabled {
-                provider.enabled = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(());
-        }
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        *config = updated_config;
-        self.refresh.set_providers(collectors).await;
-        Ok(())
+        Ok(account_id)
     }
 
     pub async fn provider_setup(
@@ -738,8 +642,8 @@ impl DaemonRuntime {
             anyhow::bail!("OpenCode workspace id must start with wrk_");
         }
 
-        let mut config = self.config.write().await;
-        let mut updated_config = config.clone();
+        let mutation = self.config_mutation.lock().await;
+        let mut updated_config = self.config.read().await.clone();
         updated_config
             .providers
             .entry(OPENCODE_GO_PROVIDER_ID.to_string())
@@ -747,9 +651,10 @@ impl DaemonRuntime {
             .workspace_id = workspace_id;
         let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
-        *config = updated_config;
+        self.publish_local_log_config(&updated_config);
+        *self.config.write().await = updated_config;
         self.refresh.set_providers(collectors).await;
-        drop(config);
+        drop(mutation);
         self.provider_setup(provider_id).await
     }
 
@@ -792,8 +697,8 @@ impl DaemonRuntime {
                 let profile_id = profile
                     .and_then(|profile| profile.id.clone())
                     .unwrap_or_else(|| "default".to_string());
-                let child = launch_codex_login(&home)?;
-                monitor_provider_login(
+                let child = launchers::launch_codex_login(&home)?;
+                launchers::monitor_login(
                     child,
                     self.refresh.clone(),
                     CODEX_PROVIDER_ID,
@@ -806,8 +711,8 @@ impl DaemonRuntime {
                 let target = self
                     .prepare_claude_login_profile(account_id.as_ref())
                     .await?;
-                let child = launch_claude_login(target.config_dir.as_deref())?;
-                monitor_provider_login(
+                let child = launchers::launch_claude_login(target.config_dir.as_deref())?;
+                launchers::monitor_login(
                     child,
                     self.refresh.clone(),
                     CLAUDE_PROVIDER_ID,
@@ -818,7 +723,7 @@ impl DaemonRuntime {
             }
             OPENCODE_GO_PROVIDER_ID => {
                 clear_cached_cookie_cache().await?;
-                open_url("https://opencode.ai")?;
+                launchers::open_url("https://opencode.ai")?;
                 "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
                     .to_string()
             }
@@ -874,8 +779,9 @@ impl DaemonRuntime {
         };
         drop(config);
 
-        let launcher = write_claude_profile_launcher(&account_id, config_dir.as_deref())?;
-        open_terminal_launcher(&launcher)?;
+        let launcher =
+            launchers::write_claude_profile_launcher(&account_id, config_dir.as_deref())?;
+        launchers::open_terminal(&launcher)?;
         Ok(ProviderActionResponse {
             provider_id: account.provider_id,
             message: format!(
@@ -901,8 +807,8 @@ impl DaemonRuntime {
             None => None,
         };
 
-        let mut config = self.config.write().await;
-        let mut updated_config = config.clone();
+        let mutation = self.config_mutation.lock().await;
+        let mut updated_config = self.config.read().await.clone();
         let provider = updated_config
             .providers
             .entry(CLAUDE_PROVIDER_ID.to_string())
@@ -912,9 +818,16 @@ impl DaemonRuntime {
 
         let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
-        *config = updated_config;
+        self.publish_local_log_config(&updated_config);
+        *self.config.write().await = updated_config;
         self.refresh.set_providers(collectors).await;
+        drop(mutation);
         Ok(target)
+    }
+
+    fn publish_local_log_config(&self, config: &Config) {
+        self.local_log_config_tx
+            .send_replace(local_logs::LocalLogConfig::from_config(config));
     }
 }
 
@@ -922,7 +835,7 @@ fn config_update_changes(
     config: &Config,
     poll_interval_seconds: Option<u64>,
     providers: Option<&BTreeMap<String, ProviderToggle>>,
-    notifications: Option<NotificationConfig>,
+    notifications: Option<&NotificationConfig>,
 ) -> ConfigUpdateChanges {
     ConfigUpdateChanges {
         poll_interval: poll_interval_seconds
@@ -933,535 +846,92 @@ fn config_update_changes(
                 .any(|(id, toggle)| config.provider_enabled(id) != toggle.enabled)
         }),
         notifications: notifications
-            .is_some_and(|notifications| notifications != config.notifications),
+            .is_some_and(|notifications| notifications != &config.notifications),
     }
+}
+
+fn notification_threshold_policy_changed(
+    previous: &NotificationConfig,
+    updated: &NotificationConfig,
+) -> bool {
+    previous.thresholds_percent_remaining != updated.thresholds_percent_remaining
+        || previous
+            .rules
+            .iter()
+            .filter(|rule| rule.thresholds_percent_remaining.is_some())
+            .map(|rule| {
+                (
+                    rule.account_id.as_ref(),
+                    rule.window_id.as_deref(),
+                    rule.thresholds_percent_remaining.as_deref(),
+                )
+            })
+            .ne(updated
+                .rules
+                .iter()
+                .filter(|rule| rule.thresholds_percent_remaining.is_some())
+                .map(|rule| {
+                    (
+                        rule.account_id.as_ref(),
+                        rule.window_id.as_deref(),
+                        rule.thresholds_percent_remaining.as_deref(),
+                    )
+                }))
 }
 
 fn ensure_supported_provider(provider_id: &ProviderId) -> anyhow::Result<()> {
-    if PROVIDER_REGISTRY
-        .iter()
-        .any(|registration| registration.id == provider_id.as_str())
-    {
-        Ok(())
-    } else {
-        anyhow::bail!("unknown provider: {provider_id}")
-    }
-}
-
-fn expand_home_path(path: PathBuf) -> PathBuf {
-    let Some(value) = path.to_str() else {
-        return path;
-    };
-    if value == "~" {
-        return dirs::home_dir().unwrap_or(path);
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    path
-}
-
-fn codex_profile_home(profile_id: &str) -> anyhow::Result<PathBuf> {
-    let app_dir = default_app_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
-    Ok(app_dir
-        .join("profiles")
-        .join(CODEX_PROVIDER_ID)
-        .join(profile_id))
-}
-
-fn claude_profile_home(profile_id: &str) -> anyhow::Result<PathBuf> {
-    let app_dir = default_app_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
-    Ok(app_dir
-        .join("profiles")
-        .join(CLAUDE_PROVIDER_ID)
-        .join(profile_id))
-}
-
-fn pending_codex_profile(provider: &ProviderConfig) -> Option<(String, PathBuf, Option<String>)> {
-    provider.profiles.iter().rev().find_map(|profile| {
-        if !profile.enabled || profile.deleted {
-            return None;
-        }
-        let profile_id = profile.id.clone()?;
-        let profile_path = expand_home_path(profile.codex_home.clone()?);
-        if !is_managed_codex_profile(&profile_path) {
-            return None;
-        }
-        let auth_path = profile
-            .auth_path
-            .clone()
-            .map(expand_home_path)
-            .unwrap_or_else(|| profile_path.join("auth.json"));
-        (!auth_path.exists()).then(|| (profile_id, profile_path, profile.display_name.clone()))
-    })
-}
-
-fn is_managed_codex_profile(path: &Path) -> bool {
-    default_app_dir()
-        .map(|root| path.starts_with(root.join("profiles").join(CODEX_PROVIDER_ID)))
-        .unwrap_or(false)
-}
-
-fn is_managed_claude_profile(path: &Path) -> bool {
-    default_app_dir()
-        .map(|root| path.starts_with(root.join("profiles").join(CLAUDE_PROVIDER_ID)))
-        .unwrap_or(false)
-}
-
-fn default_codex_profile() -> anyhow::Result<ProviderProfileConfig> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?;
-    Ok(ProviderProfileConfig {
-        id: Some("default".to_string()),
-        display_name: None,
-        codex_home: Some(home.join(".codex")),
-        ..ProviderProfileConfig::default()
-    })
-}
-
-fn ensure_claude_login_profile(
-    provider: &mut ProviderConfig,
-    requested_profile_id: Option<&str>,
-) -> anyhow::Result<ClaudeLoginTarget> {
-    if provider.profiles.is_empty() && requested_profile_id == Some("default") {
-        return Ok(ClaudeLoginTarget {
-            profile_id: "default".to_string(),
-            display_name: None,
-            config_dir: None,
-        });
-    }
-    if let Some(requested_profile_id) = requested_profile_id {
-        if let Some((index, profile)) =
-            provider
-                .profiles
-                .iter_mut()
-                .enumerate()
-                .find(|(_, profile)| {
-                    !profile.deleted && profile.id.as_deref() == Some(requested_profile_id)
-                })
-        {
-            profile.enabled = true;
-            return Ok(claude_login_target(profile, index));
-        }
-        anyhow::bail!("Claude profile {requested_profile_id} is no longer configured");
-    }
-
-    if let Some((index, profile)) = provider
-        .profiles
-        .iter()
-        .enumerate()
-        .find(|(_, profile)| profile.enabled && !profile.deleted)
-    {
-        return Ok(claude_login_target(profile, index));
-    }
-
-    create_managed_claude_profile(provider, None)
-}
-
-fn create_managed_claude_profile(
-    provider: &mut ProviderConfig,
-    display_name: Option<String>,
-) -> anyhow::Result<ClaudeLoginTarget> {
-    let profile_id = unique_profile_id(&provider.profiles, display_name.as_deref());
-    let config_dir = claude_profile_home(&profile_id)?;
-    push_managed_claude_profile(provider, profile_id, display_name, config_dir)
-}
-
-fn push_managed_claude_profile(
-    provider: &mut ProviderConfig,
-    profile_id: String,
-    display_name: Option<String>,
-    config_dir: PathBuf,
-) -> anyhow::Result<ClaudeLoginTarget> {
-    let keychain_account = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
-    let owns_default_claude_activity = !provider
-        .profiles
-        .iter()
-        .any(|profile| profile.enabled && !profile.deleted);
-    std::fs::create_dir_all(&config_dir)?;
-    let keychain_service = keychain_service_for_config_dir(&config_dir);
-    provider.profiles.push(ProviderProfileConfig {
-        id: Some(profile_id.clone()),
-        display_name: display_name.clone(),
-        keychain_account: Some(keychain_account),
-        keychain_service: Some(keychain_service),
-        credentials_file: Some(config_dir.join(".credentials.json")),
-        claude_config_dir: Some(config_dir.clone()),
-        cli_enabled: Some(true),
-        project_roots: vec![config_dir.join("projects")],
-        owns_default_claude_activity,
-        ..ProviderProfileConfig::default()
-    });
-    Ok(ClaudeLoginTarget {
-        profile_id,
-        display_name,
-        config_dir: Some(config_dir),
-    })
-}
-
-fn pending_claude_profile(
-    provider: &ProviderConfig,
-    connected_profiles: &BTreeSet<String>,
-) -> Option<ClaudeLoginTarget> {
-    provider
-        .profiles
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, profile)| {
-            if !profile.enabled || profile.deleted {
-                return None;
-            }
-            let target = claude_login_target(profile, index);
-            let config_dir = target.config_dir.as_deref()?;
-            (is_managed_claude_profile(config_dir)
-                && !connected_profiles.contains(&target.profile_id))
-            .then_some(target)
-        })
-}
-
-fn claude_login_target(profile: &ProviderProfileConfig, index: usize) -> ClaudeLoginTarget {
-    let profile_id = profile
-        .id
-        .clone()
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| {
-            if index == 0 {
-                "default".to_string()
-            } else {
-                format!("profile-{}", index + 1)
-            }
-        });
-    ClaudeLoginTarget {
-        profile_id,
-        display_name: profile.display_name.clone(),
-        config_dir: profile.claude_config_dir.clone().map(expand_home_path),
-    }
-}
-
-fn unique_profile_id(profiles: &[ProviderProfileConfig], display_name: Option<&str>) -> String {
-    let base = display_name
-        .map(slugify_profile_id)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "account".to_string());
-    let existing = profiles
-        .iter()
-        .filter_map(|profile| profile.id.as_deref())
-        .collect::<BTreeSet<_>>();
-    if !existing.contains(base.as_str()) {
-        return base;
-    }
-    for index in 2.. {
-        let candidate = format!("{base}-{index}");
-        if !existing.contains(candidate.as_str()) {
-            return candidate;
-        }
-    }
-    unreachable!("infinite profile id search should always return")
-}
-
-fn slugify_profile_id(value: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_was_dash = false;
-        } else if !last_was_dash && !slug.is_empty() {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-fn launch_codex_login(codex_home: &Path) -> anyhow::Result<std::process::Child> {
-    let mut direct = Command::new("codex");
-    configure_codex_login_command(&mut direct, codex_home);
-    match direct.spawn() {
-        Ok(child) => Ok(child),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Apps launched from Finder commonly receive a minimal PATH. Resolve the user's
-            // Codex installation through their interactive login shell without opening Terminal.
-            let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-            let mut fallback = Command::new(shell);
-            fallback.args(["-lic", "exec codex login"]);
-            configure_codex_login_stdio(&mut fallback, codex_home);
-            fallback.spawn().map_err(|fallback_err| {
-                anyhow::anyhow!("failed to start Codex login: {fallback_err}")
-            })
-        }
-        Err(err) => Err(anyhow::anyhow!("failed to start Codex login: {err}")),
-    }
-}
-
-fn configure_codex_login_command(command: &mut Command, codex_home: &Path) {
-    command.arg("login");
-    configure_codex_login_stdio(command, codex_home);
-}
-
-fn configure_codex_login_stdio(command: &mut Command, codex_home: &Path) {
-    command
-        .env("CODEX_HOME", codex_home)
-        .stdin(Stdio::null())
-        // Keep diagnostics in usage-daemon.log while Codex opens the browser itself.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-}
-
-fn monitor_provider_login(
-    mut child: std::process::Child,
-    refresh: Arc<RefreshCoordinator>,
-    provider_id: &'static str,
-    profile_id: Option<String>,
-) {
-    let runtime = tokio::runtime::Handle::current();
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) if status.success() => {
-            info!(
-                provider_id,
-                profile_id, "provider login completed; refreshing account"
-            );
-            runtime.spawn(async move {
-                let provider = ProviderId::new(provider_id);
-                let report = refresh.refresh(Some(std::slice::from_ref(&provider))).await;
-                info!(
-                    provider_id,
-                    profile_id,
-                    results = report.provider_results.len(),
-                    "post-login provider refresh completed"
-                );
-            });
-        }
-        Ok(status) => {
-            warn!(provider_id, profile_id, %status, "provider login process exited unsuccessfully");
-        }
-        Err(err) => {
-            warn!(provider_id, profile_id, error = %err, "failed to wait for provider login process");
-        }
-    });
-}
-
-fn launch_claude_login(config_dir: Option<&Path>) -> anyhow::Result<std::process::Child> {
-    let mut direct = Command::new("claude");
-    direct.args(["auth", "login"]);
-    configure_claude_login_environment(&mut direct, config_dir);
-    configure_browser_login_stdio(&mut direct);
-    match direct.spawn() {
-        Ok(child) => Ok(child),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            // Finder-launched apps usually do not inherit ~/.local/bin or other shell PATH setup.
-            let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-            let mut fallback = Command::new(shell);
-            fallback.args(["-lic", "exec claude auth login"]);
-            configure_claude_login_environment(&mut fallback, config_dir);
-            configure_browser_login_stdio(&mut fallback);
-            fallback.spawn().map_err(|fallback_err| {
-                anyhow::anyhow!("failed to start Claude login: {fallback_err}")
-            })
-        }
-        Err(err) => Err(anyhow::anyhow!("failed to start Claude login: {err}")),
-    }
-}
-
-fn configure_claude_login_environment(command: &mut Command, config_dir: Option<&Path>) {
-    if let Some(config_dir) = config_dir {
-        command
-            .env("CLAUDE_CONFIG_DIR", config_dir)
-            .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
-    }
-}
-
-fn configure_browser_login_stdio(command: &mut Command) {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-}
-
-fn write_claude_profile_launcher(
-    account_id: &AccountId,
-    config_dir: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
-    let app_dir = default_app_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
-    let launcher_dir = app_dir.join("launchers");
-    std::fs::create_dir_all(&launcher_dir)?;
-    let launcher = launcher_dir.join(format!("claude-{}.command", account_id.as_str()));
-    let temporary = launcher_dir.join(format!(
-        ".claude-{}.{}.tmp",
-        account_id.as_str(),
-        uuid::Uuid::new_v4()
-    ));
-    let contents = claude_launcher_contents(config_dir);
-    let result = (|| -> anyhow::Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o700)
-            .open(&temporary)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &launcher)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result?;
-    Ok(launcher)
-}
-
-fn claude_launcher_contents(config_dir: Option<&Path>) -> String {
-    let profile_setup = match config_dir {
-        Some(path) => format!(
-            "export CLAUDE_CONFIG_DIR={}\n",
-            shell_single_quote(&path.display().to_string())
-        ),
-        None => "unset CLAUDE_CONFIG_DIR\n".to_string(),
-    };
-    format!("#!/bin/zsh -l\nunset CLAUDE_SECURESTORAGE_CONFIG_DIR\n{profile_setup}exec claude\n")
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn open_terminal_launcher(path: &Path) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("open")
-            .args(["-a", "Terminal"])
-            .arg(path)
-            .status()
-            .map_err(|err| anyhow::anyhow!("failed to open Claude profile terminal: {err}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("failed to open Claude profile terminal")
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        anyhow::bail!("opening Claude profile terminals is only supported on macOS")
-    }
-}
-
-fn open_url(url: &str) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = Command::new("open")
-            .arg(url)
-            .status()
-            .map_err(|err| anyhow::anyhow!("failed to open {url}: {err}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("failed to open {url}")
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = url;
-        anyhow::bail!("opening provider login is only supported on macOS")
-    }
-}
-
-async fn build_providers(
-    config: &Config,
-    storage: &Storage,
-) -> anyhow::Result<Vec<Arc<dyn ProviderCollector>>> {
-    let mut providers: Vec<Arc<dyn ProviderCollector>> = Vec::new();
-    for registration in PROVIDER_REGISTRY {
-        if config.provider_enabled(registration.id) {
-            providers.push((registration.build)(config)?);
-        } else {
-            storage
-                .upsert_health(&health::disabled(ProviderId::new(registration.id)))
-                .await?;
-        }
-    }
-    Ok(providers)
-}
-
-fn build_codex_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
-    Ok(Arc::new(CodexCollector::new(
-        config
-            .providers
-            .get(CODEX_PROVIDER_ID)
-            .cloned()
-            .unwrap_or_default(),
-        config.debug_capture_raw_payloads,
-    )?))
-}
-
-fn build_claude_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
-    Ok(Arc::new(ClaudeCollector::new(
-        config
-            .providers
-            .get(CLAUDE_PROVIDER_ID)
-            .cloned()
-            .unwrap_or_default(),
-        config.debug_capture_raw_payloads,
-    )?))
-}
-
-fn build_opencode_go_provider(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
-    Ok(Arc::new(OpenCodeCollector::new(
-        config
-            .providers
-            .get(OPENCODE_GO_PROVIDER_ID)
-            .cloned()
-            .unwrap_or_default(),
-        config.debug_capture_raw_payloads,
-    )?))
+    provider_registry::ensure_supported(provider_id)
 }
 
 fn spawn_polling_loop(
-    interval_rx: watch::Receiver<u64>,
+    schedule_rx: watch::Receiver<PollSchedule>,
     refresh: Arc<RefreshCoordinator>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_polling_loop_with_delay(interval_rx, refresh, Duration::from_secs)
+    spawn_polling_loop_with_delay(schedule_rx, refresh, Duration::from_secs)
 }
 
 fn spawn_polling_loop_with_delay(
-    mut interval_rx: watch::Receiver<u64>,
+    mut schedule_rx: watch::Receiver<PollSchedule>,
     refresh: Arc<RefreshCoordinator>,
     poll_delay: fn(u64) -> Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let report = refresh.refresh(None).await;
-        info!(
-            results = report.provider_results.len(),
-            elapsed_ms = (report.finished_at - report.started_at).num_milliseconds(),
-            "initial refresh completed"
-        );
+        let mut schedule = schedule_rx.borrow_and_update().clone();
+        if !schedule.visible.is_empty() {
+            let report = refresh.refresh(Some(&schedule.visible)).await;
+            info!(
+                results = report.provider_results.len(),
+                "initial visible refresh completed"
+            );
+        }
+        let mut visible_due =
+            tokio::time::Instant::now() + poll_delay(schedule.visible_interval_seconds);
+        let mut hidden_due = tokio::time::Instant::now() + poll_delay(HIDDEN_PROVIDER_POLL_SECONDS);
 
         loop {
-            let seconds = *interval_rx.borrow_and_update();
             tokio::select! {
-                _ = tokio::time::sleep(poll_delay(seconds)) => {
-                    let report = refresh.refresh(None).await;
-                    info!(
-                        results = report.provider_results.len(),
-                        "poll refresh completed"
-                    );
+                _ = tokio::time::sleep_until(visible_due), if !schedule.visible.is_empty() => {
+                    let report = refresh.refresh(Some(&schedule.visible)).await;
+                    info!(results = report.provider_results.len(), "visible provider poll completed");
+                    visible_due = tokio::time::Instant::now()
+                        + poll_delay(schedule.visible_interval_seconds);
                 }
-                changed = interval_rx.changed() => {
+                _ = tokio::time::sleep_until(hidden_due), if !schedule.hidden.is_empty() => {
+                    let report = refresh.refresh(Some(&schedule.hidden)).await;
+                    info!(results = report.provider_results.len(), "hidden provider poll completed");
+                    hidden_due = tokio::time::Instant::now()
+                        + poll_delay(HIDDEN_PROVIDER_POLL_SECONDS);
+                }
+                changed = schedule_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    info!(
-                        poll_interval_seconds = *interval_rx.borrow(),
-                        "poll interval changed"
-                    );
+                    schedule = schedule_rx.borrow_and_update().clone();
+                    visible_due = tokio::time::Instant::now()
+                        + poll_delay(schedule.visible_interval_seconds);
+                    hidden_due = tokio::time::Instant::now()
+                        + poll_delay(HIDDEN_PROVIDER_POLL_SECONDS);
+                    info!("provider poll schedule changed");
                 }
             }
         }
@@ -1504,6 +974,8 @@ fn prepare_socket_path(socket_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::claude::keychain_service_for_config_dir;
+    use crate::runtime::profile_service::push_managed_claude_profile;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{sync::Notify, time::timeout};
@@ -1589,7 +1061,7 @@ mod tests {
                 &config,
                 Some(config.poll_interval_seconds),
                 Some(&unchanged_providers),
-                Some(config.notifications),
+                Some(&config.notifications),
             ),
             ConfigUpdateChanges::default()
         );
@@ -1600,13 +1072,12 @@ mod tests {
                 ..ConfigUpdateChanges::default()
             }
         );
+        let disabled_notifications = NotificationConfig {
+            enabled: false,
+            ..NotificationConfig::default()
+        };
         assert_eq!(
-            config_update_changes(
-                &config,
-                None,
-                None,
-                Some(NotificationConfig { enabled: false }),
-            ),
+            config_update_changes(&config, None, None, Some(&disabled_notifications),),
             ConfigUpdateChanges {
                 notifications: true,
                 ..ConfigUpdateChanges::default()
@@ -1660,10 +1131,61 @@ mod tests {
             .unwrap();
         assert_eq!(response.poll_interval_seconds, 301);
         assert!(interval_rx.has_changed().unwrap());
-        assert_eq!(*interval_rx.borrow_and_update(), 301);
+        assert_eq!(
+            interval_rx.borrow_and_update().visible_interval_seconds,
+            301
+        );
 
         drop(runtime);
         drop(refresh);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn threshold_policy_update_clears_positional_notification_state() {
+        let root = std::env::temp_dir().join(format!(
+            "usage-runtime-notification-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = test_storage_at(&root);
+        let provider_id = ProviderId::new(CODEX_PROVIDER_ID);
+        let account = storage
+            .upsert_account(&provider_id, "notification-account", None, None, None)
+            .await
+            .unwrap();
+        storage
+            .upsert_notification_window_state(
+                &account.id,
+                "weekly",
+                crate::storage::NotificationWindowState {
+                    reset_at: None,
+                    notified_mask: 1,
+                    last_attempt_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), Vec::new()));
+        let (runtime, _schedule_rx) =
+            DaemonRuntime::new(test_config(&root), storage.clone(), refresh);
+        let notifications = NotificationConfig {
+            thresholds_percent_remaining: vec![25, 10],
+            ..NotificationConfig::default()
+        };
+
+        runtime
+            .update_config(None, None, Some(notifications))
+            .await
+            .unwrap();
+
+        assert!(storage
+            .notification_window_state(&account.id, "weekly")
+            .await
+            .unwrap()
+            .is_none());
+
+        drop(runtime);
         drop(storage);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1678,7 +1200,11 @@ mod tests {
             storage.clone(),
             vec![provider.clone()],
         ));
-        let (_interval_tx, interval_rx) = watch::channel(30);
+        let (_interval_tx, interval_rx) = watch::channel(PollSchedule {
+            visible: vec![ProviderId::new(CODEX_PROVIDER_ID)],
+            hidden: Vec::new(),
+            visible_interval_seconds: 30,
+        });
         let poll_task =
             spawn_polling_loop_with_delay(interval_rx, refresh.clone(), Duration::from_millis);
         timeout(Duration::from_secs(1), provider.first_started.notified())
@@ -1707,6 +1233,26 @@ mod tests {
         drop(refresh);
         drop(storage);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn poll_schedule_assigns_hidden_providers_to_the_slow_scope() {
+        let root =
+            std::env::temp_dir().join(format!("usage-poll-scope-test-{}", uuid::Uuid::new_v4()));
+        let config = test_config(&root);
+        let schedule = PollSchedule::from_config(&config);
+
+        assert_eq!(schedule.visible, vec![ProviderId::new(CODEX_PROVIDER_ID)]);
+        assert!(schedule
+            .hidden
+            .contains(&ProviderId::new(CLAUDE_PROVIDER_ID)));
+        assert!(schedule
+            .hidden
+            .contains(&ProviderId::new(OPENCODE_GO_PROVIDER_ID)));
+        assert_eq!(
+            schedule.visible_interval_seconds,
+            config.poll_interval_seconds
+        );
     }
 
     #[test]
@@ -1751,9 +1297,13 @@ mod tests {
         let pending = pending_codex_profile(&provider).unwrap();
         assert_eq!(pending.0, "pending-test");
         assert_eq!(pending.1, managed_path);
-        assert!(is_managed_codex_profile(&pending.1));
-        assert!(!is_managed_codex_profile(
-            &dirs::home_dir().unwrap().join(".codex")
+        assert!(managed_profiles::is_managed_profile(
+            &pending.1,
+            CODEX_PROVIDER_ID
+        ));
+        assert!(!managed_profiles::is_managed_profile(
+            &dirs::home_dir().unwrap().join(".codex"),
+            CODEX_PROVIDER_ID
         ));
     }
 
@@ -1804,7 +1354,7 @@ mod tests {
 
     #[test]
     fn claude_launcher_pins_activity_to_the_profile_config_directory() {
-        let contents = claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")));
+        let contents = launchers::claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")));
 
         assert!(contents.contains("unset CLAUDE_SECURESTORAGE_CONFIG_DIR"));
         assert!(contents.contains("export CLAUDE_CONFIG_DIR='/tmp/Claude'\"'\"'s Work'"));
@@ -1813,7 +1363,7 @@ mod tests {
 
     #[test]
     fn legacy_claude_launcher_clears_profile_overrides() {
-        let contents = claude_launcher_contents(None);
+        let contents = launchers::claude_launcher_contents(None);
 
         assert!(contents.contains("unset CLAUDE_CONFIG_DIR"));
         assert!(!contents.contains("export CLAUDE_CONFIG_DIR"));

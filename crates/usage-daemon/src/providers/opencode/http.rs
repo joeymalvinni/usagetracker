@@ -2,7 +2,9 @@
 
 use reqwest::StatusCode;
 
-use crate::providers::{read_response_body, ProviderError, ProviderErrorKind};
+use crate::providers::{
+    read_response_body, retry_after_deadline, ProviderError, ProviderErrorKind,
+};
 
 pub(super) async fn response_text(
     response: reqwest::Response,
@@ -19,7 +21,8 @@ pub(super) async fn response_text(
         return Err(ProviderError::new(
             ProviderErrorKind::RateLimited,
             format!("{label} was rate limited"),
-        ));
+        )
+        .with_retry_at(retry_after_deadline(response.headers())));
     }
     if !status.is_success() {
         return Err(ProviderError::new(

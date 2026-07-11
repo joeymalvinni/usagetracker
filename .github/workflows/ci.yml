@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Rust and Swift
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test Rust
+        run: cargo test --workspace --all-features
+      - name: Build Swift with complete concurrency checks
+        working-directory: apps/UsageMenuBar
+        run: swift build -Xswiftc -strict-concurrency=complete
+      - name: Test Swift
+        working-directory: apps/UsageMenuBar
+        run: swift test -Xswiftc -strict-concurrency=complete
+
+  audit:
+    name: Dependency audit
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Audit Rust dependencies
+        run: cargo audit

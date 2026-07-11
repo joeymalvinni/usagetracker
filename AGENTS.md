@@ -47,9 +47,9 @@ When running a single test, pass a substring of the test function name to `cargo
 
 **Daemon start**: Creates `~/.usagetracker/` (config, SQLite DB, Unix socket) automatically on first run. Config defaults: codex enabled, claude/opencode_go disabled.
 
-**SQLite migrations**: Files in `crates/usage-daemon/migrations/` are named `NNNN_description.sql` and auto-run at daemon startup in order.
+**SQLite schema**: `crates/usage-daemon/migrations/0001_initial.sql` is the authoritative disposable local schema and is applied transactionally. Provider data is reproducible; incompatible legacy schemas are reset instead of repaired in production code.
 
-**Claude dual-path collection**: Attempts CLI command (`claude -p /usage --output-format json --no-session-persistence`) first. On failure, falls back to OAuth API using Keychain-stored credentials. Detailed logic in `docs/claude.md`.
+**Claude dual-path collection**: Attempts the OAuth usage API first using Keychain-stored credentials. On eligible failures, optionally falls back to the bounded CLI command (`claude -p /usage --output-format json --no-session-persistence`). Rate limits never fall back. Detailed logic in `docs/claude.md`.
 
 **Provider naming quirk**: Config and CLI use `opencode_go`, but internal Rust code (server.rs, config.rs) explicitly filters out the bare `opencode` provider name in API responses. The web-enabled provider is `opencode_go` throughout user-facing surface.
 

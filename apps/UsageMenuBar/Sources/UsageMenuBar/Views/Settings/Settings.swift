@@ -1,5 +1,12 @@
 import SwiftUI
 
+private struct HiddenWindowEntry: Identifiable {
+    /// Composite `providerId|windowId` key, also used to restore the window.
+    let id: String
+    let label: String
+    let providerName: String
+}
+
 struct Settings: View {
     @EnvironmentObject var state: AppState
     @State private var showsRemovedAccounts = false
@@ -14,6 +21,8 @@ struct Settings: View {
                 showsRefresh: false
             )
             if let error = state.actionError { SetupNotice(text: error, isError: true) }
+            if let error = state.preferencesError { SetupNotice(text: error, isError: true) }
+            if let error = state.notificationError { SetupNotice(text: error, isError: true) }
             if let message = state.actionMessage { SetupNotice(text: message, isError: false) }
 
             ScrollView {
@@ -21,15 +30,6 @@ struct Settings: View {
                     sectionTitle("Accounts & Providers")
                     ForEach(state.settingsProviders) { provider in
                         ProviderAccountCard(provider: provider)
-                    }
-
-                    if !state.accounts.isEmpty {
-                        Button("Delete all accounts…", role: .destructive) {
-                            showsDeleteAll = true
-                        }
-                        .buttonStyle(.link)
-                        .disabled(state.daemon == .offline || !state.pendingAccounts.isEmpty)
-                        .frame(maxWidth: .infinity, alignment: .trailing)
                     }
 
                     if !removedAccounts.isEmpty {
@@ -47,9 +47,30 @@ struct Settings: View {
                         .surfaceCard()
                     }
 
+                    if !hiddenWindowEntries.isEmpty {
+                        sectionTitle("Hidden metrics")
+                        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                            ForEach(hiddenWindowEntries) { entry in
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(entry.label).lineLimit(1)
+                                        Text(entry.providerName)
+                                            .font(Theme.Typography.micro)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("Show") { state.showWindow(entry.id) }
+                                        .buttonStyle(.link)
+                                }
+                                .font(Theme.Typography.caption)
+                            }
+                        }
+                        .surfaceCard()
+                    }
+
                     sectionTitle("General")
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-                        LabeledContent("Usage alerts") {
+                        LabeledContent {
                             if state.pendingNotifications {
                                 ProgressView().controlSize(.small)
                             } else {
@@ -57,11 +78,15 @@ struct Settings: View {
                                     .labelsHidden()
                                     .disabled(state.daemon == .offline)
                             }
-                        }
-                        if state.config?.notifications.enabled == true {
-                            Text(notificationPermissionText)
-                                .font(Theme.Typography.micro)
-                                .foregroundStyle(state.notificationAuthorization == .denied ? .red : .secondary)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Usage alerts")
+                                if state.config?.notifications.enabled == true {
+                                    Text(notificationPermissionText)
+                                        .font(Theme.Typography.micro)
+                                        .foregroundStyle(state.notificationAuthorization == .denied ? .red : .secondary)
+                                }
+                            }
                         }
                         LabeledContent("Refresh every") {
                             if state.pendingInterval {
@@ -75,30 +100,44 @@ struct Settings: View {
                                 .disabled(state.daemon == .offline)
                             }
                         }
-                        Button("Run setup assistant") { state.restartOnboarding() }
-                            .buttonStyle(.link)
+                        Divider()
+                        HStack {
+                            Button("Run setup assistant") { state.restartOnboarding() }
+                                .buttonStyle(.link)
+                            Spacer()
+                            if !state.accounts.isEmpty {
+                                Button("Delete all accounts…", role: .destructive) {
+                                    showsDeleteAll = true
+                                }
+                                .buttonStyle(.link)
+                                .disabled(state.daemon == .offline || !state.pendingAccounts.isEmpty)
+                            }
+                        }
                     }
                     .surfaceCard()
 
-                    DisclosureGroup(isExpanded: $showsAdvanced) {
-                        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                            LabeledContent("Socket", value: state.config?.socketPath ?? "unknown")
-                            LabeledContent("Config", value: state.config?.configPath ?? "unknown")
-                            LabeledContent("Database", value: state.config?.dbPath ?? "unknown")
-                            LabeledContent("UI config", value: UIPaths.config.path)
+                    if state.isDeveloperMode {
+                        DisclosureGroup(isExpanded: $showsAdvanced) {
+                            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                                LabeledContent("Socket", value: state.config?.socketPath ?? "unknown")
+                                LabeledContent("Config", value: state.config?.configPath ?? "unknown")
+                                LabeledContent("Database", value: state.config?.dbPath ?? "unknown")
+                                LabeledContent("UI config", value: UIPaths.config.path)
+                            }
+                            .font(Theme.Typography.micro)
+                            .padding(.top, Theme.Spacing.sm)
+                        } label: {
+                            Text("Advanced (developer)").font(Theme.Typography.caption.weight(.medium))
                         }
-                        .font(Theme.Typography.micro)
-                        .padding(.top, Theme.Spacing.sm)
-                    } label: {
-                        Text("Advanced").font(Theme.Typography.caption.weight(.medium))
+                        .surfaceCard()
                     }
-                    .surfaceCard()
                 }
                 .padding(.bottom, Theme.Spacing.xs + 2)
             }
 
             Spacer(minLength: 0)
             Button("Quit Usage") { NSApp.terminate(nil) }
+                .buttonStyle(.chip)
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(Theme.Spacing.lg)
@@ -109,6 +148,19 @@ struct Settings: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This permanently deletes all \(state.accounts.count) accounts and their local usage history. Provider accounts are not affected.")
+        }
+    }
+
+    private var hiddenWindowEntries: [HiddenWindowEntry] {
+        state.ui.hiddenWindows.map { key, label in
+            let providerId = String(key.prefix { $0 != "|" })
+            let providerName = state.settingsProviders.first { $0.providerId == providerId }?.name ?? providerId
+            return HiddenWindowEntry(id: key, label: label, providerName: providerName)
+        }
+        .sorted {
+            let byProvider = $0.providerName.localizedStandardCompare($1.providerName)
+            if byProvider != .orderedSame { return byProvider == .orderedAscending }
+            return $0.label.localizedStandardCompare($1.label) == .orderedAscending
         }
     }
 
@@ -192,19 +244,19 @@ private struct ProviderAccountCard: View {
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(provider.name).font(Theme.Typography.headline)
-                    Text(provider.enabled ? provider.healthText : "Paused")
+                    Text(provider.visibleInMenu ? provider.healthText : "Hidden")
                         .font(Theme.Typography.micro)
-                        .foregroundStyle(provider.enabled ? provider.status.tint : .secondary)
+                        .foregroundStyle(provider.visibleInMenu ? provider.status.tint : .secondary)
                 }
                 Spacer()
                 if state.pendingProviders.contains(provider.providerId) {
                     ProgressView().controlSize(.small)
                 } else {
-                    Toggle("", isOn: enabledBinding)
+                    Toggle("", isOn: visibilityBinding)
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .disabled(state.daemon == .offline)
-                        .help(provider.enabled ? "Pause \(provider.name)" : "Track \(provider.name)")
+                        .help(provider.visibleInMenu ? "Hide \(provider.name)" : "Show \(provider.name)")
                 }
             }
 
@@ -216,26 +268,24 @@ private struct ProviderAccountCard: View {
             } else {
                 VStack(spacing: Theme.Spacing.xs) {
                     ForEach(accounts) { account in
-                        AccountSettingsRow(account: account, providerEnabled: provider.enabled)
+                        AccountSettingsRow(account: account)
                     }
                 }
             }
 
-            if provider.enabled {
-                if provider.providerId == "opencode_go" { workspaceControl }
+            if provider.providerId == "opencode_go" { workspaceControl }
 
-                HStack(spacing: Theme.Spacing.sm) {
-                    Button(actionLabel) { Task { await primaryAction() } }
-                        .controlSize(.small)
-                        .disabled(busy || state.daemon == .offline)
-                    if busy { ProgressView().controlSize(.small) }
-                    Spacer()
-                }
+            HStack(spacing: Theme.Spacing.sm) {
+                Button(actionLabel) { Task { await primaryAction() } }
+                    .buttonStyle(.chipProminent)
+                    .disabled(busy || state.daemon == .offline)
+                if busy { ProgressView().controlSize(.small) }
+                Spacer()
             }
         }
         .surfaceCard()
         .task {
-            if provider.providerId == "opencode_go", provider.enabled, setup == nil {
+            if provider.providerId == "opencode_go", setup == nil {
                 await state.loadProviderSetup(provider.providerId)
             }
         }
@@ -252,10 +302,10 @@ private struct ProviderAccountCard: View {
         }
     }
 
-    private var enabledBinding: Binding<Bool> {
+    private var visibilityBinding: Binding<Bool> {
         Binding(
-            get: { provider.enabled },
-            set: { enabled in Task { await state.setProviderEnabled(provider.providerId, enabled) } }
+            get: { provider.visibleInMenu },
+            set: { visible in Task { await state.setVisible(provider.providerId, visible) } }
         )
     }
 
@@ -292,7 +342,6 @@ private struct AccountSettingsRow: View {
     @EnvironmentObject var state: AppState
     let account: Account
     var isRemoved = false
-    var providerEnabled = true
     @State private var showsRemovalOptions = false
     @State private var showsPermanentDelete = false
     @State private var showsRename = false
@@ -314,7 +363,7 @@ private struct AccountSettingsRow: View {
                 ProgressView().controlSize(.small)
             } else if isRemoved {
                 Button("Restore") { Task { await state.restoreAccount(account.id) } }
-                    .controlSize(.small)
+                    .buttonStyle(.chip)
                 Menu {
                     Button("Delete permanently", role: .destructive) { showsPermanentDelete = true }
                 } label: {
@@ -328,17 +377,7 @@ private struct AccountSettingsRow: View {
                     Button("Reconnect") {
                         Task { await state.repairProvider(account.providerId, accountId: account.id) }
                     }
-                    .controlSize(.small)
-                }
-                if account.providerId == "claude" {
-                    Button {
-                        Task { await state.launchProviderAccount(account.id) }
-                    } label: {
-                        Image(systemName: "terminal")
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(state.daemon == .offline || !account.collectionEnabled)
-                    .help("Open a Claude terminal isolated to this account")
+                    .buttonStyle(.chip)
                 }
                 Toggle("", isOn: collectionBinding)
                     .labelsHidden()
@@ -437,7 +476,7 @@ private struct AccountSettingsRow: View {
 
     private var statusText: String {
         if isRemoved { return "Removed · history kept" }
-        if !providerEnabled || !account.collectionEnabled { return "Paused" }
+        if !account.collectionEnabled { return "Paused" }
         if needsSignIn { return "Needs sign-in" }
         return account.hidden ? "Active · hidden from summary" : "Active"
     }

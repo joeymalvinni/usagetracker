@@ -1,0 +1,25 @@
+{
+  "api_version": 2,
+  "type": "refresh_job",
+  "job": {
+    "id": "fixture-refresh-1",
+    "scope": {
+      "providers": ["codex"]
+    },
+    "trigger": "manual",
+    "status": "completed",
+    "created_at": "2026-07-11T12:00:00Z",
+    "started_at": "2026-07-11T12:00:00Z",
+    "finished_at": "2026-07-11T12:00:01Z",
+    "provider_results": [
+      {
+        "provider_id": "codex",
+        "account_id": "account-1",
+        "status": "ok",
+        "collection_mode": "provider_api",
+        "collected_at": "2026-07-11T12:00:01Z",
+        "message": null
+      }
+    ]
+  }
+}

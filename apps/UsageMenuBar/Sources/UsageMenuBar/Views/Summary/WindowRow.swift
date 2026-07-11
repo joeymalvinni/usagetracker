@@ -14,6 +14,9 @@ struct WindowRow: View {
     /// countdown collapsed, the fully explicit date revealed on tap. Used by
     /// the detail-page Limits section.
     var resetExpandable: Bool = false
+    /// When provided, a right-click "Hide this metric" action is attached to the
+    /// row. Supplied only by the detail page; compact summary tiles omit it.
+    var onHide: (() -> Void)? = nil
 
     @State private var resetExpanded = false
 
@@ -76,6 +79,7 @@ struct WindowRow: View {
         // (used on the detail page) keep their own inset surface.
         .modifier(CompactOrInset(compact: compact))
         .help(resetHelp)
+        .modifier(HideMenu(onHide: onHide))
     }
 
     /// Static reset line (Credits, and any full row that isn't a dropdown).
@@ -147,6 +151,21 @@ struct WindowRow: View {
         let prefix = "\(window.providerName) · \(window.label)"
         let reset = window.reset.isEmpty ? prefix : "\(prefix) · \(window.reset)"
         return window.forecast.map { "\(reset) · \($0.summary)" } ?? reset
+    }
+}
+
+/// Attaches a "Hide this metric" right-click menu only when a hide action is
+/// supplied, so rows without one keep their normal right-click behaviour.
+private struct HideMenu: ViewModifier {
+    let onHide: (() -> Void)?
+    func body(content: Content) -> some View {
+        if let onHide {
+            content.contextMenu {
+                Button("Hide this metric", systemImage: "eye.slash", action: onHide)
+            }
+        } else {
+            content
+        }
     }
 }
 

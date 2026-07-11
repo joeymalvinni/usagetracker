@@ -41,11 +41,6 @@ struct Detail: View {
                 Header(title: group.name, subtitleStyle: subtitleStyle) {
                     Task { await state.refreshProvider(providerId) }
                 }
-                if state.showsPricingNotice(activeProvider.costDashboard) {
-                    PricingCoverageNotice {
-                        state.dismissPricingNotice(activeProvider.costDashboard)
-                    }
-                }
                 if state.showsAlertBanner(activeProvider) {
                     AlertBanner(
                         provider: activeProvider,
@@ -68,7 +63,9 @@ struct Detail: View {
                         ProviderActivityCard(provider: activeProvider, dashboard: activeProvider.costDashboard)
                         if !limitWindows(activeProvider).isEmpty {
                             ProviderSection(title: "Limits") {
-                                ForEach(limitWindows(activeProvider)) { WindowRow(window: $0, resetExpandable: true) }
+                                ForEach(limitWindows(activeProvider)) { window in
+                                    WindowRow(window: window, resetExpandable: true, onHide: { state.hideWindow(window) })
+                                }
                             }
                         }
                         if activeProvider.providerId == "codex", !activeProvider.resetCredits.isEmpty {
@@ -77,7 +74,7 @@ struct Detail: View {
                             }
                         }
                         if !activeProvider.spend.isEmpty {
-                            ProviderSection(title: activeProvider.isEstimate ? "Estimated cost" : "Cost") {
+                            ProviderSection(title: "Cost") {
                                 ForEach(SpendLine.grouped(activeProvider.spend)) { line in
                                     SpendLineRow(line: line)
                                 }
@@ -85,7 +82,9 @@ struct Detail: View {
                         }
                         if !activeProvider.credits.isEmpty {
                             ProviderSection(title: "Credits") {
-                                ForEach(activeProvider.credits) { WindowRow(window: $0) }
+                                ForEach(activeProvider.credits) { window in
+                                    WindowRow(window: window, onHide: { state.hideWindow(window) })
+                                }
                             }
                         }
                     }
@@ -499,7 +498,7 @@ private struct ProviderActivityCard: View {
 
     private var activitySubtitle: String {
         guard hasData else { return "No recent cost or token activity" }
-        return "\(range.label) \(metric == .cost && dashboard.isEstimated ? "estimated cost" : (metric == .cost ? "cost" : "tokens"))"
+        return "\(range.label) \(metric == .cost ? "cost" : "tokens")"
     }
 
     private var todayValue: String {

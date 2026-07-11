@@ -52,7 +52,7 @@ just app-release         # Optimized release build and launch
 just daemon              # Run the daemon in the foreground
 just cli status          # Run any CLI command
 just test                # Run all Rust tests
-just check               # Check formatting, Clippy, and tests
+just check               # Run CI-equivalent Rust, Swift, and audit checks
 just                     # List every available recipe
 ```
 
@@ -79,6 +79,12 @@ The daemon starts in the foreground, creates missing local files, opens a Unix s
 The Swift menu bar app uses the same daemon socket by default and stores UI-only preferences under:
 
 - `~/.usagetracker/ui/config.json`
+
+The current SQLite schema is intentionally disposable because provider usage can be recollected. A
+positively identified pre-v2 UsageTracker database is reset on upgrade; this also discards local-only
+account names, hidden/removal state, and collection preferences. The daemon logs that reset explicitly.
+If a non-empty database cannot be positively identified as UsageTracker data, startup refuses to modify
+it and asks for an empty `--db-path` instead.
 
 ## Development fixtures
 
@@ -110,7 +116,7 @@ general development hook that redirects the config, database, socket, UI config,
 
 The menu bar app's Settings page can change the polling interval, desktop usage alerts, and providers while the daemon is running; the daemon applies these immediately and persists them back to `config.json` through its `update_config` API.
 
-Desktop alerts are enabled by default. Each account and percentage-based usage window alerts once at 50%, 25%, 10%, 5%, and exhausted, with durable state preventing repeats after a daemon restart. macOS asks for notification permission on first launch. Production macOS builds must embed `usage-daemon` in the signed `UsageMenuBar.app` bundle (the supervisor looks in `Contents/MacOS`) so Notification Center can attribute and authorize it; an unbundled development daemon logs delivery failures without affecting usage collection.
+Desktop alerts are enabled by default. The default thresholds are 50%, 25%, 10%, 5%, and exhausted, with durable state preventing repeats after a daemon restart. The versioned API also supports validated per-account/window threshold and reset rules, cooldowns, local quiet hours, and snooze deadlines. Synthetic or otherwise non-authoritative windows never trigger alerts. macOS asks for notification permission only when alerts are explicitly enabled. Production macOS builds must embed `usage-daemon` in the signed `UsageMenuBar.app` bundle (the supervisor looks in `Contents/MacOS`) so Notification Center can attribute and authorize it; an unbundled development daemon logs delivery failures without affecting usage collection.
 
 On first launch, the menu app opens a setup assistant for choosing providers and connecting accounts. The same connection tools remain available under **Settings → Connections**:
 
@@ -121,6 +127,10 @@ On first launch, the menu app opens a setup assistant for choosing providers and
 Provider errors include a retry or login-repair action. Account names can be changed locally in Settings. Removing an account is a reversible soft removal: collection stops and the account disappears from dashboards, while history is retained and the account can be restored.
 
 Cost values derived from local Codex or Claude logs are estimates at API rates, not billing statements. The app labels estimated and partial totals and exposes their source in the UI.
+
+The Unix-socket protocol is API version 2. Every request and response carries `api_version`, clients negotiate capabilities through `get_server_info`, and failures use stable machine-readable codes. Usage responses contain typed daily activity, cost, pricing coverage, provenance, and reset-credit summaries built once by the daemon. Provider-specific raw JSON is optional diagnostic data only; clients do not use it to calculate dashboard values. Refreshes are coalesced background jobs, and a repeated request joins matching in-flight work instead of queuing duplicate provider calls.
+
+Cross-provider totals always retain their coverage context. The menu app and CLI distinguish account-wide data from this-Mac data, estimates from provider-reported values, and partial pricing coverage from complete totals. Local OpenCode history reports observed spend and activity only—it does not invent quota limits, percentages, or reset dates.
 
 Daemon options can be passed as flags:
 
@@ -181,7 +191,7 @@ The config file controls which providers are enabled:
 }
 ```
 
-Codex collection reads credentials from `~/.codex/auth.json`. Claude collection defaults to the local Claude Code terminal usage command, `claude -p /usage --output-format json --no-session-persistence`. If that command fails, Claude collection falls back to Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and collects quota usage from Anthropic's OAuth usage API.
+Codex collection reads credentials from `~/.codex/auth.json`. Claude collection uses Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and queries Anthropic's OAuth usage API first. If that request fails for a reason other than rate limiting and `cli_enabled` is true, it falls back to the bounded local command `claude -p /usage --output-format json --no-session-persistence`.
 
 Codex and Claude can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. The menu bar app's Add account action creates isolated profile directories for either provider. Use the terminal button on a Claude account row to open an interactive session in that profile; its local activity stays separate and refreshes automatically. For manual configuration, Codex profiles should use separate `codex_home` or `auth_path` values; Claude profiles should use separate `claude_config_dir` values and launch sessions with the matching `CLAUDE_CONFIG_DIR`. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile unless it is set per profile.
 
