@@ -13,8 +13,11 @@ use usage_core::{
     ProviderId, ProviderToggle,
 };
 
+use crate::providers::paths::expand_home_path;
+
 const POLL_INTERVAL_ENV: &str = "USAGE_TRACKER_POLL_INTERVAL_SECONDS";
 const SUPPORTED_PROVIDER_IDS: [&str; 3] = ["codex", "claude", "opencode_go"];
+pub const MIN_POLL_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -150,6 +153,10 @@ impl Config {
             write_config_atomically(&config_path, &file_config)?;
         }
         let poll_interval_seconds = poll_interval_seconds(file_config.poll_interval_seconds)?;
+        file_config
+            .notifications
+            .validate()
+            .map_err(|message| anyhow::anyhow!("invalid notification configuration: {message}"))?;
 
         Ok(Self {
             poll_interval_seconds,
@@ -186,7 +193,7 @@ impl Config {
     ) -> ConfigResponse {
         ConfigResponse {
             poll_interval_seconds: self.poll_interval_seconds,
-            notifications: self.notifications,
+            notifications: self.notifications.clone(),
             config_path: self.paths.config.display().to_string(),
             socket_path: self.paths.socket.display().to_string(),
             db_path: self.paths.db.display().to_string(),
@@ -219,9 +226,7 @@ impl Config {
         notifications: Option<NotificationConfig>,
     ) -> anyhow::Result<()> {
         if let Some(interval) = poll_interval_seconds {
-            if interval == 0 {
-                bail!("poll interval must be greater than zero");
-            }
+            validate_poll_interval(interval)?;
             self.poll_interval_seconds = interval;
         }
         if let Some(providers) = providers {
@@ -238,6 +243,9 @@ impl Config {
             }
         }
         if let Some(notifications) = notifications {
+            notifications
+                .validate()
+                .map_err(|message| anyhow::anyhow!(message))?;
             self.notifications = notifications;
         }
         Ok(())
@@ -246,7 +254,7 @@ impl Config {
     pub fn persist(&self) -> anyhow::Result<()> {
         let file_config = FileConfig {
             poll_interval_seconds: self.poll_interval_seconds,
-            notifications: self.notifications,
+            notifications: self.notifications.clone(),
             providers: self.providers.clone(),
             debug_capture_raw_payloads: self.debug_capture_raw_payloads,
         };
@@ -366,21 +374,6 @@ fn codex_account_id_from_auth(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn expand_home_path(path: &Path) -> PathBuf {
-    let Some(value) = path.to_str() else {
-        return path.to_path_buf();
-    };
-    if value == "~" {
-        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    path.to_path_buf()
-}
-
 fn assign_default_claude_activity_owner(config: &mut FileConfig) -> bool {
     let Some(provider) = config.providers.get_mut("claude") else {
         return false;
@@ -429,10 +422,15 @@ fn poll_interval_seconds(file_value: u64) -> anyhow::Result<u64> {
         Err(err) => bail!("failed to read {POLL_INTERVAL_ENV}: {err}"),
     };
 
-    if value == 0 {
-        bail!("poll interval must be greater than zero");
-    }
+    validate_poll_interval(value)?;
     Ok(value)
+}
+
+fn validate_poll_interval(value: u64) -> anyhow::Result<()> {
+    if value < MIN_POLL_INTERVAL_SECONDS {
+        bail!("poll interval must be at least {MIN_POLL_INTERVAL_SECONDS} seconds");
+    }
+    Ok(())
 }
 
 fn parse_poll_interval_env(value: &str) -> anyhow::Result<u64> {
@@ -564,7 +562,13 @@ mod tests {
     #[test]
     fn rejects_zero_poll_interval() {
         let err = poll_interval_seconds(0).unwrap_err();
-        assert!(err.to_string().contains("greater than zero"));
+        assert!(err.to_string().contains("at least 60 seconds"));
+    }
+
+    #[test]
+    fn rejects_unsafe_nonzero_poll_interval() {
+        let err = validate_poll_interval(59).unwrap_err();
+        assert!(err.to_string().contains("at least 60 seconds"));
     }
 
     #[test]

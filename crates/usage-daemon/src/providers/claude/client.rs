@@ -5,7 +5,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::providers::{read_response_body, ProviderError, ProviderErrorKind};
+use crate::providers::{
+    read_response_body, retry_after_deadline, ProviderError, ProviderErrorKind,
+};
 
 use super::credentials::{save_credentials, ClaudeCredentials, TokenRefreshResponse};
 
@@ -93,6 +95,7 @@ impl ClaudeApiClient {
             })?;
 
         let status = response.status();
+        let retry_at = retry_after_deadline(response.headers());
         let body = read_response_body(response, "Claude token refresh response").await?;
         let response_error_code = response_error_code(&body);
         debug!(
@@ -104,7 +107,7 @@ impl ClaudeApiClient {
             response_error_code = response_error_code.as_deref().unwrap_or("none"),
             "Claude OAuth response received"
         );
-        if let Err(err) = map_refresh_error(status, response_error_code.as_deref()) {
+        if let Err(err) = map_refresh_error(status, response_error_code.as_deref(), retry_at) {
             warn!(
                 provider_id = super::PROVIDER_ID,
                 endpoint = "oauth_token_refresh",
@@ -158,6 +161,7 @@ impl ClaudeApiClient {
             })?;
 
         let status = response.status();
+        let retry_at = retry_after_deadline(response.headers());
         let body = read_response_body(response, "Claude usage response").await?;
         let response_error_code = response_error_code(&body);
         debug!(
@@ -169,7 +173,7 @@ impl ClaudeApiClient {
             response_error_code = response_error_code.as_deref().unwrap_or("none"),
             "Claude OAuth response received"
         );
-        if let Err(err) = map_usage_error(status) {
+        if let Err(err) = map_usage_error(status, retry_at) {
             warn!(
                 provider_id = super::PROVIDER_ID,
                 endpoint = "oauth_usage",
@@ -210,7 +214,8 @@ impl ClaudeApiClient {
                 )
             })?;
 
-        map_profile_error(response.status())?;
+        let retry_at = retry_after_deadline(response.headers());
+        map_profile_error(response.status(), retry_at)?;
         let body = read_response_body(response, "Claude profile response").await?;
         parse_profile_identity(&body)
     }
@@ -269,12 +274,14 @@ fn normalized_identity(
 fn map_refresh_error(
     status: StatusCode,
     response_error_code: Option<&str>,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<(), ProviderError> {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(ProviderError::new(
             ProviderErrorKind::RateLimited,
             "Claude token refresh is rate limited",
-        ));
+        )
+        .with_retry_at(retry_at));
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(ProviderError::new(
@@ -323,12 +330,16 @@ fn safe_error_code(value: &str) -> Option<String> {
     .then(|| value.to_string())
 }
 
-fn map_usage_error(status: StatusCode) -> Result<(), ProviderError> {
+fn map_usage_error(
+    status: StatusCode,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ProviderError> {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(ProviderError::new(
             ProviderErrorKind::Unauthorized,
             "Claude OAuth credentials were rejected",
-        ));
+        )
+        .with_retry_at(retry_at));
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(ProviderError::new(
@@ -345,12 +356,16 @@ fn map_usage_error(status: StatusCode) -> Result<(), ProviderError> {
     Ok(())
 }
 
-fn map_profile_error(status: StatusCode) -> Result<(), ProviderError> {
+fn map_profile_error(
+    status: StatusCode,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ProviderError> {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(ProviderError::new(
             ProviderErrorKind::Unauthorized,
             "Claude OAuth profile credentials were rejected",
-        ));
+        )
+        .with_retry_at(retry_at));
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(ProviderError::new(
@@ -438,7 +453,8 @@ mod tests {
 
     #[test]
     fn maps_invalid_grant_to_rejected_credentials() {
-        let error = map_refresh_error(StatusCode::BAD_REQUEST, Some("invalid_grant")).unwrap_err();
+        let error =
+            map_refresh_error(StatusCode::BAD_REQUEST, Some("invalid_grant"), None).unwrap_err();
         assert_eq!(error.kind(), ProviderErrorKind::Unauthorized);
         assert!(error.short_message().contains("invalid_grant"));
     }

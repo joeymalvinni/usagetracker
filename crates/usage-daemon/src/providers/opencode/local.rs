@@ -2,20 +2,17 @@
 
 use std::path::PathBuf;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::ProviderId;
 
 use crate::providers::{ProviderCollectionResult, ProviderError, ProviderErrorKind, ProviderUsage};
 
 use super::{
     history::{local_usage_history_report, usage_history_windows},
-    utils::{
-        local_db_error, monthly_window_start, next_monthly_anchor, normalize_percent, table_exists,
-        utc_week_start,
-    },
-    MAX_PERCENT, OPENCODE_GO_PROVIDER_ID,
+    utils::{local_db_error, table_exists},
+    OPENCODE_GO_PROVIDER_ID,
 };
 
 pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, ProviderError> {
@@ -42,7 +39,7 @@ pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, Provi
 
     let now = Utc::now();
     let history_report = local_usage_history_report(&rows, now);
-    let mut windows = local_usage_windows(&rows, now);
+    let mut windows = Vec::new();
     if let Some(report) = &history_report {
         windows.extend(usage_history_windows(OPENCODE_GO_PROVIDER_ID, report, now));
     }
@@ -52,6 +49,8 @@ pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, Provi
         "database": db_path.display().to_string(),
         "rows": rows.len(),
         "web_authoritative": false,
+        "quota_authoritative": false,
+        "scope": "observed_local_activity",
     });
     if let Some(report) = history_report {
         if let Some(object) = metadata.as_object_mut() {
@@ -143,95 +142,6 @@ pub(super) fn read_local_usage_rows(
             })?
         })
         .collect())
-}
-
-fn local_usage_windows(rows: &[LocalUsageRow], now: DateTime<Utc>) -> Vec<UsageWindow> {
-    let session_start = now - TimeDelta::hours(5);
-    let session_cost = rows
-        .iter()
-        .filter(|row| row.created_at >= session_start && row.created_at <= now)
-        .map(|row| row.cost)
-        .sum::<f64>();
-    let session_reset = rows
-        .iter()
-        .filter(|row| row.created_at >= session_start && row.created_at <= now)
-        .map(|row| row.created_at + TimeDelta::hours(5))
-        .min();
-
-    let weekly_start = utc_week_start(now);
-    let weekly_cost = rows
-        .iter()
-        .filter(|row| row.created_at >= weekly_start && row.created_at <= now)
-        .map(|row| row.cost)
-        .sum::<f64>();
-    let weekly_reset = weekly_start + TimeDelta::weeks(1);
-
-    let anchor = rows.iter().map(|row| row.created_at).min().unwrap_or(now);
-    let monthly_start = monthly_window_start(anchor, now);
-    let monthly_cost = rows
-        .iter()
-        .filter(|row| row.created_at >= monthly_start && row.created_at <= now)
-        .map(|row| row.cost)
-        .sum::<f64>();
-    let monthly_reset = next_monthly_anchor(anchor, monthly_start);
-
-    vec![
-        local_cost_limit_window(
-            "opencode_go_session",
-            "OpenCode Go session",
-            UsageWindowKind::Session,
-            session_cost,
-            12.0,
-            session_reset,
-        ),
-        local_cost_limit_window(
-            "opencode_go_weekly",
-            "OpenCode Go weekly",
-            UsageWindowKind::Weekly,
-            weekly_cost,
-            30.0,
-            Some(weekly_reset),
-        ),
-        local_cost_limit_window(
-            "opencode_go_monthly",
-            "OpenCode Go monthly",
-            UsageWindowKind::Monthly,
-            monthly_cost,
-            60.0,
-            Some(monthly_reset),
-        ),
-    ]
-}
-
-fn local_cost_limit_window(
-    window_id: &str,
-    label: &str,
-    kind: UsageWindowKind,
-    used: f64,
-    limit: f64,
-    reset_at: Option<DateTime<Utc>>,
-) -> UsageWindow {
-    let percent_used = normalize_percent((used / limit) * 100.0);
-    UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind,
-        used: Some(UsageAmount {
-            value: used,
-            unit: UsageUnit::Usd,
-        }),
-        limit: Some(UsageAmount {
-            value: limit,
-            unit: UsageUnit::Usd,
-        }),
-        remaining: Some(UsageAmount {
-            value: (limit - used).max(0.0),
-            unit: UsageUnit::Usd,
-        }),
-        percent_used: Some(percent_used),
-        percent_remaining: Some(MAX_PERCENT - percent_used),
-        reset_at,
-    }
 }
 
 pub(super) fn local_go_auth_exists() -> bool {

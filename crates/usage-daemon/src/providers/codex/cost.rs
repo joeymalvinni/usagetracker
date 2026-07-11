@@ -3,18 +3,24 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    hash::{DefaultHasher, Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Instant, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Days, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
-use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::UsageWindowKind;
 
-use crate::providers::ProviderUsage;
+use crate::providers::{
+    local_usage::{
+        cost_window, daily_cost_rows, lookback_start, merge_daily_summary, scan_cached_files,
+        token_window, CachedFile, DailyRollup, LocalFileCache, LocalFileScan,
+    },
+    ProviderUsage,
+};
+
+pub(super) use crate::providers::local_usage::DailyCostSummary;
 
 use super::{pricing::CodexPricingCatalog, CODEX_COST_SCAN_MIN_INTERVAL, COST_LOOKBACK_DAYS};
 
@@ -40,6 +46,8 @@ impl CodexUsageCostExt for ProviderUsage {
                 "unpriced_tokens": report.unpriced_tokens,
                 "unpriced_models": unpriced_model_rows(&report.unpriced_models),
                 "pricing_source": report.pricing_source,
+                "pricing_version": report.pricing_version,
+                "pricing_effective_from": report.pricing_effective_from,
                 "pricing_fetched_at": report.pricing_fetched_at,
             });
             return;
@@ -100,6 +108,8 @@ impl CodexUsageCostExt for ProviderUsage {
             "unpriced_tokens": report.unpriced_tokens,
             "unpriced_models": unpriced_model_rows(&report.unpriced_models),
             "pricing_source": report.pricing_source,
+            "pricing_version": report.pricing_version,
+            "pricing_effective_from": report.pricing_effective_from,
             "pricing_fetched_at": report.pricing_fetched_at,
             "by_day": daily_cost_rows(&report.by_day),
             "by_model": report.by_model,
@@ -107,99 +117,17 @@ impl CodexUsageCostExt for ProviderUsage {
     }
 }
 
-fn cost_window(window_id: &str, label: &str, value: f64) -> UsageWindow {
-    UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind: UsageWindowKind::Credits,
-        used: Some(UsageAmount {
-            value,
-            unit: UsageUnit::Usd,
-        }),
-        limit: None,
-        remaining: None,
-        percent_used: None,
-        percent_remaining: None,
-        reset_at: None,
-    }
-}
-
-pub(super) fn token_window(
-    window_id: &str,
-    label: &str,
-    tokens: u64,
-    kind: UsageWindowKind,
-) -> UsageWindow {
-    UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind,
-        used: Some(UsageAmount {
-            value: tokens as f64,
-            unit: UsageUnit::Tokens,
-        }),
-        limit: None,
-        remaining: None,
-        percent_used: None,
-        percent_remaining: None,
-        reset_at: None,
-    }
-}
+pub(super) type CodexCostCache = LocalFileCache<CodexFileCostReport, CodexCostReport>;
+pub(super) type CodexCostScan = LocalFileScan<CodexCostReport>;
+#[cfg(test)]
+pub(super) type CodexCostCacheStatus = crate::providers::local_usage::CacheStatus;
 
 #[derive(Clone, Debug)]
-pub(super) struct CodexCostCache {
-    fingerprint: CodexSessionFingerprint,
-    pricing_revision: u64,
-    files: BTreeMap<PathBuf, CodexCachedFileCost>,
-    file_order: Vec<PathBuf>,
-    report: CodexCostReport,
-    report_date: NaiveDate,
-    scanned_at: Instant,
-}
-
-#[derive(Clone, Debug)]
-struct CodexCachedFileCost {
-    size: u64,
-    modified_ns: u128,
-    report: Arc<CodexFileCostReport>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CodexCostCacheStatus {
-    Hit,
-    Throttled,
-    Refreshed,
-}
-
-impl CodexCostCacheStatus {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Hit => "hit",
-            Self::Throttled => "throttled",
-            Self::Refreshed => "refreshed",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct CodexCostScan {
-    pub(super) report: CodexCostReport,
-    pub(super) cache_status: CodexCostCacheStatus,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct CodexSessionFingerprint {
-    files: usize,
-    total_size: u64,
-    latest_modified_ns: u128,
-    digest: u64,
-}
-
-#[derive(Clone, Debug)]
-struct CodexSessionFileSnapshot {
-    path: PathBuf,
-    size: u64,
-    modified_ns: u128,
+struct PricingIdentity {
+    source: String,
+    version: String,
+    effective_from: String,
+    fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -220,6 +148,8 @@ pub(super) struct CodexCostReport {
     pub(super) unpriced_tokens: u64,
     pub(super) unpriced_models: BTreeMap<String, u64>,
     pub(super) pricing_source: String,
+    pub(super) pricing_version: String,
+    pub(super) pricing_effective_from: String,
     pub(super) pricing_fetched_at: Option<DateTime<Utc>>,
     pub(super) by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     pub(super) by_model: BTreeMap<String, CodexModelCostSummary>,
@@ -230,7 +160,7 @@ pub(super) struct CodexCostReport {
 /// File reports are date-agnostic so a cached report can be re-folded against a
 /// rolling `today`/lookback window without re-reading the file.
 #[derive(Clone, Debug, Default)]
-struct CodexFileCostReport {
+pub(super) struct CodexFileCostReport {
     token_count_events: usize,
     baseline_seeded_events: usize,
     total_cost_usd: f64,
@@ -242,25 +172,6 @@ struct CodexFileCostReport {
     unpriced_models: BTreeMap<String, u64>,
     by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     by_model: BTreeMap<String, CodexModelCostSummary>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct DailyCostSummary {
-    pub(super) cost_usd: f64,
-    pub(super) tokens: u64,
-    pub(super) priced_tokens: u64,
-    pub(super) unpriced_tokens: u64,
-    pub(super) unpriced_models: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(super) struct DailyCostRow {
-    date: String,
-    cost_usd: f64,
-    tokens: u64,
-    priced_tokens: u64,
-    unpriced_tokens: u64,
-    unpriced_models: Vec<UnpricedModelRow>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -316,129 +227,51 @@ fn scan_codex_local_costs_cached_at(
     today: NaiveDate,
 ) -> anyhow::Result<CodexCostScan> {
     let pricing_revision = pricing.revision();
-    let pricing_source = pricing.source().to_string();
-    let pricing_fetched_at = pricing.fetched_at();
+    let pricing_identity = PricingIdentity {
+        source: pricing.source().to_string(),
+        version: pricing.version(),
+        effective_from: pricing.effective_from(),
+        fetched_at: pricing.fetched_at(),
+    };
     let session_roots = roots
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
-    let mut cache = cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Codex cost cache mutex poisoned"))?;
-
-    if let Some(cached) = cache.as_mut() {
-        let same_roots = cached.report.session_roots == session_roots;
-        if same_roots
-            && cached.pricing_revision == pricing_revision
-            && cached.scanned_at.elapsed() < CODEX_COST_SCAN_MIN_INTERVAL
-        {
-            if cached.report_date != today {
-                cached.report = fold_codex_file_reports(
-                    &session_roots,
-                    &cached.file_order,
-                    &cached.files,
-                    today,
-                    &pricing_source,
-                    pricing_fetched_at,
-                );
-                cached.report_date = today;
-            }
-            return Ok(CodexCostScan {
-                report: cached.report.clone(),
-                cache_status: CodexCostCacheStatus::Throttled,
-            });
-        }
-    }
-
-    let snapshots = collect_codex_session_file_snapshots(&roots)?;
-    let fingerprint = codex_session_fingerprint(&snapshots);
-    let same_roots = cache
-        .as_ref()
-        .is_some_and(|cached| cached.report.session_roots == session_roots);
-    let pricing_unchanged = cache
-        .as_ref()
-        .is_some_and(|cached| cached.pricing_revision == pricing_revision);
-    let fingerprint_unchanged = same_roots
-        && pricing_unchanged
-        && cache
-            .as_ref()
-            .is_some_and(|cached| cached.fingerprint == fingerprint);
-    let mut files = BTreeMap::<PathBuf, CodexCachedFileCost>::new();
-
-    for snapshot in &snapshots {
-        if files.get(&snapshot.path).is_some_and(|cached| {
-            cached.size == snapshot.size && cached.modified_ns == snapshot.modified_ns
-        }) {
-            continue;
-        }
-
-        // Reuse a cached per-file report only when its bytes are unchanged and it
-        // was priced against the current catalog revision.
-        let cached = cache
-            .as_ref()
-            .filter(|_| pricing_unchanged)
-            .and_then(|cache| cache.files.get(&snapshot.path))
-            .filter(|cached| {
-                cached.size == snapshot.size && cached.modified_ns == snapshot.modified_ns
-            })
-            .cloned();
-        let file = match cached {
-            Some(cached) => cached,
-            None => CodexCachedFileCost {
-                size: snapshot.size,
-                modified_ns: snapshot.modified_ns,
-                report: Arc::new(scan_codex_session_file_all_days(&snapshot.path, &pricing)?),
-            },
-        };
-        files.insert(snapshot.path.clone(), file);
-    }
-
-    let file_order = snapshots
-        .iter()
-        .map(|snapshot| snapshot.path.clone())
-        .collect::<Vec<_>>();
-    let report = fold_codex_file_reports(
-        &session_roots,
-        &file_order,
-        &files,
-        today,
-        &pricing_source,
-        pricing_fetched_at,
-    );
-    let cache_status = if fingerprint_unchanged {
-        CodexCostCacheStatus::Hit
-    } else {
-        CodexCostCacheStatus::Refreshed
-    };
-    *cache = Some(CodexCostCache {
-        fingerprint,
+    scan_cached_files(
+        cache,
+        roots,
+        "jsonl",
         pricing_revision,
-        files,
-        file_order,
-        report: report.clone(),
-        report_date: today,
-        scanned_at: Instant::now(),
-    });
-    Ok(CodexCostScan {
-        report,
-        cache_status,
-    })
+        CODEX_COST_SCAN_MIN_INTERVAL,
+        today,
+        move |path| scan_codex_session_file_all_days(path, &pricing),
+        move |file_order, files, report_date| {
+            fold_codex_file_reports(
+                &session_roots,
+                file_order,
+                files,
+                report_date,
+                &pricing_identity,
+            )
+        },
+    )
 }
 
 fn fold_codex_file_reports(
     session_roots: &[String],
     file_order: &[PathBuf],
-    files: &BTreeMap<PathBuf, CodexCachedFileCost>,
+    files: &BTreeMap<PathBuf, CachedFile<CodexFileCostReport>>,
     today: NaiveDate,
-    pricing_source: &str,
-    pricing_fetched_at: Option<DateTime<Utc>>,
+    pricing: &PricingIdentity,
 ) -> CodexCostReport {
-    let lookback_start = codex_lookback_start(today);
+    let lookback_start = lookback_start(today, COST_LOOKBACK_DAYS);
     let mut report = CodexCostReport {
         session_roots: session_roots.to_vec(),
         files_scanned: file_order.len(),
-        pricing_source: pricing_source.to_string(),
-        pricing_fetched_at,
+        pricing_source: pricing.source.clone(),
+        pricing_version: pricing.version.clone(),
+        pricing_effective_from: pricing.effective_from.clone(),
+        pricing_fetched_at: pricing.fetched_at,
         ..Default::default()
     };
 
@@ -446,85 +279,10 @@ fn fold_codex_file_reports(
         let file = files
             .get(path)
             .expect("Codex cached file exists for every traversal entry");
-        merge_codex_file_report(&mut report, &file.report, today, lookback_start);
+        merge_codex_file_report(&mut report, file.summary(), today, lookback_start);
     }
 
     report
-}
-
-fn codex_lookback_start(today: NaiveDate) -> NaiveDate {
-    today
-        .checked_sub_days(Days::new(COST_LOOKBACK_DAYS.saturating_sub(1)))
-        .unwrap_or(today)
-}
-
-fn collect_codex_session_file_snapshots(
-    roots: &[PathBuf],
-) -> anyhow::Result<Vec<CodexSessionFileSnapshot>> {
-    let mut files = Vec::<CodexSessionFileSnapshot>::new();
-    for root in roots {
-        collect_codex_session_file_snapshots_from_path(root, &mut files)?;
-    }
-    files.sort_unstable_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.size.cmp(&right.size))
-            .then_with(|| left.modified_ns.cmp(&right.modified_ns))
-    });
-    Ok(files)
-}
-
-fn collect_codex_session_file_snapshots_from_path(
-    path: &Path,
-    files: &mut Vec<CodexSessionFileSnapshot>,
-) -> anyhow::Result<()> {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(());
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let is_jsonl = path.extension().and_then(|value| value.to_str()) == Some("jsonl");
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if is_jsonl => return Err(error.into()),
-            Err(_) => continue,
-        };
-        if metadata.is_dir() {
-            collect_codex_session_file_snapshots_from_path(&path, files)?;
-        } else if is_jsonl {
-            let modified_ns = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            files.push(CodexSessionFileSnapshot {
-                path,
-                size: metadata.len(),
-                modified_ns,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn codex_session_fingerprint(files: &[CodexSessionFileSnapshot]) -> CodexSessionFingerprint {
-    let mut digest = DefaultHasher::new();
-    let mut fingerprint = CodexSessionFingerprint {
-        files: files.len(),
-        ..Default::default()
-    };
-    for file in files {
-        file.path.hash(&mut digest);
-        file.size.hash(&mut digest);
-        file.modified_ns.hash(&mut digest);
-        fingerprint.total_size = fingerprint.total_size.saturating_add(file.size);
-        fingerprint.latest_modified_ns = fingerprint.latest_modified_ns.max(file.modified_ns);
-    }
-    fingerprint.digest = digest.finish();
-    fingerprint
 }
 
 pub(super) fn codex_session_roots(
@@ -605,6 +363,7 @@ fn scan_codex_session_file_all_days(
         if let Some(date) = date {
             let day = report.by_day.entry(date).or_default();
             day.tokens = day.tokens.saturating_add(tokens);
+            day.rows = day.rows.saturating_add(1);
             if let Some(cost) = cost {
                 day.cost_usd += cost;
                 day.priced_tokens = day.priced_tokens.saturating_add(tokens);
@@ -656,24 +415,12 @@ fn merge_codex_file_report(
         add_unpriced_model(&mut report.unpriced_models, model, *tokens);
     }
 
-    for (date, summary) in &file.by_day {
-        if *date == today {
-            report.today_tokens = report.today_tokens.saturating_add(summary.tokens);
-            report.today_cost_usd += summary.cost_usd;
-        }
-        if *date >= lookback_start && *date <= today {
-            report.lookback_tokens = report.lookback_tokens.saturating_add(summary.tokens);
-            report.lookback_cost_usd += summary.cost_usd;
-            let day = report.by_day.entry(*date).or_default();
-            day.tokens = day.tokens.saturating_add(summary.tokens);
-            day.cost_usd += summary.cost_usd;
-            day.priced_tokens = day.priced_tokens.saturating_add(summary.priced_tokens);
-            day.unpriced_tokens = day.unpriced_tokens.saturating_add(summary.unpriced_tokens);
-            for (model, tokens) in &summary.unpriced_models {
-                add_unpriced_model(&mut day.unpriced_models, model, *tokens);
-            }
-        }
-    }
+    let daily = DailyRollup::from_range(&file.by_day, today, lookback_start);
+    report.today_tokens = report.today_tokens.saturating_add(daily.today.tokens);
+    report.today_cost_usd += daily.today.cost_usd;
+    report.lookback_tokens = report.lookback_tokens.saturating_add(daily.lookback.tokens);
+    report.lookback_cost_usd += daily.lookback.cost_usd;
+    merge_daily_summary(&mut report.by_day, &daily.by_day);
 
     for (model, file_summary) in &file.by_model {
         let summary = report.by_model.entry(model.clone()).or_default();
@@ -720,20 +467,6 @@ pub(super) fn codex_token_delta(
         *previous_totals = Some(previous_totals.unwrap_or_default().add(delta));
     }
     (delta, baseline_seeded)
-}
-
-fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) -> Vec<DailyCostRow> {
-    by_day
-        .iter()
-        .map(|(date, summary)| DailyCostRow {
-            date: date.to_string(),
-            cost_usd: summary.cost_usd,
-            tokens: summary.tokens,
-            priced_tokens: summary.priced_tokens,
-            unpriced_tokens: summary.unpriced_tokens,
-            unpriced_models: unpriced_model_rows(&summary.unpriced_models),
-        })
-        .collect()
 }
 
 fn add_unpriced_model(models: &mut BTreeMap<String, u64>, model: &str, tokens: u64) {
@@ -897,9 +630,13 @@ pub(super) fn normalize_codex_model(model: &str) -> String {
 
 #[cfg(test)]
 mod cache_tests {
-    use std::{fs::OpenOptions, io::Write, time::Duration};
+    use std::{
+        fs::OpenOptions,
+        io::Write,
+        time::{Duration, Instant},
+    };
 
-    use chrono::NaiveTime;
+    use chrono::{Days, NaiveTime};
 
     use super::*;
 
@@ -985,7 +722,7 @@ mod cache_tests {
             .files
             .get(&path)
             .unwrap()
-            .report
+            .summary
             .clone();
 
         expire(&cache);
@@ -998,7 +735,7 @@ mod cache_tests {
             .files
             .get(&path)
             .unwrap()
-            .report
+            .summary
             .clone();
 
         assert_eq!(second.cache_status, CodexCostCacheStatus::Hit);

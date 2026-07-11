@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 
-use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{
+    local_usage::{stable_window_fragment, usage_kind_from_name},
+    ProviderError, ProviderErrorKind, ProviderUsage,
+};
 
 use super::{credentials::ClaudeCredentials, CLAUDE_COLLECTION_MODE, PROVIDER_ID};
 
@@ -433,21 +436,6 @@ fn date_time_from_json_value(value: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
-fn usage_kind_from_name(name: &str) -> UsageWindowKind {
-    let name = name.to_ascii_lowercase();
-    if name.contains("session") || name.contains("hour") {
-        UsageWindowKind::Session
-    } else if name.contains("daily") || name.contains("day") {
-        UsageWindowKind::Daily
-    } else if name.contains("weekly") || name.contains("week") {
-        UsageWindowKind::Weekly
-    } else if name.contains("monthly") || name.contains("month") {
-        UsageWindowKind::Monthly
-    } else {
-        UsageWindowKind::Other(name)
-    }
-}
-
 fn humanize_window_label(value: impl AsRef<str>) -> String {
     let value = value.as_ref().replace(['_', '-'], " ");
     let value = value.trim();
@@ -456,19 +444,6 @@ fn humanize_window_label(value: impl AsRef<str>) -> String {
     } else {
         format!("Claude {value}")
     }
-}
-
-fn stable_window_fragment(value: &str) -> String {
-    value
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() {
-                char.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

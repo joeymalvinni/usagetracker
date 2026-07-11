@@ -25,10 +25,14 @@ struct DerivedState: Equatable {
     @Published var health = [ProviderHealth]()
     @Published var snapshots = [UsageSnapshot]()
     @Published var forecasts = [UsageForecast]()
+    @Published var dashboardSummary = UsageDashboardSummary.empty
+    @Published var windowProvenance = [UsageWindowProvenance]()
     @Published var refreshing = false
     @Published var message: String?
     @Published var actionMessage: String?
     @Published var actionError: String?
+    @Published var preferencesError: String?
+    @Published var notificationError: String?
     @Published var pendingProviders = Set<String>()
     @Published var pendingAccountProviders = Set<String>()
     @Published var pendingAccounts = Set<String>()
@@ -44,7 +48,7 @@ struct DerivedState: Equatable {
     var menuPreview: String { derived.menuPreview }
     var menuStatus: DisplayStatus { derived.menuStatus }
     var menuBars: [MenuBarProviderVM] { derived.menuBars }
-    @Published var ui = UIConfig.load() {
+    @Published var ui: UIConfig {
         didSet {
             guard ui != oldValue else { return }
             scheduleUIConfigPersistence()
@@ -59,6 +63,7 @@ struct DerivedState: Equatable {
     }
     private var client: DaemonClient
     private let daemonSupervisor = DaemonSupervisor()
+    private let notificationDelivery = NotificationDelivery()
     private let uiConfigStore = UIConfigStore()
     private var uiPersistenceTask: Task<Void, Never>?
     private var buildTask: Task<Void, Never>?
@@ -70,11 +75,23 @@ struct DerivedState: Equatable {
 
     init() {
         let socketPath = AppState.defaultSocketPath()
+        do {
+            self.ui = try UIConfig.load()
+        } catch {
+            self.ui = UIConfig()
+            self.preferencesError = "UI preferences could not be loaded: \(error.localizedDescription)"
+        }
         self.socketPath = socketPath
         self.client = DaemonClient(socketPath: socketPath)
     }
 
     init(socketPath: String) {
+        do {
+            self.ui = try UIConfig.load()
+        } catch {
+            self.ui = UIConfig()
+            self.preferencesError = "UI preferences could not be loaded: \(error.localizedDescription)"
+        }
         self.socketPath = socketPath
         self.client = DaemonClient(socketPath: socketPath)
     }
@@ -119,8 +136,15 @@ struct DerivedState: Equatable {
         }
     }
     func visible(_ id: String) -> Bool { uiVisible(id) }
-    func setVisible(_ id: String, _ on: Bool) {
-        if on { ui.hiddenProviders.remove(id) } else { ui.hiddenProviders.insert(id) }
+    func setVisible(_ id: String, _ on: Bool) async {
+        pendingProviders.insert(id); defer { pendingProviders.remove(id) }
+        do {
+            config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: on])
+            if on { ui.hiddenProviders.remove(id) } else { ui.hiddenProviders.insert(id) }
+            actionError = nil
+        } catch {
+            actionError = describe(error)
+        }
     }
 
     func setProviderEnabled(_ id: String, _ enabled: Bool) async {
@@ -157,7 +181,8 @@ struct DerivedState: Equatable {
             config = try await client.updateConfig(
                 pollIntervalSeconds: nil,
                 providers: nil,
-                notificationsEnabled: enabled
+                notifications: (config?.notifications ?? NotificationConfig(enabled: enabled))
+                    .withEnabled(enabled)
             )
             if enabled && notificationAuthorization == .denied {
                 actionMessage = "Usage alerts are enabled, but notifications are blocked in macOS System Settings."
@@ -176,16 +201,14 @@ struct DerivedState: Equatable {
 
     func refreshNotificationAuthorization() async {
         guard notificationAuthorizationAvailable else { return }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        notificationAuthorization = settings.authorizationStatus
+        notificationAuthorization = await notificationDelivery.authorizationStatus()
     }
 
     private func requestNotificationAuthorizationIfNeeded() async {
         guard notificationAuthorizationAvailable else { return }
         guard notificationAuthorization == .notDetermined else { return }
         do {
-            _ = try await UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .sound])
+            _ = try await notificationDelivery.requestAuthorization()
         } catch {
             actionError = "Could not request notification permission: \(describe(error))"
         }
@@ -249,7 +272,7 @@ struct DerivedState: Equatable {
             try await deleteAccountFromDaemon(id)
         } catch {
             let message = describe(error)
-            if isMissingAccount(message) {
+            if isMissingAccount(error) {
                 actionError = nil
                 actionMessage = "Account was already deleted."
                 await load(all: true)
@@ -275,8 +298,7 @@ struct DerivedState: Equatable {
             do {
                 try await deleteAccountFromDaemon(id)
             } catch {
-                let message = describe(error)
-                if !isMissingAccount(message) { failures.append(message) }
+                if !isMissingAccount(error) { failures.append(describe(error)) }
             }
         }
         await load(all: true)
@@ -292,9 +314,9 @@ struct DerivedState: Equatable {
     private func deleteAccountFromDaemon(_ id: String) async throws {
         do {
             try await client.deleteAccount(accountId: id)
-        } catch {
-            let message = describe(error)
-            guard message.contains("unknown variant `delete_account`"),
+        } catch let error as DaemonError {
+            guard case let .api(code, _) = error,
+                  code == "unsupported_method",
                   await daemonSupervisor.restart(socketPath: socketPath) else {
                 throw error
             }
@@ -302,9 +324,9 @@ struct DerivedState: Equatable {
         }
     }
 
-    private func isMissingAccount(_ message: String) -> Bool {
-        message.localizedCaseInsensitiveContains("unknown account")
-            || message.localizedCaseInsensitiveContains("account was not found")
+    private func isMissingAccount(_ error: Error) -> Bool {
+        guard case let DaemonError.api(code, _) = error else { return false }
+        return code == "unknown_account"
     }
 
     func restoreAccount(_ id: String) async {
@@ -461,6 +483,15 @@ struct DerivedState: Equatable {
     private static var isRunningFromAppBundle: Bool {
         Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
     }
+    /// Developer-facing surfaces (internal paths, debug affordances) are hidden
+    /// from users running the shipped `.app` and shown only in dev contexts:
+    /// running via `swift run`, a fixture session, or the popover-debug flag.
+    var isDeveloperMode: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return !AppState.isRunningFromAppBundle
+            || env["USAGE_TRACKER_FIXTURE"]?.isEmpty == false
+            || env["USAGE_POPOVER_DEBUG"] == "1"
+    }
     private func path(from config: ConfigResponse? = nil) -> String {
         config?.socketPath ?? socketPath
     }
@@ -505,6 +536,8 @@ struct DerivedState: Equatable {
             if health != latestHealth { health = latestHealth }
             if snapshots != usage.snapshots { snapshots = usage.snapshots }
             if forecasts != usage.forecasts { forecasts = usage.forecasts }
+            if dashboardSummary != usage.dashboard { dashboardSummary = usage.dashboard }
+            if windowProvenance != usage.windowProvenance { windowProvenance = usage.windowProvenance }
             if !all && hasUnknownAccountReferences() {
                 let latestAccounts = try await client.accounts()
                 if accounts != latestAccounts { accounts = latestAccounts }
@@ -513,7 +546,6 @@ struct DerivedState: Equatable {
             lastLoadCompletedAt = Date()
             await refreshNotificationAuthorization()
             if config?.notifications.enabled == true {
-                await requestNotificationAuthorizationIfNeeded()
                 await deliverPendingNotifications()
             }
         } catch {
@@ -528,29 +560,15 @@ struct DerivedState: Equatable {
         guard notificationAuthorization == .authorized || notificationAuthorization == .provisional else { return }
         do {
             let pending = try await client.pendingNotifications()
-            var delivered = [Int64]()
-            for notification in pending {
-                let content = UNMutableNotificationContent()
-                content.title = notification.title
-                content.body = notification.body
-                content.sound = .default
-                let request = UNNotificationRequest(
-                    identifier: "usage-alert-\(notification.id)",
-                    content: content,
-                    trigger: nil
-                )
-                do {
-                    try await UNUserNotificationCenter.current().add(request)
-                    delivered.append(notification.id)
-                } catch {
-                    actionError = "Could not deliver a usage alert: \(describe(error))"
-                }
-            }
-            if !delivered.isEmpty {
-                try await client.acknowledgeNotifications(delivered)
+            let delivery = await notificationDelivery.deliver(pending)
+            notificationError = delivery.errors.isEmpty
+                ? nil
+                : "Could not deliver \(delivery.errors.count) usage alert(s): \(delivery.errors.joined(separator: "; "))"
+            if !delivery.deliveredIDs.isEmpty {
+                try await client.acknowledgeNotifications(delivery.deliveredIDs)
             }
         } catch {
-            actionError = "Could not load usage alerts: \(describe(error))"
+            notificationError = "Could not load usage alerts: \(describe(error))"
         }
     }
     private func hasUnknownAccountReferences() -> Bool {
@@ -631,12 +649,7 @@ struct DerivedState: Equatable {
     }
 
     private func providerName(_ id: String) -> String {
-        switch id {
-        case "codex": "Codex"
-        case "claude": "Claude"
-        case "opencode_go": "OpenCode Go"
-        default: id
-        }
+        ProviderCatalog.name(for: id)
     }
 
     private func refreshStatusText(_ status: ProviderRefreshStatus) -> String {
@@ -661,20 +674,30 @@ struct DerivedState: Equatable {
         let health = health
         let snapshots = snapshots
         let forecasts = forecasts
+        let dashboardSummary = dashboardSummary
+        let windowProvenance = windowProvenance
         let ui = ui
         let daemon = daemon
+        let visibleProviderIds = Set(
+            config?.providers.compactMap { $0.value.enabled ? $0.key : nil } ?? []
+        )
 
         buildTask?.cancel()
         buildTask = Task { [weak self] in
             let next = await Task.detached(priority: .userInitiated) {
-                let engine = MetricEngine(
+                let engine = DashboardBuilder(
                     config: config,
                     accounts: accounts,
                     health: health,
                     snapshots: snapshots,
                     forecasts: forecasts,
+                    dashboard: dashboardSummary,
+                    windowProvenance: windowProvenance,
                     ui: ui,
-                    visible: { !ui.hiddenProviders.contains($0) }
+                    visible: {
+                        !ui.hiddenProviders.contains($0)
+                            && (config == nil || visibleProviderIds.contains($0))
+                    }
                 )
                 return Self.derive(from: engine.build(), daemon: daemon, ui: ui)
             }.value
@@ -685,13 +708,14 @@ struct DerivedState: Equatable {
     }
 
     nonisolated private static func derive(
-        from output: MetricEngine.Output,
+        from output: DashboardBuilder.Output,
         daemon: DaemonState,
         ui: UIConfig
     ) -> DerivedState {
-        let menu = menuContent(providers: output.providers, daemon: daemon, ui: ui)
+        let visibleProviders = output.providers.filter(\.visibleInMenu)
+        let menu = menuContent(providers: visibleProviders, daemon: daemon, ui: ui)
         return DerivedState(
-            providers: output.providers,
+            providers: visibleProviders,
             settingsProviders: output.settingsProviders,
             cost: output.costDashboard,
             menuPreview: menu.preview,
@@ -703,10 +727,15 @@ struct DerivedState: Equatable {
     private func scheduleUIConfigPersistence() {
         let config = ui
         uiPersistenceTask?.cancel()
-        uiPersistenceTask = Task { [uiConfigStore] in
+        uiPersistenceTask = Task { [weak self, uiConfigStore] in
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
-            await uiConfigStore.save(config)
+            do {
+                try await uiConfigStore.save(config)
+                self?.preferencesError = nil
+            } catch {
+                self?.preferencesError = "UI preferences could not be saved: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -715,19 +744,29 @@ struct DerivedState: Equatable {
     /// re-alerts, and an escalation (warning → critical) is treated as a new alert.
     private func pruneStaleAcknowledgements() {
         let liveAlerts = Set(providers.flatMap { ($0.subAccounts ?? [$0]).compactMap(\.alertSignature) })
-        let dashboards = [cost] + providers.flatMap { provider in
-            [provider.costDashboard] + (provider.subAccounts ?? []).map(\.costDashboard)
-        }
-        let livePricingNotices = Set(dashboards.compactMap(\.pricingNoticeId))
-        let pruned = ui.pruningAcknowledgements(
-            to: liveAlerts,
-            pricingNotices: livePricingNotices
-        )
+        let pruned = ui.pruningAcknowledgements(to: liveAlerts)
         guard pruned != ui else { return }
         // UIConfig is a value type whose property observer rebuilds the view models.
         // Assign the fully-pruned value once so a partial update cannot recursively
         // re-enter this method before both acknowledgement sets have been updated.
         ui = pruned
+    }
+
+    /// Stable identifier for a single progress bar (window), composed of its
+    /// provider and window ids. Hiding is provider-wide, not per-account.
+    nonisolated static func windowKey(_ providerId: String, _ windowId: String) -> String {
+        "\(providerId)|\(windowId)"
+    }
+
+    /// Hide a single progress bar. Captures the label so Settings can name it
+    /// once it's been filtered out of the live view models.
+    func hideWindow(_ window: WindowVM) {
+        ui.hiddenWindows[Self.windowKey(window.providerId, window.id)] = window.label
+    }
+
+    /// Restore a hidden progress bar by its composite key.
+    func showWindow(_ key: String) {
+        ui.hiddenWindows.removeValue(forKey: key)
     }
 
     /// Mark an account's active alert as seen, clearing its rail/chip indicator.
@@ -747,15 +786,6 @@ struct DerivedState: Equatable {
     func showsAlertBanner(_ vm: ProviderVM) -> Bool {
         guard let sig = vm.alertSignature else { return false }
         return !ui.dismissedAlerts.contains(sig)
-    }
-    func dismissPricingNotice(_ dashboard: CostDashboardVM) {
-        guard let noticeId = dashboard.pricingNoticeId else { return }
-        ui.dismissedPricingNotices.insert(noticeId)
-    }
-
-    func showsPricingNotice(_ dashboard: CostDashboardVM) -> Bool {
-        guard let noticeId = dashboard.pricingNoticeId else { return false }
-        return !ui.dismissedPricingNotices.contains(noticeId)
     }
 
     nonisolated private static func menuContent(

@@ -1,5 +1,6 @@
 mod config;
 mod daemon;
+mod dashboard;
 mod fixtures;
 mod forecast;
 mod health;
@@ -7,6 +8,7 @@ mod local_logs;
 mod notifications;
 mod polling;
 mod providers;
+mod runtime;
 mod server;
 mod storage;
 

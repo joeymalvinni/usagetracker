@@ -24,6 +24,10 @@ struct UIConfig: Codable, Equatable {
     }
 
     var hiddenProviders = Set<String>()
+    /// Individually hidden progress bars (windows), keyed by `providerId|windowId`
+    /// with the value holding the window's display label so the Settings restore
+    /// list can name a bar that has been filtered out of all live view models.
+    var hiddenWindows = [String: String]()
     var providerOrder = [String]()
     var menuMetric = MenuMetric.remaining
     var showProviderLabels = true
@@ -34,14 +38,13 @@ struct UIConfig: Codable, Equatable {
     var seenAlerts = Set<String>()
     /// Alert signatures whose banner the user has dismissed.
     var dismissedAlerts = Set<String>()
-    /// Pricing coverage notices dismissed for the current set of unknown models.
-    var dismissedPricingNotices = Set<String>()
 
     init() {}
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         hiddenProviders = try c.decodeIfPresent(Set<String>.self, forKey: .hiddenProviders) ?? []
+        hiddenWindows = try c.decodeIfPresent([String: String].self, forKey: .hiddenWindows) ?? [:]
         providerOrder = try c.decodeIfPresent([String].self, forKey: .providerOrder) ?? []
         menuMetric = try c.decodeIfPresent(MenuMetric.self, forKey: .menuMetric) ?? .remaining
         showProviderLabels = try c.decodeIfPresent(Bool.self, forKey: .showProviderLabels) ?? true
@@ -51,42 +54,37 @@ struct UIConfig: Codable, Equatable {
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
         dismissedAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedAlerts) ?? []
-        dismissedPricingNotices = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedPricingNotices) ?? []
     }
 
-    static func load() -> Self {
+    static func load() throws -> Self {
         if ProcessInfo.processInfo.environment["USAGE_TRACKER_FIXTURE"]?.isEmpty == false {
             var config = Self()
             config.onboardingCompleted = true
             return config
         }
-        guard let data = try? Data(contentsOf: UIPaths.config),
-              let config = try? JSONDecoder().decode(Self.self, from: data)
-        else { return Self() }
-        return config
+        guard FileManager.default.fileExists(atPath: UIPaths.config.path) else { return Self() }
+        let data = try Data(contentsOf: UIPaths.config)
+        return try JSONDecoder().decode(Self.self, from: data)
     }
 
-    func pruningAcknowledgements(
-        to liveAlerts: Set<String>,
-        pricingNotices livePricingNotices: Set<String>
-    ) -> Self {
+    func pruningAcknowledgements(to liveAlerts: Set<String>) -> Self {
         var pruned = self
         pruned.seenAlerts.formIntersection(liveAlerts)
         pruned.dismissedAlerts.formIntersection(liveAlerts)
-        pruned.dismissedPricingNotices.formIntersection(livePricingNotices)
         return pruned
     }
 
-    func save() {
-        try? FileManager.default.createDirectory(at: UIPaths.ui, withIntermediateDirectories: true)
+    func save() throws {
+        try FileManager.default.createDirectory(at: UIPaths.ui, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(self) { try? data.write(to: UIPaths.config, options: .atomic) }
+        let data = try encoder.encode(self)
+        try data.write(to: UIPaths.config, options: .atomic)
     }
 }
 
 actor UIConfigStore {
-    func save(_ config: UIConfig) {
-        config.save()
+    func save(_ config: UIConfig) throws {
+        try config.save()
     }
 }

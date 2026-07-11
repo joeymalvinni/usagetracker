@@ -4,7 +4,6 @@ struct UsageSnapshot: Decodable, Identifiable, Equatable {
     let providerId, accountId: String
     let collectedAt: Date
     let windows: [UsageWindow]
-    let metadata: JSONValue
 }
 
 struct UsageWindow: Decodable, Identifiable, Equatable {

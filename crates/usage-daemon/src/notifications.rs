@@ -1,16 +1,16 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use tracing::{debug, warn};
-use usage_core::{Account, UsageSnapshot, UsageWindow};
+use usage_core::{
+    Account, ForecastConfidence, ForecastStatus, NotificationConfig, NotificationQuietHours,
+    UsageForecast, UsageSnapshot, UsageWindow,
+};
 
 use crate::storage::{NotificationWindowState, Storage};
 
 const REARM_HYSTERESIS: f64 = 1.0;
-const LEVELS: [(f64, u8); 5] = [(50.0, 1), (25.0, 2), (10.0, 4), (5.0, 8), (0.0, 16)];
+const PREDICTIVE_NOTIFICATION_BIT: u8 = 1 << 7;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DesktopNotification {
@@ -20,31 +20,61 @@ pub struct DesktopNotification {
 
 pub struct NotificationManager {
     storage: Storage,
-    enabled: AtomicBool,
+    config: RwLock<NotificationConfig>,
 }
 
 impl NotificationManager {
-    pub fn new(storage: Storage, enabled: bool) -> Arc<Self> {
+    pub fn new(storage: Storage, config: impl Into<NotificationConfig>) -> Arc<Self> {
         Arc::new(Self {
             storage,
-            enabled: AtomicBool::new(enabled),
+            config: RwLock::new(config.into()),
         })
     }
 
     pub fn enabled(&self) -> bool {
-        self.enabled.load(Ordering::Relaxed)
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .enabled
     }
 
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+    pub fn set_config(&self, config: NotificationConfig) {
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
 
     pub async fn process_snapshot(&self, account: &Account, snapshot: &UsageSnapshot) {
+        self.process_snapshot_with_forecasts(account, snapshot, &[])
+            .await;
+    }
+
+    pub async fn process_snapshot_with_forecasts(
+        &self,
+        account: &Account,
+        snapshot: &UsageSnapshot,
+        forecasts: &[UsageForecast],
+    ) {
         if !self.enabled() {
             return;
         }
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         for window in &snapshot.windows {
-            if let Err(err) = self.process_window(account, snapshot, window).await {
+            let policy = ResolvedNotificationPolicy::for_window(&config, account, window);
+            let forecast = forecasts.iter().find(|forecast| {
+                forecast.provider_id == snapshot.provider_id
+                    && forecast.account_id == account.id
+                    && forecast.window_id == window.window_id
+            });
+            if let Err(err) = self
+                .process_window(account, snapshot, window, forecast, &policy)
+                .await
+            {
                 warn!(
                     provider_id = snapshot.provider_id.as_str(),
                     account_id = account.id.as_str(),
@@ -61,18 +91,34 @@ impl NotificationManager {
         account: &Account,
         snapshot: &UsageSnapshot,
         window: &UsageWindow,
+        forecast: Option<&UsageForecast>,
+        policy: &ResolvedNotificationPolicy,
     ) -> anyhow::Result<()> {
+        let now = Utc::now();
+        if !policy.enabled
+            || policy.snoozed_until.is_some_and(|deadline| deadline > now)
+            || policy.quiet_hours.as_ref().is_some_and(is_quiet_now)
+        {
+            return Ok(());
+        }
+        if !snapshot.window_is_authoritative_quota(window) {
+            debug!(
+                provider_id = snapshot.provider_id.as_str(),
+                account_id = account.id.as_str(),
+                window_id = window.window_id,
+                "skipping notifications for a non-authoritative usage window"
+            );
+            return Ok(());
+        }
         let Some(percent) = window.percent_remaining.filter(|value| value.is_finite()) else {
             return Ok(());
         };
         let percent = percent.clamp(0.0, 100.0);
-        let now = Utc::now();
         let existing = self
             .storage
             .notification_window_state(&account.id, &window.window_id)
             .await?;
         let mut state = existing.clone().unwrap_or(NotificationWindowState {
-            last_percent: percent,
             reset_at: window.reset_at,
             notified_mask: 0,
             last_attempt_at: None,
@@ -84,11 +130,15 @@ impl NotificationManager {
                     .reset_at
                     .is_some_and(|reset_at| Some(reset_at) != state.reset_at && reset_at > now)
         });
-        if reset_completed {
+        let cooldown_active = state.last_attempt_at.is_some_and(|last_attempt| {
+            now - last_attempt < chrono::TimeDelta::minutes(i64::from(policy.cooldown_minutes))
+        });
+        if reset_completed && policy.reset_alerts && !cooldown_active {
             let notification = reset_notification_content(account, snapshot, window);
             self.storage
                 .enqueue_notification(&notification.title, &notification.body)
                 .await?;
+            state.last_attempt_at = Some(now);
             debug!(
                 provider_id = snapshot.provider_id.as_str(),
                 account_id = account.id.as_str(),
@@ -101,16 +151,20 @@ impl NotificationManager {
             state.notified_mask = 0;
             state.last_attempt_at = None;
         }
-        for (threshold, bit) in LEVELS {
-            if percent > threshold + REARM_HYSTERESIS {
+        let levels = notification_levels(&policy.thresholds);
+        for (threshold, bit) in &levels {
+            if percent > *threshold + REARM_HYSTERESIS {
                 state.notified_mask &= !bit;
             }
         }
 
-        let crossed_mask = crossed_mask(percent);
+        let crossed_mask = crossed_mask(percent, &levels);
         let new_crossings = crossed_mask & !state.notified_mask;
-        if new_crossings != 0 {
-            let threshold = most_severe_threshold(new_crossings);
+        let cooldown_active = state.last_attempt_at.is_some_and(|last_attempt| {
+            now - last_attempt < chrono::TimeDelta::minutes(i64::from(policy.cooldown_minutes))
+        });
+        if new_crossings != 0 && !cooldown_active {
+            let threshold = most_severe_threshold(new_crossings, &levels);
             let notification = notification_content(account, snapshot, window, percent, threshold);
             self.storage
                 .enqueue_notification(&notification.title, &notification.body)
@@ -126,6 +180,31 @@ impl NotificationManager {
             );
         }
 
+        let cooldown_active = state.last_attempt_at.is_some_and(|last_attempt| {
+            now - last_attempt < chrono::TimeDelta::minutes(i64::from(policy.cooldown_minutes))
+        });
+        let predictive_candidate = forecast.filter(|forecast| {
+            policy.predictive_alerts
+                && state.notified_mask & PREDICTIVE_NOTIFICATION_BIT == 0
+                && forecast.status == ForecastStatus::AtRisk
+                && forecast.confidence != ForecastConfidence::Low
+                && forecast.predicted_exhaustion_at.is_some_and(|at| at > now)
+        });
+        if let Some(forecast) = predictive_candidate.filter(|_| !cooldown_active) {
+            let notification = predictive_notification_content(account, snapshot, window, forecast);
+            self.storage
+                .enqueue_notification(&notification.title, &notification.body)
+                .await?;
+            state.last_attempt_at = Some(now);
+            state.notified_mask |= PREDICTIVE_NOTIFICATION_BIT;
+            debug!(
+                provider_id = snapshot.provider_id.as_str(),
+                account_id = account.id.as_str(),
+                window_id = window.window_id,
+                "predictive usage notification queued"
+            );
+        }
+
         state.reset_at = window.reset_at;
         if !notification_decision_state_changed(existing.as_ref(), &state) {
             return Ok(());
@@ -133,6 +212,69 @@ impl NotificationManager {
         self.storage
             .upsert_notification_window_state(&account.id, &window.window_id, state)
             .await
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedNotificationPolicy {
+    enabled: bool,
+    thresholds: Vec<u8>,
+    reset_alerts: bool,
+    predictive_alerts: bool,
+    cooldown_minutes: u32,
+    quiet_hours: Option<NotificationQuietHours>,
+    snoozed_until: Option<DateTime<Utc>>,
+}
+
+impl ResolvedNotificationPolicy {
+    fn for_window(config: &NotificationConfig, account: &Account, window: &UsageWindow) -> Self {
+        let mut policy = Self {
+            enabled: config.enabled,
+            thresholds: config.thresholds_percent_remaining.clone(),
+            reset_alerts: config.reset_alerts,
+            predictive_alerts: config.predictive_alerts,
+            cooldown_minutes: config.cooldown_minutes,
+            quiet_hours: config.quiet_hours.clone(),
+            snoozed_until: None,
+        };
+        for rule in &config.rules {
+            let matches_account = rule
+                .account_id
+                .as_ref()
+                .is_none_or(|account_id| account_id == &account.id);
+            let matches_window = rule
+                .window_id
+                .as_ref()
+                .is_none_or(|window_id| window_id == &window.window_id);
+            if !matches_account || !matches_window {
+                continue;
+            }
+            if let Some(enabled) = rule.enabled {
+                policy.enabled = enabled;
+            }
+            if let Some(thresholds) = &rule.thresholds_percent_remaining {
+                policy.thresholds = thresholds.clone();
+            }
+            if let Some(reset_alerts) = rule.reset_alerts {
+                policy.reset_alerts = reset_alerts;
+            }
+            if let Some(predictive_alerts) = rule.predictive_alerts {
+                policy.predictive_alerts = predictive_alerts;
+            }
+            if rule.snoozed_until.is_some() {
+                policy.snoozed_until = rule.snoozed_until;
+            }
+        }
+        policy
+    }
+}
+
+fn is_quiet_now(hours: &NotificationQuietHours) -> bool {
+    let hour = chrono::Local::now().hour() as u8;
+    if hours.start_hour_local < hours.end_hour_local {
+        hour >= hours.start_hour_local && hour < hours.end_hour_local
+    } else {
+        hour >= hours.start_hour_local || hour < hours.end_hour_local
     }
 }
 
@@ -171,15 +313,25 @@ fn reset_notification_content(
     }
 }
 
-fn crossed_mask(percent: f64) -> u8 {
-    LEVELS
+fn notification_levels(thresholds: &[u8]) -> Vec<(f64, u8)> {
+    let mut thresholds = thresholds.to_vec();
+    thresholds.sort_unstable_by(|left, right| right.cmp(left));
+    thresholds
+        .into_iter()
+        .enumerate()
+        .map(|(index, threshold)| (f64::from(threshold), 1_u8 << index))
+        .collect()
+}
+
+fn crossed_mask(percent: f64, levels: &[(f64, u8)]) -> u8 {
+    levels
         .iter()
         .filter(|(threshold, _)| percent <= *threshold)
         .fold(0, |mask, (_, bit)| mask | bit)
 }
 
-fn most_severe_threshold(mask: u8) -> u8 {
-    LEVELS
+fn most_severe_threshold(mask: u8, levels: &[(f64, u8)]) -> u8 {
+    levels
         .iter()
         .rev()
         .find_map(|(threshold, bit)| (mask & bit != 0).then_some(*threshold as u8))
@@ -217,6 +369,40 @@ fn notification_content(
     DesktopNotification {
         title,
         body: parts.join(" · "),
+    }
+}
+
+fn predictive_notification_content(
+    account: &Account,
+    snapshot: &UsageSnapshot,
+    window: &UsageWindow,
+    forecast: &UsageForecast,
+) -> DesktopNotification {
+    let provider = provider_name(snapshot.provider_id.as_str());
+    let account_name = account
+        .display_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&account.external_account_id);
+    let exhaustion = forecast
+        .predicted_exhaustion_at
+        .map(|at| format_exhaustion(at, Utc::now()))
+        .unwrap_or_else(|| "before reset".to_string());
+    DesktopNotification {
+        title: format!(
+            "{provider} {} may run out",
+            window.label.trim().to_ascii_lowercase()
+        ),
+        body: format!("{account_name} · Projected to exhaust {exhaustion}"),
+    }
+}
+
+fn format_exhaustion(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let minutes = ((at - now).num_seconds().max(0) + 59) / 60;
+    if minutes < 60 {
+        format!("in {minutes}m")
+    } else {
+        format!("in {}h", minutes / 60)
     }
 }
 
@@ -264,10 +450,20 @@ mod tests {
 
     #[test]
     fn selects_only_the_most_severe_crossed_threshold() {
-        assert_eq!(crossed_mask(60.0), 0);
-        assert_eq!(most_severe_threshold(crossed_mask(50.0)), 50);
-        assert_eq!(most_severe_threshold(crossed_mask(4.0)), 5);
-        assert_eq!(most_severe_threshold(crossed_mask(0.0)), 0);
+        let levels = notification_levels(&[50, 25, 10, 5, 0]);
+        assert_eq!(crossed_mask(60.0, &levels), 0);
+        assert_eq!(
+            most_severe_threshold(crossed_mask(50.0, &levels), &levels),
+            50
+        );
+        assert_eq!(
+            most_severe_threshold(crossed_mask(4.0, &levels), &levels),
+            5
+        );
+        assert_eq!(
+            most_severe_threshold(crossed_mask(0.0, &levels), &levels),
+            0
+        );
     }
 
     #[tokio::test]
@@ -467,6 +663,76 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_local_quota_does_not_alert_or_initialize_state() {
+        let storage = test_storage();
+        let mut account = test_account();
+        account.provider_id = ProviderId::new("opencode_go");
+        let account = insert_account(&storage, &account).await;
+        let manager = NotificationManager::new(storage.clone(), true);
+        let mut snapshot = test_snapshot(0.0, Utc::now() + TimeDelta::hours(2));
+        snapshot.provider_id = ProviderId::new("opencode_go");
+        snapshot.account_id = account.id.clone();
+        snapshot.metadata = serde_json::json!({
+            "estimate": true,
+            "web_authoritative": false,
+        });
+
+        manager.process_snapshot(&account, &snapshot).await;
+
+        assert!(storage.pending_notifications().await.unwrap().is_empty());
+        assert!(storage
+            .notification_window_state(&account.id, "weekly")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn predictive_alert_is_confidence_gated_and_once_per_reset_cycle() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(
+            storage.clone(),
+            NotificationConfig {
+                predictive_alerts: true,
+                cooldown_minutes: 0,
+                ..NotificationConfig::default()
+            },
+        );
+        let now = Utc::now();
+        let snapshot = test_snapshot(80.0, now + TimeDelta::hours(2));
+        let forecast = UsageForecast {
+            provider_id: ProviderId::new("codex"),
+            account_id: account.id.clone(),
+            window_id: "weekly".to_string(),
+            generated_at: now,
+            reset_at: snapshot.windows[0].reset_at,
+            current_percent_used: 20.0,
+            expected_percent_used: Some(10.0),
+            pace_delta_percent: Some(10.0),
+            rate_percent_per_hour: Some(160.0),
+            projected_percent_at_reset: Some(340.0),
+            projected_percent_remaining_at_reset: Some(0.0),
+            predicted_exhaustion_at: Some(now + TimeDelta::minutes(30)),
+            status: ForecastStatus::AtRisk,
+            sample_count: 6,
+            confidence: ForecastConfidence::Medium,
+        };
+
+        manager
+            .process_snapshot_with_forecasts(&account, &snapshot, std::slice::from_ref(&forecast))
+            .await;
+        manager
+            .process_snapshot_with_forecasts(&account, &snapshot, &[forecast])
+            .await;
+
+        let notifications = storage.pending_notifications().await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].title.contains("may run out"));
+        assert!(notifications[0].body.contains("Projected to exhaust"));
     }
 
     fn test_snapshot(percent: f64, reset_at: DateTime<Utc>) -> UsageSnapshot {

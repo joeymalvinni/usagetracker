@@ -304,7 +304,7 @@ private struct TrackpadSwipeMonitor: NSViewRepresentable {
         coordinator.detach()
     }
 
-    final class Coordinator {
+    @MainActor final class Coordinator {
         enum Axis {
             case undecided
             case horizontal
@@ -456,15 +456,15 @@ private struct ProviderRowContent: View {
             if let primaryWindow = limitWindows.first {
                 VStack(spacing: 0) {
                     WindowRow(window: primaryWindow, compact: true)
-                    if limitWindows.count > 1 || resetWindow != nil {
+                    if countSummaryText != nil || resetExpiryText != nil {
                         HStack(spacing: Theme.Spacing.xs) {
-                            if let resetText {
-                                Text(resetText)
+                            if let resetExpiryText {
+                                Text(resetExpiryText)
                                     .fontWeight(.medium)
                             }
                             Spacer(minLength: Theme.Spacing.sm)
-                            if limitWindows.count > 1 {
-                                Text(limitCountText)
+                            if let countSummaryText {
+                                Text(countSummaryText)
                             }
                         }
                         .font(Theme.Typography.micro)
@@ -486,18 +486,30 @@ private struct ProviderRowContent: View {
         provider.windows.filter { $0.id != "\(provider.providerId)_rate_limit_resets" }
     }
 
-    private var resetText: String? {
+    /// Trailing count cluster — reset credits sit immediately to the left of the
+    /// limits count, e.g. "3 resets · 2 limits". Either part is dropped when it
+    /// has nothing to report.
+    private var countSummaryText: String? {
+        var parts: [String] = []
+        if let resetCountText { parts.append(resetCountText) }
+        if limitWindows.count > 1 { parts.append(limitCountText) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private var resetCountText: String? {
         guard let resetWindow else { return nil }
-        // Count comes from the window (drives visibility); the "· expires in N"
-        // relative deadline comes from the soonest credit when we have detail.
         let value = resetWindow.value.replacingOccurrences(of: " available", with: "")
         let noun = value == "1" ? "reset" : "resets"
-        guard let expiresAt = provider.resetCredits.first?.expiresAt else {
-            return "\(value) \(noun)"
-        }
+        return "\(value) \(noun)"
+    }
+
+    /// The soonest reset credit's relative deadline ("expires in 2 days"), shown
+    /// on the leading side; the count itself lives in `countSummaryText`.
+    private var resetExpiryText: String? {
+        guard resetWindow != nil, let expiresAt = provider.resetCredits.first?.expiresAt else { return nil }
         let relative = DateFormats.resetRelativeString(for: expiresAt)
         let verb = expiresAt <= Date() ? "expired" : "expires"
-        return "\(value) \(noun) · \(verb) \(relative)"
+        return "\(verb) \(relative)"
     }
 
     private var limitCountText: String {

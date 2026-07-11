@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, TimeDelta, TimeZone, Utc};
+use chrono::{Local, TimeDelta, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
@@ -12,7 +12,6 @@ use super::history::{
 };
 use super::local::{read_local_usage_rows, LocalUsageRow};
 use super::usage::{account_email_from_text, parse_usage_text, parse_zen_balance};
-use super::utils::{monthly_window_start, next_monthly_anchor};
 use super::OPENCODE_GO_PROVIDER_ID;
 
 #[test]
@@ -175,18 +174,6 @@ fn summarizes_direct_usage_history_page_payload() {
 }
 
 #[test]
-fn monthly_anchor_clamps_short_months() {
-    let anchor = Utc.with_ymd_and_hms(2026, 1, 31, 14, 30, 0).unwrap();
-    let now = Utc.with_ymd_and_hms(2026, 2, 15, 12, 0, 0).unwrap();
-    let start = monthly_window_start(anchor, now);
-    assert_eq!(start.day(), 31);
-    assert_eq!(start.month(), 1);
-    let next = next_monthly_anchor(anchor, start);
-    assert_eq!(next.day(), 28);
-    assert_eq!(next.month(), 2);
-}
-
-#[test]
 fn filters_auth_cookies_when_possible() {
     let header = normalize_cookie_header("foo=1; auth=a; __Host-auth=b; bar=2").unwrap();
     assert_eq!(header, "auth=a; __Host-auth=b");
@@ -218,6 +205,31 @@ fn excludes_future_rows_from_local_history_counts() {
     assert_eq!(metadata["total_cost_usd"], 1.25);
 
     assert!(local_usage_history_report(&rows[1..], now).is_none());
+}
+
+#[test]
+fn local_fallback_exposes_activity_without_inventing_quotas() {
+    let now = Utc.with_ymd_and_hms(2026, 7, 9, 12, 0, 0).unwrap();
+    let report = local_usage_history_report(
+        &[LocalUsageRow {
+            created_at: now - TimeDelta::minutes(1),
+            cost: 4.25,
+        }],
+        now,
+    )
+    .unwrap();
+    let windows = usage_history_windows(OPENCODE_GO_PROVIDER_ID, &report, now);
+
+    assert!(!windows.is_empty());
+    assert!(windows.iter().all(|window| window.limit.is_none()
+        && window.remaining.is_none()
+        && window.percent_used.is_none()
+        && window.percent_remaining.is_none()
+        && window.reset_at.is_none()));
+    assert!(windows.iter().all(|window| !matches!(
+        window.kind,
+        usage_core::UsageWindowKind::Session | usage_core::UsageWindowKind::Weekly
+    )));
 }
 
 #[test]

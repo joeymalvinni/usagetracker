@@ -2,10 +2,14 @@
 
 use std::{collections::BTreeMap, sync::LazyLock};
 
-use chrono::{DateTime, Local, TimeDelta, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use regex::Regex;
 use serde_json::{json, Value};
-use usage_core::{UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{UsageWindow, UsageWindowKind};
+
+use crate::providers::local_usage::{
+    cost_window, daily_cost_rows, lookback_start, token_window, DailyCostSummary, DailyRollup,
+};
 
 use super::{local::LocalUsageRow, utils::provider_display_name, COST_LOOKBACK_DAYS};
 
@@ -31,13 +35,6 @@ pub(super) struct UsageHistoryRow {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct UsageHistoryDay {
-    pub(super) tokens: u64,
-    pub(super) cost_usd: f64,
-    pub(super) rows: u64,
-}
-
-#[derive(Clone, Default)]
 pub(super) struct UsageHistoryReport {
     pub(super) source: &'static str,
     pub(super) estimate: bool,
@@ -47,65 +44,30 @@ pub(super) struct UsageHistoryReport {
     pub(super) total_tokens: u64,
     pub(super) total_cost_usd: f64,
     pub(super) latest_at: Option<DateTime<Utc>>,
-    pub(super) by_day: BTreeMap<String, UsageHistoryDay>,
+    pub(super) by_day: BTreeMap<NaiveDate, DailyCostSummary>,
 }
 
 impl UsageHistoryReport {
     pub(super) fn metadata_value(&self) -> Value {
+        let now = Local::now();
+        let rollup =
+            DailyRollup::from_days(&self.by_day, now.date_naive(), COST_LOOKBACK_DAYS as u64);
         json!({
             "source": self.source,
             "estimate": self.estimate,
             "partial": self.partial,
             "complete_lookback": self.complete_lookback,
             "row_count": self.row_count,
-            "today_cost_usd": self.cost_on(local_date_key(Local::now())),
-            "today_tokens": self.tokens_on(local_date_key(Local::now())),
+            "today_cost_usd": rollup.today.cost_usd,
+            "today_tokens": rollup.today.tokens,
             "lookback_days": COST_LOOKBACK_DAYS,
-            "lookback_cost_usd": self.lookback_cost_usd(Local::now()),
-            "lookback_tokens": self.lookback_tokens(Local::now()),
+            "lookback_cost_usd": rollup.lookback.cost_usd,
+            "lookback_tokens": rollup.lookback.tokens,
             "total_tokens": self.total_tokens,
             "total_cost_usd": self.total_cost_usd,
             "latest_usage_at": self.latest_at.map(|time| time.to_rfc3339()),
-            "by_day": self.by_day
-                .iter()
-                .map(|(date, day)| json!({
-                    "date": date,
-                    "tokens": day.tokens,
-                    "cost_usd": day.cost_usd,
-                    "rows": day.rows,
-                }))
-                .collect::<Vec<_>>(),
+            "by_day": daily_cost_rows(&self.by_day),
         })
-    }
-
-    fn cost_on(&self, date_key: String) -> f64 {
-        self.by_day
-            .get(&date_key)
-            .map(|day| day.cost_usd)
-            .unwrap_or_default()
-    }
-
-    fn tokens_on(&self, date_key: String) -> u64 {
-        self.by_day
-            .get(&date_key)
-            .map(|day| day.tokens)
-            .unwrap_or_default()
-    }
-
-    fn lookback_cost_usd(&self, now: DateTime<Local>) -> f64 {
-        self.by_day
-            .iter()
-            .filter(|(date, _)| date_in_lookback(date, now))
-            .map(|(_, day)| day.cost_usd)
-            .sum()
-    }
-
-    fn lookback_tokens(&self, now: DateTime<Local>) -> u64 {
-        self.by_day
-            .iter()
-            .filter(|(date, _)| date_in_lookback(date, now))
-            .map(|(_, day)| day.tokens)
-            .sum()
     }
 }
 
@@ -165,9 +127,10 @@ pub(super) fn usage_history_report_from_rows(
     for row in rows {
         let day = report
             .by_day
-            .entry(local_date_key(row.created_at.with_timezone(&Local)))
+            .entry(row.created_at.with_timezone(&Local).date_naive())
             .or_default();
         day.tokens = day.tokens.saturating_add(row.tokens);
+        day.priced_tokens = day.priced_tokens.saturating_add(row.tokens);
         day.cost_usd += row.cost_usd;
         day.rows = day.rows.saturating_add(1);
         report.total_tokens = report.total_tokens.saturating_add(row.tokens);
@@ -211,7 +174,7 @@ pub(super) fn local_usage_history_report(
         }
         let day = report
             .by_day
-            .entry(local_date_key(row.created_at.with_timezone(&Local)))
+            .entry(row.created_at.with_timezone(&Local).date_naive())
             .or_default();
         day.cost_usd += row.cost;
         day.rows = day.rows.saturating_add(1);
@@ -232,38 +195,43 @@ pub(super) fn usage_history_windows(
     now: DateTime<Utc>,
 ) -> Vec<UsageWindow> {
     let local_now = now.with_timezone(&Local);
-    let today_cost = report.cost_on(local_date_key(local_now));
-    let today_tokens = report.tokens_on(local_date_key(local_now));
-    let lookback_cost = report.lookback_cost_usd(local_now);
-    let lookback_tokens = report.lookback_tokens(local_now);
+    let rollup = DailyRollup::from_days(
+        &report.by_day,
+        local_now.date_naive(),
+        COST_LOOKBACK_DAYS as u64,
+    );
+    let today_cost = rollup.today.cost_usd;
+    let today_tokens = rollup.today.tokens;
+    let lookback_cost = rollup.lookback.cost_usd;
+    let lookback_tokens = rollup.lookback.tokens;
     let display_name = provider_display_name(provider_id);
     let mut windows = Vec::new();
     if today_cost > 0.0 {
-        windows.push(spend_window(
-            &format!("{provider_id}_spend_today"),
-            &format!("{display_name} spend today"),
+        windows.push(cost_window(
+            format!("{provider_id}_spend_today"),
+            format!("{display_name} spend today"),
             today_cost,
         ));
     }
     if today_tokens > 0 {
-        windows.push(token_usage_window(
-            &format!("{provider_id}_tokens_today"),
-            &format!("{display_name} tokens today"),
+        windows.push(token_window(
+            format!("{provider_id}_tokens_today"),
+            format!("{display_name} tokens today"),
             today_tokens,
             UsageWindowKind::Daily,
         ));
     }
     if lookback_cost > 0.0 {
-        windows.push(spend_window(
-            &format!("{provider_id}_spend_30d"),
-            &format!("{display_name} spend 30 days"),
+        windows.push(cost_window(
+            format!("{provider_id}_spend_30d"),
+            format!("{display_name} spend 30 days"),
             lookback_cost,
         ));
     }
     if lookback_tokens > 0 {
-        windows.push(token_usage_window(
-            &format!("{provider_id}_tokens_30d"),
-            &format!("{display_name} tokens 30 days"),
+        windows.push(token_window(
+            format!("{provider_id}_tokens_30d"),
+            format!("{display_name} tokens 30 days"),
             lookback_tokens,
             UsageWindowKind::Monthly,
         ));
@@ -271,58 +239,6 @@ pub(super) fn usage_history_windows(
     windows
 }
 
-fn spend_window(window_id: &str, label: &str, value: f64) -> UsageWindow {
-    UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind: UsageWindowKind::Credits,
-        used: Some(UsageAmount {
-            value,
-            unit: UsageUnit::Usd,
-        }),
-        limit: None,
-        remaining: None,
-        percent_used: None,
-        percent_remaining: None,
-        reset_at: None,
-    }
-}
-
-fn token_usage_window(
-    window_id: &str,
-    label: &str,
-    value: u64,
-    kind: UsageWindowKind,
-) -> UsageWindow {
-    UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind,
-        used: Some(UsageAmount {
-            value: value as f64,
-            unit: UsageUnit::Tokens,
-        }),
-        limit: None,
-        remaining: None,
-        percent_used: None,
-        percent_remaining: None,
-        reset_at: None,
-    }
-}
-
-fn local_date_key(time: DateTime<Local>) -> String {
-    time.date_naive().to_string()
-}
-
 pub(super) fn usage_history_lookback_start(now: DateTime<Local>) -> chrono::NaiveDate {
-    now.date_naive() - TimeDelta::days(COST_LOOKBACK_DAYS - 1)
-}
-
-fn date_in_lookback(date: &str, now: DateTime<Local>) -> bool {
-    let Ok(date) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
-        return false;
-    };
-    let today = now.date_naive();
-    let start = usage_history_lookback_start(now);
-    date >= start && date <= today
+    lookback_start(now.date_naive(), COST_LOOKBACK_DAYS as u64)
 }

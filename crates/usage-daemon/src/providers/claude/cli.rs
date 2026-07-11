@@ -16,7 +16,10 @@ use tracing::{debug, warn};
 use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
 use wait_timeout::ChildExt;
 
-use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{
+    local_usage::{stable_window_fragment, usage_kind_from_name},
+    ProviderError, ProviderErrorKind, ProviderUsage,
+};
 
 use super::{CLAUDE_CLI_COLLECTION_MODE, PROVIDER_ID};
 
@@ -559,40 +562,12 @@ fn local_datetime(
         .earliest()
 }
 
-fn usage_kind_from_name(name: &str) -> UsageWindowKind {
-    let name = name.to_ascii_lowercase();
-    if name.contains("session") || name.contains("hour") {
-        UsageWindowKind::Session
-    } else if name.contains("daily") || name.contains("day") {
-        UsageWindowKind::Daily
-    } else if name.contains("weekly") || name.contains("week") {
-        UsageWindowKind::Weekly
-    } else if name.contains("monthly") || name.contains("month") {
-        UsageWindowKind::Monthly
-    } else {
-        UsageWindowKind::Other(name)
-    }
-}
-
 fn claude_label(value: &str) -> String {
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
         return "Claude".to_string();
     };
     format!("Claude {}{}", first.to_ascii_lowercase(), chars.as_str())
-}
-
-fn stable_window_fragment(value: &str) -> String {
-    value
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() {
-                char.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -8,7 +8,9 @@ use usage_core::{ProviderId, UsageSnapshot, UsageWindow};
 
 pub mod claude;
 pub mod codex;
+pub(crate) mod local_usage;
 pub mod opencode;
+pub(crate) mod paths;
 
 pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -51,6 +53,27 @@ pub async fn read_response_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Parses the standard `Retry-After` response header as either delta seconds or
+/// an HTTP date. Invalid or past values are ignored instead of extending a
+/// provider outage indefinitely.
+pub fn retry_after_deadline(headers: &reqwest::header::HeaderMap) -> Option<DateTime<Utc>> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        let seconds = i64::try_from(seconds).ok()?;
+        return Utc::now().checked_add_signed(chrono::TimeDelta::seconds(seconds));
+    }
+
+    let deadline = DateTime::parse_from_rfc2822(value)
+        .or_else(|_| DateTime::parse_from_rfc3339(value))
+        .ok()?
+        .with_timezone(&Utc);
+    (deadline > Utc::now()).then_some(deadline)
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +164,7 @@ impl ProviderErrorKind {
 pub struct ProviderError {
     kind: ProviderErrorKind,
     message: String,
+    retry_at: Option<DateTime<Utc>>,
 }
 
 impl ProviderError {
@@ -148,7 +172,13 @@ impl ProviderError {
         Self {
             kind,
             message: message.into(),
+            retry_at: None,
         }
+    }
+
+    pub fn with_retry_at(mut self, retry_at: Option<DateTime<Utc>>) -> Self {
+        self.retry_at = retry_at;
+        self
     }
 
     pub fn kind(&self) -> ProviderErrorKind {
@@ -157,5 +187,24 @@ impl ProviderError {
 
     pub fn short_message(&self) -> &str {
         &self.message
+    }
+
+    pub fn retry_at(&self) -> Option<DateTime<Utc>> {
+        self.retry_at
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[test]
+    fn parses_retry_after_delta_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        let before = Utc::now() + chrono::TimeDelta::seconds(119);
+        let after = Utc::now() + chrono::TimeDelta::seconds(121);
+        let deadline = retry_after_deadline(&headers).unwrap();
+        assert!(deadline >= before && deadline <= after);
     }
 }

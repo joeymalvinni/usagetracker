@@ -11,4 +11,4 @@ pub use admin::{
 };
 pub use status::{render_status, StatusView};
 pub(crate) use style::output_width;
-pub use usage::render_usage;
+pub use usage::{render_usage_with_summary, UsageRenderOptions};

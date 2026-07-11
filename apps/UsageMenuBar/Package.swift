@@ -8,6 +8,10 @@ let package = Package(
         .executableTarget(
             name: "UsageMenuBar",
             resources: [.copy("Resources")]
+        ),
+        .testTarget(
+            name: "UsageMenuBarTests",
+            dependencies: ["UsageMenuBar"]
         )
     ]
 )
