@@ -217,7 +217,10 @@ struct DashboardBuilder {
             id: providerId,
             providerId: providerId,
             accountId: nil,
-            name: singleAccount?.name ?? pretty(providerId),
+            // A provider group always represents the provider, even when it has
+            // only one account. Keep the account's editable label in `account`
+            // so navigation and headings do not change when that label changes.
+            name: pretty(providerId),
             short: short(providerId),
             symbol: symbol(providerId),
             primary: primary,
