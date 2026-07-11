@@ -40,6 +40,14 @@ import UserNotifications
 
     func applicationDidFinishLaunching(_ note: Notification) {
         UNUserNotificationCenter.current().delegate = self
+        state.$ui
+            .map(\.darkModeEnabled)
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] enabled in
+                self?.applyAppearance(darkModeEnabled: enabled)
+            }
+            .store(in: &bag)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configureStatusButton()
 
@@ -130,8 +138,21 @@ import UserNotifications
 
     private func configurePopoverWindow() {
         guard let window = popover.contentViewController?.view.window else { return }
+        window.appearance = appearance(darkModeEnabled: state.ui.darkModeEnabled)
         window.isOpaque = false
         window.backgroundColor = .clear
+    }
+
+    private func applyAppearance(darkModeEnabled: Bool) {
+        let appearance = appearance(darkModeEnabled: darkModeEnabled)
+        NSApp.appearance = appearance
+        popover.appearance = appearance
+        popover.contentViewController?.view.appearance = appearance
+        popover.contentViewController?.view.window?.appearance = appearance
+    }
+
+    private func appearance(darkModeEnabled: Bool) -> NSAppearance? {
+        NSAppearance(named: darkModeEnabled ? .darkAqua : .aqua)
     }
 
     private func showContextMenu(with event: NSEvent, relativeTo button: NSStatusBarButton) {
@@ -458,8 +479,13 @@ private final class GlassPopoverHostingController<Content: View>: NSViewControll
             glass.cornerRadius = Theme.Radius.xl
             glass.clipsToBounds = true
             // Enough body that text stays readable over arbitrary desktops,
-            // low enough that the glass still reads as glass.
-            glass.tintColor = NSColor.windowBackgroundColor.withAlphaComponent(0.55)
+            // low enough that the glass still reads as glass. Dark mode carries
+            // a heavier tint: a bright wallpaper bleeds through the lighter
+            // light-mode value and washes the dark UI out to a muddy grey.
+            glass.tintColor = NSColor(name: "GlassShellTint") { appearance in
+                let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                return NSColor.windowBackgroundColor.withAlphaComponent(isDark ? 0.72 : 0.55)
+            }
             glass.contentView = host
             view = glass
         } else {

@@ -17,6 +17,7 @@ struct Popover: View {
             }
         }
         .frame(width: Theme.Popover.width, height: Theme.Popover.height)
+        .preferredColorScheme(state.ui.darkModeEnabled ? .dark : .light)
     }
 
     private var mainContent: some View {

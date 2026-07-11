@@ -70,6 +70,10 @@ struct Settings: View {
 
                     sectionTitle("General")
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                        LabeledContent("Dark mode") {
+                            Toggle("", isOn: darkModeBinding)
+                                .labelsHidden()
+                        }
                         LabeledContent {
                             if state.pendingNotifications {
                                 ProgressView().controlSize(.small)
@@ -189,6 +193,13 @@ struct Settings: View {
         Binding(
             get: { state.config?.notifications.enabled ?? true },
             set: { enabled in Task { await state.setNotificationsEnabled(enabled) } }
+        )
+    }
+
+    private var darkModeBinding: Binding<Bool> {
+        Binding(
+            get: { state.ui.darkModeEnabled },
+            set: { state.ui.darkModeEnabled = $0 }
         )
     }
 

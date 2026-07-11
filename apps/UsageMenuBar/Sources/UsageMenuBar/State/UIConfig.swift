@@ -33,6 +33,7 @@ struct UIConfig: Codable, Equatable {
     var showProviderLabels = true
     var maxMenuProviders = 2
     var colorByStatus = true
+    var darkModeEnabled = false
     var onboardingCompleted = false
     /// Alert signatures the user has seen (viewed the account). Clears the rail/chip dot.
     var seenAlerts = Set<String>()
@@ -50,6 +51,7 @@ struct UIConfig: Codable, Equatable {
         showProviderLabels = try c.decodeIfPresent(Bool.self, forKey: .showProviderLabels) ?? true
         maxMenuProviders = try c.decodeIfPresent(Int.self, forKey: .maxMenuProviders) ?? 2
         colorByStatus = try c.decodeIfPresent(Bool.self, forKey: .colorByStatus) ?? true
+        darkModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .darkModeEnabled) ?? false
         // Existing beta users should not be interrupted; newly created configs keep false.
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
