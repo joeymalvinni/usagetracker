@@ -238,8 +238,13 @@ impl DaemonRuntime {
         let collectors = build_providers(&updated_config, &self.storage).await?;
         let notifications_reenabled =
             !config.notifications.enabled && updated_config.notifications.enabled;
+        let notifications_disabled =
+            config.notifications.enabled && !updated_config.notifications.enabled;
         if notifications_reenabled {
             self.storage.clear_notification_window_state().await?;
+        }
+        if notifications_disabled {
+            self.storage.clear_pending_notifications().await?;
         }
         updated_config.persist()?;
         *config = updated_config;

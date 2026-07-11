@@ -1,9 +1,6 @@
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use chrono::{DateTime, Utc};
@@ -12,7 +9,6 @@ use usage_core::{Account, UsageSnapshot, UsageWindow};
 
 use crate::storage::{NotificationWindowState, Storage};
 
-const RETRY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const REARM_HYSTERESIS: f64 = 1.0;
 const LEVELS: [(f64, u8); 5] = [(50.0, 1), (25.0, 2), (10.0, 4), (5.0, 8), (0.0, 16)];
 
@@ -22,47 +18,16 @@ pub struct DesktopNotification {
     pub body: String,
 }
 
-pub trait NotificationSender: Send + Sync {
-    fn send(&self, notification: &DesktopNotification) -> anyhow::Result<()>;
-}
-
-pub struct NativeNotificationSender;
-
-impl NotificationSender for NativeNotificationSender {
-    fn send(&self, notification: &DesktopNotification) -> anyhow::Result<()> {
-        #[cfg(target_os = "macos")]
-        if !notify_rust::request_auth_blocking()? {
-            anyhow::bail!("notification permission was not granted");
-        }
-        notify_rust::Notification::new()
-            .appname("Usage Tracker")
-            .summary(&notification.title)
-            .body(&notification.body)
-            .show()?;
-        Ok(())
-    }
-}
-
 pub struct NotificationManager {
     storage: Storage,
     enabled: AtomicBool,
-    sender: Arc<dyn NotificationSender>,
 }
 
 impl NotificationManager {
     pub fn new(storage: Storage, enabled: bool) -> Arc<Self> {
-        Self::with_sender(storage, enabled, Arc::new(NativeNotificationSender))
-    }
-
-    fn with_sender(
-        storage: Storage,
-        enabled: bool,
-        sender: Arc<dyn NotificationSender>,
-    ) -> Arc<Self> {
         Arc::new(Self {
             storage,
             enabled: AtomicBool::new(enabled),
-            sender,
         })
     }
 
@@ -125,38 +90,21 @@ impl NotificationManager {
 
         let crossed_mask = crossed_mask(percent);
         let new_crossings = crossed_mask & !state.notified_mask;
-        let cooling_down = state.last_attempt_at.is_some_and(|attempt| {
-            now.signed_duration_since(attempt)
-                .to_std()
-                .is_ok_and(|elapsed| elapsed < RETRY_COOLDOWN)
-        });
-
-        if new_crossings != 0 && !cooling_down {
+        if new_crossings != 0 {
             let threshold = most_severe_threshold(new_crossings);
             let notification = notification_content(account, snapshot, window, percent, threshold);
-            let sender = self.sender.clone();
-            let send_result =
-                tokio::task::spawn_blocking(move || sender.send(&notification)).await?;
+            self.storage
+                .enqueue_notification(&notification.title, &notification.body)
+                .await?;
             state.last_attempt_at = Some(now);
-            match send_result {
-                Ok(()) => {
-                    state.notified_mask |= crossed_mask;
-                    debug!(
-                        provider_id = snapshot.provider_id.as_str(),
-                        account_id = account.id.as_str(),
-                        window_id = window.window_id,
-                        threshold,
-                        "usage notification delivered"
-                    );
-                }
-                Err(err) => warn!(
-                    provider_id = snapshot.provider_id.as_str(),
-                    account_id = account.id.as_str(),
-                    window_id = window.window_id,
-                    error = %err,
-                    "desktop notification delivery failed"
-                ),
-            }
+            state.notified_mask |= crossed_mask;
+            debug!(
+                provider_id = snapshot.provider_id.as_str(),
+                account_id = account.id.as_str(),
+                window_id = window.window_id,
+                threshold,
+                "usage notification queued"
+            );
         }
 
         state.last_percent = percent;
@@ -256,28 +204,7 @@ fn format_reset(reset_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use chrono::TimeDelta;
-    use std::sync::Mutex;
     use usage_core::{AccountDisplayNameSource, AccountId, ProviderId, UsageWindowKind};
-
-    #[derive(Default)]
-    struct RecordingSender(Mutex<Vec<DesktopNotification>>);
-
-    impl NotificationSender for RecordingSender {
-        fn send(&self, notification: &DesktopNotification) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(notification.clone());
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct FailingSender(Mutex<usize>);
-
-    impl NotificationSender for FailingSender {
-        fn send(&self, _notification: &DesktopNotification) -> anyhow::Result<()> {
-            *self.0.lock().unwrap() += 1;
-            anyhow::bail!("notifications unavailable")
-        }
-    }
 
     #[test]
     fn selects_only_the_most_severe_crossed_threshold() {
@@ -291,16 +218,15 @@ mod tests {
     async fn first_low_sample_alerts_once_and_restart_state_deduplicates() {
         let storage = test_storage();
         let account = insert_account(&storage, &test_account()).await;
-        let sender = Arc::new(RecordingSender::default());
-        let manager = NotificationManager::with_sender(storage.clone(), true, sender.clone());
+        let manager = NotificationManager::new(storage.clone(), true);
         let snapshot = test_snapshot(4.0, Utc::now() + TimeDelta::hours(2));
 
         manager.process_snapshot(&account, &snapshot).await;
         manager.process_snapshot(&account, &snapshot).await;
-        let restarted = NotificationManager::with_sender(storage, true, sender.clone());
+        let restarted = NotificationManager::new(storage.clone(), true);
         restarted.process_snapshot(&account, &snapshot).await;
 
-        let notifications = sender.0.lock().unwrap();
+        let notifications = storage.pending_notifications().await.unwrap();
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0].title.contains("usage is low"));
         assert!(notifications[0].body.contains("4% remaining"));
@@ -310,8 +236,7 @@ mod tests {
     async fn reset_rearms_thresholds() {
         let storage = test_storage();
         let account = insert_account(&storage, &test_account()).await;
-        let sender = Arc::new(RecordingSender::default());
-        let manager = NotificationManager::with_sender(storage, true, sender.clone());
+        let manager = NotificationManager::new(storage.clone(), true);
         let first_reset = Utc::now() + TimeDelta::hours(2);
         manager
             .process_snapshot(&account, &test_snapshot(24.0, first_reset))
@@ -328,36 +253,31 @@ mod tests {
                 &test_snapshot(24.0, first_reset + TimeDelta::days(7)),
             )
             .await;
-        assert_eq!(sender.0.lock().unwrap().len(), 2);
+        assert_eq!(storage.pending_notifications().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn delivery_failure_uses_retry_cooldown_without_marking_crossed() {
+    async fn acknowledged_notifications_are_removed_from_queue() {
         let storage = test_storage();
         let account = insert_account(&storage, &test_account()).await;
-        let sender = Arc::new(FailingSender::default());
-        let manager = NotificationManager::with_sender(storage.clone(), true, sender.clone());
+        let manager = NotificationManager::new(storage.clone(), true);
         let snapshot = test_snapshot(10.0, Utc::now() + TimeDelta::hours(2));
 
         manager.process_snapshot(&account, &snapshot).await;
-        manager.process_snapshot(&account, &snapshot).await;
-
-        assert_eq!(*sender.0.lock().unwrap(), 1);
-        let state = storage
-            .notification_window_state(&account.id, "weekly")
+        let pending = storage.pending_notifications().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        storage
+            .acknowledge_notifications(&[pending[0].id])
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(state.notified_mask, 0);
-        assert!(state.last_attempt_at.is_some());
+        assert!(storage.pending_notifications().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn disabled_manager_does_not_send_or_initialize_state() {
         let storage = test_storage();
         let account = insert_account(&storage, &test_account()).await;
-        let sender = Arc::new(RecordingSender::default());
-        let manager = NotificationManager::with_sender(storage.clone(), false, sender.clone());
+        let manager = NotificationManager::new(storage.clone(), false);
 
         manager
             .process_snapshot(
@@ -366,7 +286,7 @@ mod tests {
             )
             .await;
 
-        assert!(sender.0.lock().unwrap().is_empty());
+        assert!(storage.pending_notifications().await.unwrap().is_empty());
         assert!(storage
             .notification_window_state(&account.id, "weekly")
             .await

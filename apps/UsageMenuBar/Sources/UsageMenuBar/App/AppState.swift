@@ -166,6 +166,9 @@ struct DerivedState: Equatable {
             }
             actionError = nil
             build()
+            if enabled {
+                await deliverPendingNotifications()
+            }
         } catch {
             actionError = describe(error)
         }
@@ -511,6 +514,7 @@ struct DerivedState: Equatable {
             await refreshNotificationAuthorization()
             if config?.notifications.enabled == true {
                 await requestNotificationAuthorizationIfNeeded()
+                await deliverPendingNotifications()
             }
         } catch {
             if allowDaemonStart, await daemonSupervisor.ensureRunning(socketPath: socketPath) {
@@ -518,6 +522,35 @@ struct DerivedState: Equatable {
             } else {
                 fail(error); build()
             }
+        }
+    }
+    private func deliverPendingNotifications() async {
+        guard notificationAuthorization == .authorized || notificationAuthorization == .provisional else { return }
+        do {
+            let pending = try await client.pendingNotifications()
+            var delivered = [Int64]()
+            for notification in pending {
+                let content = UNMutableNotificationContent()
+                content.title = notification.title
+                content.body = notification.body
+                content.sound = .default
+                let request = UNNotificationRequest(
+                    identifier: "usage-alert-\(notification.id)",
+                    content: content,
+                    trigger: nil
+                )
+                do {
+                    try await UNUserNotificationCenter.current().add(request)
+                    delivered.append(notification.id)
+                } catch {
+                    actionError = "Could not deliver a usage alert: \(describe(error))"
+                }
+            }
+            if !delivered.isEmpty {
+                try await client.acknowledgeNotifications(delivered)
+            }
+        } catch {
+            actionError = "Could not load usage alerts: \(describe(error))"
         }
     }
     private func hasUnknownAccountReferences() -> Bool {

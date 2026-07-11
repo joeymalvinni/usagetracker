@@ -15,6 +15,10 @@ pub enum ApiRequest {
     GetProviderHealth,
     GetAccounts,
     GetConfig,
+    GetPendingNotifications,
+    AcknowledgeNotifications {
+        ids: Vec<i64>,
+    },
     UpdateConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         poll_interval_seconds: Option<u64>,
@@ -104,6 +108,12 @@ pub enum ApiResponse {
     Config {
         config: ConfigResponse,
     },
+    PendingNotifications {
+        notifications: Vec<PendingNotification>,
+    },
+    NotificationsAcknowledged {
+        ids: Vec<i64>,
+    },
     AddProviderAccount {
         account: AddProviderAccountResponse,
     },
@@ -190,6 +200,14 @@ pub struct ConfigResponse {
     pub enabled_providers: Vec<ProviderId>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderToggle>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PendingNotification {
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

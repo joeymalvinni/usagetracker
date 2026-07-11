@@ -226,6 +226,18 @@ impl SocketServer {
                 Ok(config) => ApiResponse::Config { config },
                 Err(err) => storage_error(err),
             },
+            ApiRequest::GetPendingNotifications => {
+                match self.runtime.storage.pending_notifications().await {
+                    Ok(notifications) => ApiResponse::PendingNotifications { notifications },
+                    Err(err) => storage_error(err),
+                }
+            }
+            ApiRequest::AcknowledgeNotifications { ids } => {
+                match self.runtime.storage.acknowledge_notifications(&ids).await {
+                    Ok(()) => ApiResponse::NotificationsAcknowledged { ids },
+                    Err(err) => storage_error(err),
+                }
+            }
             ApiRequest::UpdateConfig {
                 poll_interval_seconds,
                 providers,
@@ -581,6 +593,8 @@ fn response_summary(response: &ApiResponse) -> &'static str {
         ApiResponse::ProviderHealth { .. } => "provider_health",
         ApiResponse::Accounts { .. } => "accounts",
         ApiResponse::Config { .. } => "config",
+        ApiResponse::PendingNotifications { .. } => "pending_notifications",
+        ApiResponse::NotificationsAcknowledged { .. } => "notifications_acknowledged",
         ApiResponse::AddProviderAccount { .. } => "add_provider_account",
         ApiResponse::Account { .. } => "account",
         ApiResponse::AccountDeleted { .. } => "account_deleted",
@@ -746,6 +760,57 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn serves_and_acknowledges_pending_notifications_over_socket() {
+        let env = test_env(BTreeMap::new());
+        env.runtime
+            .storage
+            .enqueue_notification("Usage low", "5% remaining")
+            .await
+            .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+
+        wait_for_socket(&env.socket_path).await;
+        let response = request_line(
+            &env.socket_path,
+            r#"{"method":"get_pending_notifications"}"#,
+        )
+        .await;
+        let ApiResponse::PendingNotifications { notifications } = response else {
+            panic!("unexpected response")
+        };
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].title, "Usage low");
+
+        let response = request_line(
+            &env.socket_path,
+            &format!(
+                r#"{{"method":"acknowledge_notifications","ids":[{}]}}"#,
+                notifications[0].id
+            ),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            ApiResponse::NotificationsAcknowledged { .. }
+        ));
+        assert!(env
+            .runtime
+            .storage
+            .pending_notifications()
+            .await
+            .unwrap()
+            .is_empty());
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);
