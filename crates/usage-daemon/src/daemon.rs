@@ -19,6 +19,7 @@ use usage_core::{
 
 use crate::{
     config::{Config, ProviderConfig, ProviderProfileConfig},
+    fixtures::{self, FixtureScenario},
     health, local_logs,
     notifications::NotificationManager,
     polling::RefreshCoordinator,
@@ -45,6 +46,7 @@ pub struct DaemonRuntime {
     pub refresh: Arc<RefreshCoordinator>,
     notifications: Arc<NotificationManager>,
     poll_interval_tx: watch::Sender<u64>,
+    fixture_mode: bool,
 }
 
 struct ProviderRegistration {
@@ -104,6 +106,23 @@ impl Daemon {
         })
     }
 
+    pub async fn new_fixture(config: Config, scenario: FixtureScenario) -> anyhow::Result<Self> {
+        let storage = Storage::open(&config.paths.db)?;
+        fixtures::seed(&storage, scenario).await?;
+        let notifications = NotificationManager::new(storage.clone(), true);
+        let refresh = Arc::new(RefreshCoordinator::with_notifications(
+            storage.clone(),
+            Vec::new(),
+            notifications,
+        ));
+        let (runtime, poll_interval_rx) =
+            DaemonRuntime::new_with_fixture_mode(config, storage, refresh, true);
+        Ok(Self {
+            runtime,
+            poll_interval_rx,
+        })
+    }
+
     pub async fn run(self) -> anyhow::Result<()> {
         let socket_path = self.runtime.config.read().await.paths.socket.clone();
         prepare_socket_path(&socket_path)?;
@@ -116,17 +135,23 @@ impl Daemon {
         };
 
         let mut poll_task = spawn_polling_loop(self.poll_interval_rx, self.runtime.refresh.clone());
-        let claude_config = self
-            .runtime
-            .config
-            .read()
-            .await
-            .providers
-            .get(CLAUDE_PROVIDER_ID)
-            .cloned()
-            .unwrap_or_default();
-        let local_log_task =
-            local_logs::spawn_change_log_loop(self.runtime.refresh.clone(), claude_config);
+        let local_log_task = if self.runtime.fixture_mode {
+            None
+        } else {
+            let claude_config = self
+                .runtime
+                .config
+                .read()
+                .await
+                .providers
+                .get(CLAUDE_PROVIDER_ID)
+                .cloned()
+                .unwrap_or_default();
+            Some(local_logs::spawn_change_log_loop(
+                self.runtime.refresh.clone(),
+                claude_config,
+            ))
+        };
 
         let outcome = tokio::select! {
             signal = shutdown_signal() => {
@@ -151,10 +176,14 @@ impl Daemon {
 
         server_task.abort();
         poll_task.abort();
-        local_log_task.abort();
+        if let Some(task) = &local_log_task {
+            task.abort();
+        }
         let _ = server_task.await;
         let _ = poll_task.await;
-        let _ = local_log_task.await;
+        if let Some(task) = local_log_task {
+            let _ = task.await;
+        }
         if let Err(err) = std::fs::remove_file(&socket_path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(error = %err, "failed to remove socket file");
@@ -178,6 +207,15 @@ impl DaemonRuntime {
         storage: Storage,
         refresh: Arc<RefreshCoordinator>,
     ) -> (Arc<Self>, watch::Receiver<u64>) {
+        Self::new_with_fixture_mode(config, storage, refresh, false)
+    }
+
+    fn new_with_fixture_mode(
+        config: Config,
+        storage: Storage,
+        refresh: Arc<RefreshCoordinator>,
+        fixture_mode: bool,
+    ) -> (Arc<Self>, watch::Receiver<u64>) {
         let notifications = refresh.notification_manager();
         notifications.set_enabled(config.notifications.enabled);
         let (poll_interval_tx, poll_interval_rx) = watch::channel(config.poll_interval_seconds);
@@ -187,6 +225,7 @@ impl DaemonRuntime {
             refresh,
             notifications,
             poll_interval_tx,
+            fixture_mode,
         });
         (runtime, poll_interval_rx)
     }
@@ -216,6 +255,17 @@ impl DaemonRuntime {
                 .map(|id| id.as_str().to_string()),
         );
         Ok(providers)
+    }
+
+    async fn collectors_for_config(
+        &self,
+        config: &Config,
+    ) -> anyhow::Result<Vec<Arc<dyn ProviderCollector>>> {
+        if self.fixture_mode {
+            Ok(Vec::new())
+        } else {
+            build_providers(config, &self.storage).await
+        }
     }
 
     pub async fn update_config(
@@ -248,7 +298,7 @@ impl DaemonRuntime {
         updated_config.apply_update(poll_interval_seconds, providers.as_ref(), notifications)?;
 
         let collectors = if changes.providers {
-            Some(build_providers(&updated_config, &self.storage).await?)
+            Some(self.collectors_for_config(&updated_config).await?)
         } else {
             None
         };
@@ -297,6 +347,9 @@ impl DaemonRuntime {
         provider_id: ProviderId,
         display_name: Option<String>,
     ) -> anyhow::Result<AddProviderAccountResponse> {
+        if self.fixture_mode {
+            anyhow::bail!("account sign-in is unavailable in development fixture mode");
+        }
         let display_name = display_name
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
@@ -338,7 +391,7 @@ impl DaemonRuntime {
                 (profile_id, profile_path, display_name)
             };
 
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
@@ -394,7 +447,7 @@ impl DaemonRuntime {
             create_managed_claude_profile(provider, display_name.clone())?
         };
 
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
@@ -542,7 +595,7 @@ impl DaemonRuntime {
             }
         }
 
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
@@ -600,7 +653,7 @@ impl DaemonRuntime {
         if !changed {
             return Ok(());
         }
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
@@ -692,7 +745,7 @@ impl DaemonRuntime {
             .entry(OPENCODE_GO_PROVIDER_ID.to_string())
             .or_default()
             .workspace_id = workspace_id;
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;
@@ -705,6 +758,9 @@ impl DaemonRuntime {
         provider_id: ProviderId,
         account_id: Option<AccountId>,
     ) -> anyhow::Result<ProviderActionResponse> {
+        if self.fixture_mode {
+            anyhow::bail!("provider repair is unavailable in development fixture mode");
+        }
         ensure_supported_provider(&provider_id)?;
         let message = match provider_id.as_str() {
             CODEX_PROVIDER_ID => {
@@ -778,6 +834,9 @@ impl DaemonRuntime {
         &self,
         account_id: AccountId,
     ) -> anyhow::Result<ProviderActionResponse> {
+        if self.fixture_mode {
+            anyhow::bail!("provider launch is unavailable in development fixture mode");
+        }
         let account = self
             .storage
             .account(&account_id)
@@ -851,7 +910,7 @@ impl DaemonRuntime {
         provider.enabled = true;
         let target = ensure_claude_login_profile(provider, requested_profile_id.as_deref())?;
 
-        let collectors = build_providers(&updated_config, &self.storage).await?;
+        let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
         *config = updated_config;
         self.refresh.set_providers(collectors).await;

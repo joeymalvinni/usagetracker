@@ -1,7 +1,17 @@
 import Foundation
 
 enum UIPaths {
-    static let root = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".usagetracker")
+    static let root: URL = {
+        let environment = ProcessInfo.processInfo.environment
+        if let override = environment["USAGE_TRACKER_HOME"], !override.isEmpty {
+            return URL(fileURLWithPath: override).standardizedFileURL
+        }
+        let production = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".usagetracker")
+        if let fixture = environment["USAGE_TRACKER_FIXTURE"], !fixture.isEmpty {
+            return production.appending(path: "fixtures").appending(path: fixture)
+        }
+        return production
+    }()
     static let ui = root.appending(path: "ui")
     static let socket = root.appending(path: "usage.sock")
     static let config = ui.appending(path: "config.json")
@@ -45,6 +55,11 @@ struct UIConfig: Codable, Equatable {
     }
 
     static func load() -> Self {
+        if ProcessInfo.processInfo.environment["USAGE_TRACKER_FIXTURE"]?.isEmpty == false {
+            var config = Self()
+            config.onboardingCompleted = true
+            return config
+        }
         guard let data = try? Data(contentsOf: UIPaths.config),
               let config = try? JSONDecoder().decode(Self.self, from: data)
         else { return Self() }

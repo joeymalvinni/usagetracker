@@ -118,6 +118,23 @@ impl Config {
         db_override: Option<PathBuf>,
         socket_override: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        Self::load_inner(config_override, db_override, socket_override, true)
+    }
+
+    pub fn load_fixture(
+        config_override: Option<PathBuf>,
+        db_override: Option<PathBuf>,
+        socket_override: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        Self::load_inner(config_override, db_override, socket_override, false)
+    }
+
+    fn load_inner(
+        config_override: Option<PathBuf>,
+        db_override: Option<PathBuf>,
+        socket_override: Option<PathBuf>,
+        discover_local_activity_owners: bool,
+    ) -> anyhow::Result<Self> {
         let paths = default_paths()?;
         let config_path = config_override.unwrap_or(paths.config);
         let db_path = db_override.unwrap_or(paths.db);
@@ -125,8 +142,10 @@ impl Config {
 
         let mut file_config = read_or_create_config(&config_path)?;
         add_missing_default_providers(&mut file_config);
-        let assigned_codex_owner = assign_default_codex_activity_owner(&mut file_config);
-        let assigned_claude_owner = assign_default_claude_activity_owner(&mut file_config);
+        let assigned_codex_owner =
+            discover_local_activity_owners && assign_default_codex_activity_owner(&mut file_config);
+        let assigned_claude_owner = discover_local_activity_owners
+            && assign_default_claude_activity_owner(&mut file_config);
         if assigned_codex_owner || assigned_claude_owner {
             write_config_atomically(&config_path, &file_config)?;
         }

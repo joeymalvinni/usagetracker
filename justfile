@@ -3,6 +3,7 @@ set shell := ["zsh", "-cu"]
 app_dir := "apps/UsageMenuBar"
 dev_app_bundle := app_dir + "/.build/UsageMenuBar-dev.app"
 release_app_bundle := app_dir + "/.build/UsageMenuBar.app"
+fixture_home := justfile_directory() + "/.dev/fixture"
 
 # Show the available commands.
 default:
@@ -33,6 +34,10 @@ app-dev: build-app-dev
 # Build and launch the optimized macOS app bundle.
 app-release: build-app-release
     open -n {{release_app_bundle}}
+
+# Launch the app against a reset synthetic database (demo or notifications).
+fixture scenario="demo": build-app-dev
+    open -n --env USAGE_TRACKER_HOME="{{fixture_home}}" --env USAGE_TRACKER_FIXTURE="{{scenario}}" {{dev_app_bundle}}
 
 # Run the daemon in the foreground; pass daemon flags after the recipe name.
 daemon *args:

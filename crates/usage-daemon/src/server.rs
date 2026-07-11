@@ -764,6 +764,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_fixture_accounts_usage_and_notifications_over_socket() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let server_task = tokio::spawn({
+            let socket_path = env.socket_path.clone();
+            async move { server.run(&socket_path).await }
+        });
+        wait_for_socket(&env.socket_path).await;
+
+        let accounts = request_line(&env.socket_path, r#"{"method":"get_accounts"}"#).await;
+        let ApiResponse::Accounts { accounts } = accounts else {
+            panic!("unexpected accounts response")
+        };
+        assert_eq!(accounts.len(), 4);
+
+        let usage = request_line(&env.socket_path, r#"{"method":"get_usage"}"#).await;
+        let ApiResponse::Usage {
+            snapshots,
+            forecasts,
+        } = usage
+        else {
+            panic!("unexpected usage response")
+        };
+        assert_eq!(snapshots.len(), 4);
+        assert!(!forecasts.is_empty());
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot.metadata["codex_activity"]["by_day"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 30)
+        }));
+
+        let pending = request_line(
+            &env.socket_path,
+            r#"{"method":"get_pending_notifications"}"#,
+        )
+        .await;
+        let ApiResponse::PendingNotifications { notifications } = pending else {
+            panic!("unexpected notifications response")
+        };
+        assert!(notifications.len() >= 4);
+
+        server_task.abort();
+        let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
     async fn serves_and_acknowledges_pending_notifications_over_socket() {
         let env = test_env(BTreeMap::new());
         env.runtime

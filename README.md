@@ -80,6 +80,34 @@ The Swift menu bar app uses the same daemon socket by default and stores UI-only
 
 - `~/.usagetracker/ui/config.json`
 
+## Development fixtures
+
+Launch the real app and bundled daemon against a reset synthetic SQLite database:
+
+```sh
+just fixture                 # full dashboard, accounts, activity, costs, forecasts, and an error
+just fixture notifications   # low/exhausted windows plus queued desktop alerts
+```
+
+Fixture launches store every file under `.dev/fixture/`, including UI preferences, config, database,
+socket, and daemon log. They never read or replace `~/.usagetracker`. Each launch restarts the fixture
+daemon and regenerates relative timestamps, 30 days of activity, multiple accounts, provider health,
+quota history, and pending notifications. The Swift app still reads all of this through the production
+Unix-socket API; there are no mock branches in its views or view models.
+
+For terminal-only development, point any daemon and CLI process at an isolated home:
+
+```sh
+USAGE_TRACKER_HOME="$PWD/.dev/manual" USAGE_TRACKER_FIXTURE=demo \
+  cargo run -p usage-daemon
+
+USAGE_TRACKER_HOME="$PWD/.dev/manual" cargo run -p usage-cli -- status
+```
+
+Without `USAGE_TRACKER_HOME`, `--fixture demo` and `--fixture notifications` use isolated directories
+under `~/.usagetracker/fixtures/`; they do not use the production database. `USAGE_TRACKER_HOME` is a
+general development hook that redirects the config, database, socket, UI config, and daemon log together.
+
 The menu bar app's Settings page can change the polling interval, desktop usage alerts, and providers while the daemon is running; the daemon applies these immediately and persists them back to `config.json` through its `update_config` API.
 
 Desktop alerts are enabled by default. Each account and percentage-based usage window alerts once at 50%, 25%, 10%, 5%, and exhausted, with durable state preventing repeats after a daemon restart. macOS asks for notification permission on first launch. Production macOS builds must embed `usage-daemon` in the signed `UsageMenuBar.app` bundle (the supervisor looks in `Contents/MacOS`) so Notification Center can attribute and authorize it; an unbundled development daemon logs delivery failures without affecting usage collection.

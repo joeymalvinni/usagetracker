@@ -31,7 +31,12 @@ final class DaemonSupervisor {
 
             let process = Process()
             process.executableURL = executable
-            process.arguments = ["--foreground", "--socket-path", socketPath]
+            var arguments = ["--foreground", "--socket-path", socketPath]
+            if let fixture = ProcessInfo.processInfo.environment["USAGE_TRACKER_FIXTURE"],
+               !fixture.isEmpty {
+                arguments += ["--fixture", fixture]
+            }
+            process.arguments = arguments
             process.standardOutput = output
             process.standardError = output
             try process.run()
@@ -89,7 +94,11 @@ final class DaemonSupervisor {
     /// binaries equal, so compare the mapped device/inode/size reported by
     /// `lsof` with the executable currently embedded in this app bundle.
     private func shouldReplaceBundledDaemon(listeningOn socketPath: String) -> Bool {
-        guard ProcessInfo.processInfo.environment["USAGE_TRACKER_DAEMON"] == nil,
+        let environment = ProcessInfo.processInfo.environment
+        if environment["USAGE_TRACKER_FIXTURE"]?.isEmpty == false {
+            return true
+        }
+        guard environment["USAGE_TRACKER_DAEMON"] == nil,
               let bundled = bundledDaemonExecutable(),
               let expected = fileIdentity(at: bundled) else {
             return false
