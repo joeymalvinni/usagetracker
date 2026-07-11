@@ -1,4 +1,24 @@
+use std::io::{self, IsTerminal};
+
 use chrono::{DateTime, Local, Utc};
+
+/// Lower bound for the rendered box/table width.
+const MIN_WIDTH: usize = 60;
+/// Width used when stdout is not a terminal (pipes, redirects, tests).
+const DEFAULT_WIDTH: usize = 80;
+
+/// Effective rendering width: the terminal's column count when stdout is a
+/// TTY, otherwise a stable default. The result never exceeds `max_width`.
+pub(crate) fn output_width(max_width: usize) -> usize {
+    let width = if io::stdout().is_terminal() {
+        terminal_size::terminal_size()
+            .map(|(terminal_size::Width(cols), _)| cols as usize)
+            .unwrap_or(DEFAULT_WIDTH)
+    } else {
+        DEFAULT_WIDTH
+    };
+    width.clamp(MIN_WIDTH, max_width)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Theme {
@@ -91,6 +111,30 @@ pub(crate) fn format_local_time(time: Option<DateTime<Utc>>) -> String {
             .to_string()
     })
     .unwrap_or_else(|| "-".to_string())
+}
+
+/// Compact, human-friendly "time since" label ("just now", "3m ago", "2d
+/// ago"), falling back to an absolute date for anything older than a week.
+pub(crate) fn relative_time(time: DateTime<Utc>) -> String {
+    let delta = Utc::now() - time;
+    if delta.num_minutes() < 1 {
+        return "just now".to_string();
+    }
+    if delta.num_hours() < 1 {
+        return format!("{}m ago", delta.num_minutes());
+    }
+    if delta.num_days() < 1 {
+        return format!("{}h ago", delta.num_hours());
+    }
+    if delta.num_days() < 7 {
+        return format!("{}d ago", delta.num_days());
+    }
+    time.with_timezone(&Local).format("%b %-d").to_string()
+}
+
+/// `relative_time` for an optional timestamp, rendering `-` when absent.
+pub(crate) fn relative_time_opt(time: Option<DateTime<Utc>>) -> String {
+    time.map(relative_time).unwrap_or_else(|| "-".to_string())
 }
 
 pub(crate) fn format_provider_name(provider_id: &str) -> String {

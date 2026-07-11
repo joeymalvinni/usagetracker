@@ -4,38 +4,40 @@ local ai usage reports
 
 
 ```
-┌─ Overview ─────────────────────────────────────────────────┐
-│ Lifetime tokens  3.8B       Peak tokens    167.9M          │
-│ Longest task     n/a        Current streak 2 days          │
-│ Longest streak   8 days                                    │
-└────────────────────────────────────────────────────────────┘
+╭─ Overview ───────────────────────────────────────────────────────────────────╮
+│ Lifetime tokens  2.9B       Peak tokens    185.9M                            │
+│ Tracked spend    $1720.31   Current streak 18 days                           │
+│ Longest streak   18 days                                                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
 
-┌─ Activity · last 7 days ───────────────────────────────────┐
-│ Wed    1.6M  █░░░░░░░░░░░                                  │
-│ Thu   81.5M  ████████████                                  │
-│ Fri   30.9M  ████░░░░░░░░                                  │
-│ Sat    1.6M  █░░░░░░░░░░░                                  │
-│ Sun       0  ░░░░░░░░░░░░                                  │
-│ Mon  106.3K  █░░░░░░░░░░░                                  │
-│ Tue   84.1M  ████████████                                  │
-└────────────────────────────────────────────────────────────┘
+╭─ Activity · last 7 days ─────────────────────────────────────────────────────╮
+│ Sat    6.1M  █░░░░░░░░░░░░░░░░░░░░░░░░░░░                                    │
+│ Sun     14M  ██░░░░░░░░░░░░░░░░░░░░░░░░░░                                    │
+│ Mon    5.9M  █░░░░░░░░░░░░░░░░░░░░░░░░░░░                                    │
+│ Tue   55.3M  ████████░░░░░░░░░░░░░░░░░░░░                                    │
+│ Wed   48.4M  ███████░░░░░░░░░░░░░░░░░░░░░                                    │
+│ Thu  185.9M  ████████████████████████████                                    │
+│ Fri  141.4M  █████████████████████░░░░░░░                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
 
-┌─ Claude · web · Team ──────────────────────────────────────┐
-│ Session   80% left  ██████████░░  resets in 2h 1m          │
-│ Weekly   100% left  ████████████  resets in 6d 22h         │
-│ Pace     on track     0% used vs   1% expected             │
-│ Forecast lasts      until reset                            │
-│ Account  joey                                              │
-└────────────────────────────────────────────────────────────┘
+╭─ Claude · web · Team ───────────────────────────────────── alex@example.com ─╮
+│ Session   █████████████████████░░░░░░░   75%  ·  resets in 4h 14m            │
+│ Weekly    ████████████████████████░░░░   84%  ·  resets in 4d 2h             │
+│ Usage     11.1M today · 98.2M 30d                                            │
+│ Pace      under · 16% used vs 41% expected                                   │
+│ Updated   just now                                                           │
+╰──────────────────────────────────────────────────────────────────────────────╯
 
-┌─ Codex · openai-web · Pro Lite ────────────────────────────┐
-│ Session   82% left  ██████████░░  resets in 3h 20m         │
-│ Weekly    87% left  ██████████░░  resets in 6d 12h         │
-│ Pace     over        13% used vs   7% expected             │
-│ Forecast tight       before reset                          │
-│ Credits  0 left    empty                                   │
-│ Account  joeymalvinni@gmail.com                            │
-└────────────────────────────────────────────────────────────┘
+╭─ Codex · app-server · Team ─────────────────────────────── alex@example.com ─╮
+│ Session   ████████████████████████████   99%  ·  resets in 4h 57m            │
+│ Weekly    ████████████████████████████  100%  ·  resets in 6d 18h            │
+│ Usage     152.1K today · 2.4M 30d · 937.6M lifetime                          │
+│ Pace      on track · 0% used vs 3% expected                                  │
+│ Updated   2m ago                                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+Pass `--details` to add per-window sub-limits, credits, forecast, and identity to
+each panel; the box width follows your terminal.
 ```
 
 ## Usage
@@ -240,26 +242,43 @@ With the daemon running, use the CLI from another terminal:
 cargo run -p usage-cli --
 ```
 
-That default command is the same as `usage` / `status` and renders the latest stored usage dashboard.
+That default command is the same as `usage` and renders the latest stored usage dashboard.
 
 CLI commands:
 
 ```sh
 cargo run -p usage-cli -- status
 cargo run -p usage-cli -- usage
+cargo run -p usage-cli -- usage --provider codex --account ACCOUNT_ID
+cargo run -p usage-cli -- usage --details
+cargo run -p usage-cli -- usage --all-providers
+cargo run -p usage-cli -- --max-width 72
 cargo run -p usage-cli -- --color always
 cargo run -p usage-cli -- --style compact
 cargo run -p usage-cli -- --style json
 cargo run -p usage-cli -- refresh
 cargo run -p usage-cli -- refresh --provider codex
-cargo run -p usage-cli -- health
 cargo run -p usage-cli -- accounts
-cargo run -p usage-cli -- config
+cargo run -p usage-cli -- accounts list --verbose
+cargo run -p usage-cli -- accounts add codex --name Work
+cargo run -p usage-cli -- accounts rename ACCOUNT_ID "Work account"
+cargo run -p usage-cli -- accounts hide ACCOUNT_ID
+cargo run -p usage-cli -- accounts disable ACCOUNT_ID
+cargo run -p usage-cli -- accounts remove ACCOUNT_ID
+cargo run -p usage-cli -- accounts delete ACCOUNT_ID --yes
+cargo run -p usage-cli -- accounts launch ACCOUNT_ID
+cargo run -p usage-cli -- providers
+cargo run -p usage-cli -- providers enable claude
+cargo run -p usage-cli -- providers setup opencode_go
+cargo run -p usage-cli -- providers workspace opencode_go wrk_...
+cargo run -p usage-cli -- providers repair codex --account ACCOUNT_ID
+cargo run -p usage-cli -- config set --poll-interval 300 --notifications on
 ```
 
-Usage/status output supports `--style dashboard`, `--style compact`, and `--style json`.
+All commands support `--style dashboard`, `--style compact`, and `--style json`.
+The dashboard fits its boxes to the terminal width, capped at 80 columns by default. Use `--max-width COLUMNS` or `USAGE_TRACKER_MAX_WIDTH` to change the cap (minimum 60 columns). `usage --details` adds per-window sub-limits, credits, forecast, and identity to each panel, and `accounts list --verbose` adds the profile and external-ID columns.
 Color defaults to `--color auto`, can be forced with `--color always`, disabled with `--color never`, and respects `NO_COLOR`.
-Other commands continue to return daemon API JSON.
+`--style json` emits the daemon's stable response shape for scripting. `usage --provider` and `--account` are repeatable. Account listings include the stable account IDs used by the management commands; `accounts remove` retains history, while `accounts delete --yes` permanently deletes it.
 
 The CLI also defaults to `~/.usagetracker/usage.sock`. If the daemon is listening on a non-default socket, point the CLI at it:
 
@@ -278,5 +297,5 @@ After installing or wrapping the CLI as `usage`, the commands are the same witho
 ```sh
 usage status
 usage refresh --provider codex
-usage health
+usage accounts
 ```

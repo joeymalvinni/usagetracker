@@ -10,5 +10,6 @@ chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+terminal_size.workspace = true
 tokio.workspace = true
 usage-core = { path = "../usage-core" }

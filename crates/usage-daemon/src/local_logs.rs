@@ -270,14 +270,14 @@ fn provider_id_for_event<'a>(targets: &'a [LocalLogTarget], event: &Event) -> Op
         return None;
     }
 
-    let provider_id = provider_id_for_paths(targets, &paths).unwrap_or("unknown");
+    let provider_id = provider_id_for_paths(targets, &paths);
     debug!(
-        provider_id,
+        provider_id = provider_id.unwrap_or("unknown"),
         kind = ?event.kind,
         paths = ?display_paths(&paths),
         "local message logs changed; scheduling usage refresh"
     );
-    provider_id_for_paths(targets, &paths)
+    provider_id
 }
 
 async fn refresh_local_usage(refresh: &RefreshCoordinator, pending: BTreeSet<String>) {

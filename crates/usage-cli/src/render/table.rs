@@ -30,6 +30,11 @@ impl Table {
         push_row(&mut output, &self.headers, &widths, |value| {
             theme.label(value)
         });
+        let rule = widths
+            .iter()
+            .map(|width| "─".repeat(*width))
+            .collect::<Vec<_>>();
+        push_row(&mut output, &rule, &widths, |value| theme.border(value));
         for row in &self.rows {
             push_row(&mut output, row, &widths, |value| value.to_string());
         }

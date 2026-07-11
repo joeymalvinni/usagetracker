@@ -25,7 +25,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DASHBOARD_HISTORY_DAYS: u64 = 30;
 const FORECAST_HISTORY_DAYS: i64 = 35;
-const FORECAST_HISTORY_LIMIT: usize = 10_000;
+const FORECAST_HISTORY_LIMIT: usize = 1_024;
 
 #[derive(Clone)]
 pub struct SocketServer {
@@ -87,6 +87,7 @@ impl SocketServer {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::with_capacity(8 * 1024, reader);
         let mut line = Vec::with_capacity(1024);
+        let mut response_bytes = Vec::with_capacity(8 * 1024);
 
         loop {
             let frame = match tokio::time::timeout(
@@ -107,8 +108,10 @@ impl SocketServer {
                         "request_too_large",
                         format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
                     );
-                    writer.write_all(&serde_json::to_vec(&response)?).await?;
-                    writer.write_all(b"\n").await?;
+                    response_bytes.clear();
+                    serde_json::to_writer(&mut response_bytes, &response)?;
+                    response_bytes.push(b'\n');
+                    writer.write_all(&response_bytes).await?;
                 }
                 return Ok(());
             };
@@ -134,60 +137,54 @@ impl SocketServer {
                     ApiResponse::error("invalid_json", format!("invalid request JSON: {err}"))
                 }
             };
-            let bytes = serde_json::to_vec(&response)?;
-            writer.write_all(&bytes).await?;
-            writer.write_all(b"\n").await?;
+            response_bytes.clear();
+            serde_json::to_writer(&mut response_bytes, &response)?;
+            response_bytes.push(b'\n');
+            writer.write_all(&response_bytes).await?;
         }
     }
 
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
         match request {
             ApiRequest::GetUsage => {
-                let today = chrono::Utc::now().date_naive();
+                let generated_at = chrono::Utc::now();
+                let today = generated_at.date_naive();
                 let recent_since = today
                     .checked_sub_days(chrono::Days::new(DASHBOARD_HISTORY_DAYS - 1))
                     .unwrap_or(today);
-                match (
-                    self.runtime.storage.latest_usage().await,
-                    self.runtime.storage.accounts().await,
-                    self.runtime
-                        .storage
-                        .daily_usage_dashboard(recent_since)
-                        .await,
-                ) {
-                    (Ok(mut snapshots), Ok(accounts), Ok(history)) => {
-                        merge_daily_usage_history(&mut snapshots, &history);
-                        let snapshots = supported_visible_usage_snapshots(snapshots, &accounts);
-                        let generated_at = chrono::Utc::now();
-                        let since = generated_at - chrono::TimeDelta::days(FORECAST_HISTORY_DAYS);
-                        let mut forecasts = Vec::new();
-                        for snapshot in &snapshots {
-                            let history = match self
-                                .runtime
-                                .storage
-                                .recent_usage(
-                                    &snapshot.provider_id,
-                                    &snapshot.account_id,
-                                    since,
-                                    FORECAST_HISTORY_LIMIT,
-                                )
-                                .await
-                            {
-                                Ok(history) => history,
-                                Err(err) => return storage_error(err),
-                            };
-                            forecasts.extend(forecast::forecast_snapshot(
-                                snapshot,
-                                &history,
-                                generated_at,
-                            ));
-                        }
+                let since = generated_at - chrono::TimeDelta::days(FORECAST_HISTORY_DAYS);
+                match self
+                    .runtime
+                    .storage
+                    .usage_dashboard(recent_since, since, FORECAST_HISTORY_LIMIT)
+                    .await
+                {
+                    Ok(mut dashboard) => {
+                        merge_daily_usage_history(&mut dashboard.snapshots, &dashboard.daily_usage);
+                        let snapshots = supported_visible_usage_snapshots(
+                            dashboard.snapshots,
+                            &dashboard.accounts,
+                        );
+                        let empty_history = crate::storage::StoredForecastHistory::default();
+                        let forecasts = snapshots
+                            .iter()
+                            .flat_map(|snapshot| {
+                                let history = dashboard
+                                    .forecast_histories
+                                    .get(&(
+                                        snapshot.provider_id.clone(),
+                                        snapshot.account_id.clone(),
+                                    ))
+                                    .unwrap_or(&empty_history);
+                                forecast::forecast_snapshot(snapshot, history, generated_at)
+                            })
+                            .collect();
                         ApiResponse::Usage {
                             snapshots,
                             forecasts,
                         }
                     }
-                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => storage_error(err),
+                    Err(err) => storage_error(err),
                 }
             }
             ApiRequest::Refresh { providers } => {

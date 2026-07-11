@@ -2,12 +2,18 @@ use std::fmt::Write;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
-use usage_core::{Account, ConfigResponse, ProviderRefreshResult, UsageSnapshot};
+use usage_core::{
+    Account, AddProviderAccountResponse, ConfigResponse, ProviderActionResponse,
+    ProviderRefreshResult, ProviderSetupResponse, UsageSnapshot,
+};
 
 use crate::{
     render::{
         labels::{identity_labels, latest_snapshots_by_account},
-        style::{format_collection_mode, format_local_time, format_provider_name, Theme},
+        style::{
+            format_collection_mode, format_local_time, format_provider_name, relative_time,
+            relative_time_opt, Theme,
+        },
         table::Table,
     },
     OutputStyle,
@@ -18,11 +24,12 @@ pub fn render_accounts(
     snapshots: &[UsageSnapshot],
     style: OutputStyle,
     color: bool,
+    verbose: bool,
 ) -> String {
     let theme = Theme::new(color);
     match style {
-        OutputStyle::Dashboard => render_accounts_dashboard(accounts, snapshots, theme),
-        OutputStyle::Compact => render_accounts_compact(accounts, snapshots, theme),
+        OutputStyle::Dashboard => render_accounts_dashboard(accounts, snapshots, theme, verbose),
+        OutputStyle::Compact => render_accounts_compact(accounts, snapshots, theme, verbose),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -129,7 +136,7 @@ fn render_refresh_dashboard(
                 .as_deref()
                 .map(|mode| format_collection_mode(result.provider_id.as_str(), mode))
                 .unwrap_or_else(|| "-".to_string()),
-            format_local_time(result.collected_at),
+            relative_time_opt(result.collected_at),
             result.message.clone().unwrap_or_else(|| "-".to_string()),
         ]);
     }
@@ -194,7 +201,7 @@ fn render_refresh_compact(
             plan,
             theme.status(&json_name(&result.status)),
             mode,
-            format_local_time(result.collected_at),
+            relative_time_opt(result.collected_at),
             message
         )
     }));
@@ -205,35 +212,42 @@ fn render_accounts_dashboard(
     accounts: &[Account],
     snapshots: &[UsageSnapshot],
     theme: Theme,
+    verbose: bool,
 ) -> String {
     let latest_by_account = latest_snapshots_by_account(snapshots);
     let mut output = String::new();
     let _ = writeln!(output, "{}", theme.title("Accounts"));
     output.push('\n');
 
-    let mut table = Table::new([
-        "Provider",
-        "Identity",
-        "Kind",
-        "State",
-        "Plan",
-        "External ID",
-        "Updated",
-    ]);
+    let mut headers = vec!["Provider", "Identity", "Account ID", "State", "Plan"];
+    if verbose {
+        headers.extend(["Profile", "External ID"]);
+    }
+    headers.push("Updated");
+    let mut table = Table::new(headers);
     for account in accounts {
         let labels = identity_labels(
             Some(account),
             latest_by_account.get(account.id.as_str()).copied(),
         );
-        table.row([
+        let mut row = vec![
             format_provider_name(account.provider_id.as_str()),
             labels.identity.unwrap_or_else(|| "-".to_string()),
-            labels.identity_kind.unwrap_or("-").to_string(),
+            account.id.as_str().to_string(),
             account_state(account, theme),
             labels.plan.unwrap_or_else(|| "-".to_string()),
-            account.external_account_id.clone(),
-            format_local_time(Some(account.updated_at)),
-        ]);
+        ];
+        if verbose {
+            row.push(
+                account
+                    .profile_id
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            row.push(account.external_account_id.clone());
+        }
+        row.push(relative_time(account.updated_at));
+        table.row(row);
     }
 
     output.push_str(&table.render(theme));
@@ -244,6 +258,7 @@ fn render_accounts_compact(
     accounts: &[Account],
     snapshots: &[UsageSnapshot],
     theme: Theme,
+    verbose: bool,
 ) -> String {
     let latest_by_account = latest_snapshots_by_account(snapshots);
     accounts
@@ -261,12 +276,15 @@ fn render_accounts_compact(
             if let Some(plan) = labels.plan {
                 parts.push(format!("plan {plan}"));
             }
+            parts.push(format!("id {}", account.id));
             parts.push(format!("state {}", account_state_plain(account)));
-            parts.push(format!("external {}", account.external_account_id));
-            parts.push(format!(
-                "updated {}",
-                format_local_time(Some(account.updated_at))
-            ));
+            if verbose {
+                if let Some(profile) = &account.profile_id {
+                    parts.push(format!("profile {profile}"));
+                }
+                parts.push(format!("external {}", account.external_account_id));
+            }
+            parts.push(format!("updated {}", relative_time(account.updated_at)));
             format!(
                 "{}: {}",
                 theme.title(&format_provider_name(account.provider_id.as_str())),
@@ -275,6 +293,190 @@ fn render_accounts_compact(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub fn render_account_action(account: &Account, style: OutputStyle, color: bool) -> String {
+    let theme = Theme::new(color);
+    match style {
+        OutputStyle::Dashboard => {
+            let mut output = String::new();
+            let _ = writeln!(output, "{}", theme.title("Account updated"));
+            output.push('\n');
+            push_kv(
+                &mut output,
+                theme,
+                "Provider",
+                &format_provider_name(account.provider_id.as_str()),
+            );
+            push_kv(&mut output, theme, "Account ID", account.id.as_str());
+            push_kv(
+                &mut output,
+                theme,
+                "Name",
+                account.display_name.as_deref().unwrap_or("-"),
+            );
+            push_kv(
+                &mut output,
+                theme,
+                "Email",
+                account.email.as_deref().unwrap_or("-"),
+            );
+            push_kv(&mut output, theme, "State", account_state_plain(account));
+            output.trim_end().to_string()
+        }
+        OutputStyle::Compact => format!(
+            "{} account {} · {} · {}",
+            format_provider_name(account.provider_id.as_str()),
+            account.id,
+            account.display_name.as_deref().unwrap_or("unnamed"),
+            account_state_plain(account)
+        ),
+        OutputStyle::Json => unreachable!("json style is handled before rendering"),
+    }
+}
+
+pub fn render_added_account(
+    account: &AddProviderAccountResponse,
+    style: OutputStyle,
+    color: bool,
+) -> String {
+    let theme = Theme::new(color);
+    match style {
+        OutputStyle::Dashboard => {
+            let mut output = String::new();
+            let _ = writeln!(output, "{}", theme.title("Provider account created"));
+            output.push('\n');
+            push_kv(
+                &mut output,
+                theme,
+                "Provider",
+                &format_provider_name(account.provider_id.as_str()),
+            );
+            push_kv(&mut output, theme, "Profile ID", &account.profile_id);
+            push_kv(
+                &mut output,
+                theme,
+                "Name",
+                account.display_name.as_deref().unwrap_or("-"),
+            );
+            push_kv(&mut output, theme, "Profile path", &account.profile_path);
+            let _ = writeln!(
+                output,
+                "\n{}",
+                theme.muted("Complete sign-in in the launched provider window, then refresh.")
+            );
+            output.trim_end().to_string()
+        }
+        OutputStyle::Compact => format!(
+            "Created {} profile {} · {}",
+            format_provider_name(account.provider_id.as_str()),
+            account.profile_id,
+            account.profile_path
+        ),
+        OutputStyle::Json => unreachable!("json style is handled before rendering"),
+    }
+}
+
+pub fn render_provider_setup(
+    setup: &ProviderSetupResponse,
+    style: OutputStyle,
+    color: bool,
+) -> String {
+    let theme = Theme::new(color);
+    match style {
+        OutputStyle::Dashboard => {
+            let mut output = String::new();
+            let _ = writeln!(
+                output,
+                "{}",
+                theme.title(&format!(
+                    "{} setup",
+                    format_provider_name(setup.provider_id.as_str())
+                ))
+            );
+            output.push('\n');
+            push_kv(
+                &mut output,
+                theme,
+                "Workspace",
+                setup
+                    .selected_workspace_id
+                    .as_deref()
+                    .unwrap_or("automatic"),
+            );
+            if !setup.workspace_options.is_empty() {
+                push_kv(
+                    &mut output,
+                    theme,
+                    "Choices",
+                    &setup.workspace_options.join(", "),
+                );
+            }
+            if let Some(error) = &setup.discovery_error {
+                push_kv(&mut output, theme, "Discovery", error);
+            }
+            output.push('\n');
+            let mut table = Table::new(["Profile ID", "Name", "State"]);
+            for profile in &setup.profiles {
+                table.row([
+                    profile.id.clone(),
+                    profile
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                    if profile.enabled {
+                        theme.good("enabled")
+                    } else {
+                        theme.muted("disabled")
+                    },
+                ]);
+            }
+            output.push_str(&table.render(theme));
+            output.trim_end().to_string()
+        }
+        OutputStyle::Compact => {
+            let profiles = setup
+                .profiles
+                .iter()
+                .map(|profile| {
+                    format!(
+                        "{}={}",
+                        profile.id,
+                        if profile.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{} setup · workspace {} · profiles [{}]{}",
+                format_provider_name(setup.provider_id.as_str()),
+                setup
+                    .selected_workspace_id
+                    .as_deref()
+                    .unwrap_or("automatic"),
+                profiles,
+                setup
+                    .discovery_error
+                    .as_ref()
+                    .map(|error| format!(" · discovery {error}"))
+                    .unwrap_or_default()
+            )
+        }
+        OutputStyle::Json => unreachable!("json style is handled before rendering"),
+    }
+}
+
+pub fn render_provider_action(action: &ProviderActionResponse, color: bool) -> String {
+    let theme = Theme::new(color);
+    format!(
+        "{}: {}",
+        theme.title(&format_provider_name(action.provider_id.as_str())),
+        action.message
+    )
 }
 
 fn render_config_dashboard(config: &ConfigResponse, theme: Theme) -> String {
@@ -417,6 +619,7 @@ mod tests {
             &[sample_account()],
             &[sample_snapshot()],
             OutputStyle::Dashboard,
+            false,
             false,
         );
 

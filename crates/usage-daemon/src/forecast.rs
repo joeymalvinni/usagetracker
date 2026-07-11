@@ -3,6 +3,8 @@ use usage_core::{
     ForecastConfidence, ForecastStatus, UsageForecast, UsageSnapshot, UsageWindow, UsageWindowKind,
 };
 
+use crate::storage::StoredForecastHistory;
+
 const MIN_SAMPLES: usize = 3;
 const MIN_SPAN: TimeDelta = TimeDelta::minutes(15);
 const RESET_DROP_PERCENT: f64 = 20.0;
@@ -23,7 +25,7 @@ struct RateEstimate {
 
 pub fn forecast_snapshot(
     current: &UsageSnapshot,
-    history: &[UsageSnapshot],
+    history: &StoredForecastHistory,
     generated_at: DateTime<Utc>,
 ) -> Vec<UsageForecast> {
     current
@@ -42,7 +44,7 @@ pub fn forecast_snapshot(
 fn forecast_window(
     current: &UsageSnapshot,
     window: &UsageWindow,
-    history: &[UsageSnapshot],
+    history: &StoredForecastHistory,
     generated_at: DateTime<Utc>,
 ) -> Option<UsageForecast> {
     let current_percent = window.percent_used.filter(|value| value.is_finite())?;
@@ -120,26 +122,21 @@ fn forecast_window(
 fn current_cycle(
     current: &UsageSnapshot,
     window: &UsageWindow,
-    history: &[UsageSnapshot],
+    history: &StoredForecastHistory,
 ) -> Vec<Observation> {
     let mut observations = history
-        .iter()
-        .filter(|snapshot| {
-            snapshot.provider_id == current.provider_id
-                && snapshot.account_id == current.account_id
-                && snapshot.collected_at <= current.collected_at
-        })
-        .filter_map(|snapshot| {
-            let historical = snapshot
-                .windows
-                .iter()
-                .find(|candidate| candidate.window_id == window.window_id)?;
-            if !compatible_reset(window.reset_at, historical.reset_at) {
+        .by_window
+        .get(&window.window_id)
+        .into_iter()
+        .flatten()
+        .filter(|observation| observation.collected_at <= current.collected_at)
+        .filter_map(|observation| {
+            if !compatible_reset(window.reset_at, observation.reset_at) {
                 return None;
             }
             Some(Observation {
-                at: snapshot.collected_at,
-                percent: historical.percent_used.filter(|value| value.is_finite())?,
+                at: observation.collected_at,
+                percent: observation.percent_used,
             })
         })
         .collect::<Vec<_>>();
@@ -286,14 +283,17 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use serde_json::json;
+    use std::collections::HashMap;
     use usage_core::{AccountId, ProviderId};
+
+    use crate::storage::{StoredForecastHistory, StoredWindowObservation};
 
     #[test]
     fn schedule_pace_is_available_from_the_first_snapshot() {
         let now = time(2026, 7, 10, 12, 0);
         let current = snapshot(now, now + TimeDelta::hours(2), 50.0);
 
-        let forecast = &forecast_snapshot(&current, &[], now)[0];
+        let forecast = &forecast_from_snapshots(&current, &[], now)[0];
 
         assert_eq!(forecast.sample_count, 1);
         assert_eq!(forecast.expected_percent_used, Some(60.0));
@@ -313,7 +313,7 @@ mod tests {
             snapshot(now - TimeDelta::minutes(30), reset, 60.0),
         ];
 
-        let forecast = &forecast_snapshot(&current, &history, now)[0];
+        let forecast = &forecast_from_snapshots(&current, &history, now)[0];
 
         assert_eq!(forecast.sample_count, 3);
         assert_eq!(forecast.rate_percent_per_hour, Some(60.0));
@@ -337,7 +337,7 @@ mod tests {
             snapshot(now - TimeDelta::minutes(30), reset, 90.0),
         ];
 
-        let forecast = &forecast_snapshot(&current, &history, now)[0];
+        let forecast = &forecast_from_snapshots(&current, &history, now)[0];
 
         assert_eq!(forecast.sample_count, 3);
         assert!(forecast.rate_percent_per_hour.is_some());
@@ -353,7 +353,7 @@ mod tests {
             snapshot(now - TimeDelta::minutes(30), reset, 20.0),
         ];
 
-        let forecast = &forecast_snapshot(&current, &history, now)[0];
+        let forecast = &forecast_from_snapshots(&current, &history, now)[0];
 
         assert!(forecast.rate_percent_per_hour.is_none());
         assert!(forecast.projected_percent_at_reset.is_none());
@@ -371,7 +371,7 @@ mod tests {
             snapshot(now - TimeDelta::minutes(30), reset, 35.0),
         ];
 
-        let forecast = &forecast_snapshot(&current, &history, now)[0];
+        let forecast = &forecast_from_snapshots(&current, &history, now)[0];
 
         assert_eq!(forecast.rate_percent_per_hour, Some(10.0));
         assert_eq!(forecast.projected_percent_at_reset, Some(60.0));
@@ -383,7 +383,7 @@ mod tests {
         let now = time(2026, 7, 10, 12, 0);
         let current = snapshot(now, now + TimeDelta::hours(2), 100.0);
 
-        let forecast = &forecast_snapshot(&current, &[], now)[0];
+        let forecast = &forecast_from_snapshots(&current, &[], now)[0];
 
         assert_eq!(forecast.projected_percent_remaining_at_reset, Some(0.0));
         assert_eq!(forecast.status, ForecastStatus::Exhausted);
@@ -404,7 +404,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let forecast = &forecast_snapshot(&current, &history, now)[0];
+        let forecast = &forecast_from_snapshots(&current, &history, now)[0];
 
         assert_eq!(forecast.sample_count, 13);
         assert_eq!(forecast.rate_percent_per_hour, Some(2.0));
@@ -417,10 +417,38 @@ mod tests {
         let mut current = snapshot(now, now, 20.0);
         current.windows[0].reset_at = None;
 
-        let forecast = &forecast_snapshot(&current, &[], now)[0];
+        let forecast = &forecast_from_snapshots(&current, &[], now)[0];
 
         assert_eq!(forecast.status, ForecastStatus::InsufficientData);
         assert!(forecast.expected_percent_used.is_none());
+    }
+
+    fn forecast_from_snapshots(
+        current: &UsageSnapshot,
+        snapshots: &[UsageSnapshot],
+        generated_at: DateTime<Utc>,
+    ) -> Vec<UsageForecast> {
+        let mut by_window = HashMap::<String, Vec<StoredWindowObservation>>::new();
+        for snapshot in snapshots.iter().filter(|snapshot| {
+            snapshot.provider_id == current.provider_id
+                && snapshot.account_id == current.account_id
+                && snapshot.collected_at <= current.collected_at
+        }) {
+            for window in &snapshot.windows {
+                let Some(percent_used) = window.percent_used.filter(|value| value.is_finite())
+                else {
+                    continue;
+                };
+                by_window.entry(window.window_id.clone()).or_default().push(
+                    StoredWindowObservation {
+                        collected_at: snapshot.collected_at,
+                        percent_used,
+                        reset_at: window.reset_at,
+                    },
+                );
+            }
+        }
+        forecast_snapshot(current, &StoredForecastHistory { by_window }, generated_at)
     }
 
     fn snapshot(at: DateTime<Utc>, reset_at: DateTime<Utc>, percent: f64) -> UsageSnapshot {

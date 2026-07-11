@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
+use std::hash::Hash;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
@@ -8,7 +9,10 @@ use usage_core::{Account, ConfigResponse, ProviderHealth, ProviderHealthStatus, 
 use crate::{
     render::{
         labels::identity_labels,
-        style::{format_collection_mode, format_local_time, format_provider_name, Theme},
+        style::{
+            format_collection_mode, format_local_time, format_provider_name, relative_time_opt,
+            Theme,
+        },
         table::Table,
     },
     OutputStyle,
@@ -29,6 +33,7 @@ pub struct StatusView {
 #[derive(Debug, Serialize)]
 struct ProviderStatusRow {
     provider_id: String,
+    account_id: Option<String>,
     identity: Option<String>,
     plan: Option<String>,
     state: String,
@@ -46,6 +51,80 @@ enum UsageFreshness {
     Missing,
 }
 
+struct StatusIndexes<'a> {
+    accounts_by_provider: HashMap<&'a str, Vec<&'a Account>>,
+    latest_by_account: HashMap<(&'a str, &'a str), &'a UsageSnapshot>,
+    latest_by_provider: HashMap<&'a str, &'a UsageSnapshot>,
+    health_by_account: HashMap<(&'a str, Option<&'a str>), &'a ProviderHealth>,
+}
+
+impl<'a> StatusIndexes<'a> {
+    fn new(
+        snapshots: &'a [UsageSnapshot],
+        accounts: &'a [Account],
+        health: &'a [ProviderHealth],
+    ) -> Self {
+        let mut accounts_by_provider: HashMap<&str, Vec<&Account>> = HashMap::new();
+        for account in accounts.iter().filter(|account| !account.hidden) {
+            accounts_by_provider
+                .entry(account.provider_id.as_str())
+                .or_default()
+                .push(account);
+        }
+
+        let mut latest_by_account = HashMap::with_capacity(snapshots.len());
+        let mut latest_by_provider = HashMap::new();
+        for snapshot in snapshots {
+            insert_latest_snapshot(
+                &mut latest_by_account,
+                (snapshot.provider_id.as_str(), snapshot.account_id.as_str()),
+                snapshot,
+            );
+            insert_latest_snapshot(
+                &mut latest_by_provider,
+                snapshot.provider_id.as_str(),
+                snapshot,
+            );
+        }
+
+        let mut health_by_account = HashMap::with_capacity(health.len());
+        for row in health {
+            health_by_account
+                .entry((
+                    row.provider_id.as_str(),
+                    row.account_id.as_ref().map(|id| id.as_str()),
+                ))
+                .or_insert(row);
+        }
+
+        Self {
+            accounts_by_provider,
+            latest_by_account,
+            latest_by_provider,
+            health_by_account,
+        }
+    }
+}
+
+fn insert_latest_snapshot<'a, K: Eq + Hash>(
+    snapshots: &mut HashMap<K, &'a UsageSnapshot>,
+    key: K,
+    candidate: &'a UsageSnapshot,
+) {
+    match snapshots.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            // Iterator::max_by_key selects the last equal maximum. Keep that
+            // exact tie behavior while building the index in input order.
+            if candidate.collected_at >= entry.get().collected_at {
+                entry.insert(candidate);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+    }
+}
+
 impl StatusView {
     pub fn from_parts(
         socket_path: String,
@@ -54,40 +133,30 @@ impl StatusView {
         health: &[ProviderHealth],
         config: &ConfigResponse,
     ) -> Self {
-        let account_by_id = account_by_id(accounts);
-        let latest_snapshots = latest_snapshots_by_provider(snapshots);
-        let health_by_provider = health
-            .iter()
-            .map(|row| (row.provider_id.as_str().to_string(), row))
-            .collect::<HashMap<_, _>>();
+        let indexes = StatusIndexes::new(snapshots, accounts, health);
         let provider_ids = provider_ids(config, health, snapshots, accounts);
         let freshness_window = TimeDelta::seconds((config.poll_interval_seconds * 2) as i64);
 
-        let providers = provider_ids
-            .into_iter()
-            .map(|provider_id| {
-                let latest = latest_snapshots.get(&provider_id).copied();
-                let health = health_by_provider.get(&provider_id).copied();
-                let account_model = health
-                    .and_then(|row| row.account_id.as_ref())
-                    .or_else(|| latest.map(|snapshot| &snapshot.account_id))
-                    .and_then(|id| account_by_id.get(id.as_str()).copied());
-                let labels = identity_labels(account_model, latest);
-                let last_update_at = latest.map(|snapshot| snapshot.collected_at);
-                ProviderStatusRow {
-                    provider_id: provider_id.clone(),
-                    identity: labels.identity,
-                    plan: labels.plan,
-                    state: health
-                        .map(|row| json_name(&row.status))
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    usage: usage_freshness(last_update_at, freshness_window),
-                    last_success_at: health.and_then(|row| row.last_success_at),
-                    last_update_at,
-                    detail: status_detail(provider_id.as_str(), health),
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut providers = Vec::with_capacity(accounts.len().max(provider_ids.len()));
+        for provider_id in provider_ids {
+            let provider_accounts = indexes
+                .accounts_by_provider
+                .get(provider_id.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if provider_accounts.is_empty() {
+                providers.push(provider_status_row(
+                    &provider_id,
+                    None,
+                    &indexes,
+                    freshness_window,
+                ));
+            } else {
+                providers.extend(provider_accounts.iter().map(|account| {
+                    provider_status_row(&provider_id, Some(*account), &indexes, freshness_window)
+                }));
+            }
+        }
 
         let updated_at = providers
             .iter()
@@ -108,6 +177,44 @@ impl StatusView {
             updated_at,
             providers,
         }
+    }
+}
+
+fn provider_status_row(
+    provider_id: &str,
+    account: Option<&Account>,
+    indexes: &StatusIndexes<'_>,
+    freshness_window: TimeDelta,
+) -> ProviderStatusRow {
+    let account_id = account.map(|account| account.id.as_str());
+    let latest = match account_id {
+        Some(account_id) => indexes
+            .latest_by_account
+            .get(&(provider_id, account_id))
+            .copied(),
+        None => indexes.latest_by_provider.get(provider_id).copied(),
+    };
+    let provider_health = indexes
+        .health_by_account
+        .get(&(provider_id, account_id))
+        .or_else(|| indexes.health_by_account.get(&(provider_id, None)))
+        .copied();
+    let labels = identity_labels(account, latest);
+    let last_update_at = latest.map(|snapshot| snapshot.collected_at);
+    ProviderStatusRow {
+        provider_id: provider_id.to_string(),
+        account_id: account_id.map(str::to_string),
+        identity: labels.identity,
+        plan: labels.plan,
+        state: account
+            .filter(|account| !account.collection_enabled)
+            .map(|_| "disabled".to_string())
+            .or_else(|| provider_health.map(|row| json_name(&row.status)))
+            .unwrap_or_else(|| "unknown".to_string()),
+        usage: usage_freshness(last_update_at, freshness_window),
+        last_success_at: provider_health.and_then(|row| row.last_success_at),
+        last_update_at,
+        detail: status_detail(provider_id, provider_health),
     }
 }
 
@@ -147,14 +254,7 @@ fn render_status_dashboard(status: &StatusView, theme: Theme) -> String {
 
     output.push('\n');
     let mut table = Table::new([
-        "Provider",
-        "Identity",
-        "Plan",
-        "State",
-        "Usage",
-        "Last success",
-        "Last update",
-        "Detail",
+        "Provider", "Identity", "Plan", "State", "Usage", "Updated", "Detail",
     ]);
     for row in &status.providers {
         table.row([
@@ -163,8 +263,7 @@ fn render_status_dashboard(status: &StatusView, theme: Theme) -> String {
             row.plan.clone().unwrap_or_else(|| "-".to_string()),
             theme.status(&row.state),
             freshness_text(row.usage, theme),
-            format_local_time(row.last_success_at),
-            format_local_time(row.last_update_at),
+            relative_time_opt(row.last_success_at.max(row.last_update_at)),
             row.detail.clone().unwrap_or_else(|| "-".to_string()),
         ]);
     }
@@ -198,14 +297,14 @@ fn render_status_compact(status: &StatusView, theme: Theme) -> String {
             .map(|detail| format!(" · {detail}"))
             .unwrap_or_default();
         format!(
-            "{}{}{}: {} · {}{} · success {}",
+            "{}{}{}: {} · {}{} · updated {}",
             theme.title(&format_provider_name(&row.provider_id)),
             identity,
             plan,
             theme.status(&row.state),
             freshness_text(row.usage, theme),
             detail,
-            format_local_time(row.last_success_at)
+            relative_time_opt(row.last_success_at.max(row.last_update_at))
         )
     }));
     lines.join("\n")
@@ -253,6 +352,19 @@ fn provider_ids(
     snapshots: &[UsageSnapshot],
     accounts: &[Account],
 ) -> Vec<String> {
+    let providers_with_data = snapshots
+        .iter()
+        .map(|snapshot| snapshot.provider_id.as_str())
+        .chain(accounts.iter().map(|account| account.provider_id.as_str()))
+        .collect::<HashSet<_>>();
+    let unavailable_without_data = health
+        .iter()
+        .filter(|row| {
+            matches!(row.status, ProviderHealthStatus::ProviderError)
+                && row.last_error_code.as_deref() == Some("provider_unavailable")
+        })
+        .map(|row| row.provider_id.as_str())
+        .collect::<HashSet<_>>();
     let mut provider_ids = BTreeSet::new();
     provider_ids.extend(config.providers.keys().cloned());
     provider_ids.extend(
@@ -274,19 +386,10 @@ fn provider_ids(
         .into_iter()
         .filter(|provider_id| {
             is_enabled_provider(provider_id, config)
-                && (has_provider_data(provider_id, snapshots, accounts)
-                    || !is_unavailable_without_data(provider_id, health))
+                && (providers_with_data.contains(provider_id.as_str())
+                    || !unavailable_without_data.contains(provider_id.as_str()))
         })
         .collect()
-}
-
-fn has_provider_data(provider_id: &str, snapshots: &[UsageSnapshot], accounts: &[Account]) -> bool {
-    snapshots
-        .iter()
-        .any(|snapshot| snapshot.provider_id.as_str() == provider_id)
-        || accounts
-            .iter()
-            .any(|account| account.provider_id.as_str() == provider_id)
 }
 
 fn is_enabled_provider(provider_id: &str, config: &ConfigResponse) -> bool {
@@ -298,36 +401,6 @@ fn is_enabled_provider(provider_id: &str, config: &ConfigResponse) -> bool {
             .enabled_providers
             .iter()
             .any(|id| id.as_str() == provider_id)
-}
-
-fn is_unavailable_without_data(provider_id: &str, health: &[ProviderHealth]) -> bool {
-    health.iter().any(|row| {
-        row.provider_id.as_str() == provider_id
-            && matches!(row.status, ProviderHealthStatus::ProviderError)
-            && row.last_error_code.as_deref() == Some("provider_unavailable")
-    })
-}
-
-fn latest_snapshots_by_provider(snapshots: &[UsageSnapshot]) -> HashMap<String, &UsageSnapshot> {
-    let mut latest = HashMap::new();
-    for snapshot in snapshots {
-        latest
-            .entry(snapshot.provider_id.as_str().to_string())
-            .and_modify(|current: &mut &UsageSnapshot| {
-                if snapshot.collected_at > current.collected_at {
-                    *current = snapshot;
-                }
-            })
-            .or_insert(snapshot);
-    }
-    latest
-}
-
-fn account_by_id(accounts: &[Account]) -> HashMap<String, &Account> {
-    accounts
-        .iter()
-        .map(|account| (account.id.as_str().to_string(), account))
-        .collect()
 }
 
 fn json_name(value: &impl Serialize) -> String {
@@ -494,6 +567,129 @@ mod tests {
         let rendered = serde_json::to_string(&status).unwrap();
 
         assert!(!rendered.contains(r#""provider_id":"codex""#));
+    }
+
+    #[test]
+    fn indexed_status_preserves_snapshot_ties_health_precedence_and_account_order() {
+        let collected_at = Utc::now();
+        let account_a = Account {
+            id: AccountId::new("a"),
+            provider_id: ProviderId::new("codex"),
+            external_account_id: "external-a".to_string(),
+            profile_id: None,
+            display_name: None,
+            display_name_source: Default::default(),
+            email: None,
+            hidden: false,
+            collection_enabled: true,
+            created_at: collected_at,
+            updated_at: collected_at,
+        };
+        let account_b = Account {
+            id: AccountId::new("b"),
+            provider_id: ProviderId::new("codex"),
+            external_account_id: "external-b".to_string(),
+            profile_id: None,
+            display_name: None,
+            display_name_source: Default::default(),
+            email: None,
+            hidden: false,
+            collection_enabled: true,
+            created_at: collected_at,
+            updated_at: collected_at,
+        };
+        let snapshots = vec![
+            UsageSnapshot {
+                provider_id: ProviderId::new("codex"),
+                account_id: AccountId::new("a"),
+                collected_at,
+                windows: Vec::new(),
+                metadata: json!({"email": "first@example.com"}),
+            },
+            UsageSnapshot {
+                provider_id: ProviderId::new("codex"),
+                account_id: AccountId::new("a"),
+                collected_at,
+                windows: Vec::new(),
+                metadata: json!({"email": "second@example.com"}),
+            },
+            UsageSnapshot {
+                provider_id: ProviderId::new("codex"),
+                account_id: AccountId::new("b"),
+                collected_at,
+                windows: Vec::new(),
+                metadata: json!({"email": "b@example.com"}),
+            },
+        ];
+        let health = vec![
+            ProviderHealth {
+                provider_id: ProviderId::new("codex"),
+                account_id: None,
+                status: ProviderHealthStatus::RateLimited,
+                collection_mode: None,
+                last_success_at: None,
+                last_failure_at: Some(collected_at),
+                last_error_code: Some("fallback".to_string()),
+                last_error_message: Some("provider fallback".to_string()),
+                updated_at: collected_at,
+            },
+            ProviderHealth {
+                provider_id: ProviderId::new("codex"),
+                account_id: Some(AccountId::new("a")),
+                status: ProviderHealthStatus::Ok,
+                collection_mode: None,
+                last_success_at: Some(collected_at),
+                last_failure_at: None,
+                last_error_code: None,
+                last_error_message: Some("first exact".to_string()),
+                updated_at: collected_at,
+            },
+            ProviderHealth {
+                provider_id: ProviderId::new("codex"),
+                account_id: Some(AccountId::new("a")),
+                status: ProviderHealthStatus::AuthFailed,
+                collection_mode: None,
+                last_success_at: None,
+                last_failure_at: Some(collected_at),
+                last_error_code: Some("second".to_string()),
+                last_error_message: Some("second exact".to_string()),
+                updated_at: collected_at,
+            },
+        ];
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("codex".to_string(), ProviderToggle { enabled: true });
+        let config = ConfigResponse {
+            poll_interval_seconds: 60,
+            notifications: Default::default(),
+            config_path: "/tmp/config.json".to_string(),
+            socket_path: "/tmp/usage.sock".to_string(),
+            db_path: "/tmp/usage.sqlite3".to_string(),
+            enabled_providers: vec![ProviderId::new("codex")],
+            providers,
+        };
+
+        let status = StatusView::from_parts(
+            "/tmp/usage.sock".to_string(),
+            &snapshots,
+            &[account_a, account_b],
+            &health,
+            &config,
+        );
+
+        assert_eq!(status.providers.len(), 2);
+        assert_eq!(status.providers[0].account_id.as_deref(), Some("a"));
+        assert_eq!(status.providers[1].account_id.as_deref(), Some("b"));
+        assert_eq!(
+            status.providers[0].identity.as_deref(),
+            Some("second@example.com")
+        );
+        assert_eq!(status.providers[0].state, "ok");
+        assert_eq!(status.providers[0].detail.as_deref(), Some("first exact"));
+        assert_eq!(status.providers[1].state, "rate_limited");
+        assert_eq!(
+            status.providers[1].detail.as_deref(),
+            Some("provider fallback")
+        );
     }
 
     fn sample_status(collected_at: DateTime<Utc>) -> StatusView {
