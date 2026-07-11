@@ -618,7 +618,7 @@ impl CookieHeaderSource {
     }
 }
 
-mod cookies;
+pub(crate) mod cookies;
 mod history;
 mod http;
 mod local;

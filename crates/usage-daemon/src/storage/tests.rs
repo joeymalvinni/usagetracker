@@ -627,6 +627,32 @@ async fn upgrades_a_legacy_claude_identity_to_an_account_uuid_once() {
 }
 
 #[tokio::test]
+async fn grok_default_profile_adopts_provider_identity_without_duplication() {
+    let storage = test_storage();
+    let provider_id = ProviderId::new("grok");
+    let provisional = storage
+        .upsert_account(&provider_id, "grok_default", Some("default"), None, None)
+        .await
+        .unwrap();
+
+    let identified = storage
+        .upsert_account(
+            &provider_id,
+            "grok-user-123",
+            Some("default"),
+            None,
+            Some("user@example.com"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(identified.id, provisional.id);
+    assert_eq!(identified.external_account_id, "grok-user-123");
+    assert_eq!(identified.email.as_deref(), Some("user@example.com"));
+    assert_eq!(storage.accounts().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn rejects_a_legacy_claude_upgrade_when_uuid_is_connected_elsewhere() {
     let storage = test_storage();
     let provider_id = ProviderId::new("claude");

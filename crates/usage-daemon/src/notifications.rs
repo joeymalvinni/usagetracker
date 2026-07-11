@@ -411,6 +411,7 @@ fn provider_name(provider_id: &str) -> String {
         "codex" => "Codex".to_string(),
         "claude" => "Claude".to_string(),
         "opencode_go" => "OpenCode Go".to_string(),
+        "grok" => "Grok".to_string(),
         value => value.to_string(),
     }
 }

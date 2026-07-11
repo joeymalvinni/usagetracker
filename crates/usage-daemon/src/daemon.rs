@@ -26,6 +26,7 @@ use crate::{
     providers::{
         claude::PROVIDER_ID as CLAUDE_PROVIDER_ID,
         codex::PROVIDER_ID as CODEX_PROVIDER_ID,
+        grok::{self, PROVIDER_ID as GROK_PROVIDER_ID},
         opencode::{clear_cached_cookie_cache, OpenCodeCollector, OPENCODE_GO_PROVIDER_ID},
         paths::expand_home_path,
         ProviderCollector,
@@ -531,6 +532,9 @@ impl DaemonRuntime {
         if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
             clear_cached_cookie_cache().await?;
         }
+        if account.provider_id.as_str() == GROK_PROVIDER_ID {
+            grok::clear_cached_cookie_cache().await?;
+        }
 
         let mutation = self.config_mutation.lock().await;
         let previous_config = self.config.read().await.clone();
@@ -726,6 +730,19 @@ impl DaemonRuntime {
                 launchers::open_url("https://opencode.ai")?;
                 "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
                     .to_string()
+            }
+            GROK_PROVIDER_ID => {
+                grok::clear_cached_cookie_cache().await?;
+                if let Some(binary) = grok::find_grok_binary() {
+                    let child = launchers::launch_grok_login(&binary)?;
+                    launchers::monitor_login(child, self.refresh.clone(), GROK_PROVIDER_ID, None);
+                    "Finish signing in to Grok in your browser. UsageTracker will refresh automatically."
+                        .to_string()
+                } else {
+                    launchers::open_url("https://grok.com/?_s=usage")?;
+                    "Grok opened in your browser. Sign in there, or install Grok Build for CLI billing."
+                        .to_string()
+                }
             }
             _ => unreachable!("supported provider validation should reject unknown ids"),
         };

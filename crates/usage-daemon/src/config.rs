@@ -16,7 +16,7 @@ use usage_core::{
 use crate::providers::paths::expand_home_path;
 
 const POLL_INTERVAL_ENV: &str = "USAGE_TRACKER_POLL_INTERVAL_SECONDS";
-const SUPPORTED_PROVIDER_IDS: [&str; 3] = ["codex", "claude", "opencode_go"];
+const SUPPORTED_PROVIDER_IDS: [&str; 4] = ["codex", "claude", "opencode_go", "grok"];
 pub const MIN_POLL_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]
@@ -59,6 +59,10 @@ pub struct ProviderConfig {
     pub cookie_header: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    /// Optional provider-specific collection strategy. Providers that do not
+    /// expose selectable strategies ignore this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -238,6 +242,7 @@ impl Config {
                         profiles: Vec::new(),
                         cookie_header: None,
                         workspace_id: None,
+                        source_mode: None,
                     })
                     .enabled = toggle.enabled;
             }
@@ -449,6 +454,7 @@ impl Default for FileConfig {
                 profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         providers.insert(
@@ -458,6 +464,7 @@ impl Default for FileConfig {
                 profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         providers.insert(
@@ -467,6 +474,17 @@ impl Default for FileConfig {
                 profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
+            },
+        );
+        providers.insert(
+            "grok".to_string(),
+            ProviderConfig {
+                enabled: false,
+                profiles: Vec::new(),
+                cookie_header: None,
+                workspace_id: None,
+                source_mode: None,
             },
         );
         Self {
@@ -549,6 +567,7 @@ mod tests {
         let config = FileConfig::default();
         assert!(config.providers["codex"].enabled);
         assert!(!config.providers["claude"].enabled);
+        assert!(!config.providers["grok"].enabled);
         assert!(config.notifications.enabled);
     }
 
@@ -557,6 +576,16 @@ mod tests {
         let config: FileConfig =
             serde_json::from_str(r#"{"poll_interval_seconds":300,"providers":{}}"#).unwrap();
         assert!(config.notifications.enabled);
+    }
+
+    #[test]
+    fn preserves_provider_source_mode_without_emitting_empty_defaults() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"providers":{"grok":{"enabled":true,"source_mode":"web"}}}"#)
+                .unwrap();
+        assert_eq!(config.providers["grok"].source_mode.as_deref(), Some("web"));
+        let defaults = serde_json::to_value(FileConfig::default()).unwrap();
+        assert!(defaults["providers"]["grok"].get("source_mode").is_none());
     }
 
     #[test]
@@ -619,10 +648,11 @@ mod tests {
 
         add_missing_default_providers(&mut config);
 
-        assert_eq!(config.providers.len(), 3);
+        assert_eq!(config.providers.len(), 4);
         assert!(!config.providers["codex"].enabled);
         assert!(config.providers.contains_key("claude"));
         assert!(config.providers.contains_key("opencode_go"));
+        assert!(config.providers.contains_key("grok"));
         assert!(!is_supported_provider("unknown"));
         assert!(!is_supported_provider("opencode"));
     }

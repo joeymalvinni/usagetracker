@@ -251,7 +251,8 @@ final class DaemonLogRotatorTests: XCTestCase {
 
 final class ProviderCatalogTests: XCTestCase {
     func testUsesAnExplicitProviderAllowlist() {
-        XCTAssertEqual(ProviderCatalog.supportedIDs, ["codex", "claude", "opencode_go"])
+        XCTAssertEqual(ProviderCatalog.supportedIDs, ["codex", "claude", "opencode_go", "grok"])
+        XCTAssertTrue(ProviderCatalog.supports("grok"))
         XCTAssertTrue(ProviderCatalog.supports("opencode_go"))
         XCTAssertFalse(ProviderCatalog.supports("opencode"))
         XCTAssertFalse(ProviderCatalog.supports("future_provider"))

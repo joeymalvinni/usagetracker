@@ -123,6 +123,7 @@ On first launch, the menu app opens a setup assistant for choosing providers and
 - Codex opens an isolated profile login in Terminal and supports multiple named profiles.
 - Claude opens `claude auth login` in Terminal.
 - OpenCode Go opens its web login, then discovers available workspaces for selection.
+- Grok launches `grok login` when Grok Build is installed, with grok.com sign-in as a fallback.
 
 Provider errors include a retry or login-repair action. Account names can be changed locally in Settings. Removing an account is a reversible soft removal: collection stops and the account disappears from dashboards, while history is retained and the account can be restored.
 
@@ -185,6 +186,9 @@ The config file controls which providers are enabled:
     },
     "opencode_go": {
       "enabled": false
+    },
+    "grok": {
+      "enabled": false
     }
   },
   "debug_capture_raw_payloads": false
@@ -246,6 +250,23 @@ Example multi-account config:
 Quota/rate-limit usage is collected per profile. Local cost estimates are also profile-scoped when separate Codex homes or Claude project roots are configured. During migration, a sole active managed Claude profile becomes the durable owner of existing `~/.claude` activity; additional profiles only scan their isolated roots, preventing duplication. For Claude's default `~/.claude` profile, omit `claude_config_dir` to retain the legacy unsuffixed Keychain service.
 
 OpenCode Go collection is disabled by default. `opencode_go` tries authenticated web console usage first, then falls back to the local OpenCode SQLite database at `~/.local/share/opencode/opencode.db` when web collection is unavailable. Zen balance is fetched as optional best-effort enrichment.
+
+Grok collection is disabled by default. `grok` first uses the official Grok Build ACP process and
+its billing extension, then falls back to grok.com's account-wide billing RPC using the existing
+Grok token and/or a browser session. Provider rate limits never fall back, and local Grok session
+tokens are not presented as quota. See [docs/grok.md](docs/grok.md) for the transport, credential,
+fallback, and security details.
+
+Grok source selection can be pinned when diagnosing either transport:
+
+```json
+"grok": {
+  "enabled": true,
+  "source_mode": "auto"
+}
+```
+
+Supported values are `auto` (CLI then web fallback), `cli`, and `web`.
 
 OpenCode web collection resolves cookies automatically:
 

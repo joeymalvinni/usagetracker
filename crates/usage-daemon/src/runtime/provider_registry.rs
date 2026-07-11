@@ -7,6 +7,7 @@ use crate::{
     providers::{
         claude::{ClaudeCollector, PROVIDER_ID as CLAUDE_PROVIDER_ID},
         codex::{CodexCollector, PROVIDER_ID as CODEX_PROVIDER_ID},
+        grok::{GrokCollector, PROVIDER_ID as GROK_PROVIDER_ID},
         opencode::{OpenCodeCollector, OPENCODE_GO_PROVIDER_ID},
         ProviderCollector,
     },
@@ -30,6 +31,10 @@ const PROVIDERS: &[ProviderRegistration] = &[
     ProviderRegistration {
         id: OPENCODE_GO_PROVIDER_ID,
         build: build_opencode_go,
+    },
+    ProviderRegistration {
+        id: GROK_PROVIDER_ID,
+        build: build_grok,
     },
 ];
 
@@ -88,6 +93,17 @@ fn build_opencode_go(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollecto
         config
             .providers
             .get(OPENCODE_GO_PROVIDER_ID)
+            .cloned()
+            .unwrap_or_default(),
+        config.debug_capture_raw_payloads,
+    )?))
+}
+
+fn build_grok(config: &Config) -> anyhow::Result<Arc<dyn ProviderCollector>> {
+    Ok(Arc::new(GrokCollector::new(
+        config
+            .providers
+            .get(GROK_PROVIDER_ID)
             .cloned()
             .unwrap_or_default(),
         config.debug_capture_raw_payloads,

@@ -25,6 +25,7 @@ struct Onboarding: View {
                     OnboardingProviderCard(providerId: "codex")
                     OnboardingProviderCard(providerId: "claude")
                     OnboardingProviderCard(providerId: "opencode_go")
+                    OnboardingProviderCard(providerId: "grok")
                 }
             }
 
@@ -82,16 +83,18 @@ private struct OnboardingProviderCard: View {
     }
 
     private var name: String {
-        switch providerId { case "codex": "Codex"; case "claude": "Claude"; default: "OpenCode Go" }
+        ProviderCatalog.name(for: providerId)
     }
     private var symbol: String {
-        switch providerId { case "codex": "terminal"; case "claude": "sparkles"; default: "bolt.horizontal" }
+        ProviderCatalog.symbol(for: providerId)
     }
     private var description: String {
         switch providerId {
         case "codex": "Rate limits plus estimated local token activity"
         case "claude": "Claude Code limits plus estimated local activity"
-        default: "Workspace usage, balance, and local fallback"
+        case "opencode_go": "Workspace usage, balance, and local fallback"
+        case "grok": "Shared Grok usage from Grok Build or grok.com"
+        default: "Provider usage and limits"
         }
     }
 }
@@ -175,7 +178,9 @@ struct ProviderSetupControls: View {
         switch providerId {
         case "codex": accounts.isEmpty ? "Connect Codex" : "Repair login"
         case "claude": accounts.isEmpty ? "Connect Claude" : "Repair Claude login"
-        default: "Open OpenCode login"
+        case "opencode_go": "Open OpenCode login"
+        case "grok": accounts.isEmpty ? "Connect Grok" : "Repair Grok login"
+        default: "Connect provider"
         }
     }
 
@@ -183,7 +188,9 @@ struct ProviderSetupControls: View {
         switch providerId {
         case "codex": "Each account uses an isolated Codex profile. Finish the browser sign-in; the account appears automatically."
         case "claude": "Each account uses an isolated Claude profile. After sign-in, open its profile terminal from Settings to keep activity separate."
-        default: "Sign in at opencode.ai, then discover and choose the workspace to track."
+        case "opencode_go": "Sign in at opencode.ai, then discover and choose the workspace to track."
+        case "grok": "Uses Grok Build billing first, then your signed-in grok.com session. Grok is tracked as one account."
+        default: "Connect the provider, then refresh usage."
         }
     }
 }

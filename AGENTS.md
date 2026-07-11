@@ -2,7 +2,7 @@
 
 ## Project
 
-Local AI usage tracker: background daemon polls providers (Codex/OpenAI, Claude/Anthropic, OpenCode Go) for usage/rate-limit data, stores in SQLite, exposes via Unix socket. CLI and macOS menu bar app consume the socket.
+Local AI usage tracker: background daemon polls providers (Codex/OpenAI, Claude/Anthropic, OpenCode Go, Grok/xAI) for usage/rate-limit data, stores in SQLite, exposes via Unix socket. CLI and macOS menu bar app consume the socket.
 
 ## Workspace layout
 
@@ -45,7 +45,9 @@ When running a single test, pass a substring of the test function name to `cargo
 
 ## Architecture notes
 
-**Daemon start**: Creates `~/.usagetracker/` (config, SQLite DB, Unix socket) automatically on first run. Config defaults: codex enabled, claude/opencode_go disabled.
+**Daemon start**: Creates `~/.usagetracker/` (config, SQLite DB, Unix socket) automatically on first run. Config defaults: codex enabled, claude/opencode_go/grok disabled.
+
+**Grok dual-path collection**: Attempts the Grok Build ACP `x.ai/billing` RPC first, then falls back to grok.com's billing gRPC-web endpoint using the cached Grok token and/or browser session cookies. Rate limits never fall back. Detailed logic in `docs/grok.md`.
 
 **SQLite schema**: `crates/usage-daemon/migrations/0001_initial.sql` is the authoritative disposable local schema and is applied transactionally. Provider data is reproducible; incompatible legacy schemas are reset instead of repaired in production code.
 
