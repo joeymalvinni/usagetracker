@@ -1,7 +1,7 @@
 import AppKit
 
 enum MenuBarProgressIcon {
-    private static let maxRows = 2
+    static let maxRows = UIConfig.menuProviderCountRange.upperBound
     private static let height: CGFloat = 18
     private static let horizontalInset: CGFloat = 2
 

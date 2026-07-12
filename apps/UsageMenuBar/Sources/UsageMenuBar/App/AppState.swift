@@ -48,11 +48,26 @@ struct DerivedState: Equatable {
     var menuPreview: String { derived.menuPreview }
     var menuStatus: DisplayStatus { derived.menuStatus }
     var menuBars: [MenuBarProviderVM] { derived.menuBars }
+    var menuProviderCount: Int {
+        let eligibleProviderIDs = Self.providerIDsWithDataOrConnection(
+            accounts: accounts,
+            snapshots: snapshots
+        )
+        return ui.resolvedMenuProviderCount(
+            automaticCount: providers.filter {
+                $0.enabled && $0.visibleInMenu && eligibleProviderIDs.contains($0.providerId)
+            }.count
+        )
+    }
     @Published var ui: UIConfig {
         didSet {
             guard ui != oldValue else { return }
             scheduleUIConfigPersistence()
-            build()
+            if dashboardConfigurationChanged(from: oldValue) {
+                build()
+            } else if menuBarConfigurationChanged(from: oldValue) {
+                updateMenuBarPresentation()
+            }
         }
     }
 
@@ -678,6 +693,10 @@ struct DerivedState: Equatable {
         let windowProvenance = windowProvenance
         let ui = ui
         let daemon = daemon
+        let menuEligibleProviderIDs = Self.providerIDsWithDataOrConnection(
+            accounts: accounts,
+            snapshots: snapshots
+        )
         let visibleProviderIds = Set(
             config?.providers.compactMap { $0.value.enabled ? $0.key : nil } ?? []
         )
@@ -699,10 +718,19 @@ struct DerivedState: Equatable {
                             && (config == nil || visibleProviderIds.contains($0))
                     }
                 )
-                return Self.derive(from: engine.build(), daemon: daemon, ui: ui)
+                return Self.derive(
+                    from: engine.build(),
+                    daemon: daemon,
+                    ui: ui,
+                    menuEligibleProviderIDs: menuEligibleProviderIDs
+                )
             }.value
             guard let self, !Task.isCancelled, revision == self.buildRevision else { return }
-            if self.derived != next { self.derived = next }
+            // A menu-only preference may have changed while this detached build
+            // was running. Apply the latest menu configuration so an older
+            // captured metric or row count cannot flash back into the status item.
+            let current = self.updatingMenuBarPresentation(in: next)
+            if self.derived != current { self.derived = current }
             self.pruneStaleAcknowledgements()
         }
     }
@@ -710,10 +738,16 @@ struct DerivedState: Equatable {
     nonisolated private static func derive(
         from output: DashboardBuilder.Output,
         daemon: DaemonState,
-        ui: UIConfig
+        ui: UIConfig,
+        menuEligibleProviderIDs: Set<String>
     ) -> DerivedState {
         let visibleProviders = output.providers.filter(\.visibleInMenu)
-        let menu = menuContent(providers: visibleProviders, daemon: daemon, ui: ui)
+        let menu = menuContent(
+            providers: visibleProviders,
+            daemon: daemon,
+            ui: ui,
+            eligibleProviderIDs: menuEligibleProviderIDs
+        )
         return DerivedState(
             providers: visibleProviders,
             settingsProviders: output.settingsProviders,
@@ -722,6 +756,49 @@ struct DerivedState: Equatable {
             menuStatus: menu.status,
             menuBars: menu.bars
         )
+    }
+
+    /// Menu-bar preferences only transform already-built provider view models.
+    /// Updating these synchronously avoids launching and awaiting a full detached
+    /// dashboard build for every right-click menu selection.
+    private func updateMenuBarPresentation() {
+        let next = updatingMenuBarPresentation(in: derived)
+        if derived != next { derived = next }
+    }
+
+    private func updatingMenuBarPresentation(in state: DerivedState) -> DerivedState {
+        let eligibleProviderIDs = Self.providerIDsWithDataOrConnection(
+            accounts: accounts,
+            snapshots: snapshots
+        )
+        let menu = Self.menuContent(
+            providers: state.providers,
+            daemon: daemon,
+            ui: ui,
+            eligibleProviderIDs: eligibleProviderIDs
+        )
+        let next = DerivedState(
+            providers: state.providers,
+            settingsProviders: state.settingsProviders,
+            cost: state.cost,
+            menuPreview: menu.preview,
+            menuStatus: menu.status,
+            menuBars: menu.bars
+        )
+        return next
+    }
+
+    private func dashboardConfigurationChanged(from oldValue: UIConfig) -> Bool {
+        ui.hiddenProviders != oldValue.hiddenProviders
+            || ui.hiddenWindows != oldValue.hiddenWindows
+            || ui.providerOrder != oldValue.providerOrder
+            || ui.seenAlerts != oldValue.seenAlerts
+    }
+
+    private func menuBarConfigurationChanged(from oldValue: UIConfig) -> Bool {
+        ui.menuMetric != oldValue.menuMetric
+            || ui.showProviderLabels != oldValue.showProviderLabels
+            || ui.maxMenuProviders != oldValue.maxMenuProviders
     }
 
     private func scheduleUIConfigPersistence() {
@@ -788,15 +865,19 @@ struct DerivedState: Equatable {
         return !ui.dismissedAlerts.contains(sig)
     }
 
-    nonisolated private static func menuContent(
+    nonisolated static func menuContent(
         providers: [ProviderVM],
         daemon: DaemonState,
-        ui: UIConfig
+        ui: UIConfig,
+        eligibleProviderIDs: Set<String>
     ) -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
         guard daemon != .offline else { return ("Usage offline", .offline, []) }
         var preview = ""
-        let eligible = providers.filter { $0.enabled && $0.visibleInMenu }
-        let shown = Array(eligible.prefix(max(0, ui.maxMenuProviders)))
+        let eligible = providers.filter {
+            $0.enabled && $0.visibleInMenu && eligibleProviderIDs.contains($0.providerId)
+        }
+        let providerCount = ui.resolvedMenuProviderCount(automaticCount: eligible.count)
+        let shown = Array(eligible.prefix(providerCount))
         for (index, provider) in shown.enumerated() {
             if index > 0 { preview += "  " }
             let value: String
@@ -809,12 +890,21 @@ struct DerivedState: Equatable {
             let text = ui.showProviderLabels ? "\(provider.short) \(value)" : value
             preview += text
         }
-        let bars = eligible.prefix(2).map { provider in
+        let bars = shown.map { provider in
             let displayed = provider.percent.map { max(0, min(100, ui.menuMetric == .used ? 100 - $0 : $0)) }
             return MenuBarProviderVM(id: provider.id, providerId: provider.providerId, short: provider.short, percent: displayed, status: provider.status)
         }
         if preview.isEmpty { return ("Usage", .stale, []) }
         return (preview, menuStatus(for: shown), bars)
+    }
+
+    nonisolated static func providerIDsWithDataOrConnection(
+        accounts: [Account],
+        snapshots: [UsageSnapshot]
+    ) -> Set<String> {
+        var providerIDs = Set(snapshots.map(\.providerId))
+        providerIDs.formUnion(accounts.lazy.filter { !$0.hidden }.map(\.providerId))
+        return providerIDs
     }
 
     nonisolated private static func menuStatus(for providers: [ProviderVM]) -> DisplayStatus {

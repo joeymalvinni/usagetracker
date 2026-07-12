@@ -258,6 +258,127 @@ final class ProviderCatalogTests: XCTestCase {
     }
 }
 
+final class MenuBarPresentationTests: XCTestCase {
+    func testProviderCountControlsBothTooltipAndIconRows() {
+        var ui = UIConfig()
+        ui.maxMenuProviders = 1
+        let providers = [
+            provider("codex", short: "C", percent: 80),
+            provider("claude", short: "A", percent: 60),
+        ]
+
+        let presentation = AppState.menuContent(
+            providers: providers,
+            daemon: .online,
+            ui: ui,
+            eligibleProviderIDs: Set(providers.map(\.providerId))
+        )
+
+        XCTAssertEqual(presentation.preview, "C 80%")
+        XCTAssertEqual(presentation.bars.map(\.providerId), ["codex"])
+    }
+
+    func testUsedMetricAndTooltipNamePreferenceApplyTogether() {
+        var ui = UIConfig()
+        ui.maxMenuProviders = 2
+        ui.menuMetric = .used
+        ui.showProviderLabels = false
+        let providers = [
+            provider("codex", short: "C", percent: 80),
+            provider("claude", short: "A", percent: 60),
+        ]
+
+        let presentation = AppState.menuContent(
+            providers: providers,
+            daemon: .online,
+            ui: ui,
+            eligibleProviderIDs: Set(providers.map(\.providerId))
+        )
+
+        XCTAssertEqual(presentation.preview, "20%  40%")
+        XCTAssertEqual(presentation.bars.map(\.percent), [20, 40])
+    }
+
+    func testStatusMenuProvidersAreEligibleAndCappedAtFive() {
+        var providers = (1...8).map { provider("provider-\($0)", short: "P\($0)", percent: 50) }
+        providers[2] = provider("provider-3", short: "P3", percent: 50, enabled: false)
+        let eligible = Set(providers.map(\.providerId)).subtracting(["provider-2"])
+
+        let selected = StatusMenuProviderSelection.select(
+            from: providers,
+            eligibleProviderIDs: eligible
+        )
+
+        XCTAssertEqual(selected.map(\.providerId), [
+            "provider-1", "provider-4", "provider-5", "provider-6", "provider-7",
+        ])
+    }
+
+    func testSavedProviderCountIsClampedToIconCapacity() throws {
+        let data = Data(#"{"maxMenuProviders":99}"#.utf8)
+        let ui = try JSONDecoder().decode(UIConfig.self, from: data)
+
+        XCTAssertEqual(ui.maxMenuProviders, .some(MenuBarProgressIcon.maxRows))
+    }
+
+    func testDefaultProviderCountTracksConnectedProviders() {
+        let ui = UIConfig()
+        let providers = [
+            provider("claude", short: "A", percent: 60),
+            provider("codex", short: "C", percent: 80),
+        ]
+
+        let oneProvider = AppState.menuContent(
+            providers: providers,
+            daemon: .online,
+            ui: ui,
+            eligibleProviderIDs: ["codex"]
+        )
+        let twoProviders = AppState.menuContent(
+            providers: providers,
+            daemon: .online,
+            ui: ui,
+            eligibleProviderIDs: ["codex", "claude"]
+        )
+
+        XCTAssertEqual(oneProvider.bars.count, 1)
+        XCTAssertEqual(oneProvider.bars.first?.providerId, "codex")
+        XCTAssertEqual(twoProviders.bars.count, 2)
+    }
+
+    private func provider(
+        _ id: String,
+        short: String,
+        percent: Double,
+        enabled: Bool = true
+    ) -> ProviderVM {
+        ProviderVM(
+            id: id,
+            providerId: id,
+            accountId: nil,
+            name: id,
+            short: short,
+            symbol: "circle",
+            primary: "\(Int(percent))%",
+            detail: "updated now",
+            percent: percent,
+            status: .normal,
+            spend: [],
+            windows: [],
+            credits: [],
+            resetCredits: [],
+            account: nil,
+            healthText: "all good",
+            visibleInMenu: true,
+            enabled: enabled,
+            secondary: "",
+            sparkline: [],
+            costDashboard: .empty,
+            subAccounts: nil
+        )
+    }
+}
+
 private actor RecordingTransport: DaemonTransport {
     private var responses: [String]
     private var requests = [String]()

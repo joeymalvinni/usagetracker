@@ -14,6 +14,11 @@ import UserNotifications
 }
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
+    private struct MenuIconPresentation: Equatable {
+        let status: DisplayStatus
+        let bars: [MenuBarProviderVM]
+    }
+
     private struct ProviderMenuSelection {
         let providerId: String
         let accountId: String?
@@ -31,10 +36,10 @@ import UserNotifications
     private var providerLabelsMenuItem: NSMenuItem!
     private var remainingMetricMenuItem: NSMenuItem!
     private var usedMetricMenuItem: NSMenuItem!
-    private var oneProviderMenuItem: NSMenuItem!
-    private var twoProvidersMenuItem: NSMenuItem!
+    private var providerCountMenuItems = [Int: NSMenuItem]()
     private var iconCache = [String: NSImage]()
     private var providerMenuSignature = ""
+    private var renderedMenuIcon: MenuIconPresentation?
     private var bag = Set<AnyCancellable>()
     private let menuIconSize = NSSize(width: 16, height: 16)
 
@@ -56,16 +61,10 @@ import UserNotifications
         popover.contentViewController = popoverController
         makeStatusMenu()
 
-        state.$derived.map(\.menuPreview).removeDuplicates().receive(on: RunLoop.main).sink { [weak self] preview in self?.item.button?.toolTip = preview.isEmpty ? "Usage" : preview }.store(in: &bag)
-        state.$derived.map { ($0.menuStatus, $0.menuBars) }
-            .receive(on: RunLoop.main)
-            .sink { [weak self] value in self?.updateMenuIcon(for: value.0, bars: value.1) }
-            .store(in: &bag)
-        state.objectWillChange
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.updateStatusMenu() }
-            }
+        state.$derived.map(\.menuPreview).removeDuplicates().sink { [weak self] preview in self?.item.button?.toolTip = preview.isEmpty ? "Usage" : preview }.store(in: &bag)
+        state.$derived.map { MenuIconPresentation(status: $0.menuStatus, bars: $0.menuBars) }
+            .removeDuplicates()
+            .sink { [weak self] value in self?.updateMenuIcon(for: value.status, bars: value.bars) }
             .store(in: &bag)
         Task { await state.bootstrap(); await state.pollLoop() }
 
@@ -100,6 +99,9 @@ import UserNotifications
     }
 
     private func updateMenuIcon(for status: DisplayStatus, bars: [MenuBarProviderVM]) {
+        let presentation = MenuIconPresentation(status: status, bars: bars)
+        guard presentation != renderedMenuIcon else { return }
+        renderedMenuIcon = presentation
         guard let button = item.button else { return }
         item.length = MenuBarProgressIcon.statusItemLength(for: bars)
         button.image = MenuBarProgressIcon.image(for: bars, status: status)
@@ -157,6 +159,7 @@ import UserNotifications
 
     private func showContextMenu(with event: NSEvent, relativeTo button: NSStatusBarButton) {
         popover.performClose(nil)
+        updateStatusMenu()
         NSMenu.popUpContextMenu(contextMenu, with: event, for: button)
     }
 
@@ -203,20 +206,16 @@ import UserNotifications
         statusMenuItem.title = statusSummary
         refreshMenuItem.title = state.refreshing ? "Refreshing..." : "Refresh"
         refreshMenuItem.isEnabled = !state.refreshing
-        providerLabelsMenuItem.state = state.ui.showProviderLabels ? .on : .off
-        remainingMetricMenuItem.state = state.ui.menuMetric == .remaining ? .on : .off
-        usedMetricMenuItem.state = state.ui.menuMetric == .used ? .on : .off
-        oneProviderMenuItem.state = state.ui.maxMenuProviders == 1 ? .on : .off
-        twoProvidersMenuItem.state = state.ui.maxMenuProviders == 2 ? .on : .off
+        updateMenuBarSettingsStates()
 
-        let providers = state.providers.filter(\.enabled)
+        let providers = contextMenuProviders()
         let signature = makeProviderMenuSignature(providers)
         guard signature != providerMenuSignature else { return }
         providerMenuSignature = signature
 
         providerMenuItems.forEach(menuRemoveItem)
         if providers.isEmpty {
-            let empty = NSMenuItem(title: "Waiting for usage data", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "No connected providers or usage data", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             providerMenuItems = [empty]
         } else {
@@ -225,6 +224,26 @@ import UserNotifications
         for (offset, providerItem) in providerMenuItems.enumerated() {
             contextMenu.insertItem(providerItem, at: 3 + offset)
         }
+    }
+
+    private func updateMenuBarSettingsStates() {
+        providerLabelsMenuItem.state = state.ui.showProviderLabels ? .on : .off
+        remainingMetricMenuItem.state = state.ui.menuMetric == .remaining ? .on : .off
+        usedMetricMenuItem.state = state.ui.menuMetric == .used ? .on : .off
+        for (count, item) in providerCountMenuItems {
+            item.state = state.menuProviderCount == count ? .on : .off
+        }
+    }
+
+    private func contextMenuProviders() -> [ProviderVM] {
+        let eligibleProviderIDs = AppState.providerIDsWithDataOrConnection(
+            accounts: state.accounts,
+            snapshots: state.snapshots
+        )
+        return StatusMenuProviderSelection.select(
+            from: state.providers,
+            eligibleProviderIDs: eligibleProviderIDs
+        )
     }
 
     private func makeProviderMenuSignature(_ providers: [ProviderVM]) -> String {
@@ -316,27 +335,28 @@ import UserNotifications
     }
 
     private func menuBarSettingsItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Menu Bar", action: nil, keyEquivalent: "")
+        let item = NSMenuItem(title: "Menu Bar Icon", action: nil, keyEquivalent: "")
         item.image = menuIcon(symbolImage("menubar.rectangle"), cacheKey: "menubar")
 
-        let submenu = NSMenu(title: "Menu Bar")
+        let submenu = NSMenu(title: "Menu Bar Icon")
         submenu.autoenablesItems = false
+        for count in UIConfig.menuProviderCountRange {
+            let countItem = maxProvidersItem(count: count)
+            providerCountMenuItems[count] = countItem
+            submenu.addItem(countItem)
+        }
+        submenu.addItem(.separator())
+        remainingMetricMenuItem = metricItem(title: "Show Remaining", metric: .remaining)
+        usedMetricMenuItem = metricItem(title: "Show Used", metric: .used)
+        submenu.addItem(remainingMetricMenuItem)
+        submenu.addItem(usedMetricMenuItem)
+        submenu.addItem(.separator())
         providerLabelsMenuItem = toggleItem(
-            title: "Show Provider Labels",
+            title: "Show Provider Names in Tooltip",
             state: state.ui.showProviderLabels,
             action: #selector(toggleProviderLabelsFromMenu)
         )
         submenu.addItem(providerLabelsMenuItem)
-        submenu.addItem(.separator())
-        remainingMetricMenuItem = metricItem(title: "% Left", metric: .remaining)
-        usedMetricMenuItem = metricItem(title: "% Used", metric: .used)
-        submenu.addItem(remainingMetricMenuItem)
-        submenu.addItem(usedMetricMenuItem)
-        submenu.addItem(.separator())
-        oneProviderMenuItem = maxProvidersItem(count: 1)
-        twoProvidersMenuItem = maxProvidersItem(count: 2)
-        submenu.addItem(oneProviderMenuItem)
-        submenu.addItem(twoProvidersMenuItem)
         item.submenu = submenu
         return item
     }
@@ -357,10 +377,12 @@ import UserNotifications
     }
 
     private func maxProvidersItem(count: Int) -> NSMenuItem {
-        let item = NSMenuItem(title: "Show \(count) Provider\(count == 1 ? "" : "s")", action: #selector(setMaxProvidersFromMenu(_:)), keyEquivalent: "")
+        let title = count == 1 ? "One Provider" : "Two Providers"
+        let item = NSMenuItem(title: title, action: #selector(setMaxProvidersFromMenu(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = count
-        item.state = state.ui.maxMenuProviders == count ? .on : .off
+        item.state = state.menuProviderCount == count ? .on : .off
+        item.toolTip = "Uses provider order from Settings."
         return item
     }
 
@@ -411,6 +433,7 @@ import UserNotifications
 
     @objc private func toggleProviderLabelsFromMenu() {
         state.ui.showProviderLabels.toggle()
+        updateMenuIconPreferences()
     }
 
     @objc private func setMetricFromMenu(_ sender: NSMenuItem) {
@@ -418,11 +441,20 @@ import UserNotifications
               let metric = UIConfig.MenuMetric(rawValue: raw)
         else { return }
         state.ui.menuMetric = metric
+        updateMenuIconPreferences()
     }
 
     @objc private func setMaxProvidersFromMenu(_ sender: NSMenuItem) {
         guard let count = sender.representedObject as? Int else { return }
         state.ui.maxMenuProviders = count
+        updateMenuIconPreferences()
+    }
+
+    private func updateMenuIconPreferences() {
+        updateMenuBarSettingsStates()
+        let preview = state.menuPreview.isEmpty ? "Usage" : state.menuPreview
+        item.button?.toolTip = preview
+        updateMenuIcon(for: state.menuStatus, bars: state.menuBars)
     }
 
     @objc private func quitFromMenu() {
@@ -444,6 +476,21 @@ import UserNotifications
         }
         window.orderFrontRegardless()
         debugWindow = window
+    }
+}
+
+enum StatusMenuProviderSelection {
+    static let maximumCount = 5
+
+    static func select(
+        from providers: [ProviderVM],
+        eligibleProviderIDs: Set<String>
+    ) -> [ProviderVM] {
+        Array(
+            providers.lazy
+                .filter { $0.enabled && eligibleProviderIDs.contains($0.providerId) }
+                .prefix(maximumCount)
+        )
     }
 }
 

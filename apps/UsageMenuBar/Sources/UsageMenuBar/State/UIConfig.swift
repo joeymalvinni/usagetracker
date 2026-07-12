@@ -18,6 +18,8 @@ enum UIPaths {
 }
 
 struct UIConfig: Codable, Equatable {
+    static let menuProviderCountRange = 1...2
+
     enum MenuMetric: String, Codable, CaseIterable {
         case remaining, used
         var label: String { self == .remaining ? "% left" : "% used" }
@@ -30,8 +32,12 @@ struct UIConfig: Codable, Equatable {
     var hiddenWindows = [String: String]()
     var providerOrder = [String]()
     var menuMetric = MenuMetric.remaining
+    /// Controls provider names in the status item's tooltip. The icon itself is
+    /// intentionally label-free so it remains compact in the menu bar.
     var showProviderLabels = true
-    var maxMenuProviders = 2
+    /// Nil means the app chooses one or two rows from the number of connected
+    /// providers. Setting a value records an explicit user choice.
+    var maxMenuProviders: Int?
     var colorByStatus = true
     var darkModeEnabled = false
     var onboardingCompleted = false
@@ -49,7 +55,12 @@ struct UIConfig: Codable, Equatable {
         providerOrder = try c.decodeIfPresent([String].self, forKey: .providerOrder) ?? []
         menuMetric = try c.decodeIfPresent(MenuMetric.self, forKey: .menuMetric) ?? .remaining
         showProviderLabels = try c.decodeIfPresent(Bool.self, forKey: .showProviderLabels) ?? true
-        maxMenuProviders = try c.decodeIfPresent(Int.self, forKey: .maxMenuProviders) ?? 2
+        maxMenuProviders = try c.decodeIfPresent(Int.self, forKey: .maxMenuProviders).map {
+            min(
+                max($0, Self.menuProviderCountRange.lowerBound),
+                Self.menuProviderCountRange.upperBound
+            )
+        }
         colorByStatus = try c.decodeIfPresent(Bool.self, forKey: .colorByStatus) ?? true
         darkModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .darkModeEnabled) ?? false
         // Existing beta users should not be interrupted; newly created configs keep false.
@@ -74,6 +85,13 @@ struct UIConfig: Codable, Equatable {
         pruned.seenAlerts.formIntersection(liveAlerts)
         pruned.dismissedAlerts.formIntersection(liveAlerts)
         return pruned
+    }
+
+    func resolvedMenuProviderCount(automaticCount: Int) -> Int {
+        min(
+            max(maxMenuProviders ?? automaticCount, Self.menuProviderCountRange.lowerBound),
+            Self.menuProviderCountRange.upperBound
+        )
     }
 
     func save() throws {
