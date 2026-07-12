@@ -121,6 +121,16 @@ struct DerivedState: Equatable {
         // replaces an older daemon instead of silently serving stale data.
         _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
         await load(all: true)
+        // Running the notifications fixture is an explicit request to exercise
+        // desktop delivery. Development builds use their own bundle identity,
+        // so request its authorization on the first fixture launch and then
+        // drain the alerts that the initial load left queued.
+        if ProcessInfo.processInfo.environment["USAGE_TRACKER_FIXTURE"] == "notifications",
+           notificationAuthorization == .notDetermined
+        {
+            await requestNotificationAuthorizationIfNeeded()
+            await deliverPendingNotifications()
+        }
     }
     func refreshForPopoverOpen() async {
         await load(all: false)

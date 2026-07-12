@@ -8,6 +8,10 @@ private struct HiddenWindowEntry: Identifiable {
 }
 
 struct Settings: View {
+    private static let notificationSettingsURL = URL(
+        string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+    )!
+
     @EnvironmentObject var state: AppState
     @State private var showsRemovedAccounts = false
     @State private var showsAdvanced = false
@@ -86,9 +90,15 @@ struct Settings: View {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text("Usage alerts")
                                 if state.config?.notifications.enabled == true {
-                                    Text(notificationPermissionText)
-                                        .font(Theme.Typography.micro)
-                                        .foregroundStyle(state.notificationAuthorization == .denied ? .red : .secondary)
+                                    HStack(spacing: Theme.Spacing.xs) {
+                                        Text(notificationPermissionText)
+                                            .foregroundStyle(state.notificationAuthorization == .denied ? .red : .secondary)
+                                        if state.notificationAuthorization == .denied {
+                                            Link("Open Settings", destination: Self.notificationSettingsURL)
+                                                .buttonStyle(.link)
+                                        }
+                                    }
+                                    .font(Theme.Typography.micro)
                                 }
                             }
                         }
@@ -209,7 +219,7 @@ struct Settings: View {
         }
         return switch state.notificationAuthorization {
         case .authorized, .provisional, .ephemeral: "Allowed by macOS"
-        case .denied: "Blocked by macOS; enable Usage in System Settings → Notifications"
+        case .denied: "Blocked by macOS"
         case .notDetermined: "macOS will ask for permission when alerts are enabled"
         @unknown default: "Notification permission status unavailable"
         }
