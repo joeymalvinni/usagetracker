@@ -91,14 +91,15 @@ fn resolve_from_login_shell() -> Option<PathBuf> {
     executable_file(PathBuf::from(path.lines().next()?.trim()))
 }
 
-pub(super) fn fetch_billing(binary: &Path) -> Result<Value, ProviderError> {
-    run_rpc(binary).map_err(|err| classify_rpc_error(&err.to_string()))
+pub(super) fn fetch_billing(binary: &Path, grok_home: &Path) -> Result<Value, ProviderError> {
+    run_rpc(binary, grok_home).map_err(|err| classify_rpc_error(&err.to_string()))
 }
 
-fn run_rpc(binary: &Path) -> anyhow::Result<Value> {
+fn run_rpc(binary: &Path, grok_home: &Path) -> anyhow::Result<Value> {
     let mut child = ChildGuard(
         Command::new(binary)
             .args(["--no-auto-update", "agent", "stdio"])
+            .env("GROK_HOME", grok_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -306,6 +307,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let script = root.join("grok");
         std::fs::write(&script, r#"#!/bin/sh
+printf '%s' "$GROK_HOME" > "$(dirname "$0")/seen-home"
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}' ;;
@@ -318,8 +320,14 @@ done
         permissions.set_mode(0o700);
         std::fs::set_permissions(&script, permissions).unwrap();
 
-        let result = run_rpc(&script).unwrap();
+        let grok_home = root.join("profile");
+        std::fs::create_dir_all(&grok_home).unwrap();
+        let result = run_rpc(&script, &grok_home).unwrap();
         assert_eq!(result["usage"]["includedUsed"]["val"], 25);
+        assert_eq!(
+            std::fs::read_to_string(root.join("seen-home")).unwrap(),
+            grok_home.display().to_string()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

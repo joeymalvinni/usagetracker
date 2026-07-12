@@ -187,6 +187,8 @@ pub(crate) fn unique_profile_id(
     let existing = profiles
         .iter()
         .filter_map(|profile| profile.id.as_deref())
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
         .collect::<BTreeSet<_>>();
     if !existing.contains(base.as_str()) {
         return base;

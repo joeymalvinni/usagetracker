@@ -86,6 +86,33 @@ pub struct DiscoveredAccount {
     pub profile_id: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct AccountDiscoveryFailure {
+    pub profile_id: String,
+    pub error: ProviderError,
+}
+
+#[derive(Debug, Default)]
+pub struct AccountDiscovery {
+    pub accounts: Vec<DiscoveredAccount>,
+    pub failures: Vec<AccountDiscoveryFailure>,
+}
+
+impl From<Vec<DiscoveredAccount>> for AccountDiscovery {
+    fn from(accounts: Vec<DiscoveredAccount>) -> Self {
+        Self {
+            accounts,
+            failures: Vec::new(),
+        }
+    }
+}
+
+impl FromIterator<DiscoveredAccount> for AccountDiscovery {
+    fn from_iter<T: IntoIterator<Item = DiscoveredAccount>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
@@ -128,7 +155,7 @@ impl ProviderUsage {
 pub trait ProviderCollector: Send + Sync {
     fn provider_id(&self) -> ProviderId;
 
-    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError>;
+    async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError>;
 
     async fn collect_usage(
         &self,

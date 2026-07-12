@@ -200,7 +200,8 @@ async fn discovers_each_codex_identity_once_regardless_of_profile_nickname() {
     )
     .unwrap();
 
-    let accounts = collector.discover_accounts().await.unwrap();
+    let discovery = collector.discover_accounts().await.unwrap();
+    let accounts = discovery.accounts;
 
     assert_eq!(accounts.len(), 2);
     assert_eq!(accounts[0].external_account_id, "shared-account");

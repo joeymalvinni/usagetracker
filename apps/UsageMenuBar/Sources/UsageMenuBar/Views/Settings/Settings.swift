@@ -329,15 +329,15 @@ private struct ProviderAccountCard: View {
     }
 
     private var actionLabel: String {
-        switch provider.providerId {
-        case "codex": accounts.isEmpty ? "Connect account" : "Add account"
-        case "claude": accounts.isEmpty ? "Connect account" : "Add account"
-        default: accounts.isEmpty ? "Sign in" : "Reconnect"
+        if ProviderCatalog.supportsMultipleAccounts(provider.providerId) {
+            accounts.isEmpty ? "Connect account" : "Add account"
+        } else {
+            accounts.isEmpty ? "Sign in" : "Reconnect"
         }
     }
 
     private func primaryAction() async {
-        if provider.providerId == "codex" || provider.providerId == "claude" {
+        if ProviderCatalog.supportsMultipleAccounts(provider.providerId) {
             await state.addProviderAccount(provider.providerId)
         } else {
             await state.repairProvider(provider.providerId, accountId: accounts.first?.id)

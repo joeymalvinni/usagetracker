@@ -31,7 +31,9 @@ use crate::{
         paths::expand_home_path,
         ProviderCollector,
     },
-    runtime::{launchers, managed_profiles, profile_service, provider_registry},
+    runtime::{
+        grok_profile_service, launchers, managed_profiles, profile_service, provider_registry,
+    },
     server::SocketServer,
     storage::Storage,
 };
@@ -83,6 +85,11 @@ impl PollSchedule {
     }
 }
 
+use grok_profile_service::{
+    ensure_login_profile as ensure_grok_login_profile,
+    select_browser_login_target as select_grok_browser_login_target,
+    select_login_target as select_grok_login_target, GrokLoginTarget,
+};
 use profile_service::{
     codex_profile_home, create_managed_claude_profile, default_codex_profile,
     ensure_claude_login_profile, pending_claude_profile, pending_codex_profile, unique_profile_id,
@@ -375,6 +382,7 @@ impl DaemonRuntime {
         match provider_id.as_str() {
             CODEX_PROVIDER_ID => self.add_codex_account(provider_id, display_name).await,
             CLAUDE_PROVIDER_ID => self.add_claude_account(provider_id, display_name).await,
+            GROK_PROVIDER_ID => self.add_grok_account(provider_id, display_name).await,
             _ => anyhow::bail!("adding accounts is not supported for {provider_id}"),
         }
     }
@@ -501,6 +509,71 @@ impl DaemonRuntime {
         })
     }
 
+    async fn add_grok_account(
+        &self,
+        provider_id: ProviderId,
+        display_name: Option<String>,
+    ) -> anyhow::Result<AddProviderAccountResponse> {
+        let connected_profiles = self
+            .storage
+            .accounts()
+            .await?
+            .into_iter()
+            .filter(|account| account.provider_id.as_str() == GROK_PROVIDER_ID)
+            .filter_map(|account| account.profile_id)
+            .collect::<BTreeSet<_>>();
+        let binary = grok::find_grok_binary();
+        if binary.is_none() && !connected_profiles.is_empty() {
+            anyhow::bail!("adding another Grok account requires the Grok Build CLI");
+        }
+
+        let mutation = self.config_mutation.lock().await;
+        let mut updated_config = self.config.read().await.clone();
+        let provider = updated_config
+            .providers
+            .entry(GROK_PROVIDER_ID.to_string())
+            .or_default();
+        provider.enabled = true;
+        let target = if binary.is_some() {
+            select_grok_login_target(provider, &connected_profiles, display_name.clone())?
+        } else {
+            select_grok_browser_login_target(provider)?
+        };
+
+        let collectors = self.collectors_for_config(&updated_config).await?;
+        updated_config.persist()?;
+        self.publish_local_log_config(&updated_config);
+        *self.config.write().await = updated_config;
+        self.refresh.set_providers(collectors).await;
+        drop(mutation);
+
+        if let Some(binary) = binary {
+            let child = launchers::launch_grok_login(&binary, &target.grok_home)?;
+            launchers::monitor_login(
+                child,
+                self.refresh.clone(),
+                GROK_PROVIDER_ID,
+                Some(target.profile_id.clone()),
+            );
+        } else {
+            launchers::open_url("https://grok.com/?_s=usage")?;
+        }
+
+        info!(
+            provider_id = provider_id.as_str(),
+            profile_id = target.profile_id.as_str(),
+            profile_path = %target.grok_home.display(),
+            "provider account login launched"
+        );
+
+        Ok(AddProviderAccountResponse {
+            provider_id,
+            profile_id: target.profile_id,
+            display_name: target.display_name,
+            profile_path: target.grok_home.display().to_string(),
+        })
+    }
+
     pub async fn update_account(
         &self,
         account_id: AccountId,
@@ -532,7 +605,9 @@ impl DaemonRuntime {
         if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
             clear_cached_cookie_cache().await?;
         }
-        if account.provider_id.as_str() == GROK_PROVIDER_ID {
+        if account.provider_id.as_str() == GROK_PROVIDER_ID
+            && account.profile_id.as_deref() == Some("default")
+        {
             grok::clear_cached_cookie_cache().await?;
         }
 
@@ -732,13 +807,36 @@ impl DaemonRuntime {
                     .to_string()
             }
             GROK_PROVIDER_ID => {
-                grok::clear_cached_cookie_cache().await?;
                 if let Some(binary) = grok::find_grok_binary() {
-                    let child = launchers::launch_grok_login(&binary)?;
-                    launchers::monitor_login(child, self.refresh.clone(), GROK_PROVIDER_ID, None);
+                    let target = self.prepare_grok_login_profile(account_id.as_ref()).await?;
+                    if target.profile_id == "default" {
+                        grok::clear_cached_cookie_cache().await?;
+                    }
+                    let child = launchers::launch_grok_login(&binary, &target.grok_home)?;
+                    launchers::monitor_login(
+                        child,
+                        self.refresh.clone(),
+                        GROK_PROVIDER_ID,
+                        Some(target.profile_id),
+                    );
                     "Finish signing in to Grok in your browser. UsageTracker will refresh automatically."
                         .to_string()
                 } else {
+                    let requested_profile = match account_id.as_ref() {
+                        Some(id) => self
+                            .storage
+                            .account(id)
+                            .await?
+                            .and_then(|account| account.profile_id),
+                        None => None,
+                    };
+                    if requested_profile
+                        .as_deref()
+                        .is_some_and(|id| id != "default")
+                    {
+                        anyhow::bail!("reconnecting this Grok account requires the Grok Build CLI");
+                    }
+                    grok::clear_cached_cookie_cache().await?;
                     launchers::open_url("https://grok.com/?_s=usage")?;
                     "Grok opened in your browser. Sign in there, or install Grok Build for CLI billing."
                         .to_string()
@@ -832,6 +930,37 @@ impl DaemonRuntime {
             .or_default();
         provider.enabled = true;
         let target = ensure_claude_login_profile(provider, requested_profile_id.as_deref())?;
+
+        let collectors = self.collectors_for_config(&updated_config).await?;
+        updated_config.persist()?;
+        self.publish_local_log_config(&updated_config);
+        *self.config.write().await = updated_config;
+        self.refresh.set_providers(collectors).await;
+        drop(mutation);
+        Ok(target)
+    }
+
+    async fn prepare_grok_login_profile(
+        &self,
+        account_id: Option<&AccountId>,
+    ) -> anyhow::Result<GrokLoginTarget> {
+        let requested_profile_id = match account_id {
+            Some(account_id) => self
+                .storage
+                .account(account_id)
+                .await?
+                .and_then(|account| account.profile_id),
+            None => None,
+        };
+
+        let mutation = self.config_mutation.lock().await;
+        let mut updated_config = self.config.read().await.clone();
+        let provider = updated_config
+            .providers
+            .entry(GROK_PROVIDER_ID.to_string())
+            .or_default();
+        provider.enabled = true;
+        let target = ensure_grok_login_profile(provider, requested_profile_id.as_deref())?;
 
         let collectors = self.collectors_for_config(&updated_config).await?;
         updated_config.persist()?;
@@ -1013,14 +1142,13 @@ mod tests {
 
         async fn discover_accounts(
             &self,
-        ) -> Result<Vec<crate::providers::DiscoveredAccount>, crate::providers::ProviderError>
-        {
+        ) -> Result<crate::providers::AccountDiscovery, crate::providers::ProviderError> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first_started.notify_one();
                 self.release_first.notified().await;
                 self.first_finished.notify_one();
             }
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
 
         async fn collect_usage(
@@ -1291,6 +1419,12 @@ mod tests {
             "personal-email"
         );
         assert_eq!(unique_profile_id(&profiles, None), "account");
+
+        let whitespace = vec![ProviderProfileConfig {
+            id: Some(" account ".to_string()),
+            ..ProviderProfileConfig::default()
+        }];
+        assert_eq!(unique_profile_id(&whitespace, None), "account-2");
     }
 
     #[test]
@@ -1322,6 +1456,33 @@ mod tests {
             &dirs::home_dir().unwrap().join(".codex"),
             CODEX_PROVIDER_ID
         ));
+    }
+
+    #[test]
+    fn grok_pending_login_never_reuses_a_connected_profile() {
+        let root = std::env::temp_dir().join(format!("grok-pending-{}", uuid::Uuid::new_v4()));
+        let mut provider = ProviderConfig {
+            enabled: true,
+            profiles: vec![
+                ProviderProfileConfig {
+                    id: Some("default".to_string()),
+                    grok_home: Some(root.join("default")),
+                    ..ProviderProfileConfig::default()
+                },
+                ProviderProfileConfig {
+                    id: Some("work".to_string()),
+                    grok_home: Some(root.join("work")),
+                    ..ProviderProfileConfig::default()
+                },
+            ],
+            ..ProviderConfig::default()
+        };
+        let connected = BTreeSet::from(["default".to_string()]);
+
+        let pending = select_grok_login_target(&mut provider, &connected, None).unwrap();
+
+        assert_eq!(pending.profile_id, "work");
+        assert_eq!(pending.grok_home, root.join("work"));
     }
 
     #[test]
@@ -1367,6 +1528,26 @@ mod tests {
         assert_eq!(target.profile_id, "default");
         assert!(target.config_dir.is_none());
         assert!(provider.profiles.is_empty());
+    }
+
+    #[test]
+    fn reconnecting_grok_restores_a_tombstoned_default_profile() {
+        let mut provider = ProviderConfig {
+            profiles: vec![ProviderProfileConfig {
+                id: Some("default".to_string()),
+                enabled: false,
+                deleted: true,
+                ..ProviderProfileConfig::default()
+            }],
+            ..ProviderConfig::default()
+        };
+
+        let target = ensure_grok_login_profile(&mut provider, Some("default")).unwrap();
+
+        assert_eq!(target.profile_id, "default");
+        assert!(provider.profiles[0].enabled);
+        assert!(!provider.profiles[0].deleted);
+        assert!(provider.profiles[0].grok_home.is_some());
     }
 
     #[test]

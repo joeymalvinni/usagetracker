@@ -5,6 +5,21 @@ struct ProviderDescriptor: Equatable, Sendable {
     let name: String
     let shortName: String
     let symbol: String
+    let supportsMultipleAccounts: Bool
+
+    init(
+        id: String,
+        name: String,
+        shortName: String,
+        symbol: String,
+        supportsMultipleAccounts: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.shortName = shortName
+        self.symbol = symbol
+        self.supportsMultipleAccounts = supportsMultipleAccounts
+    }
 }
 
 /// The menu app has provider-specific presentation assets and must therefore
@@ -12,10 +27,10 @@ struct ProviderDescriptor: Equatable, Sendable {
 /// surface until a matching descriptor is added here.
 enum ProviderCatalog {
     static let providers: [ProviderDescriptor] = [
-        ProviderDescriptor(id: "codex", name: "Codex", shortName: "Cdx", symbol: "terminal"),
-        ProviderDescriptor(id: "claude", name: "Claude", shortName: "Clde", symbol: "sparkles"),
+        ProviderDescriptor(id: "codex", name: "Codex", shortName: "Cdx", symbol: "terminal", supportsMultipleAccounts: true),
+        ProviderDescriptor(id: "claude", name: "Claude", shortName: "Clde", symbol: "sparkles", supportsMultipleAccounts: true),
         ProviderDescriptor(id: "opencode_go", name: "OpenCode Go", shortName: "Go", symbol: "bolt.horizontal"),
-        ProviderDescriptor(id: "grok", name: "Grok", shortName: "Grok", symbol: "sparkle"),
+        ProviderDescriptor(id: "grok", name: "Grok", shortName: "Grok", symbol: "sparkle", supportsMultipleAccounts: true),
     ]
 
     static let supportedIDs = providers.map(\.id)
@@ -23,6 +38,10 @@ enum ProviderCatalog {
 
     static func supports(_ id: String) -> Bool {
         byID[id] != nil
+    }
+
+    static func supportsMultipleAccounts(_ id: String) -> Bool {
+        byID[id]?.supportsMultipleAccounts == true
     }
 
     static func descriptor(for id: String) -> ProviderDescriptor? {

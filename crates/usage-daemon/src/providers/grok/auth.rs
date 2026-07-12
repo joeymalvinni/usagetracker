@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -57,29 +57,12 @@ impl GrokCredentials {
     }
 }
 
-pub(super) fn grok_home() -> Result<PathBuf, ProviderError> {
-    std::env::var_os("GROK_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))
-        .ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::ProviderUnavailable,
-                "failed to resolve GROK_HOME",
-            )
-        })
+pub(super) fn auth_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("auth.json")
 }
 
-pub(super) fn auth_path() -> Result<PathBuf, ProviderError> {
-    Ok(grok_home()?.join("auth.json"))
-}
-
-pub(super) fn auth_file_exists() -> bool {
-    auth_path().is_ok_and(|path| path.exists())
-}
-
-pub(super) fn load_credentials() -> Result<GrokCredentials, ProviderError> {
-    let path = auth_path()?;
+pub(super) fn load_credentials(grok_home: &Path) -> Result<GrokCredentials, ProviderError> {
+    let path = auth_path(grok_home);
     let data = std::fs::read(&path).map_err(|err| {
         ProviderError::new(
             if err.kind() == std::io::ErrorKind::NotFound {

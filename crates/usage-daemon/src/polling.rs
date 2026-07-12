@@ -22,8 +22,8 @@ use crate::{
     health,
     notifications::NotificationManager,
     providers::{
-        DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-        ProviderErrorKind,
+        AccountDiscoveryFailure, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
+        ProviderError, ProviderErrorKind,
     },
     storage::{Storage, StoredProviderBackoff},
 };
@@ -371,9 +371,9 @@ impl RefreshCoordinator {
         );
         let discovery_started = Instant::now();
 
-        let accounts = match timeout(PROVIDER_DISCOVERY_BUDGET, provider.discover_accounts()).await
+        let discovery = match timeout(PROVIDER_DISCOVERY_BUDGET, provider.discover_accounts()).await
         {
-            Ok(Ok(accounts)) => accounts,
+            Ok(Ok(discovery)) => discovery,
             Ok(Err(err)) => return vec![self.record_failure(provider_id, None, err).await],
             Err(_) => {
                 let message = format!(
@@ -393,15 +393,68 @@ impl RefreshCoordinator {
 
         info!(
             provider_id = provider_id.as_str(),
-            account_count = accounts.len(),
+            account_count = discovery.accounts.len(),
+            failure_count = discovery.failures.len(),
             elapsed_ms = discovery_started.elapsed().as_millis(),
             "provider account discovery completed"
         );
 
-        join_all(accounts.into_iter().map(|discovered| {
+        let mut results = join_all(discovery.accounts.into_iter().map(|discovered| {
             self.refresh_account(provider.as_ref(), provider_id.clone(), discovered)
         }))
-        .await
+        .await;
+        results.extend(
+            self.record_account_discovery_failures(&provider_id, discovery.failures)
+                .await,
+        );
+        results
+    }
+
+    async fn record_account_discovery_failures(
+        &self,
+        provider_id: &ProviderId,
+        failures: Vec<AccountDiscoveryFailure>,
+    ) -> Vec<ProviderRefreshResult> {
+        if failures.is_empty() {
+            return Vec::new();
+        }
+        let accounts = match self.storage.accounts().await {
+            Ok(accounts) => accounts,
+            Err(err) => {
+                warn!(
+                    provider_id = provider_id.as_str(),
+                    error = %err,
+                    "failed to load accounts for profile discovery failures"
+                );
+                return vec![storage_error_result(
+                    provider_id.clone(),
+                    None,
+                    format!("failed to load accounts for discovery failures: {err}"),
+                )];
+            }
+        };
+        let mut results = Vec::new();
+        for failure in failures {
+            let Some(account) = accounts.iter().find(|account| {
+                account.provider_id == *provider_id
+                    && account.profile_id.as_deref() == Some(failure.profile_id.as_str())
+            }) else {
+                debug!(
+                    provider_id = provider_id.as_str(),
+                    profile_id = failure.profile_id.as_str(),
+                    "ignoring discovery failure for a pending profile"
+                );
+                continue;
+            };
+            if !account.collection_enabled {
+                continue;
+            }
+            results.push(
+                self.record_failure(provider_id.clone(), Some(account.id.clone()), failure.error)
+                    .await,
+            );
+        }
+        results
     }
 
     async fn refresh_account(
@@ -926,7 +979,9 @@ mod tests {
     };
     use uuid::Uuid;
 
-    use crate::providers::{ProviderCollectionResult, ProviderUsage};
+    use crate::providers::{
+        AccountDiscovery, AccountDiscoveryFailure, ProviderCollectionResult, ProviderUsage,
+    };
 
     struct FakeProvider;
 
@@ -936,13 +991,14 @@ mod tests {
             ProviderId::new("claude")
         }
 
-        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(vec![DiscoveredAccount {
                 external_account_id: "external-account".to_string(),
                 display_name: None,
                 email: None,
                 profile_id: None,
-            }])
+            }]
+            .into())
         }
 
         async fn collect_usage(
@@ -986,13 +1042,49 @@ mod tests {
 
     struct MultiAccountProvider;
 
+    struct MixedDiscoveryProvider;
+
+    #[async_trait]
+    impl ProviderCollector for MixedDiscoveryProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("grok")
+        }
+
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
+            Ok(AccountDiscovery {
+                accounts: vec![DiscoveredAccount {
+                    external_account_id: "healthy-user".to_string(),
+                    display_name: None,
+                    email: Some("healthy@example.com".to_string()),
+                    profile_id: Some("healthy".to_string()),
+                }],
+                failures: vec![AccountDiscoveryFailure {
+                    profile_id: "broken".to_string(),
+                    error: ProviderError::new(
+                        ProviderErrorKind::CredentialsInvalid,
+                        "broken Grok credentials",
+                    ),
+                }],
+            })
+        }
+
+        async fn collect_usage(
+            &self,
+            account: &DiscoveredAccount,
+        ) -> Result<ProviderCollectionResult, ProviderError> {
+            let mut result = FakeProvider.collect_usage(account).await?;
+            result.usage.provider_id = ProviderId::new("grok");
+            Ok(result)
+        }
+    }
+
     #[async_trait]
     impl ProviderCollector for MultiAccountProvider {
         fn provider_id(&self) -> ProviderId {
             ProviderId::new("codex")
         }
 
-        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(vec![
                 DiscoveredAccount {
                     external_account_id: "same-openai-account".to_string(),
@@ -1006,7 +1098,8 @@ mod tests {
                     email: Some("work@example.com".to_string()),
                     profile_id: Some("work".to_string()),
                 },
-            ])
+            ]
+            .into())
         }
 
         async fn collect_usage(
@@ -1041,7 +1134,7 @@ mod tests {
             ProviderId::new("codex")
         }
 
-        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(["personal", "work"]
                 .into_iter()
                 .map(|profile| DiscoveredAccount {
@@ -1096,13 +1189,14 @@ mod tests {
             ProviderId::new(self.provider_id)
         }
 
-        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(vec![DiscoveredAccount {
                 external_account_id: format!("{}-coalesced-account", self.provider_id),
                 display_name: None,
                 email: None,
                 profile_id: Some("default".to_string()),
-            }])
+            }]
+            .into())
         }
 
         async fn collect_usage(
@@ -1134,13 +1228,14 @@ mod tests {
             ProviderId::new("claude")
         }
 
-        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(vec![DiscoveredAccount {
                 external_account_id: "rate-limited-account".to_string(),
                 display_name: None,
                 email: None,
                 profile_id: Some("default".to_string()),
-            }])
+            }]
+            .into())
         }
 
         async fn collect_usage(
@@ -1161,14 +1256,15 @@ mod tests {
             ProviderId::new(self.provider_id)
         }
 
-        async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             self.barrier.wait().await;
             Ok(vec![DiscoveredAccount {
                 external_account_id: self.provider_id.to_string(),
                 display_name: None,
                 email: None,
                 profile_id: Some("default".to_string()),
-            }])
+            }]
+            .into())
         }
 
         async fn collect_usage(
@@ -1409,6 +1505,43 @@ mod tests {
         assert_eq!(health[0].provider_id, provider_id);
         assert!(health[0].account_id.is_some());
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn mixed_discovery_updates_health_for_the_failed_existing_profile() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("grok");
+        let healthy = storage
+            .upsert_account(&provider_id, "healthy-user", Some("healthy"), None, None)
+            .await
+            .unwrap();
+        let broken = storage
+            .upsert_account(&provider_id, "broken-user", Some("broken"), None, None)
+            .await
+            .unwrap();
+        let coordinator =
+            RefreshCoordinator::new(storage.clone(), vec![Arc::new(MixedDiscoveryProvider)]);
+
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(report.provider_results.len(), 2);
+        assert!(report.provider_results.iter().any(|result| {
+            result.account_id.as_ref() == Some(&healthy.id)
+                && result.status == ProviderRefreshStatus::Ok
+        }));
+        assert!(report.provider_results.iter().any(|result| {
+            result.account_id.as_ref() == Some(&broken.id)
+                && result.status == ProviderRefreshStatus::CredentialsInvalid
+        }));
+        let health = storage.provider_health().await.unwrap();
+        assert!(health.iter().any(|entry| {
+            entry.account_id.as_ref() == Some(&healthy.id)
+                && matches!(entry.status, ProviderHealthStatus::Ok)
+        }));
+        assert!(health.iter().any(|entry| {
+            entry.account_id.as_ref() == Some(&broken.id)
+                && matches!(entry.status, ProviderHealthStatus::AuthFailed)
+        }));
     }
 
     #[tokio::test]

@@ -116,7 +116,7 @@ struct ProviderSetupControls: View {
                 }
                 .disabled(busy || state.daemon == .offline)
 
-                if (providerId == "codex" || providerId == "claude"), !accounts.isEmpty {
+                if ProviderCatalog.supportsMultipleAccounts(providerId), !accounts.isEmpty {
                     Button("Add another account") { Task { await state.addProviderAccount(providerId) } }
                         .disabled(busy)
                 }
@@ -159,7 +159,7 @@ struct ProviderSetupControls: View {
     }
 
     private func repair() async {
-        if (providerId == "codex" || providerId == "claude"), accounts.isEmpty {
+        if ProviderCatalog.supportsMultipleAccounts(providerId), accounts.isEmpty {
             await state.addProviderAccount(providerId)
         } else {
             await state.repairProvider(providerId, accountId: accounts.first?.id)
@@ -189,7 +189,7 @@ struct ProviderSetupControls: View {
         case "codex": "Each account uses an isolated Codex profile. Finish the browser sign-in; the account appears automatically."
         case "claude": "Each account uses an isolated Claude profile. After sign-in, open its profile terminal from Settings to keep activity separate."
         case "opencode_go": "Sign in at opencode.ai, then discover and choose the workspace to track."
-        case "grok": "Uses Grok Build billing first, then your signed-in grok.com session. Grok is tracked as one account."
+        case "grok": "Each CLI-backed account uses an isolated Grok profile. Browser-only sign-in remains available for the default account."
         default: "Connect the provider, then refresh usage."
         }
     }

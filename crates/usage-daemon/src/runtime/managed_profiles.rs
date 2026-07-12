@@ -12,6 +12,7 @@ const PROFILES_DIR: &str = "profiles";
 const QUARANTINE_DIR: &str = ".quarantine";
 const CODEX_PROVIDER_ID: &str = "codex";
 const CLAUDE_PROVIDER_ID: &str = "claude";
+const GROK_PROVIDER_ID: &str = "grok";
 
 /// Returns the only directory that may represent a managed provider profile.
 ///
@@ -162,7 +163,10 @@ fn profile_home_in(
 }
 
 fn provider_root(app_root: &Path, provider_id: &str) -> anyhow::Result<PathBuf> {
-    if !matches!(provider_id, CODEX_PROVIDER_ID | CLAUDE_PROVIDER_ID) {
+    if !matches!(
+        provider_id,
+        CODEX_PROVIDER_ID | CLAUDE_PROVIDER_ID | GROK_PROVIDER_ID
+    ) {
         bail!("provider '{provider_id}' does not have managed profiles");
     }
     Ok(app_root.join(PROFILES_DIR).join(provider_id))
@@ -203,6 +207,10 @@ mod tests {
         assert_eq!(
             profile_home_in(&root, CODEX_PROVIDER_ID, "work").unwrap(),
             root.join("profiles/codex/work")
+        );
+        assert_eq!(
+            profile_home_in(&root, GROK_PROVIDER_ID, "work").unwrap(),
+            root.join("profiles/grok/work")
         );
         for invalid in [
             "",

@@ -66,8 +66,8 @@ struct SessionSignals {
     last_session_at: Option<Value>,
 }
 
-pub(super) fn scan_default() -> Result<LocalSessionSummary, ProviderError> {
-    scan(&super::auth::grok_home()?.join("sessions"), Utc::now())
+pub(super) fn scan_home(grok_home: &Path) -> Result<LocalSessionSummary, ProviderError> {
+    scan(&grok_home.join("sessions"), Utc::now())
 }
 
 fn scan(root: &Path, now: DateTime<Utc>) -> Result<LocalSessionSummary, ProviderError> {

@@ -49,6 +49,8 @@ When running a single test, pass a substring of the test function name to `cargo
 
 **Grok dual-path collection**: Attempts the Grok Build ACP `x.ai/billing` RPC first, then falls back to grok.com's billing gRPC-web endpoint using the cached Grok token and/or browser session cookies. Rate limits never fall back. Detailed logic in `docs/grok.md`.
 
+**Grok accounts**: The legacy `default` profile uses the normal Grok home. Additional accounts use isolated `GROK_HOME` directories under `~/.usagetracker/profiles/grok/`; global browser cookies are never shared with those managed profiles.
+
 **SQLite schema**: `crates/usage-daemon/migrations/0001_initial.sql` is the authoritative disposable local schema and is applied transactionally. Provider data is reproducible; incompatible legacy schemas are reset instead of repaired in production code.
 
 **Claude dual-path collection**: Attempts the OAuth usage API first using Keychain-stored credentials. On eligible failures, optionally falls back to the bounded CLI command (`claude -p /usage --output-format json --no-session-persistence`). Rate limits never fall back. Detailed logic in `docs/claude.md`.

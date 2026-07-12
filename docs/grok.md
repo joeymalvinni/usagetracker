@@ -77,9 +77,10 @@ credentials to bypass provider throttling would be incorrect and could make back
 
 ## Credentials and browser sessions
 
-Identity comes from `$GROK_HOME/auth.json` or `~/.grok/auth.json`. The file is a map keyed by auth
-scope; OIDC entries under `https://auth.x.ai::` are preferred over legacy sign-in entries. Access
-tokens are never included in raw-payload captures or logs.
+Identity comes from each profile's `GROK_HOME/auth.json`; the legacy `default` profile uses
+`$GROK_HOME/auth.json` or `~/.grok/auth.json`. The file is a map keyed by auth scope; OIDC entries
+under `https://auth.x.ai::` are preferred over legacy sign-in entries. Access tokens are never
+included in raw-payload captures or logs.
 
 For web billing, sources are:
 
@@ -97,15 +98,23 @@ sent only to the fixed HTTPS grok.com endpoint, redirects are disabled, and a ca
 cleared and re-imported after auth rejection. Unit-test processes do not import browser cookies
 unless `USAGE_TRACKER_ALLOW_BROWSER_COOKIE_IMPORT=1` is set.
 
-When a non-expired Grok login token is available, each browser session is tried with the bearer
-token and then cookie-only. A bearer-only request is the final web attempt.
+When a non-expired legacy-profile Grok login token is available, each browser session is tried with
+the bearer token and then cookie-only. A bearer-only request is the final web attempt. Managed
+profiles never consume global manual, cached, or imported browser cookies: their web fallback is
+bearer-only so one Chrome login cannot be attributed to multiple tracked accounts.
 
 ## Account model and UI
 
-Grok currently uses one `default` local profile. Before identity is available its external ID is
-`grok_default`; storage may atomically adopt the later Grok user ID without creating a duplicate
-account. Grok is disabled by default. The Settings action launches `grok login` when installed and
-otherwise opens Grok's web usage page.
+Grok supports multiple CLI-backed profiles. The legacy `default` profile uses the normal Grok home;
+additional profiles use `~/.usagetracker/profiles/grok/<profile-id>`. Login and billing subprocesses
+receive that directory through a child-only `GROK_HOME`, so concurrent refreshes cannot cross
+credentials or session files. Duplicate Grok user IDs are retained only through the first configured
+profile.
+
+Before identity is available, the legacy profile's external ID is `grok_default`; storage may
+atomically adopt the later Grok user ID without creating a duplicate account. Browser-only discovery
+remains limited to that profile because Grok cookies do not expose a reliable identity binding.
+Adding a second account therefore requires the Grok Build CLI. Grok is disabled by default.
 
 Collection modes exposed to clients are:
 

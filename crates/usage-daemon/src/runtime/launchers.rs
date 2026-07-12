@@ -62,9 +62,13 @@ pub(crate) fn launch_claude_login(
     }
 }
 
-pub(crate) fn launch_grok_login(binary: &Path) -> anyhow::Result<std::process::Child> {
+pub(crate) fn launch_grok_login(
+    binary: &Path,
+    grok_home: &Path,
+) -> anyhow::Result<std::process::Child> {
     let mut command = Command::new(binary);
     command.arg("login");
+    command.env("GROK_HOME", grok_home);
     configure_browser_stdio(&mut command);
     command
         .spawn()

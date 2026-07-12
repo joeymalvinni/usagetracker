@@ -16,8 +16,8 @@ use usage_core::ProviderId;
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
-        paths::expand_home_path, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
-        ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
+        paths::expand_home_path, AccountDiscovery, DiscoveredAccount, ProviderCollectionResult,
+        ProviderCollector, ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
         HTTP_REQUEST_TIMEOUT,
     },
 };
@@ -473,7 +473,7 @@ impl ProviderCollector for ClaudeCollector {
         ProviderId::new(PROVIDER_ID)
     }
 
-    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+    async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
         if self.profiles.is_empty() {
             return Err(ProviderError::new(
                 ProviderErrorKind::CredentialsMissing,
@@ -499,7 +499,7 @@ impl ProviderCollector for ClaudeCollector {
 
         if !accounts.is_empty() {
             deduplicate_accounts(&mut accounts);
-            return Ok(accounts);
+            return Ok(accounts.into());
         }
         Err(failures.into_iter().next().unwrap_or_else(|| {
             ProviderError::new(

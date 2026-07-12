@@ -188,7 +188,13 @@ The config file controls which providers are enabled:
       "enabled": false
     },
     "grok": {
-      "enabled": false
+      "enabled": false,
+      "profiles": [
+        {
+          "id": "default",
+          "grok_home": "~/.grok"
+        }
+      ]
     }
   },
   "debug_capture_raw_payloads": false
@@ -197,7 +203,7 @@ The config file controls which providers are enabled:
 
 Codex collection reads credentials from `~/.codex/auth.json`. Claude collection uses Claude Code OAuth credentials from the macOS Keychain item `Claude Code-credentials`, refreshes expired OAuth tokens, and queries Anthropic's OAuth usage API first. If that request fails for a reason other than rate limiting and `cli_enabled` is true, it falls back to the bounded local command `claude -p /usage --output-format json --no-session-persistence`.
 
-Codex and Claude can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. The menu bar app's Add account action creates isolated profile directories for either provider. Use the terminal button on a Claude account row to open an interactive session in that profile; its local activity stays separate and refreshes automatically. For manual configuration, Codex profiles should use separate `codex_home` or `auth_path` values; Claude profiles should use separate `claude_config_dir` values and launch sessions with the matching `CLAUDE_CONFIG_DIR`. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile unless it is set per profile.
+Codex, Claude, and Grok can track multiple accounts with provider profiles. Existing configs without `profiles` keep the legacy single-account behavior. The menu bar app's Add account action creates isolated profile directories. Use the terminal button on a Claude account row to open an interactive session in that profile; its local activity stays separate and refreshes automatically. For manual configuration, Codex profiles should use separate `codex_home` or `auth_path` values; Claude profiles should use separate `claude_config_dir` values and launch sessions with the matching `CLAUDE_CONFIG_DIR`; Grok profiles should use separate `grok_home` values. In explicit Claude multi-profile configs, `cli_enabled` defaults to true only for the first profile unless it is set per profile.
 
 Account labels are independent from provider identity. A configured or UI-edited `display_name` is preserved across refreshes and daemon restarts. Profiles without a name receive a short stable label such as `Codex 1`, `Claude 1`, or `OpenCode Go`; provider email addresses are stored separately and shown as secondary identity text.
 
@@ -241,6 +247,21 @@ Example multi-account config:
           "project_roots": ["~/.claude-work/projects"]
         }
       ]
+    },
+    "grok": {
+      "enabled": true,
+      "profiles": [
+        {
+          "id": "default",
+          "display_name": "Personal",
+          "grok_home": "~/.grok"
+        },
+        {
+          "id": "work",
+          "display_name": "Work",
+          "grok_home": "~/.usagetracker/profiles/grok/work"
+        }
+      ]
     }
   },
   "debug_capture_raw_payloads": false
@@ -255,7 +276,9 @@ Grok collection is disabled by default. `grok` first uses the official Grok Buil
 its billing extension, then falls back to grok.com's account-wide billing RPC using the existing
 Grok token and/or a browser session. Provider rate limits never fall back, and local Grok session
 tokens are not presented as quota. See [docs/grok.md](docs/grok.md) for the transport, credential,
-fallback, and security details.
+fallback, and security details. Additional accounts are CLI-backed and receive isolated
+`GROK_HOME` directories. Browser-only login remains limited to the legacy `default` profile because
+Chrome cookies cannot be reliably bound to separate Grok identities.
 
 Grok source selection can be pinned when diagnosing either transport:
 

@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     config::ProviderConfig,
     providers::{
-        DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-        ProviderErrorKind, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        AccountDiscovery, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
+        ProviderError, ProviderErrorKind, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -495,7 +495,7 @@ impl ProviderCollector for OpenCodeCollector {
         ProviderId::new(OPENCODE_GO_PROVIDER_ID)
     }
 
-    async fn discover_accounts(&self) -> Result<Vec<DiscoveredAccount>, ProviderError> {
+    async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
         if let Some(workspace_id) = self
             .config
             .workspace_id
@@ -508,7 +508,8 @@ impl ProviderCollector for OpenCodeCollector {
                 display_name: None,
                 email: None,
                 profile_id: None,
-            }]);
+            }]
+            .into());
         }
 
         if let Ok(cookie_header) = self.resolve_cookie_header(true).await {
@@ -518,7 +519,8 @@ impl ProviderCollector for OpenCodeCollector {
                     display_name: None,
                     email: None,
                     profile_id: None,
-                }]);
+                }]
+                .into());
             }
         }
 
@@ -528,7 +530,8 @@ impl ProviderCollector for OpenCodeCollector {
                 display_name: None,
                 email: None,
                 profile_id: None,
-            }]);
+            }]
+            .into());
         }
 
         Err(ProviderError::new(

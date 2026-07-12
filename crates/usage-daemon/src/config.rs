@@ -89,6 +89,8 @@ pub struct ProviderProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_config_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_home: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_roots: Vec<PathBuf>,
@@ -111,6 +113,7 @@ impl Default for ProviderProfileConfig {
             keychain_service: None,
             credentials_file: None,
             claude_config_dir: None,
+            grok_home: None,
             cli_enabled: None,
             project_roots: Vec::new(),
             owns_default_codex_activity: false,
@@ -586,6 +589,26 @@ mod tests {
         assert_eq!(config.providers["grok"].source_mode.as_deref(), Some("web"));
         let defaults = serde_json::to_value(FileConfig::default()).unwrap();
         assert!(defaults["providers"]["grok"].get("source_mode").is_none());
+    }
+
+    #[test]
+    fn round_trips_isolated_grok_profile_homes() {
+        let config: FileConfig = serde_json::from_str(
+            r#"{"providers":{"grok":{"enabled":true,"profiles":[{"id":"work","grok_home":"~/.usagetracker/profiles/grok/work"}]}}}"#,
+        )
+        .unwrap();
+
+        let profile = &config.providers["grok"].profiles[0];
+        assert_eq!(profile.id.as_deref(), Some("work"));
+        assert_eq!(
+            profile.grok_home.as_deref(),
+            Some(Path::new("~/.usagetracker/profiles/grok/work"))
+        );
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            encoded["providers"]["grok"]["profiles"][0]["grok_home"],
+            "~/.usagetracker/profiles/grok/work"
+        );
     }
 
     #[test]
