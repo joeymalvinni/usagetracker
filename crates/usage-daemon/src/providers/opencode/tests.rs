@@ -59,6 +59,52 @@ fn parses_rendered_go_usage_cards() {
 }
 
 #[test]
+fn rendered_usage_ignores_css_percentages_and_reports_remaining_capacity() {
+    let parsed = parse_usage_text(
+        r#"
+        <div>
+          <span>Rolling Usage</span>
+          <div class="progress-track" style="width: 100%"></div>
+          <span>1%</span>
+          <span data-slot="reset-time">Resets in 4 hours 56 minutes</span>
+        </div>
+        <div>
+          <span>Weekly Usage</span>
+          <div class="progress-track" style="width: 100%"></div>
+          <span>20%</span>
+          <span data-slot="reset-time">Resets in 1 day 4 hours</span>
+        </div>
+        <div>
+          <span>Monthly Usage</span>
+          <div class="progress-track" style="width: 100%"></div>
+          <span>11%</span>
+          <span data-slot="reset-time">Resets in 21 days 23 hours</span>
+        </div>
+        "#,
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.rolling.percent_used, 1.0);
+    assert_eq!(parsed.weekly.as_ref().unwrap().percent_used, 20.0);
+    assert_eq!(parsed.monthly.as_ref().unwrap().percent_used, 11.0);
+
+    let usage = parsed.to_provider_usage(super::usage::UsageContext {
+        provider_id: OPENCODE_GO_PROVIDER_ID,
+        collection_mode: "test",
+        zen_balance_usd: None,
+        workspace_id: None,
+        account_email: None,
+        cookie_source: "test",
+        history: None,
+    });
+    assert_eq!(usage.windows[0].percent_used, Some(1.0));
+    assert_eq!(usage.windows[0].percent_remaining, Some(99.0));
+    assert_eq!(usage.windows[1].percent_remaining, Some(80.0));
+    assert_eq!(usage.windows[2].percent_remaining, Some(89.0));
+}
+
+#[test]
 fn parses_json_usage_windows() {
     let parsed = parse_usage_text(
         r#"{

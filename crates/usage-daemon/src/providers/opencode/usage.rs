@@ -34,12 +34,14 @@ static WEEKLY_USAGE_LABEL_REGEX: LazyLock<Regex> =
 static MONTHLY_USAGE_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)Monthly\s+Usage"#).expect("valid monthly usage label regex")
 });
-static USAGE_CARD_PERCENT_REGEXES: LazyLock<[Regex; 3]> = LazyLock::new(|| {
+static USAGE_CARD_PERCENT_REGEXES: LazyLock<[Regex; 2]> = LazyLock::new(|| {
     [
         Regex::new(r#"(?is)data-slot=["']usage-value["'][^>]*>.*?([0-9]+(?:\.[0-9]+)?)\s*(?:<!--/-->)?\s*%"#).expect("valid usage value regex"),
         Regex::new(r#"(?is)style=["'][^"']*width\s*:\s*([0-9]+(?:\.[0-9]+)?)%"#).expect("valid usage width regex"),
-        Regex::new(r#"(?is)([0-9]+(?:\.[0-9]+)?)\s*(?:<!--/-->)?\s*%"#).expect("valid usage percent regex"),
     ]
+});
+static VISIBLE_PERCENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)([0-9]+(?:\.[0-9]+)?)\s*%"#).expect("valid visible percent regex")
 });
 static RESET_TIME_HTML_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?is)data-slot=["']reset-time["'][^>]*>(.*?)</span>"#)
@@ -388,8 +390,21 @@ fn find_labeled_usage_card(text: &str, labels: &[&str]) -> Option<ParsedWindow> 
 }
 
 fn usage_card_percent(segment: &str) -> Option<f64> {
+    // Progress-card markup can contain CSS percentages (for example, a 100%-wide
+    // track) before the percentage shown to the user. Prefer percentages from
+    // rendered text so those layout values cannot be mistaken for usage.
+    if let Some(value) = regex_number(&html_text(segment), &VISIBLE_PERCENT_REGEX) {
+        // Unlike JSON utilization fields, a value followed by `%` is already
+        // expressed on a 0..100 scale. In particular, `1%` must stay 1 rather
+        // than being interpreted as the fractional ratio 1.0 (100%).
+        return Some(value.clamp(0.0, MAX_PERCENT));
+    }
+
+    // Keep the structural selectors as fallbacks for payloads where the value
+    // is present only in an attribute or serialized component state.
     for regex in USAGE_CARD_PERCENT_REGEXES.iter() {
-        if let Some(value) = regex_number(segment, regex).map(normalize_percent) {
+        if let Some(value) = regex_number(segment, regex).map(|value| value.clamp(0.0, MAX_PERCENT))
+        {
             return Some(value);
         }
     }
