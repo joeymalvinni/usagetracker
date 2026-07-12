@@ -657,6 +657,10 @@ struct DashboardBuilder {
 
     private func absoluteText(_ w: UsageWindow) -> String? {
         guard let used = w.used, let limit = w.limit, used.unit == limit.unit, limit.value > 0 else { return nil }
+        // Percentage windows already render their remaining percentage. Claude
+        // also reports these as an absolute N-of-100 pair, which would only
+        // duplicate that value as a confusing "N / 100" label.
+        guard used.unit != .percent else { return nil }
         return "\(compact(used.value)) / \(compact(limit.value))"
     }
 
