@@ -61,7 +61,7 @@ enum MenuBarProgressIcon {
             return .systemOrange
         case .critical, .error, .offline:
             return .systemRed
-        case .stale, .disabled:
+        case .stale, .refreshing, .disabled:
             return .secondaryLabelColor
         case .normal:
             return NSColor(ProviderBrand.palette(row.providerId).chart)
@@ -72,7 +72,7 @@ enum MenuBarProgressIcon {
         let percent: Double? = switch status {
         case .offline, .error, .warning, .critical:
             100
-        case .stale, .disabled, .normal:
+        case .stale, .refreshing, .disabled, .normal:
             nil
         }
         return MenuBarProviderVM(id: "usage", providerId: "usage", short: "", percent: percent, status: status)

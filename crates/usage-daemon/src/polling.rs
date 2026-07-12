@@ -376,10 +376,7 @@ impl RefreshCoordinator {
             Ok(Ok(discovery)) => discovery,
             Ok(Err(err)) => return vec![self.record_failure(provider_id, None, err).await],
             Err(_) => {
-                let message = format!(
-                    "provider account discovery exceeded the {}-second budget",
-                    PROVIDER_DISCOVERY_BUDGET.as_secs()
-                );
+                let message = "Finding accounts took too long. Try again.".to_string();
                 return vec![
                     self.record_failure(
                         provider_id,
@@ -601,10 +598,7 @@ impl RefreshCoordinator {
             Err(_) => {
                 let err = ProviderError::new(
                     ProviderErrorKind::ProviderUnavailable,
-                    format!(
-                        "provider account collection exceeded the {}-second budget",
-                        collection_budget.as_secs()
-                    ),
+                    "Usage refresh took too long. Try again.",
                 );
                 warn!(
                     provider_id = provider_id.as_str(),
@@ -1683,10 +1677,10 @@ mod tests {
         .expect("the timed-out collector must not be awaited again");
 
         assert_eq!(result.status, ProviderRefreshStatus::ProviderUnavailable);
-        assert!(result
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains("collection exceeded")));
+        assert_eq!(
+            result.message.as_deref(),
+            Some("Usage refresh took too long. Try again.")
+        );
     }
 
     #[tokio::test]

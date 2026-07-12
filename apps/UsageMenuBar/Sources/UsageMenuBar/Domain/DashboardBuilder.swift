@@ -43,6 +43,7 @@ struct DashboardBuilder {
     let dashboard: UsageDashboardSummary
     let windowProvenance: [UsageWindowProvenance]
     let ui: UIConfig
+    let refreshingProviderIDs: Set<String>
     let visible: (String) -> Bool
     private let accountsById: [String: Account]
     private let healthByProvider: [String: [ProviderHealth]]
@@ -62,6 +63,7 @@ struct DashboardBuilder {
         dashboard: UsageDashboardSummary,
         windowProvenance: [UsageWindowProvenance],
         ui: UIConfig,
+        refreshingProviderIDs: Set<String> = [],
         visible: @escaping (String) -> Bool
     ) {
         self.config = config
@@ -72,6 +74,7 @@ struct DashboardBuilder {
         self.dashboard = dashboard
         self.windowProvenance = windowProvenance
         self.ui = ui
+        self.refreshingProviderIDs = refreshingProviderIDs
         self.visible = visible
         accountsById = Dictionary(uniqueKeysWithValues: accounts.map { ($0.id, $0) })
         hiddenAccountIdSet = Set(accounts.lazy.filter(\.hidden).map(\.id))
@@ -118,6 +121,11 @@ struct DashboardBuilder {
             }
             let enabled = isEnabledProvider(providerId)
             let h = selectedHealth(providerId: providerId, accountId: nil)
+            let status: DisplayStatus = if enabled {
+                refreshingProviderIDs.contains(providerId) ? .refreshing : .stale
+            } else {
+                .disabled
+            }
             return ProviderVM(
                 id: providerId,
                 providerId: providerId,
@@ -128,7 +136,7 @@ struct DashboardBuilder {
                 primary: "No data",
                 detail: "waiting for data",
                 percent: nil,
-                status: enabled ? .stale : .disabled,
+                status: status,
                 spend: [], windows: [], credits: [], resetCredits: [],
                 account: nil,
                 healthText: h.map { $0.status.friendly } ?? "unknown",
@@ -676,9 +684,12 @@ struct DashboardBuilder {
         case .backingOff?: return .warning
         default: return .error
         }
-        if let latest, Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) { return .stale }
+        if let latest, Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) {
+            return refreshingProviderIDs.contains(id) ? .refreshing : .stale
+        }
         if let percent { return percent < 10 ? .critical : (percent < 25 ? .warning : .normal) }
-        return latest == nil ? .stale : .normal
+        if latest == nil { return refreshingProviderIDs.contains(id) ? .refreshing : .stale }
+        return .normal
     }
 
     private func computedPercent(_ w: UsageWindow) -> Double? {
@@ -756,7 +767,7 @@ struct DashboardBuilder {
         switch status {
         case .normal: 0
         case .disabled: 1
-        case .stale: 2
+        case .stale, .refreshing: 2
         case .warning: 3
         case .critical: 4
         case .error, .offline: 5

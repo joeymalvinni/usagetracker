@@ -85,8 +85,12 @@ struct DerivedState: Equatable {
     private var buildRevision = 0
     private var loadTask: Task<Void, Never>?
     private var inFlightIncludesAccounts = false
-    private var lastLoadCompletedAt: Date?
-    private let popoverFreshness: TimeInterval = 30
+    private var automaticRecoveryTask: Task<Void, Never>?
+    private var lastAutomaticRecoveryAt: Date?
+    private var refreshActivityCount = 0
+    private var refreshingProviderCounts = [String: Int]()
+    private let automaticRecoveryCooldown: TimeInterval = 30
+    private let wakeRecoveryDelay: Duration = .seconds(2)
 
     init() {
         let socketPath = AppState.defaultSocketPath()
@@ -119,9 +123,11 @@ struct DerivedState: Equatable {
         await load(all: true)
     }
     func refreshForPopoverOpen() async {
-        if let lastLoadCompletedAt,
-           Date().timeIntervalSince(lastLoadCompletedAt) < popoverFreshness { return }
         await load(all: false)
+        await requestStaleDataRecovery(delay: .zero, reloadBeforeChecking: false)
+    }
+    func refreshAfterWake() async {
+        await requestStaleDataRecovery(delay: wakeRecoveryDelay, reloadBeforeChecking: true)
     }
     func pollLoop() async {
         while !Task.isCancelled {
@@ -131,7 +137,9 @@ struct DerivedState: Equatable {
         }
     }
     func refreshAll() async {
-        refreshing = true; defer { refreshing = false }
+        let providerIDs = enabledProviderIDs()
+        beginRefreshing(providerIDs)
+        defer { endRefreshing(providerIDs) }
         do {
             let report = try await client.refresh(nil)
             applyRefreshOutcome(report)
@@ -141,7 +149,9 @@ struct DerivedState: Equatable {
         }
     }
     func refreshProvider(_ id: String) async {
-        refreshing = true; defer { refreshing = false }
+        let providerIDs = Set([id])
+        beginRefreshing(providerIDs)
+        defer { endRefreshing(providerIDs) }
         do {
             let report = try await client.refresh([id])
             applyRefreshOutcome(report)
@@ -558,7 +568,6 @@ struct DerivedState: Equatable {
                 if accounts != latestAccounts { accounts = latestAccounts }
             }
             daemon = .online; message = nil; build()
-            lastLoadCompletedAt = Date()
             await refreshNotificationAuthorization()
             if config?.notifications.enabled == true {
                 await deliverPendingNotifications()
@@ -570,6 +579,120 @@ struct DerivedState: Equatable {
                 fail(error); build()
             }
         }
+    }
+
+    private func requestStaleDataRecovery(
+        delay: Duration,
+        reloadBeforeChecking: Bool
+    ) async {
+        if let automaticRecoveryTask {
+            await automaticRecoveryTask.value
+            return
+        }
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled else { return }
+            }
+            if reloadBeforeChecking { await load(all: false) }
+
+            let now = Date()
+            if let lastAutomaticRecoveryAt,
+               now.timeIntervalSince(lastAutomaticRecoveryAt) < automaticRecoveryCooldown {
+                return
+            }
+            let providerIDs = Set(Self.staleProviderIDs(
+                config: config,
+                accounts: accounts,
+                snapshots: snapshots,
+                now: now
+            ))
+            guard !providerIDs.isEmpty else { return }
+
+            lastAutomaticRecoveryAt = now
+            beginRefreshing(providerIDs)
+            defer { endRefreshing(providerIDs) }
+            do {
+                let report = try await client.refresh(Array(providerIDs).sorted())
+                applyRefreshOutcome(report)
+                await load(all: true)
+            } catch {
+                actionError = describe(error)
+            }
+        }
+        automaticRecoveryTask = task
+        await task.value
+        if automaticRecoveryTask != nil { automaticRecoveryTask = nil }
+    }
+
+    nonisolated static func staleProviderIDs(
+        config: ConfigResponse?,
+        accounts: [Account],
+        snapshots: [UsageSnapshot],
+        now: Date
+    ) -> [String] {
+        guard let config else { return [] }
+        let staleAfter = TimeInterval(config.pollIntervalSeconds * 2)
+        return config.providers.compactMap { providerID, toggle in
+            guard toggle.enabled else { return nil }
+            let allProviderAccounts = accounts.filter { $0.providerId == providerID }
+            let providerAccounts = allProviderAccounts.filter { !$0.hidden }
+            if !allProviderAccounts.isEmpty && providerAccounts.isEmpty { return nil }
+            let enabledAccounts = providerAccounts.filter(\.collectionEnabled)
+            if !providerAccounts.isEmpty && enabledAccounts.isEmpty { return nil }
+
+            let accountIDs = Set(enabledAccounts.map(\.id))
+            let relevantSnapshots = snapshots.filter {
+                $0.providerId == providerID
+                    && (accountIDs.isEmpty || accountIDs.contains($0.accountId))
+            }
+            if !enabledAccounts.isEmpty {
+                let latestByAccount = Dictionary(grouping: relevantSnapshots, by: \.accountId)
+                    .mapValues { values in values.map(\.collectedAt).max() }
+                let hasStaleAccount = enabledAccounts.contains { account in
+                    guard let latest = latestByAccount[account.id].flatMap({ $0 }) else { return true }
+                    return now.timeIntervalSince(latest) > staleAfter
+                }
+                return hasStaleAccount ? providerID : nil
+            }
+
+            guard !relevantSnapshots.isEmpty else { return providerID }
+            let latestByAccount = Dictionary(grouping: relevantSnapshots, by: \.accountId)
+            let hasStaleAccount = latestByAccount.values.contains { values in
+                guard let latest = values.map(\.collectedAt).max() else { return true }
+                return now.timeIntervalSince(latest) > staleAfter
+            }
+            return hasStaleAccount ? providerID : nil
+        }.sorted()
+    }
+
+    private func enabledProviderIDs() -> Set<String> {
+        Set(config?.providers.compactMap { $0.value.enabled ? $0.key : nil } ?? [])
+    }
+
+    private func beginRefreshing(_ providerIDs: Set<String>) {
+        refreshActivityCount += 1
+        for providerID in providerIDs {
+            refreshingProviderCounts[providerID, default: 0] += 1
+        }
+        refreshing = true
+        build()
+    }
+
+    private func endRefreshing(_ providerIDs: Set<String>) {
+        refreshActivityCount = max(0, refreshActivityCount - 1)
+        for providerID in providerIDs {
+            let remaining = (refreshingProviderCounts[providerID] ?? 1) - 1
+            if remaining > 0 {
+                refreshingProviderCounts[providerID] = remaining
+            } else {
+                refreshingProviderCounts.removeValue(forKey: providerID)
+            }
+        }
+        refreshing = refreshActivityCount > 0
+        build()
     }
     private func deliverPendingNotifications() async {
         guard notificationAuthorization == .authorized || notificationAuthorization == .provisional else { return }
@@ -692,6 +815,7 @@ struct DerivedState: Equatable {
         let dashboardSummary = dashboardSummary
         let windowProvenance = windowProvenance
         let ui = ui
+        let refreshingProviderIDs = Set(refreshingProviderCounts.keys)
         let daemon = daemon
         let menuEligibleProviderIDs = Self.providerIDsWithDataOrConnection(
             accounts: accounts,
@@ -713,6 +837,7 @@ struct DerivedState: Equatable {
                     dashboard: dashboardSummary,
                     windowProvenance: windowProvenance,
                     ui: ui,
+                    refreshingProviderIDs: refreshingProviderIDs,
                     visible: {
                         !ui.hiddenProviders.contains($0)
                             && (config == nil || visibleProviderIds.contains($0))
@@ -915,7 +1040,7 @@ struct DerivedState: Equatable {
         switch status {
         case .normal: 0
         case .disabled: 1
-        case .stale: 2
+        case .stale, .refreshing: 2
         case .warning: 3
         case .critical: 4
         case .error, .offline: 5

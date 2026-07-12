@@ -1,14 +1,14 @@
 import SwiftUI
 
 enum DisplayStatus: Equatable, Sendable {
-    case normal, warning, critical, stale, error, disabled, offline
+    case normal, warning, critical, stale, refreshing, error, disabled, offline
 
     var tint: Color {
         switch self {
         case .normal: .green
         case .warning: .orange
         case .critical, .error, .offline: .red
-        case .stale, .disabled: .secondary
+        case .stale, .refreshing, .disabled: .secondary
         }
     }
     var menuColor: NSColor? { switch self { case .warning: .systemOrange; case .critical, .error: .systemRed; default: nil } }
@@ -35,6 +35,7 @@ enum DisplayStatus: Equatable, Sendable {
         case .warning: "warning"
         case .critical: "critical"
         case .stale: "stale"
+        case .refreshing: "refreshing"
         case .error: "error"
         case .disabled: "disabled"
         case .offline: "offline"
@@ -47,6 +48,7 @@ enum DisplayStatus: Equatable, Sendable {
         case .warning: "running low"
         case .critical: "almost out"
         case .stale: "stale data"
+        case .refreshing: "refreshing…"
         case .error: "error"
         case .disabled: "off"
         case .offline: "offline"

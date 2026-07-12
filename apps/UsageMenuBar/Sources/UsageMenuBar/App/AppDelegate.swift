@@ -66,6 +66,11 @@ import UserNotifications
             .removeDuplicates()
             .sink { [weak self] value in self?.updateMenuIcon(for: value.status, bars: value.bars) }
             .store(in: &bag)
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { [weak self] _ in
+                Task { await self?.state.refreshAfterWake() }
+            }
+            .store(in: &bag)
         Task { await state.bootstrap(); await state.pollLoop() }
 
         // Force the retained SwiftUI/AppKit tree to load and lay itself out after

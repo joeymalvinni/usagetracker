@@ -176,10 +176,10 @@ struct ProviderSetupControls: View {
 
     private var repairLabel: String {
         switch providerId {
-        case "codex": accounts.isEmpty ? "Connect Codex" : "Repair login"
-        case "claude": accounts.isEmpty ? "Connect Claude" : "Repair Claude login"
+        case "codex": accounts.isEmpty ? "Connect Codex" : "Sign in again"
+        case "claude": accounts.isEmpty ? "Connect Claude" : "Sign in to Claude again"
         case "opencode_go": "Open OpenCode login"
-        case "grok": accounts.isEmpty ? "Connect Grok" : "Repair Grok login"
+        case "grok": accounts.isEmpty ? "Connect Grok" : "Sign in to Grok again"
         default: "Connect provider"
         }
     }
