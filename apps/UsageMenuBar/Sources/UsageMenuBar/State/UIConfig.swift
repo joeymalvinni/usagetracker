@@ -39,7 +39,7 @@ struct UIConfig: Codable, Equatable {
     /// providers. Setting a value records an explicit user choice.
     var maxMenuProviders: Int?
     var colorByStatus = true
-    var darkModeEnabled = false
+    var darkModeEnabled = true
     var onboardingCompleted = false
     /// Alert signatures the user has seen (viewed the account). Clears the rail/chip dot.
     var seenAlerts = Set<String>()
@@ -62,7 +62,7 @@ struct UIConfig: Codable, Equatable {
             )
         }
         colorByStatus = try c.decodeIfPresent(Bool.self, forKey: .colorByStatus) ?? true
-        darkModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .darkModeEnabled) ?? false
+        darkModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .darkModeEnabled) ?? true
         // Existing beta users should not be interrupted; newly created configs keep false.
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []

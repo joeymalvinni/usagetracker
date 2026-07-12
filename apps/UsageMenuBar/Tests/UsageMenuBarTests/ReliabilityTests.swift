@@ -260,6 +260,13 @@ final class ProviderCatalogTests: XCTestCase {
 }
 
 final class MenuBarPresentationTests: XCTestCase {
+    func testDarkModeIsEnabledByDefault() throws {
+        XCTAssertTrue(UIConfig().darkModeEnabled)
+
+        let decoded = try JSONDecoder().decode(UIConfig.self, from: Data("{}".utf8))
+        XCTAssertTrue(decoded.darkModeEnabled)
+    }
+
     func testProviderCountControlsBothTooltipAndIconRows() {
         var ui = UIConfig()
         ui.maxMenuProviders = 1
