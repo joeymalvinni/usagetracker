@@ -359,12 +359,12 @@ fn imports_plaintext_browser_cookie_db() {
     .unwrap();
     conn.execute(
             "INSERT INTO cookies (host_key, name, value, encrypted_value, expires_utc, last_access_utc, creation_utc) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![".opencode.ai", "auth", "a", Vec::<u8>::new(), 10_i64, 10_i64, 10_i64],
+            params![".opencode.ai", "auth", "a", Vec::<u8>::new(), 99_999_999_999_999_999_i64, 10_i64, 10_i64],
         )
         .unwrap();
     conn.execute(
             "INSERT INTO cookies (host_key, name, value, encrypted_value, expires_utc, last_access_utc, creation_utc) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params!["opencode.ai", "__Host-auth", "b", Vec::<u8>::new(), 10_i64, 10_i64, 10_i64],
+            params!["opencode.ai", "__Host-auth", "b", Vec::<u8>::new(), 99_999_999_999_999_999_i64, 10_i64, 10_i64],
         )
         .unwrap();
     drop(conn);
@@ -403,12 +403,12 @@ fn imports_firefox_cookie_db() {
     .unwrap();
     conn.execute(
             "INSERT INTO moz_cookies (host, name, value, expiry, lastAccessed, creationTime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![".opencode.ai", "auth", "a", 10_i64, 10_i64, 10_i64],
+            params![".opencode.ai", "auth", "a", 4_000_000_000_i64, 10_i64, 10_i64],
         )
         .unwrap();
     conn.execute(
             "INSERT INTO moz_cookies (host, name, value, expiry, lastAccessed, creationTime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params!["app.opencode.ai", "__Host-auth", "b", 10_i64, 10_i64, 10_i64],
+            params!["app.opencode.ai", "__Host-auth", "b", 4_000_000_000_i64, 10_i64, 10_i64],
         )
         .unwrap();
 

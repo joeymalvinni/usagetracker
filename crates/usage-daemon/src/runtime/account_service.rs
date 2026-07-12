@@ -6,7 +6,8 @@ use crate::{
     config::{Config, ProviderProfileConfig},
     providers::{
         claude::PROVIDER_ID as CLAUDE_PROVIDER_ID, codex::PROVIDER_ID as CODEX_PROVIDER_ID,
-        opencode::OPENCODE_GO_PROVIDER_ID, paths::expand_home_path,
+        grok::PROVIDER_ID as GROK_PROVIDER_ID, opencode::OPENCODE_GO_PROVIDER_ID,
+        paths::expand_home_path,
     },
     runtime::managed_profiles,
 };
@@ -30,7 +31,10 @@ pub(crate) fn plan_deletion(
         .or_default();
     let mut managed_profile_path = None;
 
-    if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
+    if matches!(
+        account.provider_id.as_str(),
+        OPENCODE_GO_PROVIDER_ID | GROK_PROVIDER_ID
+    ) {
         provider.enabled = false;
         provider.workspace_id = None;
         provider.cookie_header = None;

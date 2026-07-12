@@ -62,6 +62,15 @@ pub(crate) fn launch_claude_login(
     }
 }
 
+pub(crate) fn launch_grok_login(binary: &Path) -> anyhow::Result<std::process::Child> {
+    let mut command = Command::new(binary);
+    command.arg("login");
+    configure_browser_stdio(&mut command);
+    command
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("failed to start Grok login: {err}"))
+}
+
 fn configure_claude_environment(command: &mut Command, config_dir: Option<&Path>) {
     if let Some(config_dir) = config_dir {
         command

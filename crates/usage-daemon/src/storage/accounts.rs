@@ -326,7 +326,7 @@ fn normalized_profile_id(profile_id: Option<&str>, external_account_id: &str) ->
 }
 
 fn provider_requires_unique_external_account(provider_id: &ProviderId) -> bool {
-    matches!(provider_id.as_str(), "codex" | "claude")
+    matches!(provider_id.as_str(), "codex" | "claude" | "grok")
 }
 
 fn can_adopt_legacy_external_identity(
@@ -334,9 +334,12 @@ fn can_adopt_legacy_external_identity(
     stored_external_account_id: &str,
     discovered_external_account_id: &str,
 ) -> bool {
-    provider_id.as_str() == "claude"
+    (provider_id.as_str() == "claude"
         && !is_canonical_uuid(stored_external_account_id)
-        && is_canonical_uuid(discovered_external_account_id)
+        && is_canonical_uuid(discovered_external_account_id))
+        || (provider_id.as_str() == "grok"
+            && stored_external_account_id == "grok_default"
+            && discovered_external_account_id != "grok_default")
 }
 
 fn is_canonical_uuid(value: &str) -> bool {

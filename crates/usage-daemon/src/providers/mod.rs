@@ -6,8 +6,10 @@ use futures_util::StreamExt;
 use thiserror::Error;
 use usage_core::{ProviderId, UsageSnapshot, UsageWindow};
 
+pub(crate) mod browser_cookies;
 pub mod claude;
 pub mod codex;
+pub mod grok;
 pub(crate) mod local_usage;
 pub mod opencode;
 pub(crate) mod paths;

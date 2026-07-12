@@ -405,7 +405,7 @@ struct DerivedState: Equatable {
             let response = try await client.repairProvider(providerId: providerId, accountId: accountId)
             actionError = nil
             actionMessage = response.message
-            if providerId == "codex" || providerId == "claude" {
+            if providerId == "codex" || providerId == "claude" || providerId == "grok" {
                 await waitForProviderRepair(
                     providerId: providerId,
                     accountId: accountId,

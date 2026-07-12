@@ -19,7 +19,10 @@ use usage_core::{
     UsageWindowKind, API_VERSION,
 };
 
-use crate::{daemon::DaemonRuntime, dashboard, forecast, storage::StoredDailyUsageHistory};
+use crate::{
+    daemon::DaemonRuntime, dashboard, forecast, runtime::provider_registry,
+    storage::StoredDailyUsageHistory,
+};
 
 const MAX_CLIENT_CONNECTIONS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -720,7 +723,7 @@ fn supported_accounts(accounts: Vec<Account>) -> Vec<Account> {
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
-    matches!(provider_id, "codex" | "claude" | "opencode_go")
+    provider_registry::is_supported(provider_id)
 }
 
 fn provider_validation_error(provider_id: &usage_core::ProviderId) -> Option<ApiResponse> {
@@ -1141,6 +1144,7 @@ mod tests {
                 profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         let env = test_env(providers);
@@ -1190,6 +1194,7 @@ mod tests {
                 profiles: Vec::new(),
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         let env = test_env(providers);
@@ -1320,6 +1325,7 @@ mod tests {
                 }],
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         let env = test_env(providers);
@@ -1364,6 +1370,7 @@ mod tests {
                 }],
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         let env = test_env(providers);
@@ -1431,6 +1438,7 @@ mod tests {
                 }],
                 cookie_header: None,
                 workspace_id: None,
+                source_mode: None,
             },
         );
         let env = test_env(providers);

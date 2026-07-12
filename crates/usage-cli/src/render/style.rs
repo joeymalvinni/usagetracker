@@ -142,6 +142,7 @@ pub(crate) fn format_provider_name(provider_id: &str) -> String {
         "codex" => "Codex".to_string(),
         "claude" => "Claude".to_string(),
         "opencode_go" => "OpenCode Go".to_string(),
+        "grok" => "Grok".to_string(),
         value => title_case(&value.replace(['_', '-'], " ")),
     }
 }
@@ -154,6 +155,8 @@ pub(crate) fn format_collection_mode(provider_id: &str, mode: &str) -> String {
         ("claude", "oauth_usage_api") => "web".to_string(),
         ("opencode_go", "opencode_go_web_console") => "web".to_string(),
         ("opencode_go", "opencode_go_local_sqlite") => "local".to_string(),
+        ("grok", "grok_cli_billing_rpc") => "cli-rpc".to_string(),
+        ("grok", "grok_web_billing_rpc") => "web".to_string(),
         _ => mode.replace('_', "-"),
     }
 }
