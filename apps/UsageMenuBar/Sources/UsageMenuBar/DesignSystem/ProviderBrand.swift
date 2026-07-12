@@ -44,9 +44,9 @@ enum ProviderBrand {
             progressEnd: Color(red: 0.23, green: 0.53, blue: 0.54)
         ),
         "opencode_go": ProviderPalette(
-            chart: Color(red: 0.18, green: 0.21, blue: 0.25),
-            progressStart: Color(red: 0.42, green: 0.47, blue: 0.55),
-            progressEnd: Color(red: 0.12, green: 0.14, blue: 0.18)
+            chart: Color(red: 0.48, green: 0.42, blue: 0.90),
+            progressStart: Color(red: 0.65, green: 0.59, blue: 1.00),
+            progressEnd: Color(red: 0.36, green: 0.30, blue: 0.76)
         ),
     ]
 
