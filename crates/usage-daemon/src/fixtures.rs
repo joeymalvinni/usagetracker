@@ -42,10 +42,26 @@ pub fn reset_database(path: &Path) -> anyhow::Result<()> {
 pub async fn seed(storage: &Storage, scenario: FixtureScenario) -> anyhow::Result<()> {
     let now = Utc::now();
     let accounts = [
-        FixtureAccount::new("codex"),
-        FixtureAccount::new("claude"),
-        FixtureAccount::new("opencode_go"),
-        FixtureAccount::new("grok"),
+        FixtureAccount::new("codex", 4.0),
+        FixtureAccount::additional(
+            "codex",
+            "work",
+            "Acme Engineering",
+            "joey@acme.example",
+            -24.0,
+            0.0,
+        ),
+        FixtureAccount::new("claude", 9.0),
+        FixtureAccount::additional(
+            "claude",
+            "work",
+            "Acme Research",
+            "joey@research.example",
+            -31.0,
+            5.0,
+        ),
+        FixtureAccount::new("opencode_go", 7.0),
+        FixtureAccount::new("grok", 3.0),
     ];
 
     let notification_manager = NotificationManager::new(storage.clone(), true);
@@ -77,10 +93,8 @@ async fn seed_account(
     now: DateTime<Utc>,
     account_index: usize,
 ) -> anyhow::Result<UsageSnapshot> {
-    let notification_remaining = match scenario {
-        FixtureScenario::Demo => None,
-        FixtureScenario::Notifications => Some([4.0, 0.0, 9.0, 5.0][account_index]),
-    };
+    let notification_remaining =
+        (scenario == FixtureScenario::Notifications).then_some(fixture.notification_remaining);
     let daily_usage = daily_usage(fixture.provider_id, account_index, now);
     let cost_usage = cost_usage(fixture.provider_id, now);
     let metadata = fixture_metadata(fixture.provider_id, &cost_usage, now);
@@ -97,6 +111,7 @@ async fn seed_account(
             windows: fixture_windows(
                 fixture.provider_id,
                 historical_boost,
+                fixture.percent_adjustment,
                 notification_remaining,
                 now,
             ),
@@ -120,12 +135,13 @@ async fn seed_account(
 fn fixture_windows(
     provider_id: &str,
     historical_boost: f64,
+    percent_adjustment: f64,
     notification_remaining: Option<f64>,
     now: DateTime<Utc>,
 ) -> Vec<UsageWindow> {
     let percent = |value: f64| {
         notification_remaining
-            .unwrap_or(value + historical_boost)
+            .unwrap_or(value + historical_boost + percent_adjustment)
             .clamp(0.0, 100.0)
     };
     match provider_id {
@@ -561,10 +577,12 @@ struct FixtureAccount {
     email: Option<&'static str>,
     health: ProviderHealthStatus,
     error_message: Option<&'static str>,
+    percent_adjustment: f64,
+    notification_remaining: f64,
 }
 
 impl FixtureAccount {
-    fn new(provider_id: &'static str) -> Self {
+    fn new(provider_id: &'static str, notification_remaining: f64) -> Self {
         Self {
             provider_id,
             profile_id: "joeymalvinni",
@@ -572,6 +590,28 @@ impl FixtureAccount {
             email: None,
             health: ProviderHealthStatus::Ok,
             error_message: None,
+            percent_adjustment: 0.0,
+            notification_remaining,
+        }
+    }
+
+    fn additional(
+        provider_id: &'static str,
+        profile_id: &'static str,
+        display_name: &'static str,
+        email: &'static str,
+        percent_adjustment: f64,
+        notification_remaining: f64,
+    ) -> Self {
+        Self {
+            provider_id,
+            profile_id,
+            display_name,
+            email: Some(email),
+            health: ProviderHealthStatus::Ok,
+            error_message: None,
+            percent_adjustment,
+            notification_remaining,
         }
     }
 }
@@ -581,7 +621,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_fixture_gives_each_session_limit_a_distinct_non_full_value() {
+    fn demo_fixture_gives_providers_and_accounts_distinct_session_limits() {
         let now = Utc::now();
         let expected = [
             ("claude", "claude_usage_utilization_five_hour", 68.0),
@@ -591,7 +631,19 @@ mod tests {
         ];
 
         for (provider_id, window_id, percent_remaining) in expected {
-            let windows = fixture_windows(provider_id, 0.0, None, now);
+            let windows = fixture_windows(provider_id, 0.0, 0.0, None, now);
+            let window = windows
+                .iter()
+                .find(|window| window.window_id == window_id)
+                .unwrap();
+            assert_eq!(window.percent_remaining, Some(percent_remaining));
+        }
+
+        for (provider_id, window_id, adjustment, percent_remaining) in [
+            ("claude", "claude_usage_utilization_five_hour", -31.0, 37.0),
+            ("codex", "codex_session", -24.0, 32.0),
+        ] {
+            let windows = fixture_windows(provider_id, 0.0, adjustment, None, now);
             let window = windows
                 .iter()
                 .find(|window| window.window_id == window_id)
@@ -611,17 +663,27 @@ mod tests {
             .unwrap();
 
         let accounts = storage.accounts().await.unwrap();
-        assert_eq!(accounts.len(), 4);
-        assert!(accounts.iter().all(|account| {
-            account.profile_id.as_deref() == Some("joeymalvinni")
-                && account.display_name.as_deref() == Some("joeymalvinni")
-                && account.email.is_none()
-        }));
-        assert_eq!(storage.latest_usage().await.unwrap().len(), 4);
-        assert_eq!(storage.provider_health().await.unwrap().len(), 4);
-        assert_eq!(storage.daily_usage_history().await.unwrap().len(), 30);
+        assert_eq!(accounts.len(), 6);
+        for provider_id in ["claude", "codex"] {
+            let provider_accounts = accounts
+                .iter()
+                .filter(|account| account.provider_id.as_str() == provider_id)
+                .collect::<Vec<_>>();
+            assert_eq!(provider_accounts.len(), 2);
+            assert!(provider_accounts.iter().any(|account| {
+                account.profile_id.as_deref() == Some("joeymalvinni")
+                    && account.display_name.as_deref() == Some("joeymalvinni")
+                    && account.email.is_none()
+            }));
+            assert!(provider_accounts.iter().any(|account| {
+                account.profile_id.as_deref() == Some("work") && account.email.is_some()
+            }));
+        }
+        assert_eq!(storage.latest_usage().await.unwrap().len(), 6);
+        assert_eq!(storage.provider_health().await.unwrap().len(), 6);
+        assert_eq!(storage.daily_usage_history().await.unwrap().len(), 60);
         let notifications = storage.pending_notifications().await.unwrap();
-        assert!(notifications.len() >= 4);
+        assert!(notifications.len() >= 6);
         assert!(notifications
             .iter()
             .any(|item| item.title.contains("exhausted")));
