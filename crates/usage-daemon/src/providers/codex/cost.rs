@@ -48,7 +48,6 @@ impl CodexUsageCostExt for ProviderUsage {
                 "pricing_source": report.pricing_source,
                 "pricing_version": report.pricing_version,
                 "pricing_effective_from": report.pricing_effective_from,
-                "pricing_fetched_at": report.pricing_fetched_at,
             });
             return;
         }
@@ -110,7 +109,6 @@ impl CodexUsageCostExt for ProviderUsage {
             "pricing_source": report.pricing_source,
             "pricing_version": report.pricing_version,
             "pricing_effective_from": report.pricing_effective_from,
-            "pricing_fetched_at": report.pricing_fetched_at,
             "by_day": daily_cost_rows(&report.by_day),
             "by_model": report.by_model,
         });
@@ -127,7 +125,6 @@ struct PricingIdentity {
     source: String,
     version: String,
     effective_from: String,
-    fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -150,7 +147,6 @@ pub(super) struct CodexCostReport {
     pub(super) pricing_source: String,
     pub(super) pricing_version: String,
     pub(super) pricing_effective_from: String,
-    pub(super) pricing_fetched_at: Option<DateTime<Utc>>,
     pub(super) by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     pub(super) by_model: BTreeMap<String, CodexModelCostSummary>,
 }
@@ -229,9 +225,8 @@ fn scan_codex_local_costs_cached_at(
     let pricing_revision = pricing.revision();
     let pricing_identity = PricingIdentity {
         source: pricing.source().to_string(),
-        version: pricing.version(),
-        effective_from: pricing.effective_from(),
-        fetched_at: pricing.fetched_at(),
+        version: pricing.version().to_string(),
+        effective_from: pricing.effective_from().to_string(),
     };
     let session_roots = roots
         .iter()
@@ -271,7 +266,6 @@ fn fold_codex_file_reports(
         pricing_source: pricing.source.clone(),
         pricing_version: pricing.version.clone(),
         pricing_effective_from: pricing.effective_from.clone(),
-        pricing_fetched_at: pricing.fetched_at,
         ..Default::default()
     };
 

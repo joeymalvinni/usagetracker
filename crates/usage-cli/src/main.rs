@@ -12,9 +12,9 @@ use tokio::{
 };
 use usage_core::{
     default_socket_path, Account, AccountId, ApiRequest, ApiResponse, ConfigResponse,
-    NotificationConfig, ProviderHealth, ProviderId, ProviderToggle, RefreshJob, RefreshJobStatus,
-    RequestEnvelope, ResponseEnvelope, UsageDashboardSummary, UsageForecast, UsageSnapshot,
-    UsageWindowProvenance, API_VERSION,
+    NotificationConfig, ProviderId, ProviderToggle, RefreshJob, RefreshJobStatus, RequestEnvelope,
+    ResponseEnvelope, StateSnapshot, UsageDashboardSummary, UsageForecast, UsageSnapshot,
+    UsageWindowProvenance, API_VERSION, MAX_RESPONSE_BYTES,
 };
 
 mod render;
@@ -25,7 +25,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const REFRESH_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,7 +37,7 @@ struct Cli {
     /// Override the daemon Unix socket.
     #[arg(long, env = "USAGE_TRACKER_SOCKET", global = true)]
     socket_path: Option<PathBuf>,
-    /// Human dashboard, one-line records, or machine-readable JSON.
+    /// Human dashboard or machine-readable JSON.
     #[arg(long, value_enum, default_value_t = OutputStyle::Dashboard, global = true)]
     style: OutputStyle,
     /// Colorize human-readable output.
@@ -60,7 +59,6 @@ struct Cli {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputStyle {
     Dashboard,
-    Compact,
     Json,
 }
 
@@ -254,33 +252,26 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_status(socket: &Path, style: OutputStyle, color: bool) -> anyhow::Result<()> {
-    let mut responses = request_batch(
-        socket,
-        [
-            ApiRequest::GetUsage,
-            ApiRequest::GetAccounts,
-            ApiRequest::GetProviderHealth,
-            ApiRequest::GetConfig,
-        ],
-    )
-    .await?
-    .into_iter();
-    let snapshots = usage_from_response(next_response(&mut responses, "usage")?)?.0;
-    let accounts = accounts_from_response(next_response(&mut responses, "accounts")?)?;
-    let health = health_from_response(next_response(&mut responses, "health")?)?;
-    let config = config_from_response(next_response(&mut responses, "config")?)?;
+    let state = state_from_response(request(socket, ApiRequest::GetState).await?)?;
     let status = render::StatusView::from_parts(
         socket.display().to_string(),
-        &snapshots,
-        &accounts,
-        &health,
-        &config,
+        &state.snapshots,
+        &state.accounts,
+        &state.health,
+        &state.config,
     );
     if style == OutputStyle::Json {
         print_json(&status)
     } else {
         println!("{}", render::render_status(&status, style, color));
         Ok(())
+    }
+}
+
+fn state_from_response(response: ApiResponse) -> anyhow::Result<StateSnapshot> {
+    match response {
+        ApiResponse::State { state } => Ok(state),
+        other => unexpected("state", other),
     }
 }
 
@@ -800,13 +791,6 @@ fn usage_from_response(response: ApiResponse) -> anyhow::Result<UsagePayload> {
     }
 }
 
-fn health_from_response(response: ApiResponse) -> anyhow::Result<Vec<ProviderHealth>> {
-    match response {
-        ApiResponse::ProviderHealth { health } => Ok(health),
-        other => unexpected("health", other),
-    }
-}
-
 async fn fetch_config(socket: &Path) -> anyhow::Result<ConfigResponse> {
     config_from_response(request(socket, ApiRequest::GetConfig).await?)
 }
@@ -831,10 +815,6 @@ fn default_visible_provider(provider_id: &str, config: &ConfigResponse) -> bool 
         .providers
         .get(provider_id)
         .is_some_and(|provider| provider.enabled)
-        || config
-            .enabled_providers
-            .iter()
-            .any(|id| id.as_str() == provider_id)
 }
 
 fn contains_id(values: &[String], id: &str) -> bool {
@@ -1059,6 +1039,16 @@ mod tests {
     #[test]
     fn rejects_dashboard_max_width_below_layout_minimum() {
         assert!(Cli::try_parse_from(["usage", "--max-width", "59"]).is_err());
+    }
+
+    #[test]
+    fn rejects_removed_compact_style_with_supported_replacements() {
+        let error = Cli::try_parse_from(["usage", "--style", "compact"]).unwrap_err();
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(message.contains("dashboard"));
+        assert!(message.contains("json"));
     }
 
     #[test]

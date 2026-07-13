@@ -1,0 +1,45 @@
+{
+  "api_version": 3,
+  "type": "usage",
+  "snapshots": [{
+    "provider_id": "codex",
+    "account_id": "account-1",
+    "collected_at": "2026-07-11T12:00:00Z",
+    "windows": [{
+      "window_id": "weekly",
+      "label": "Weekly",
+      "kind": "weekly",
+      "used": null,
+      "limit": null,
+      "remaining": null,
+      "percent_used": 25.0,
+      "percent_remaining": 75.0,
+      "reset_at": "2026-07-18T12:00:00Z"
+    }]
+  }],
+  "dashboard": {
+    "accounts": [],
+    "days": [],
+    "pricing": {"priced_tokens": 0, "unpriced_tokens": 0, "covered_percent": 100.0},
+    "provenance": {
+      "scopes": ["account_wide"],
+      "qualities": ["authoritative"],
+      "partial": false,
+      "estimated": false,
+      "mixed_scope": false,
+      "explanation": "Quota data is provider-reported."
+    }
+  },
+  "window_provenance": [{
+    "provider_id": "codex",
+    "account_id": "account-1",
+    "window_id": "weekly",
+    "source": "provider_reported",
+    "scope": "account_wide",
+    "quality": "authoritative",
+    "completeness": "complete",
+    "confidence": "high",
+    "authoritative": true,
+    "quota_like": true
+  }]
+}

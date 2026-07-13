@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
 use thiserror::Error;
-use usage_core::{ProviderId, UsageSnapshot, UsageWindow};
+use usage_core::{ProviderFailureCode, ProviderId, UsageSnapshot, UsageWindow};
 
 pub(crate) mod browser_cookies;
 pub mod claude;
@@ -119,7 +119,6 @@ pub struct ProviderCollectionResult {
     pub daily_usage: Vec<DailyUsageBucket>,
     pub collection_mode: String,
     pub account_email: Option<String>,
-    pub raw_payload: Option<serde_json::Value>,
     pub warnings: Vec<String>,
 }
 
@@ -163,30 +162,7 @@ pub trait ProviderCollector: Send + Sync {
     ) -> Result<ProviderCollectionResult, ProviderError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderErrorKind {
-    CredentialsMissing,
-    CredentialsInvalid,
-    Unauthorized,
-    RateLimited,
-    Network,
-    Parse,
-    ProviderUnavailable,
-}
-
-impl ProviderErrorKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CredentialsMissing => "credentials_missing",
-            Self::CredentialsInvalid => "credentials_invalid",
-            Self::Unauthorized => "unauthorized",
-            Self::RateLimited => "rate_limited",
-            Self::Network => "network",
-            Self::Parse => "parse",
-            Self::ProviderUnavailable => "provider_unavailable",
-        }
-    }
-}
+pub type ProviderErrorKind = ProviderFailureCode;
 
 #[derive(Debug, Error)]
 #[error("{kind:?}: {message}")]

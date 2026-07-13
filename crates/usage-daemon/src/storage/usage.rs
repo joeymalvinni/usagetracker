@@ -9,22 +9,16 @@ use crate::providers::DailyUsageBucket;
 
 use super::{
     accounts::{accounts_from_conn, looks_like_email},
-    health::health_status_to_sql,
+    health::{health_status_to_sql, provider_health_from_conn},
     parse_time_sql, Storage, StoredDailyUsage, StoredDailyUsageHistory, StoredForecastHistory,
     StoredUsageDashboard, StoredWindowObservation, FORECAST_OBSERVATIONS_QUERY,
-    MAX_RAW_PAYLOADS_PER_ACCOUNT, MAX_SNAPSHOTS_PER_ACCOUNT, SNAPSHOT_RETENTION_DAYS,
-    UPSERT_DAILY_USAGE_QUERY,
+    MAX_SNAPSHOTS_PER_ACCOUNT, SNAPSHOT_RETENTION_DAYS, UPSERT_DAILY_USAGE_QUERY,
 };
 
 impl Storage {
     #[cfg(test)]
-    pub async fn insert_snapshot(
-        &self,
-        snapshot: &UsageSnapshot,
-        raw_payload: Option<&serde_json::Value>,
-    ) -> anyhow::Result<()> {
+    pub async fn insert_snapshot(&self, snapshot: &UsageSnapshot) -> anyhow::Result<()> {
         let snapshot = snapshot.clone();
-        let raw_payload = raw_payload.cloned();
         self.with_connection(move |conn| {
             let snapshot_id = Uuid::new_v4().to_string();
             let normalized_json = serde_json::to_string(&snapshot)?;
@@ -42,21 +36,6 @@ impl Storage {
             )?;
             let snapshot_sequence = conn.last_insert_rowid();
             insert_window_observations(conn, &snapshot_id, snapshot_sequence, &snapshot)?;
-
-            if let Some(raw_payload) = raw_payload {
-                conn.execute(
-                    "INSERT INTO raw_payloads
-                 (id, snapshot_id, provider_id, collected_at, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        Uuid::new_v4().to_string(),
-                        snapshot_id,
-                        snapshot.provider_id.as_str(),
-                        snapshot.collected_at.to_rfc3339(),
-                        serde_json::to_string(&raw_payload)?,
-                    ],
-                )?;
-            }
 
             Ok(())
         })
@@ -150,6 +129,7 @@ impl Storage {
             let transaction = conn.unchecked_transaction()?;
             let snapshots = latest_usage_from_conn(&transaction)?;
             let accounts = accounts_from_conn(&transaction)?;
+            let health = provider_health_from_conn(&transaction)?;
             let daily_usage = daily_usage_dashboard_from_conn(&transaction, recent_since)?;
             let forecast_histories = forecast_histories_from_conn(
                 &transaction,
@@ -161,6 +141,7 @@ impl Storage {
             Ok(StoredUsageDashboard {
                 snapshots,
                 accounts,
+                health,
                 daily_usage,
                 forecast_histories,
             })
@@ -190,13 +171,11 @@ impl Storage {
     pub async fn record_success(
         &self,
         snapshot: &UsageSnapshot,
-        raw_payload: Option<&serde_json::Value>,
         daily_usage: &[DailyUsageBucket],
         health: &ProviderHealth,
         email: Option<&str>,
     ) -> anyhow::Result<()> {
         let snapshot = snapshot.clone();
-        let raw_payload = raw_payload.cloned();
         let daily_usage = daily_usage.to_vec();
         let health = health.clone();
         let email = email
@@ -206,10 +185,6 @@ impl Storage {
         self.with_connection(move |conn| {
             let snapshot_id = Uuid::new_v4().to_string();
             let normalized_json = serde_json::to_string(&snapshot)?;
-            let raw_payload_json = raw_payload
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?;
             let collected_at = snapshot.collected_at.to_rfc3339();
             let transaction = conn.unchecked_transaction()?;
 
@@ -240,21 +215,6 @@ impl Storage {
                 snapshot_sequence,
                 &snapshot,
             )?;
-            if let Some(payload_json) = raw_payload_json {
-                transaction.execute(
-                    "INSERT INTO raw_payloads
-                     (id, snapshot_id, provider_id, collected_at, payload_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        Uuid::new_v4().to_string(),
-                        snapshot_id,
-                        snapshot.provider_id.as_str(),
-                        collected_at,
-                        payload_json,
-                    ],
-                )?;
-            }
-
             let health_account_id = health
                 .account_id
                 .as_ref()
@@ -308,7 +268,6 @@ impl Storage {
                 &snapshot.account_id,
                 retention_cutoff,
                 MAX_SNAPSHOTS_PER_ACCOUNT,
-                MAX_RAW_PAYLOADS_PER_ACCOUNT,
             )?;
 
             transaction.commit()?;
@@ -562,22 +521,8 @@ pub(super) fn prune_account_history(
     account_id: &AccountId,
     retention_cutoff: DateTime<Utc>,
     max_snapshots: usize,
-    max_raw_payloads: usize,
 ) -> anyhow::Result<()> {
     let max_snapshots = i64::try_from(max_snapshots)?;
-    let max_raw_payloads = i64::try_from(max_raw_payloads)?;
-    conn.execute(
-        "DELETE FROM raw_payloads
-         WHERE id IN (
-           SELECT raw.id
-           FROM raw_payloads AS raw
-           JOIN usage_snapshots AS snapshot ON snapshot.id = raw.snapshot_id
-           WHERE snapshot.provider_id = ?1 AND snapshot.account_id = ?2
-           ORDER BY raw.collected_at DESC, raw.rowid DESC
-           LIMIT -1 OFFSET ?3
-         )",
-        params![provider_id.as_str(), account_id.as_str(), max_raw_payloads],
-    )?;
     let old_snapshot_ids = "SELECT id FROM usage_snapshots
          WHERE provider_id = ?1 AND account_id = ?2
            AND (
@@ -589,15 +534,6 @@ pub(super) fn prune_account_history(
                LIMIT -1 OFFSET ?4
              )
            )";
-    conn.execute(
-        &format!("DELETE FROM raw_payloads WHERE snapshot_id IN ({old_snapshot_ids})"),
-        params![
-            provider_id.as_str(),
-            account_id.as_str(),
-            retention_cutoff.to_rfc3339(),
-            max_snapshots,
-        ],
-    )?;
     conn.execute(
         &format!("DELETE FROM usage_snapshots WHERE id IN ({old_snapshot_ids})"),
         params![

@@ -58,20 +58,23 @@ impl Storage {
         .await
     }
     pub async fn provider_health(&self) -> anyhow::Result<Vec<ProviderHealth>> {
-        self.with_connection(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT provider_id, account_id, status, collection_mode, last_success_at,
-                    last_failure_at, last_error_code, last_error_message, updated_at
-             FROM provider_health
-             ORDER BY provider_id, account_id",
-            )?;
-            let health = stmt
-                .query_map([], provider_health_from_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(health)
-        })
-        .await
+        self.with_connection(provider_health_from_conn).await
     }
+}
+
+pub(super) fn provider_health_from_conn(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<Vec<ProviderHealth>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_id, account_id, status, collection_mode, last_success_at,
+                last_failure_at, last_error_code, last_error_message, updated_at
+         FROM provider_health
+         ORDER BY provider_id, account_id",
+    )?;
+    let health = stmt
+        .query_map([], provider_health_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(health)
 }
 
 fn provider_health_from_row(row: &Row<'_>) -> rusqlite::Result<ProviderHealth> {

@@ -210,8 +210,6 @@ pub struct PricingCoverage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fetched_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_effective_from: Option<NaiveDate>,
 }
 
@@ -283,7 +281,6 @@ pub fn aggregate_usage_dashboard(accounts: Vec<AccountUsageSummary>) -> UsageDas
     let mut unpriced_models = BTreeSet::new();
     let mut catalog_sources = BTreeSet::new();
     let mut catalog_versions = BTreeSet::new();
-    let mut fetched_at = None;
     let mut catalog_effective_dates = BTreeSet::new();
 
     for summary in &accounts {
@@ -311,7 +308,6 @@ pub fn aggregate_usage_dashboard(accounts: Vec<AccountUsageSummary>) -> UsageDas
             if let Some(version) = &cost.pricing.catalog_version {
                 catalog_versions.insert(version.clone());
             }
-            fetched_at = fetched_at.max(cost.pricing.fetched_at);
             if let Some(effective_from) = cost.pricing.catalog_effective_from {
                 catalog_effective_dates.insert(effective_from);
             }
@@ -359,7 +355,6 @@ pub fn aggregate_usage_dashboard(accounts: Vec<AccountUsageSummary>) -> UsageDas
             unpriced_models: unpriced_models.into_iter().collect(),
             catalog_version: one_or_mixed(catalog_versions),
             catalog_source: one_or_mixed(catalog_sources),
-            fetched_at,
             catalog_effective_from: one_or_none(catalog_effective_dates),
         },
         provenance: AggregateProvenance {

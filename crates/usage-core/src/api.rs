@@ -8,8 +8,52 @@ use crate::{
     UsageForecast, UsageSnapshot, UsageWindowProvenance,
 };
 
-pub const API_VERSION: u16 = 2;
-pub const MINIMUM_CLIENT_API_VERSION: u16 = 2;
+pub const API_VERSION: u16 = 3;
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderSpec {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub minimum_refresh_interval_seconds: u64,
+    pub default_visible: bool,
+    pub capabilities: ProviderCapabilities,
+}
+
+pub const PROVIDER_SPECS: &[ProviderSpec] = &[
+    ProviderSpec {
+        id: "codex",
+        display_name: "Codex",
+        minimum_refresh_interval_seconds: 60,
+        default_visible: true,
+        capabilities: ProviderCapabilities::managed_accounts(),
+    },
+    ProviderSpec {
+        id: "claude",
+        display_name: "Claude",
+        minimum_refresh_interval_seconds: 60,
+        default_visible: false,
+        capabilities: ProviderCapabilities::managed_accounts(),
+    },
+    ProviderSpec {
+        id: "opencode_go",
+        display_name: "OpenCode Go",
+        minimum_refresh_interval_seconds: 60,
+        default_visible: false,
+        capabilities: ProviderCapabilities::workspace(),
+    },
+    ProviderSpec {
+        id: "grok",
+        display_name: "Grok",
+        minimum_refresh_interval_seconds: 60,
+        default_visible: false,
+        capabilities: ProviderCapabilities::managed_accounts(),
+    },
+];
+
+pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
+    PROVIDER_SPECS.iter().find(|provider| provider.id == id)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestEnvelope {
@@ -51,6 +95,7 @@ impl ResponseEnvelope {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ApiRequest {
     GetServerInfo,
+    GetState,
     GetUsage,
     Refresh {
         providers: Option<Vec<ProviderId>>,
@@ -112,33 +157,11 @@ pub enum ApiRequest {
 }
 
 impl ApiRequest {
-    pub fn method_name(&self) -> &'static str {
-        match self {
-            Self::GetServerInfo => "get_server_info",
-            Self::GetUsage => "get_usage",
-            Self::Refresh { .. } => "refresh",
-            Self::GetRefreshJob { .. } => "get_refresh_job",
-            Self::GetProviderHealth => "get_provider_health",
-            Self::GetAccounts => "get_accounts",
-            Self::GetConfig => "get_config",
-            Self::GetPendingNotifications => "get_pending_notifications",
-            Self::AcknowledgeNotifications { .. } => "acknowledge_notifications",
-            Self::UpdateConfig { .. } => "update_config",
-            Self::AddProviderAccount { .. } => "add_provider_account",
-            Self::UpdateAccount { .. } => "update_account",
-            Self::RemoveAccount { .. } => "remove_account",
-            Self::DeleteAccount { .. } => "delete_account",
-            Self::GetProviderSetup { .. } => "get_provider_setup",
-            Self::UpdateProviderSetup { .. } => "update_provider_setup",
-            Self::RepairProvider { .. } => "repair_provider",
-            Self::LaunchProviderAccount { .. } => "launch_provider_account",
-        }
-    }
-
     pub fn supports_method(method: &str) -> bool {
         matches!(
             method,
             "get_server_info"
+                | "get_state"
                 | "get_usage"
                 | "refresh"
                 | "get_refresh_job"
@@ -301,6 +324,9 @@ pub enum ApiResponse {
     ServerInfo {
         server: ServerInfo,
     },
+    State {
+        state: StateSnapshot,
+    },
     Usage {
         snapshots: Vec<UsageSnapshot>,
         dashboard: UsageDashboardSummary,
@@ -351,10 +377,24 @@ pub enum ApiResponse {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StateSnapshot {
+    pub generated_at: DateTime<Utc>,
+    pub server: ServerInfo,
+    pub config: ConfigResponse,
+    pub accounts: Vec<Account>,
+    pub health: Vec<ProviderHealth>,
+    pub snapshots: Vec<UsageSnapshot>,
+    pub dashboard: UsageDashboardSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forecasts: Vec<UsageForecast>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub window_provenance: Vec<UsageWindowProvenance>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServerInfo {
     pub api_version: u16,
-    pub minimum_client_api_version: u16,
     pub capabilities: Vec<ApiCapability>,
     pub providers: Vec<ProviderDescriptor>,
 }
@@ -363,19 +403,17 @@ impl ServerInfo {
     pub fn current() -> Self {
         Self {
             api_version: API_VERSION,
-            minimum_client_api_version: MINIMUM_CLIENT_API_VERSION,
             capabilities: vec![
                 ApiCapability::TypedErrors,
                 ApiCapability::UsageProvenance,
                 ApiCapability::RefreshJobs,
                 ApiCapability::RefreshCoalescing,
-                ApiCapability::DiagnosticMetadata,
+                ApiCapability::CombinedState,
             ],
-            providers: vec![
-                ProviderDescriptor::new("codex", "Codex", 60),
-                ProviderDescriptor::new("claude", "Claude", 60),
-                ProviderDescriptor::new("opencode_go", "OpenCode Go", 60),
-            ],
+            providers: PROVIDER_SPECS
+                .iter()
+                .map(ProviderDescriptor::from)
+                .collect(),
         }
     }
 }
@@ -383,11 +421,11 @@ impl ServerInfo {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiCapability {
+    CombinedState,
     TypedErrors,
     UsageProvenance,
     RefreshJobs,
     RefreshCoalescing,
-    DiagnosticMetadata,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -395,14 +433,47 @@ pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
     pub minimum_refresh_interval_seconds: u64,
+    pub capabilities: ProviderCapabilities,
 }
 
-impl ProviderDescriptor {
-    fn new(id: &str, display_name: &str, minimum_refresh_interval_seconds: u64) -> Self {
+impl From<&ProviderSpec> for ProviderDescriptor {
+    fn from(spec: &ProviderSpec) -> Self {
         Self {
-            id: ProviderId::new(id),
-            display_name: display_name.to_string(),
-            minimum_refresh_interval_seconds,
+            id: ProviderId::new(spec.id),
+            display_name: spec.display_name.to_string(),
+            minimum_refresh_interval_seconds: spec.minimum_refresh_interval_seconds,
+            capabilities: spec.capabilities,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderCapabilities {
+    pub multiple_accounts: bool,
+    pub add_account: bool,
+    pub repair: bool,
+    pub launch_account: bool,
+    pub workspace_setup: bool,
+}
+
+impl ProviderCapabilities {
+    const fn managed_accounts() -> Self {
+        Self {
+            multiple_accounts: true,
+            add_account: true,
+            repair: true,
+            launch_account: true,
+            workspace_setup: false,
+        }
+    }
+
+    const fn workspace() -> Self {
+        Self {
+            multiple_accounts: false,
+            add_account: false,
+            repair: true,
+            launch_account: false,
+            workspace_setup: true,
         }
     }
 }
@@ -519,6 +590,46 @@ pub enum ProviderRefreshStatus {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFailureCode {
+    CredentialsMissing,
+    CredentialsInvalid,
+    Unauthorized,
+    RateLimited,
+    Network,
+    Parse,
+    ProviderUnavailable,
+}
+
+impl ProviderFailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialsMissing => "credentials_missing",
+            Self::CredentialsInvalid => "credentials_invalid",
+            Self::Unauthorized => "unauthorized",
+            Self::RateLimited => "rate_limited",
+            Self::Network => "network",
+            Self::Parse => "parse",
+            Self::ProviderUnavailable => "provider_unavailable",
+        }
+    }
+}
+
+impl From<ProviderFailureCode> for ProviderRefreshStatus {
+    fn from(value: ProviderFailureCode) -> Self {
+        match value {
+            ProviderFailureCode::CredentialsMissing => Self::CredentialsMissing,
+            ProviderFailureCode::CredentialsInvalid => Self::CredentialsInvalid,
+            ProviderFailureCode::Unauthorized => Self::Unauthorized,
+            ProviderFailureCode::RateLimited => Self::RateLimited,
+            ProviderFailureCode::Network => Self::Network,
+            ProviderFailureCode::Parse => Self::Parse,
+            ProviderFailureCode::ProviderUnavailable => Self::ProviderUnavailable,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConfigResponse {
     pub poll_interval_seconds: u64,
@@ -527,8 +638,6 @@ pub struct ConfigResponse {
     pub config_path: String,
     pub socket_path: String,
     pub db_path: String,
-    pub enabled_providers: Vec<ProviderId>,
-    #[serde(default)]
     pub providers: BTreeMap<String, ProviderToggle>,
 }
 
@@ -614,7 +723,7 @@ mod tests {
     #[test]
     fn request_envelope_round_trips_with_flat_method() {
         let request: RequestEnvelope = serde_json::from_str(
-            r#"{"api_version":2,"method":"launch_provider_account","account_id":"account-1"}"#,
+            r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1"}"#,
         )
         .unwrap();
 
@@ -630,7 +739,7 @@ mod tests {
     #[test]
     fn decodes_usage_response_without_optional_collections() {
         let response: ResponseEnvelope = serde_json::from_str(
-            r#"{"api_version":2,"type":"usage","snapshots":[],"dashboard":{"accounts":[],"days":[],"pricing":{"priced_tokens":0,"unpriced_tokens":0,"covered_percent":100.0},"provenance":{"scopes":[],"qualities":[],"partial":false,"estimated":false,"mixed_scope":false,"explanation":"No usage data."}}}"#,
+            r#"{"api_version":3,"type":"usage","snapshots":[],"dashboard":{"accounts":[],"days":[],"pricing":{"priced_tokens":0,"unpriced_tokens":0,"covered_percent":100.0},"provenance":{"scopes":[],"qualities":[],"partial":false,"estimated":false,"mixed_scope":false,"explanation":"No usage data."}}}"#,
         )
         .unwrap();
 
@@ -652,18 +761,51 @@ mod tests {
     #[test]
     fn fixture_server_info_decodes() {
         let response: ResponseEnvelope =
-            serde_json::from_str(include_str!("../wire-fixtures/server_info_v2.json")).unwrap();
+            serde_json::from_str(include_str!("../wire-fixtures/server_info_v3.json")).unwrap();
         let ApiResponse::ServerInfo { server } = response.response else {
             panic!("unexpected fixture response");
         };
         assert_eq!(server.api_version, API_VERSION);
         assert!(server.capabilities.contains(&ApiCapability::RefreshJobs));
+        assert_eq!(server.providers.len(), PROVIDER_SPECS.len());
+        assert!(server
+            .providers
+            .iter()
+            .any(|provider| provider.id.as_str() == "grok"));
+    }
+
+    #[test]
+    fn fixture_state_decodes() {
+        let response: ResponseEnvelope =
+            serde_json::from_str(include_str!("../wire-fixtures/state_v3.json")).unwrap();
+        let ApiResponse::State { state } = response.response else {
+            panic!("unexpected fixture response");
+        };
+        assert_eq!(state.server.api_version, API_VERSION);
+        assert_eq!(state.config.poll_interval_seconds, 300);
+        assert!(state.snapshots.is_empty());
+    }
+
+    #[test]
+    fn wire_fixtures_round_trip_without_losing_contract_fields() {
+        for fixture in [
+            include_str!("../wire-fixtures/server_info_v3.json"),
+            include_str!("../wire-fixtures/state_v3.json"),
+            include_str!("../wire-fixtures/refresh_job_v3.json"),
+            include_str!("../wire-fixtures/error_v3.json"),
+            include_str!("../wire-fixtures/usage_v3.json"),
+        ] {
+            let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let response: ResponseEnvelope = serde_json::from_value(expected.clone()).unwrap();
+            let actual = serde_json::to_value(response).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
     fn fixture_refresh_job_decodes() {
         let response: ResponseEnvelope =
-            serde_json::from_str(include_str!("../wire-fixtures/refresh_job_v2.json")).unwrap();
+            serde_json::from_str(include_str!("../wire-fixtures/refresh_job_v3.json")).unwrap();
         let ApiResponse::RefreshJob { job } = response.response else {
             panic!("unexpected fixture response");
         };
@@ -674,7 +816,7 @@ mod tests {
     #[test]
     fn fixture_typed_error_decodes() {
         let response: ResponseEnvelope =
-            serde_json::from_str(include_str!("../wire-fixtures/error_v2.json")).unwrap();
+            serde_json::from_str(include_str!("../wire-fixtures/error_v3.json")).unwrap();
         let ApiResponse::Error { error } = response.response else {
             panic!("unexpected fixture response");
         };
@@ -685,7 +827,7 @@ mod tests {
     #[test]
     fn fixture_usage_provenance_decodes() {
         let response: ResponseEnvelope =
-            serde_json::from_str(include_str!("../wire-fixtures/usage_v2.json")).unwrap();
+            serde_json::from_str(include_str!("../wire-fixtures/usage_v3.json")).unwrap();
         let ApiResponse::Usage {
             snapshots,
             window_provenance,

@@ -30,7 +30,6 @@ const MAX_PERCENT: f64 = 100.0;
 
 pub(super) struct ClaudeCliUsage {
     pub usage: ProviderUsage,
-    pub raw_output: serde_json::Value,
 }
 
 pub(super) fn collect_usage_from_cli(
@@ -43,10 +42,9 @@ pub(super) fn collect_usage_from_cli(
             format!("Claude CLI usage fallback failed: {err}"),
         )
     })?;
-    let decoded = serde_json::from_str::<serde_json::Value>(&raw_output).and_then(|raw_payload| {
-        ClaudePrintResponse::deserialize(&raw_payload).map(|response| (raw_payload, response))
-    });
-    let (raw_payload, response) = match decoded {
+    let decoded = serde_json::from_str::<serde_json::Value>(&raw_output)
+        .and_then(|value| ClaudePrintResponse::deserialize(&value));
+    let response = match decoded {
         Ok(decoded) => decoded,
         Err(err) => {
             warn!(
@@ -90,10 +88,7 @@ pub(super) fn collect_usage_from_cli(
             return Err(err);
         }
     };
-    Ok(ClaudeCliUsage {
-        usage,
-        raw_output: raw_payload,
-    })
+    Ok(ClaudeCliUsage { usage })
 }
 
 fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::Result<String> {

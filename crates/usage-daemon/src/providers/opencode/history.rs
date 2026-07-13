@@ -23,7 +23,6 @@ static USAGE_HISTORY_ROW_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Default)]
 pub(super) struct UsageHistoryCollection {
     pub(super) report: Option<UsageHistoryReport>,
-    pub(super) raw_pages: Vec<String>,
     pub(super) account_email: Option<String>,
 }
 

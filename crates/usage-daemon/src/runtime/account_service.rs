@@ -157,7 +157,6 @@ mod tests {
                     ..crate::config::ProviderConfig::default()
                 },
             )]),
-            debug_capture_raw_payloads: false,
             paths: crate::config::Paths {
                 config: PathBuf::from("/tmp/config.json"),
                 db: PathBuf::from("/tmp/usage.sqlite3"),
@@ -204,7 +203,6 @@ mod tests {
                     ..crate::config::ProviderConfig::default()
                 },
             )]),
-            debug_capture_raw_payloads: false,
             paths: crate::config::Paths {
                 config: PathBuf::from("/tmp/config.json"),
                 db: PathBuf::from("/tmp/usage.sqlite3"),

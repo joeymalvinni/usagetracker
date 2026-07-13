@@ -12,8 +12,8 @@ use crate::{
     render::{
         labels::{identity_labels, metadata_str, plan_label},
         style::{
-            collapse_spaces, format_collection_mode, format_provider_name, relative_time, truncate,
-            visible_len, Theme,
+            format_collection_mode, format_provider_name, relative_time, truncate, visible_len,
+            Theme,
         },
     },
     OutputStyle,
@@ -76,7 +76,6 @@ pub fn render_usage_with_summary(
     let theme = Theme::new(color);
     match style {
         OutputStyle::Dashboard => render_dashboard(&dashboard, normalized, theme, width, details),
-        OutputStyle::Compact => render_compact(&dashboard, normalized, theme),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -296,69 +295,6 @@ fn render_dashboard(
             theme,
         );
     }
-    output.trim_end().to_string()
-}
-
-fn render_compact(
-    dashboard: &Dashboard,
-    normalized: Option<&UsageDashboardSummary>,
-    theme: Theme,
-) -> String {
-    let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "Tokens {} total · {} peak · streak {}d current / {}d longest",
-        theme.value(&format_tokens(dashboard.overview.lifetime_tokens)),
-        theme.value(&format_tokens(dashboard.overview.peak_tokens)),
-        dashboard.overview.current_streak_days,
-        dashboard.overview.longest_streak_days
-    );
-
-    let activity = dashboard
-        .activity
-        .iter()
-        .map(|day| {
-            format!(
-                "{} {}",
-                theme.muted(&day.date.format("%a").to_string()),
-                theme.value(&format_tokens(day.tokens))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let _ = writeln!(output, "{} {activity}", theme.label("Activity"));
-
-    for provider in &dashboard.providers {
-        let mut head = theme.title(&provider.provider);
-        if let Some(plan) = &provider.plan {
-            head.push_str(&theme.muted(&format!("/{plan}")));
-        }
-        if let Some(identity) = &provider.identity {
-            head.push(' ');
-            head.push_str(&theme.muted(identity));
-        }
-
-        let mut parts = Vec::new();
-        for window in [&provider.session, &provider.weekly, &provider.monthly]
-            .into_iter()
-            .flatten()
-        {
-            parts.push(compact_window(window, theme));
-        }
-        parts.extend(provider.usage.iter().map(|value| collapse_spaces(value)));
-        let _ = writeln!(output, "{head}  {}", parts.join(" · "));
-    }
-
-    if let Some(normalized) = normalized {
-        let _ = writeln!(
-            output,
-            "coverage {:.0}% priced · {} unpriced · {}",
-            normalized.pricing.covered_percent,
-            format_tokens(normalized.pricing.unpriced_tokens),
-            normalized.provenance.explanation
-        );
-    }
-
     output.trim_end().to_string()
 }
 
@@ -633,26 +569,6 @@ fn bar_width_for(width: usize, reserved: usize) -> usize {
     content_width(width)
         .saturating_sub(reserved)
         .clamp(BAR_MIN, BAR_MAX)
-}
-
-fn compact_window(window: &WindowLine, theme: Theme) -> String {
-    let remaining = window
-        .percent_remaining
-        .map(format_percent)
-        .unwrap_or_else(|| "?".to_string());
-    let remaining = window
-        .percent_remaining
-        .map(|value| theme.quota(value, &remaining))
-        .unwrap_or_else(|| theme.muted(&remaining));
-    let reset = window
-        .reset_at
-        .map(|reset| format!(" ({})", compact_reset(reset)))
-        .unwrap_or_default();
-    format!(
-        "{} {remaining}{}",
-        window.label.to_ascii_lowercase(),
-        theme.muted(&reset)
-    )
 }
 
 fn window_line(label: &'static str, window: &UsageWindow) -> WindowLine {
@@ -1042,28 +958,6 @@ fn reset_label(reset_at: DateTime<Utc>) -> String {
         return format!("resets in {days}d {hours}h");
     }
     format!("resets {}", reset_at.with_timezone(&Local).format("%b %-d"))
-}
-
-/// Terse reset delta for compact rows: "40m", "2h", "4d3h".
-fn compact_reset(reset_at: DateTime<Utc>) -> String {
-    let now = Utc::now();
-    if reset_at <= now {
-        return "now".to_string();
-    }
-    let delta = reset_at - now;
-    if delta.num_hours() < 1 {
-        return format!("{}m", delta.num_minutes().max(1));
-    }
-    if delta.num_hours() < 24 {
-        return format!("{}h", delta.num_hours());
-    }
-    let days = delta.num_days();
-    let hours = (delta - TimeDelta::days(days)).num_hours();
-    if hours == 0 {
-        format!("{days}d")
-    } else {
-        format!("{days}d{hours}h")
-    }
 }
 
 fn reset_credit_expiry_label(expires_at: DateTime<Utc>) -> String {

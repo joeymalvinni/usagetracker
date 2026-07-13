@@ -19,6 +19,7 @@ struct DaemonClient: Sendable {
     }
 
     func serverInfo() async throws -> ServerInfo { guard case let .serverInfo(v) = try await send(.getServerInfo) else { throw DaemonError.badResponse }; return v }
+    func state() async throws -> StateResponse { guard case let .state(v) = try await send(.getState) else { throw DaemonError.badResponse }; return v }
     func config() async throws -> ConfigResponse { guard case let .config(v) = try await send(.getConfig) else { throw DaemonError.badResponse }; return v }
     func accounts() async throws -> [Account] { guard case let .accounts(v) = try await send(.getAccounts) else { throw DaemonError.badResponse }; return v }
     func health() async throws -> [ProviderHealth] { guard case let .providerHealth(v) = try await send(.getProviderHealth) else { throw DaemonError.badResponse }; return v }
@@ -113,7 +114,7 @@ struct DaemonClient: Sendable {
 private enum DaemonRequestTimeout {
     static func seconds(for request: DaemonRequest) -> TimeInterval {
         switch request {
-        case .getServerInfo, .getUsage, .getRefreshJob, .getProviderHealth,
+        case .getServerInfo, .getState, .getUsage, .getRefreshJob, .getProviderHealth,
              .getAccounts, .getConfig, .getPendingNotifications,
              .acknowledgeNotifications:
             3

@@ -35,20 +35,6 @@ CREATE TABLE usage_snapshots (
 CREATE INDEX usage_snapshots_provider_account_time
 ON usage_snapshots(provider_id, account_id, collected_at DESC, sequence DESC);
 
-CREATE TABLE raw_payloads (
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-  id TEXT NOT NULL UNIQUE,
-  snapshot_id TEXT NOT NULL,
-  provider_id TEXT NOT NULL,
-  collected_at TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  FOREIGN KEY(snapshot_id) REFERENCES usage_snapshots(id) ON DELETE CASCADE
-);
-
-CREATE INDEX raw_payloads_snapshot_id ON raw_payloads(snapshot_id);
-CREATE INDEX raw_payloads_provider_time
-ON raw_payloads(provider_id, collected_at DESC, sequence DESC);
-
 CREATE TABLE usage_window_observations (
   snapshot_id TEXT NOT NULL,
   snapshot_sequence INTEGER NOT NULL,

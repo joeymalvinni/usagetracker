@@ -18,6 +18,10 @@ struct DerivedState: Equatable {
     let menuBars: [MenuBarProviderVM]
 }
 
+private enum PendingAction {
+    case provider(String), accountProvider(String), account(String), interval, notifications
+}
+
 @MainActor final class AppState: ObservableObject {
     @Published var daemon: DaemonState = .unknown
     @Published var config: ConfigResponse?
@@ -41,6 +45,7 @@ struct DerivedState: Equatable {
     @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
     @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
+    @Published var serverProviders = [String: ServerProviderDescriptor]()
     @Published private(set) var derived = DerivedState.empty
     var providers: [ProviderVM] { derived.providers }
     var settingsProviders: [ProviderVM] { derived.settingsProviders }
@@ -84,7 +89,6 @@ struct DerivedState: Equatable {
     private var buildTask: Task<Void, Never>?
     private var buildRevision = 0
     private var loadTask: Task<Void, Never>?
-    private var inFlightIncludesAccounts = false
     private var automaticRecoveryTask: Task<Void, Never>?
     private var lastAutomaticRecoveryAt: Date?
     private var refreshActivityCount = 0
@@ -120,7 +124,7 @@ struct DerivedState: Equatable {
         // before the first API request so replacing the app bundle also
         // replaces an older daemon instead of silently serving stale data.
         _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
-        await load(all: true)
+        await load()
         // Running the notifications fixture is an explicit request to exercise
         // desktop delivery. Development builds use their own bundle identity,
         // so request its authorization on the first fixture launch and then
@@ -133,7 +137,7 @@ struct DerivedState: Equatable {
         }
     }
     func refreshForPopoverOpen() async {
-        await load(all: false)
+        await load()
         await requestStaleDataRecovery(delay: .zero, reloadBeforeChecking: false)
     }
     func refreshAfterWake() async {
@@ -143,7 +147,7 @@ struct DerivedState: Equatable {
         while !Task.isCancelled {
             let seconds = max(15, Int(config?.pollIntervalSeconds ?? 60))
             try? await Task.sleep(for: .seconds(seconds))
-            await load(all: false)
+            await load()
         }
     }
     func refreshAll() async {
@@ -153,7 +157,7 @@ struct DerivedState: Equatable {
         do {
             let report = try await client.refresh(nil)
             applyRefreshOutcome(report)
-            await load(all: true)
+            await load()
         } catch {
             actionError = describe(error)
         }
@@ -165,54 +169,40 @@ struct DerivedState: Equatable {
         do {
             let report = try await client.refresh([id])
             applyRefreshOutcome(report)
-            await load(all: true)
+            await load()
         } catch {
             actionError = describe(error)
         }
     }
-    func visible(_ id: String) -> Bool { uiVisible(id) }
+    func visible(_ id: String) -> Bool { config?.providers[id]?.enabled == true }
     func setVisible(_ id: String, _ on: Bool) async {
-        pendingProviders.insert(id); defer { pendingProviders.remove(id) }
-        do {
+        await perform(.provider(id)) {
             config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: on])
-            if on { ui.hiddenProviders.remove(id) } else { ui.hiddenProviders.insert(id) }
-            actionError = nil
-        } catch {
-            actionError = describe(error)
         }
     }
 
     func setProviderEnabled(_ id: String, _ enabled: Bool) async {
-        pendingProviders.insert(id); defer { pendingProviders.remove(id) }
-        do {
+        await perform(.provider(id)) {
             config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: enabled])
-            actionError = nil
             build()
             if enabled { applyRefreshOutcome(try await client.refresh([id])) }
-            await load(all: true)
-        } catch {
-            actionError = describe(error)
+            await load()
         }
     }
 
     func setPollInterval(_ seconds: UInt64) async {
-        pendingInterval = true; defer { pendingInterval = false }
-        do {
+        await perform(.interval) {
             config = try await client.updateConfig(pollIntervalSeconds: seconds, providers: nil)
-            actionError = nil
             build()
-            await load(all: true)
-        } catch {
-            actionError = describe(error)
+            await load()
         }
     }
 
     func setNotificationsEnabled(_ enabled: Bool) async {
-        pendingNotifications = true; defer { pendingNotifications = false }
         if enabled && notificationAuthorization == .notDetermined {
             await requestNotificationAuthorizationIfNeeded()
         }
-        do {
+        await perform(.notifications) {
             config = try await client.updateConfig(
                 pollIntervalSeconds: nil,
                 providers: nil,
@@ -224,13 +214,10 @@ struct DerivedState: Equatable {
             } else {
                 actionMessage = enabled ? "Usage alerts enabled." : "Usage alerts disabled."
             }
-            actionError = nil
             build()
             if enabled {
                 await deliverPendingNotifications()
             }
-        } catch {
-            actionError = describe(error)
         }
     }
 
@@ -251,6 +238,10 @@ struct DerivedState: Equatable {
     }
 
     func addProviderAccount(_ providerId: String) async {
+        guard supportsAddAccount(providerId) else {
+            actionError = "\(providerName(providerId)) does not support adding accounts."
+            return
+        }
         pendingAccountProviders.insert(providerId)
         defer { pendingAccountProviders.remove(providerId) }
         do {
@@ -265,39 +256,27 @@ struct DerivedState: Equatable {
     }
 
     func setAccountHidden(_ id: String, _ hidden: Bool) async {
-        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
-        do {
+        await perform(.account(id)) {
             _ = try await client.updateAccount(accountId: id, hidden: hidden)
-            actionError = nil
-            await load(all: true)
-        } catch {
-            actionError = describe(error)
+            await load()
         }
     }
 
     func setAccountCollectionEnabled(_ id: String, _ enabled: Bool) async {
-        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
-        do {
+        await perform(.account(id)) {
             _ = try await client.updateAccount(accountId: id, hidden: enabled ? false : nil, collectionEnabled: enabled)
-            actionError = nil
             if enabled, let providerId = accounts.first(where: { $0.id == id })?.providerId {
                 applyRefreshOutcome(try await client.refresh([providerId]))
             }
-            await load(all: true)
-        } catch {
-            actionError = describe(error)
+            await load()
         }
     }
 
     func removeAccount(_ id: String) async {
-        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
-        do {
+        await perform(.account(id)) {
             _ = try await client.removeAccount(accountId: id)
-            actionError = nil
             actionMessage = "Account removed. Usage history was kept."
-            await load(all: true)
-        } catch {
-            actionError = describe(error)
+            await load()
         }
     }
 
@@ -310,16 +289,16 @@ struct DerivedState: Equatable {
             if isMissingAccount(error) {
                 actionError = nil
                 actionMessage = "Account was already deleted."
-                await load(all: true)
+                await load()
             } else {
                 actionError = message
-                await load(all: true)
+                await load()
             }
             return
         }
         actionError = nil
         actionMessage = "Account and usage history deleted."
-        await load(all: true)
+        await load()
     }
 
     func deleteAllAccounts() async {
@@ -336,7 +315,7 @@ struct DerivedState: Equatable {
                 if !isMissingAccount(error) { failures.append(describe(error)) }
             }
         }
-        await load(all: true)
+        await load()
         if failures.isEmpty {
             actionError = nil
             actionMessage = "All accounts and usage history deleted."
@@ -374,79 +353,74 @@ struct DerivedState: Equatable {
             actionError = "Enter a name for this account."
             return
         }
-        pendingAccounts.insert(id); defer { pendingAccounts.remove(id) }
-        do {
+        await perform(.account(id)) {
             _ = try await client.updateAccount(accountId: id, displayName: name)
-            actionError = nil
             actionMessage = "Account renamed to \(name)."
-            await load(all: true)
+            await load()
             if let providerId = accounts.first(where: { $0.id == id })?.providerId,
                providerSetups[providerId] != nil {
                 await loadProviderSetup(providerId)
             }
-        } catch {
-            actionError = describe(error)
         }
     }
 
     func loadProviderSetup(_ providerId: String) async {
-        pendingAccountProviders.insert(providerId)
-        defer { pendingAccountProviders.remove(providerId) }
-        do {
+        guard supportsWorkspaceSetup(providerId) else {
+            actionError = "\(providerName(providerId)) does not support workspace setup."
+            return
+        }
+        await perform(.accountProvider(providerId)) {
             providerSetups[providerId] = try await client.providerSetup(providerId: providerId)
-            actionError = nil
-        } catch {
-            actionError = describe(error)
         }
     }
 
     func selectWorkspace(providerId: String, workspaceId: String) async {
-        pendingAccountProviders.insert(providerId)
-        defer { pendingAccountProviders.remove(providerId) }
-        do {
+        guard supportsWorkspaceSetup(providerId) else {
+            actionError = "\(providerName(providerId)) does not support workspace setup."
+            return
+        }
+        await perform(.accountProvider(providerId)) {
             providerSetups[providerId] = try await client.updateProviderSetup(
                 providerId: providerId,
                 workspaceId: workspaceId
             )
-            actionError = nil
             actionMessage = "OpenCode workspace selected."
             applyRefreshOutcome(try await client.refresh([providerId]))
-            await load(all: true)
-        } catch {
-            actionError = describe(error)
+            await load()
         }
     }
 
     func repairProvider(_ providerId: String, accountId: String? = nil) async {
-        pendingAccountProviders.insert(providerId)
-        defer { pendingAccountProviders.remove(providerId) }
+        guard supportsRepair(providerId) else {
+            actionError = "\(providerName(providerId)) does not support reconnecting accounts."
+            return
+        }
         let startedAt = Date()
-        do {
+        await perform(.accountProvider(providerId)) {
             let response = try await client.repairProvider(providerId: providerId, accountId: accountId)
-            actionError = nil
             actionMessage = response.message
-            if ProviderCatalog.supportsMultipleAccounts(providerId) {
+            if supportsMultipleAccounts(providerId) {
                 await waitForProviderRepair(
                     providerId: providerId,
                     accountId: accountId,
                     startedAt: startedAt
                 )
             }
-        } catch {
-            actionError = describe(error)
         }
     }
 
     func launchProviderAccount(_ accountId: String) async {
-        pendingAccounts.insert(accountId)
-        defer { pendingAccounts.remove(accountId) }
-        do {
+        guard let providerId = accounts.first(where: { $0.id == accountId })?.providerId else {
+            actionError = "The selected account is no longer available."
+            return
+        }
+        guard supportsLaunchAccount(providerId) else {
+            actionError = "\(providerName(providerId)) does not support launching account sessions."
+            return
+        }
+        await perform(.account(accountId)) {
             let response = try await client.launchProviderAccount(accountId: accountId)
-            actionError = nil
             actionMessage = response.message
-        } catch {
-            actionMessage = nil
-            actionError = describe(error)
         }
     }
 
@@ -533,49 +507,35 @@ struct DerivedState: Equatable {
     private func updateSocketPath(from config: ConfigResponse?) {
         socketPath = path(from: config)
     }
-    private func uiVisible(_ id: String) -> Bool { ui.hiddenProviders.contains(id) == false }
-    private func load(all: Bool) async {
-        await load(all: all, allowDaemonStart: true)
-    }
-    private func load(all: Bool, allowDaemonStart: Bool) async {
+    private func load(allowDaemonStart: Bool = true) async {
         if let current = loadTask {
-            let satisfiesRequest = !all || inFlightIncludesAccounts
             await current.value
-            if !satisfiesRequest { await load(all: true, allowDaemonStart: allowDaemonStart) }
             return
         }
 
-        inFlightIncludesAccounts = all
         let task = Task {
-            await performLoad(all: all, allowDaemonStart: allowDaemonStart)
+            await performLoad(allowDaemonStart: allowDaemonStart)
             loadTask = nil
-            inFlightIncludesAccounts = false
         }
         loadTask = task
         await task.value
     }
 
-    private func performLoad(all: Bool, allowDaemonStart: Bool) async {
+    private func performLoad(allowDaemonStart: Bool) async {
         do {
-            let latestConfig = try await client.config()
-            if config != latestConfig { config = latestConfig }
-            updateSocketPath(from: latestConfig)
-            if all {
-                let latestAccounts = try await client.accounts()
-                if accounts != latestAccounts { accounts = latestAccounts }
-            }
-            async let h = client.health()
-            async let u = client.usage()
-            let latestHealth = try await h
-            let usage = try await u
-            if health != latestHealth { health = latestHealth }
-            if snapshots != usage.snapshots { snapshots = usage.snapshots }
-            if forecasts != usage.forecasts { forecasts = usage.forecasts }
-            if dashboardSummary != usage.dashboard { dashboardSummary = usage.dashboard }
-            if windowProvenance != usage.windowProvenance { windowProvenance = usage.windowProvenance }
-            if !all && hasUnknownAccountReferences() {
-                let latestAccounts = try await client.accounts()
-                if accounts != latestAccounts { accounts = latestAccounts }
+            let state = try await client.state()
+            serverProviders = Dictionary(
+                uniqueKeysWithValues: state.server.providers.map { ($0.id, $0) }
+            )
+            if config != state.config { config = state.config }
+            updateSocketPath(from: state.config)
+            if accounts != state.accounts { accounts = state.accounts }
+            if health != state.health { health = state.health }
+            if snapshots != state.snapshots { snapshots = state.snapshots }
+            if forecasts != state.forecasts { forecasts = state.forecasts }
+            if dashboardSummary != state.dashboard { dashboardSummary = state.dashboard }
+            if windowProvenance != state.windowProvenance {
+                windowProvenance = state.windowProvenance
             }
             daemon = .online; message = nil; build()
             await refreshNotificationAuthorization()
@@ -584,7 +544,7 @@ struct DerivedState: Equatable {
             }
         } catch {
             if allowDaemonStart, await daemonSupervisor.ensureRunning(socketPath: socketPath) {
-                await performLoad(all: all, allowDaemonStart: false)
+                await performLoad(allowDaemonStart: false)
             } else {
                 fail(error); build()
             }
@@ -606,7 +566,7 @@ struct DerivedState: Equatable {
                 try? await Task.sleep(for: delay)
                 guard !Task.isCancelled else { return }
             }
-            if reloadBeforeChecking { await load(all: false) }
+            if reloadBeforeChecking { await load() }
 
             let now = Date()
             if let lastAutomaticRecoveryAt,
@@ -627,7 +587,7 @@ struct DerivedState: Equatable {
             do {
                 let report = try await client.refresh(Array(providerIDs).sorted())
                 applyRefreshOutcome(report)
-                await load(all: true)
+                await load()
             } catch {
                 actionError = describe(error)
             }
@@ -635,47 +595,6 @@ struct DerivedState: Equatable {
         automaticRecoveryTask = task
         await task.value
         if automaticRecoveryTask != nil { automaticRecoveryTask = nil }
-    }
-
-    nonisolated static func staleProviderIDs(
-        config: ConfigResponse?,
-        accounts: [Account],
-        snapshots: [UsageSnapshot],
-        now: Date
-    ) -> [String] {
-        guard let config else { return [] }
-        let staleAfter = TimeInterval(config.pollIntervalSeconds * 2)
-        return config.providers.compactMap { providerID, toggle in
-            guard toggle.enabled else { return nil }
-            let allProviderAccounts = accounts.filter { $0.providerId == providerID }
-            let providerAccounts = allProviderAccounts.filter { !$0.hidden }
-            if !allProviderAccounts.isEmpty && providerAccounts.isEmpty { return nil }
-            let enabledAccounts = providerAccounts.filter(\.collectionEnabled)
-            if !providerAccounts.isEmpty && enabledAccounts.isEmpty { return nil }
-
-            let accountIDs = Set(enabledAccounts.map(\.id))
-            let relevantSnapshots = snapshots.filter {
-                $0.providerId == providerID
-                    && (accountIDs.isEmpty || accountIDs.contains($0.accountId))
-            }
-            if !enabledAccounts.isEmpty {
-                let latestByAccount = Dictionary(grouping: relevantSnapshots, by: \.accountId)
-                    .mapValues { values in values.map(\.collectedAt).max() }
-                let hasStaleAccount = enabledAccounts.contains { account in
-                    guard let latest = latestByAccount[account.id].flatMap({ $0 }) else { return true }
-                    return now.timeIntervalSince(latest) > staleAfter
-                }
-                return hasStaleAccount ? providerID : nil
-            }
-
-            guard !relevantSnapshots.isEmpty else { return providerID }
-            let latestByAccount = Dictionary(grouping: relevantSnapshots, by: \.accountId)
-            let hasStaleAccount = latestByAccount.values.contains { values in
-                guard let latest = values.map(\.collectedAt).max() else { return true }
-                return now.timeIntervalSince(latest) > staleAfter
-            }
-            return hasStaleAccount ? providerID : nil
-        }.sorted()
     }
 
     private func enabledProviderIDs() -> Set<String> {
@@ -719,11 +638,6 @@ struct DerivedState: Equatable {
             notificationError = "Could not load usage alerts: \(describe(error))"
         }
     }
-    private func hasUnknownAccountReferences() -> Bool {
-        let known = Set(accounts.map(\.id))
-        let referenced = Set(snapshots.map(\.accountId) + health.compactMap(\.accountId))
-        return referenced.contains { !known.contains($0) }
-    }
     private func waitForProviderAccount(providerId: String, profileId: String) async {
         for _ in 0..<600 {
             guard !Task.isCancelled else { return }
@@ -735,7 +649,7 @@ struct DerivedState: Equatable {
                     actionMessage = providerId == "claude"
                         ? "Claude account connected. Use its terminal button in Settings for profile-scoped activity."
                         : "\(providerName(providerId)) account connected."
-                    await load(all: true)
+                    await load()
                     return
                 }
             } catch {
@@ -760,7 +674,7 @@ struct DerivedState: Equatable {
                 if repaired != nil {
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) login connected."
-                    await load(all: true)
+                    await load()
                     return
                 }
             } catch {
@@ -774,6 +688,37 @@ struct DerivedState: Equatable {
         daemon = .offline
         message = describe(error)
     }
+
+    private func perform(
+        _ pending: PendingAction,
+        operation: () async throws -> Void
+    ) async {
+        setPending(pending, true)
+        defer { setPending(pending, false) }
+        actionError = nil
+        do {
+            try await operation()
+        } catch {
+            actionMessage = nil
+            actionError = describe(error)
+        }
+    }
+
+    private func setPending(_ action: PendingAction, _ active: Bool) {
+        switch action {
+        case .provider(let id):
+            if active { pendingProviders.insert(id) } else { pendingProviders.remove(id) }
+        case .accountProvider(let id):
+            if active { pendingAccountProviders.insert(id) } else { pendingAccountProviders.remove(id) }
+        case .account(let id):
+            if active { pendingAccounts.insert(id) } else { pendingAccounts.remove(id) }
+        case .interval:
+            pendingInterval = active
+        case .notifications:
+            pendingNotifications = active
+        }
+    }
+
     private func describe(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
@@ -798,6 +743,26 @@ struct DerivedState: Equatable {
 
     private func providerName(_ id: String) -> String {
         ProviderCatalog.name(for: id)
+    }
+
+    func supportsMultipleAccounts(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.multipleAccounts, in: serverProviders)
+    }
+
+    func supportsAddAccount(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.addAccount, in: serverProviders)
+    }
+
+    func supportsRepair(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.repair, in: serverProviders)
+    }
+
+    func supportsLaunchAccount(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.launchAccount, in: serverProviders)
+    }
+
+    func supportsWorkspaceSetup(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.workspaceSetup, in: serverProviders)
     }
 
     private func refreshStatusText(_ status: ProviderRefreshStatus) -> String {
@@ -848,10 +813,7 @@ struct DerivedState: Equatable {
                     windowProvenance: windowProvenance,
                     ui: ui,
                     refreshingProviderIDs: refreshingProviderIDs,
-                    visible: {
-                        !ui.hiddenProviders.contains($0)
-                            && (config == nil || visibleProviderIds.contains($0))
-                    }
+                    visible: { config == nil || visibleProviderIds.contains($0) }
                 )
                 return Self.derive(
                     from: engine.build(),
@@ -924,8 +886,7 @@ struct DerivedState: Equatable {
     }
 
     private func dashboardConfigurationChanged(from oldValue: UIConfig) -> Bool {
-        ui.hiddenProviders != oldValue.hiddenProviders
-            || ui.hiddenWindows != oldValue.hiddenWindows
+        ui.hiddenWindows != oldValue.hiddenWindows
             || ui.providerOrder != oldValue.providerOrder
             || ui.seenAlerts != oldValue.seenAlerts
     }
@@ -1000,60 +961,4 @@ struct DerivedState: Equatable {
         return !ui.dismissedAlerts.contains(sig)
     }
 
-    nonisolated static func menuContent(
-        providers: [ProviderVM],
-        daemon: DaemonState,
-        ui: UIConfig,
-        eligibleProviderIDs: Set<String>
-    ) -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
-        guard daemon != .offline else { return ("Usage offline", .offline, []) }
-        var preview = ""
-        let eligible = providers.filter {
-            $0.enabled && $0.visibleInMenu && eligibleProviderIDs.contains($0.providerId)
-        }
-        let providerCount = ui.resolvedMenuProviderCount(automaticCount: eligible.count)
-        let shown = Array(eligible.prefix(providerCount))
-        for (index, provider) in shown.enumerated() {
-            if index > 0 { preview += "  " }
-            let value: String
-            if let percent = provider.percent {
-                let displayedValue = max(0, min(100, ui.menuMetric == .used ? 100 - percent : percent))
-                value = "\(Int(displayedValue.rounded()))%"
-            } else {
-                value = provider.primary
-            }
-            let text = ui.showProviderLabels ? "\(provider.short) \(value)" : value
-            preview += text
-        }
-        let bars = shown.map { provider in
-            let displayed = provider.percent.map { max(0, min(100, ui.menuMetric == .used ? 100 - $0 : $0)) }
-            return MenuBarProviderVM(id: provider.id, providerId: provider.providerId, short: provider.short, percent: displayed, status: provider.status)
-        }
-        if preview.isEmpty { return ("Usage", .stale, []) }
-        return (preview, menuStatus(for: shown), bars)
-    }
-
-    nonisolated static func providerIDsWithDataOrConnection(
-        accounts: [Account],
-        snapshots: [UsageSnapshot]
-    ) -> Set<String> {
-        var providerIDs = Set(snapshots.map(\.providerId))
-        providerIDs.formUnion(accounts.lazy.filter { !$0.hidden }.map(\.providerId))
-        return providerIDs
-    }
-
-    nonisolated private static func menuStatus(for providers: [ProviderVM]) -> DisplayStatus {
-        providers.map(\.status).max { severity($0) < severity($1) } ?? .stale
-    }
-
-    nonisolated private static func severity(_ status: DisplayStatus) -> Int {
-        switch status {
-        case .normal: 0
-        case .disabled: 1
-        case .stale, .refreshing: 2
-        case .warning: 3
-        case .critical: 4
-        case .error, .offline: 5
-        }
-    }
 }

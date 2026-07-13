@@ -1,6 +1,10 @@
-use std::io::{self, IsTerminal};
+use std::{
+    fmt::Write,
+    io::{self, IsTerminal},
+};
 
 use chrono::{DateTime, Local, Utc};
+use serde::Serialize;
 
 /// Lower bound for the rendered box/table width.
 const MIN_WIDTH: usize = 60;
@@ -113,6 +117,17 @@ pub(crate) fn format_local_time(time: Option<DateTime<Utc>>) -> String {
     .unwrap_or_else(|| "-".to_string())
 }
 
+pub(crate) fn push_kv(output: &mut String, theme: Theme, key: &str, value: &str) {
+    let _ = writeln!(output, "{}  {}", theme.label(&format!("{key:<14}")), value);
+}
+
+pub(crate) fn json_name(value: &impl Serialize) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"unknown\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
 /// Compact, human-friendly "time since" label ("just now", "3m ago", "2d
 /// ago"), falling back to an absolute date for anything older than a week.
 pub(crate) fn relative_time(time: DateTime<Utc>) -> String {
@@ -173,10 +188,6 @@ pub(crate) fn title_case(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-pub(crate) fn collapse_spaces(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub(crate) fn truncate(value: &str, max_chars: usize) -> String {

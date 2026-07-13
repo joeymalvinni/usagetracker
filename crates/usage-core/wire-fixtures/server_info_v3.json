@@ -1,0 +1,34 @@
+{
+  "api_version": 3,
+  "type": "server_info",
+  "server": {
+    "api_version": 3,
+    "capabilities": ["typed_errors", "usage_provenance", "refresh_jobs", "refresh_coalescing", "combined_state"],
+    "providers": [
+      {
+        "id": "codex",
+        "display_name": "Codex",
+        "minimum_refresh_interval_seconds": 60,
+        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "workspace_setup": false}
+      },
+      {
+        "id": "claude",
+        "display_name": "Claude",
+        "minimum_refresh_interval_seconds": 60,
+        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "workspace_setup": false}
+      },
+      {
+        "id": "opencode_go",
+        "display_name": "OpenCode Go",
+        "minimum_refresh_interval_seconds": 60,
+        "capabilities": {"multiple_accounts": false, "add_account": false, "repair": true, "launch_account": false, "workspace_setup": true}
+      },
+      {
+        "id": "grok",
+        "display_name": "Grok",
+        "minimum_refresh_interval_seconds": 60,
+        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "workspace_setup": false}
+      }
+    ]
+  }
+}

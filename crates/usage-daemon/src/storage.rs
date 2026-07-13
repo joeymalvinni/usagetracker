@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use usage_core::{Account, AccountId, ProviderId, UsageSnapshot};
+use usage_core::{Account, AccountId, ProviderHealth, ProviderId, UsageSnapshot};
 
 mod accounts;
 mod backoff;
@@ -21,7 +21,6 @@ mod usage;
 use usage::prune_account_history;
 const SNAPSHOT_RETENTION_DAYS: u64 = 90;
 const MAX_SNAPSHOTS_PER_ACCOUNT: usize = 10_000;
-const MAX_RAW_PAYLOADS_PER_ACCOUNT: usize = 100;
 const FORECAST_OBSERVATIONS_QUERY: &str = "SELECT collected_at, percent_used, reset_at
      FROM usage_window_observations
      WHERE provider_id = ?1
@@ -104,6 +103,7 @@ pub struct StoredForecastHistory {
 pub struct StoredUsageDashboard {
     pub snapshots: Vec<UsageSnapshot>,
     pub accounts: Vec<Account>,
+    pub health: Vec<ProviderHealth>,
     pub daily_usage: Vec<StoredDailyUsageHistory>,
     pub forecast_histories: HashMap<(ProviderId, AccountId), StoredForecastHistory>,
 }

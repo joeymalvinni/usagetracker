@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     io,
     os::unix::fs::PermissionsExt,
     path::Path,
@@ -8,25 +8,23 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::Semaphore,
 };
 use tracing::{debug, trace, warn};
 use usage_core::{
     Account, AccountId, ApiErrorCode, ApiRequest, ApiResponse, ProviderHealth, RequestEnvelope,
-    ResponseEnvelope, ServerInfo, UsageAmount, UsageSnapshot, UsageUnit, UsageWindow,
-    UsageWindowKind, API_VERSION,
+    ResponseEnvelope, ServerInfo, StateSnapshot, UsageDashboardSummary, UsageForecast,
+    UsageSnapshot, UsageWindowProvenance, API_VERSION, MAX_RESPONSE_BYTES,
 };
 
-use crate::{
-    daemon::DaemonRuntime, dashboard, forecast, runtime::provider_registry,
-    storage::StoredDailyUsageHistory,
-};
+use crate::{daemon::DaemonRuntime, dashboard, forecast};
 
 const MAX_CLIENT_CONNECTIONS: usize = 64;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DASHBOARD_HISTORY_DAYS: u64 = 30;
 const FORECAST_HISTORY_DAYS: i64 = 35;
 const FORECAST_HISTORY_LIMIT: usize = 1_024;
@@ -113,9 +111,7 @@ impl SocketServer {
                         format!("request exceeds the {MAX_REQUEST_BYTES}-byte limit"),
                     );
                     response_bytes.clear();
-                    serde_json::to_writer(&mut response_bytes, &response)?;
-                    response_bytes.push(b'\n');
-                    writer.write_all(&response_bytes).await?;
+                    write_response(&mut writer, &response, &mut response_bytes).await?;
                 }
                 return Ok(());
             };
@@ -129,7 +125,6 @@ impl SocketServer {
                     let started = Instant::now();
                     let response = self.handle_request(request).await;
                     debug!(
-                        response = response_summary(&response),
                         elapsed_ms = started.elapsed().as_millis(),
                         "daemon request completed"
                     );
@@ -141,10 +136,9 @@ impl SocketServer {
                     ResponseEnvelope::new(response)
                 }
             };
-            response_bytes.clear();
-            serde_json::to_writer(&mut response_bytes, &response)?;
-            response_bytes.push(b'\n');
-            writer.write_all(&response_bytes).await?;
+            if write_response(&mut writer, &response, &mut response_bytes).await? {
+                return Ok(());
+            }
         }
     }
 
@@ -153,6 +147,7 @@ impl SocketServer {
             ApiRequest::GetServerInfo => ApiResponse::ServerInfo {
                 server: ServerInfo::current(),
             },
+            ApiRequest::GetState => self.state_response().await,
             ApiRequest::GetUsage => {
                 let generated_at = chrono::Utc::now();
                 let today = generated_at.with_timezone(&chrono::Local).date_naive();
@@ -166,41 +161,13 @@ impl SocketServer {
                     .usage_dashboard(recent_since, since, FORECAST_HISTORY_LIMIT)
                     .await
                 {
-                    Ok(mut dashboard) => {
-                        merge_daily_usage_history(&mut dashboard.snapshots, &dashboard.daily_usage);
-                        let snapshots = supported_visible_usage_snapshots(
-                            dashboard.snapshots,
-                            &dashboard.accounts,
-                        );
-                        let empty_history = crate::storage::StoredForecastHistory::default();
-                        let forecasts = snapshots
-                            .iter()
-                            .flat_map(|snapshot| {
-                                let history = dashboard
-                                    .forecast_histories
-                                    .get(&(
-                                        snapshot.provider_id.clone(),
-                                        snapshot.account_id.clone(),
-                                    ))
-                                    .unwrap_or(&empty_history);
-                                forecast::forecast_snapshot(snapshot, history, generated_at)
-                            })
-                            .collect();
-                        let window_provenance = snapshots
-                            .iter()
-                            .flat_map(|snapshot| {
-                                snapshot
-                                    .windows
-                                    .iter()
-                                    .map(|window| snapshot.window_provenance(window))
-                            })
-                            .collect();
-                        let dashboard = dashboard::build_usage_dashboard(&snapshots);
+                    Ok(stored) => {
+                        let usage = build_usage_view(stored, generated_at);
                         ApiResponse::Usage {
-                            snapshots,
-                            dashboard,
-                            forecasts,
-                            window_provenance,
+                            snapshots: usage.snapshots,
+                            dashboard: usage.dashboard,
+                            forecasts: usage.forecasts,
+                            window_provenance: usage.window_provenance,
                         }
                     }
                     Err(err) => storage_error(err),
@@ -290,7 +257,9 @@ impl SocketServer {
             } => {
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
-                } else if provider_id.as_str() == "opencode_go" {
+                } else if !usage_core::provider_spec(provider_id.as_str())
+                    .is_some_and(|provider| provider.capabilities.add_account)
+                {
                     ApiResponse::error(
                         ApiErrorCode::UnsupportedOperation,
                         "adding accounts is not supported for OpenCode Go",
@@ -376,7 +345,9 @@ impl SocketServer {
             } => {
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
-                } else if provider_id.as_str() != "opencode_go" {
+                } else if !usage_core::provider_spec(provider_id.as_str())
+                    .is_some_and(|provider| provider.capabilities.workspace_setup)
+                {
                     ApiResponse::error(
                         ApiErrorCode::UnsupportedOperation,
                         "workspace selection is only supported for OpenCode Go",
@@ -405,6 +376,13 @@ impl SocketServer {
                 };
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
+                } else if !usage_core::provider_spec(provider_id.as_str())
+                    .is_some_and(|provider| provider.capabilities.repair)
+                {
+                    ApiResponse::error(
+                        ApiErrorCode::UnsupportedOperation,
+                        format!("repair is not supported for {provider_id}"),
+                    )
                 } else if let Some(error) = account_error {
                     error
                 } else {
@@ -433,6 +411,61 @@ impl SocketServer {
         }
     }
 
+    async fn state_response(&self) -> ApiResponse {
+        let generated_at = chrono::Utc::now();
+        let today = generated_at.with_timezone(&chrono::Local).date_naive();
+        let recent_since = today
+            .checked_sub_days(chrono::Days::new(DASHBOARD_HISTORY_DAYS - 1))
+            .unwrap_or(today);
+        let forecast_since = generated_at - chrono::TimeDelta::days(FORECAST_HISTORY_DAYS);
+        let stored = match self
+            .runtime
+            .storage
+            .usage_dashboard(recent_since, forecast_since, FORECAST_HISTORY_LIMIT)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(err) => return storage_error(err),
+        };
+
+        let data_provider_ids = stored
+            .accounts
+            .iter()
+            .map(|account| account.provider_id.as_str().to_string())
+            .chain(
+                stored
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.provider_id.as_str().to_string()),
+            )
+            .collect();
+        let (config, visible_provider_ids) = self
+            .runtime
+            .config_response_for_provider_data(data_provider_ids)
+            .await;
+        let health = visible_supported_provider_health(
+            stored.health.clone(),
+            &stored.accounts,
+            &visible_provider_ids,
+        );
+        let accounts = supported_accounts(stored.accounts.clone());
+        let usage = build_usage_view(stored, generated_at);
+
+        ApiResponse::State {
+            state: StateSnapshot {
+                generated_at,
+                server: ServerInfo::current(),
+                config,
+                accounts,
+                health,
+                snapshots: usage.snapshots,
+                dashboard: usage.dashboard,
+                forecasts: usage.forecasts,
+                window_provenance: usage.window_provenance,
+            },
+        }
+    }
+
     async fn account_validation_error(&self, account_id: &AccountId) -> Option<ApiResponse> {
         match self.runtime.storage.account(account_id).await {
             Ok(Some(_)) => None,
@@ -442,6 +475,131 @@ impl SocketServer {
             )),
             Err(err) => Some(storage_error(err)),
         }
+    }
+}
+
+struct UsageView {
+    snapshots: Vec<UsageSnapshot>,
+    dashboard: UsageDashboardSummary,
+    forecasts: Vec<UsageForecast>,
+    window_provenance: Vec<UsageWindowProvenance>,
+}
+
+fn build_usage_view(
+    stored: crate::storage::StoredUsageDashboard,
+    generated_at: chrono::DateTime<chrono::Utc>,
+) -> UsageView {
+    let snapshots = supported_visible_usage_snapshots(stored.snapshots, &stored.accounts);
+    let empty_history = crate::storage::StoredForecastHistory::default();
+    let forecasts = snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            let history = stored
+                .forecast_histories
+                .get(&(snapshot.provider_id.clone(), snapshot.account_id.clone()))
+                .unwrap_or(&empty_history);
+            forecast::forecast_snapshot(snapshot, history, generated_at)
+        })
+        .collect();
+    let window_provenance = snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            snapshot
+                .windows
+                .iter()
+                .map(|window| snapshot.window_provenance(window))
+        })
+        .collect();
+    let dashboard = dashboard::build_usage_dashboard(&snapshots, &stored.daily_usage);
+    UsageView {
+        snapshots,
+        dashboard,
+        forecasts,
+        window_provenance,
+    }
+}
+
+async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &ResponseEnvelope,
+    buffer: &mut Vec<u8>,
+) -> anyhow::Result<bool> {
+    let close_after_write = encode_response(response, buffer, MAX_RESPONSE_BYTES)?;
+    write_all_with_timeout(writer, buffer, CLIENT_WRITE_TIMEOUT).await?;
+    Ok(close_after_write)
+}
+
+async fn write_all_with_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(timeout, writer.write_all(bytes))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out writing daemon response"))??;
+    Ok(())
+}
+
+fn encode_response(
+    response: &ResponseEnvelope,
+    buffer: &mut Vec<u8>,
+    max_response_bytes: usize,
+) -> serde_json::Result<bool> {
+    buffer.clear();
+    let (result, limit_exceeded) = {
+        let mut writer = BoundedResponseWriter::new(buffer, max_response_bytes.saturating_sub(1));
+        let result = serde_json::to_writer(&mut writer, response);
+        (result, writer.limit_exceeded)
+    };
+    if !limit_exceeded {
+        result?;
+        buffer.push(b'\n');
+        return Ok(false);
+    }
+
+    buffer.clear();
+    serde_json::to_writer(
+        &mut *buffer,
+        &ResponseEnvelope::error(
+            ApiErrorCode::Internal,
+            format!("daemon response exceeds the {max_response_bytes}-byte limit"),
+        ),
+    )?;
+    buffer.push(b'\n');
+    Ok(true)
+}
+
+struct BoundedResponseWriter<'a> {
+    buffer: &'a mut Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl<'a> BoundedResponseWriter<'a> {
+    fn new(buffer: &'a mut Vec<u8>, max_bytes: usize) -> Self {
+        Self {
+            buffer,
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl io::Write for BoundedResponseWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.max_bytes.saturating_sub(self.buffer.len()) {
+            self.limit_exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "daemon response exceeds size limit",
+            ));
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -557,146 +715,6 @@ fn supported_visible_usage_snapshots(
         .collect()
 }
 
-fn merge_daily_usage_history(snapshots: &mut [UsageSnapshot], history: &[StoredDailyUsageHistory]) {
-    let history_by_account = history
-        .iter()
-        .map(|history| {
-            (
-                (history.provider_id.as_str(), history.account_id.as_str()),
-                history,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    for snapshot in snapshots {
-        let Some(matching) =
-            history_by_account.get(&(snapshot.provider_id.as_str(), snapshot.account_id.as_str()))
-        else {
-            continue;
-        };
-
-        let rows = matching
-            .recent
-            .iter()
-            .map(|row| {
-                let mut value = serde_json::json!({
-                    "date": row.date.to_string(),
-                    "tokens": row.tokens,
-                });
-                if let Some(cost_usd) = row.cost_usd {
-                    value["cost_usd"] = serde_json::json!(cost_usd);
-                }
-                value
-            })
-            .collect::<Vec<_>>();
-        let source = matching
-            .recent
-            .last()
-            .map(|row| row.source.as_str())
-            .unwrap_or("persisted_daily_usage");
-        let key = format!("{}_activity", snapshot.provider_id.as_str());
-        if !snapshot.metadata.is_object() {
-            snapshot.metadata = serde_json::json!({});
-        }
-        if !snapshot
-            .metadata
-            .get(&key)
-            .is_some_and(serde_json::Value::is_object)
-        {
-            snapshot.metadata[&key] = serde_json::json!({});
-        }
-        let activity = &mut snapshot.metadata[&key];
-        if activity.get("source").is_none() {
-            activity["source"] = serde_json::json!(source);
-        }
-        activity["retained_history"] = serde_json::json!(true);
-        activity["daily_bucket_count"] = serde_json::json!(matching.bucket_count);
-        activity["history_days"] = serde_json::json!(DASHBOARD_HISTORY_DAYS);
-        activity["by_day"] = serde_json::json!(rows);
-        if snapshot.provider_id.as_str() == "codex" {
-            replace_codex_activity_windows(snapshot, matching);
-        }
-    }
-}
-
-fn replace_codex_activity_windows(snapshot: &mut UsageSnapshot, history: &StoredDailyUsageHistory) {
-    let today = chrono::Local::now().date_naive();
-    let lookback_start = today
-        .checked_sub_days(chrono::Days::new(29))
-        .unwrap_or(today);
-    let today_tokens = history
-        .recent
-        .iter()
-        .find(|row| row.date == today)
-        .map(|row| row.tokens)
-        .unwrap_or(0);
-    let lookback_tokens = history
-        .recent
-        .iter()
-        .filter(|row| row.date >= lookback_start && row.date <= today)
-        .fold(0_u64, |total, row| total.saturating_add(row.tokens));
-    let reported_lifetime_tokens = snapshot.metadata["codex_activity"]["lifetime_tokens"]
-        .as_u64()
-        .unwrap_or(0);
-    let lifetime_tokens = history.total_tokens.max(reported_lifetime_tokens);
-
-    snapshot.windows.retain(|window| {
-        !matches!(
-            window.window_id.as_str(),
-            "codex_tokens_today" | "codex_tokens_30d" | "codex_tokens_lifetime"
-        )
-    });
-    if today_tokens > 0 {
-        snapshot.windows.push(activity_token_window(
-            "codex_tokens_today",
-            "Codex tokens today",
-            today_tokens,
-            UsageWindowKind::Daily,
-        ));
-    }
-    if lookback_tokens > 0 {
-        snapshot.windows.push(activity_token_window(
-            "codex_tokens_30d",
-            "Codex tokens 30 days",
-            lookback_tokens,
-            UsageWindowKind::Monthly,
-        ));
-    }
-    if lifetime_tokens > 0 {
-        snapshot.windows.push(activity_token_window(
-            "codex_tokens_lifetime",
-            "Codex lifetime tokens",
-            lifetime_tokens,
-            UsageWindowKind::Other("lifetime".to_string()),
-        ));
-    }
-    snapshot.metadata["codex_activity"]["today_tokens"] = serde_json::json!(today_tokens);
-    snapshot.metadata["codex_activity"]["lookback_days"] = serde_json::json!(30);
-    snapshot.metadata["codex_activity"]["lookback_tokens"] = serde_json::json!(lookback_tokens);
-    snapshot.metadata["codex_activity"]["lifetime_tokens"] = serde_json::json!(lifetime_tokens);
-}
-
-fn activity_token_window(
-    window_id: &str,
-    label: &str,
-    tokens: u64,
-    kind: UsageWindowKind,
-) -> UsageWindow {
-    UsageWindow {
-        window_id: window_id.to_string(),
-        label: label.to_string(),
-        kind,
-        used: Some(UsageAmount {
-            value: tokens as f64,
-            unit: UsageUnit::Tokens,
-        }),
-        limit: None,
-        remaining: None,
-        percent_used: None,
-        percent_remaining: None,
-        reset_at: None,
-    }
-}
-
 fn visible_supported_provider_health(
     health: Vec<ProviderHealth>,
     accounts: &[Account],
@@ -723,7 +741,7 @@ fn supported_accounts(accounts: Vec<Account>) -> Vec<Account> {
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
-    provider_registry::is_supported(provider_id)
+    usage_core::provider_spec(provider_id).is_some()
 }
 
 fn provider_validation_error(provider_id: &usage_core::ProviderId) -> Option<ApiResponse> {
@@ -770,31 +788,10 @@ fn storage_error(err: anyhow::Error) -> ApiResponse {
     ApiResponse::error(ApiErrorCode::StorageUnavailable, err.to_string())
 }
 
-fn response_summary(response: &ApiResponse) -> &'static str {
-    match response {
-        ApiResponse::ServerInfo { .. } => "server_info",
-        ApiResponse::Usage { .. } => "usage",
-        ApiResponse::RefreshStarted { .. } => "refresh_started",
-        ApiResponse::RefreshJob { .. } => "refresh_job",
-        ApiResponse::ProviderHealth { .. } => "provider_health",
-        ApiResponse::Accounts { .. } => "accounts",
-        ApiResponse::Config { .. } => "config",
-        ApiResponse::PendingNotifications { .. } => "pending_notifications",
-        ApiResponse::NotificationsAcknowledged { .. } => "notifications_acknowledged",
-        ApiResponse::AddProviderAccount { .. } => "add_provider_account",
-        ApiResponse::Account { .. } => "account",
-        ApiResponse::AccountDeleted { .. } => "account_deleted",
-        ApiResponse::ProviderSetup { .. } => "provider_setup",
-        ApiResponse::ProviderAction { .. } => "provider_action",
-        ApiResponse::Error { .. } => "error",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::polling::RefreshCoordinator;
-    use crate::storage::StoredDailyUsage;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
     use tokio::time::{timeout, Duration};
@@ -819,7 +816,6 @@ mod tests {
             poll_interval_seconds: 30,
             notifications: Default::default(),
             providers,
-            debug_capture_raw_payloads: false,
             paths: crate::config::Paths {
                 config: config_path,
                 db: db_path,
@@ -833,62 +829,6 @@ mod tests {
             socket_path,
             runtime,
         }
-    }
-
-    #[test]
-    fn merges_retained_daily_usage_and_replaces_local_token_windows() {
-        let today = chrono::Local::now().date_naive();
-        let account_id = usage_core::AccountId::new("account");
-        let provider_id = ProviderId::new("codex");
-        let mut snapshots = vec![UsageSnapshot {
-            provider_id: provider_id.clone(),
-            account_id: account_id.clone(),
-            collected_at: chrono::Utc::now(),
-            windows: vec![activity_token_window(
-                "codex_tokens_today",
-                "local fallback",
-                1,
-                UsageWindowKind::Daily,
-            )],
-            metadata: serde_json::json!({
-                "codex_activity": {"lifetime_tokens": 40}
-            }),
-        }];
-        let history = vec![StoredDailyUsageHistory {
-            provider_id: provider_id.clone(),
-            account_id: account_id.clone(),
-            bucket_count: 2,
-            total_tokens: 40,
-            recent: vec![StoredDailyUsage {
-                provider_id,
-                account_id,
-                date: today,
-                tokens: 25,
-                cost_usd: None,
-                source: "codex_account_usage".to_string(),
-            }],
-        }];
-
-        merge_daily_usage_history(&mut snapshots, &history);
-
-        assert_eq!(
-            snapshots[0].metadata["codex_activity"]["by_day"][0]["tokens"],
-            25
-        );
-        assert_eq!(
-            snapshots[0].metadata["codex_activity"]["lifetime_tokens"],
-            40
-        );
-        assert_eq!(
-            snapshots[0].metadata["codex_activity"]["daily_bucket_count"],
-            2
-        );
-        let today_window = snapshots[0]
-            .windows
-            .iter()
-            .find(|window| window.window_id == "codex_tokens_today")
-            .unwrap();
-        assert_eq!(today_window.used.as_ref().unwrap().value, 25.0);
     }
 
     async fn request_line(socket_path: &Path, request: &str) -> ApiResponse {
@@ -967,6 +907,37 @@ mod tests {
         assert!(line.len() <= MAX_REQUEST_BYTES);
     }
 
+    #[test]
+    fn replaces_oversized_responses_with_a_bounded_error_and_closes() {
+        let response = ResponseEnvelope::new(ApiResponse::ServerInfo {
+            server: ServerInfo::current(),
+        });
+        let mut buffer = Vec::new();
+
+        let close = encode_response(&response, &mut buffer, 512).unwrap();
+
+        assert!(close);
+        assert!(buffer.len() <= 512);
+        let encoded: ResponseEnvelope = serde_json::from_slice(&buffer).unwrap();
+        let ApiResponse::Error { error } = encoded.response else {
+            panic!("expected a bounded error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::Internal);
+    }
+
+    #[tokio::test]
+    async fn times_out_when_a_client_stops_reading_a_response() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+
+        let error = write_all_with_timeout(&mut writer, &[0; 1024], Duration::from_millis(10))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("timed out writing daemon response"));
+    }
+
     #[tokio::test]
     async fn serves_config_request_over_socket() {
         let env = test_env(BTreeMap::new());
@@ -991,7 +962,7 @@ mod tests {
         match response {
             ApiResponse::Config { config } => {
                 assert_eq!(config.poll_interval_seconds, 30);
-                assert_eq!(config.enabled_providers, Vec::<ProviderId>::new());
+                assert!(config.providers.is_empty());
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1054,6 +1025,7 @@ mod tests {
         let usage = request_line(&env.socket_path, r#"{"method":"get_usage"}"#).await;
         let ApiResponse::Usage {
             snapshots,
+            dashboard,
             forecasts,
             ..
         } = usage
@@ -1062,11 +1034,24 @@ mod tests {
         };
         assert_eq!(snapshots.len(), 4);
         assert!(!forecasts.is_empty());
-        assert!(snapshots.iter().any(|snapshot| {
-            snapshot.metadata["codex_activity"]["by_day"]
-                .as_array()
-                .is_some_and(|rows| rows.len() == 30)
+        assert!(dashboard.accounts.iter().any(|account| {
+            account
+                .activity
+                .as_ref()
+                .is_some_and(|activity| activity.days.len() == 30)
         }));
+
+        let state = request_line(&env.socket_path, r#"{"method":"get_state"}"#).await;
+        let ApiResponse::State { state } = state else {
+            panic!("unexpected state response")
+        };
+        assert_eq!(state.accounts.len(), 4);
+        assert_eq!(state.snapshots.len(), 4);
+        assert_eq!(state.server.api_version, API_VERSION);
+        assert!(state
+            .server
+            .capabilities
+            .contains(&usage_core::ApiCapability::CombinedState));
 
         let pending = request_line(
             &env.socket_path,
@@ -1167,7 +1152,6 @@ mod tests {
             ApiResponse::Config { config } => {
                 assert_eq!(config.poll_interval_seconds, 120);
                 assert!(!config.notifications.enabled);
-                assert_eq!(config.enabled_providers, Vec::<ProviderId>::new());
                 assert!(!config.providers.contains_key("codex"));
             }
             other => panic!("unexpected response: {other:?}"),
@@ -1221,7 +1205,6 @@ mod tests {
 
         match response {
             ApiResponse::Config { config } => {
-                assert_eq!(config.enabled_providers, Vec::<ProviderId>::new());
                 assert!(!config.providers["codex"].enabled);
             }
             other => panic!("unexpected response: {other:?}"),

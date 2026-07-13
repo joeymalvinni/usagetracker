@@ -1,11 +1,11 @@
 import Foundation
 
 enum DaemonWireProtocol {
-    static let currentVersion = 2
+    static let currentVersion = 3
 }
 
 enum DaemonRequest: Encodable {
-    case getServerInfo, getUsage, refresh([String]?), getRefreshJob(String)
+    case getServerInfo, getState, getUsage, refresh([String]?), getRefreshJob(String)
     case getProviderHealth, getAccounts, getConfig, getPendingNotifications
     case acknowledgeNotifications([Int64])
     case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notifications: NotificationConfig?)
@@ -22,6 +22,7 @@ enum DaemonRequest: Encodable {
         try c.encode(DaemonWireProtocol.currentVersion, forKey: .apiVersion)
         switch self {
         case .getServerInfo: try c.encode("get_server_info", forKey: .method)
+        case .getState: try c.encode("get_state", forKey: .method)
         case .getUsage: try c.encode("get_usage", forKey: .method)
         case .getProviderHealth: try c.encode("get_provider_health", forKey: .method)
         case .getAccounts: try c.encode("get_accounts", forKey: .method)
@@ -101,6 +102,39 @@ struct UsageResponse: Decodable {
     private enum K: String, CodingKey { case snapshots, forecasts, dashboard, windowProvenance }
 }
 
+struct StateResponse: Decodable {
+    let generatedAt: Date
+    let server: ServerInfo
+    let config: ConfigResponse
+    let accounts: [Account]
+    let health: [ProviderHealth]
+    let snapshots: [UsageSnapshot]
+    let forecasts: [UsageForecast]
+    let dashboard: UsageDashboardSummary
+    let windowProvenance: [UsageWindowProvenance]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        server = try c.decode(ServerInfo.self, forKey: .server)
+        config = try c.decode(ConfigResponse.self, forKey: .config)
+        accounts = try c.decode([Account].self, forKey: .accounts)
+        health = try c.decode([ProviderHealth].self, forKey: .health)
+        snapshots = try c.decode([UsageSnapshot].self, forKey: .snapshots)
+        forecasts = try c.decodeIfPresent([UsageForecast].self, forKey: .forecasts) ?? []
+        dashboard = try c.decode(UsageDashboardSummary.self, forKey: .dashboard)
+        windowProvenance = try c.decodeIfPresent(
+            [UsageWindowProvenance].self,
+            forKey: .windowProvenance
+        ) ?? []
+    }
+
+    private enum K: String, CodingKey {
+        case generatedAt, server, config, accounts, health, snapshots, forecasts, dashboard
+        case windowProvenance
+    }
+}
+
 struct PendingNotification: Decodable, Sendable {
     let id: Int64
     let title: String
@@ -109,7 +143,7 @@ struct PendingNotification: Decodable, Sendable {
 }
 
 struct ServerInfo: Decodable, Equatable, Sendable {
-    let apiVersion, minimumClientApiVersion: Int
+    let apiVersion: Int
     let capabilities: [String]
     let providers: [ServerProviderDescriptor]
 }
@@ -117,10 +151,27 @@ struct ServerInfo: Decodable, Equatable, Sendable {
 struct ServerProviderDescriptor: Decodable, Equatable, Sendable {
     let id, displayName: String
     let minimumRefreshIntervalSeconds: UInt64
+    let capabilities: ProviderCapabilities
+}
+
+struct ProviderCapabilities: Decodable, Equatable, Sendable {
+    let multipleAccounts: Bool
+    let addAccount: Bool
+    let repair: Bool
+    let launchAccount: Bool
+    let workspaceSetup: Bool
+}
+
+func providerSupports(
+    _ providerId: String,
+    capability: KeyPath<ProviderCapabilities, Bool>,
+    in providers: [String: ServerProviderDescriptor]
+) -> Bool {
+    providers[providerId]?.capabilities[keyPath: capability] == true
 }
 
 enum DaemonResponse: Decodable {
-    case serverInfo(ServerInfo), usage(UsageResponse)
+    case serverInfo(ServerInfo), state(StateResponse), usage(UsageResponse)
     case refreshStarted(job: RefreshJob, coalesced: Bool), refreshJob(RefreshJob)
     case providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse)
     case pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64])
@@ -138,6 +189,7 @@ enum DaemonResponse: Decodable {
         }
         switch try c.decode(String.self, forKey: .type) {
         case "server_info": self = .serverInfo(try c.decode(ServerInfo.self, forKey: .server))
+        case "state": self = .state(try c.decode(StateResponse.self, forKey: .state))
         case "usage": self = .usage(try UsageResponse(from: decoder))
         case "refresh_started": self = .refreshStarted(
             job: try c.decode(RefreshJob.self, forKey: .job),
@@ -160,7 +212,7 @@ enum DaemonResponse: Decodable {
     }
     enum K: String, CodingKey {
         case apiVersion, type, snapshots, health, accounts, config, notifications, ids
-        case server, job, coalesced, account, setup, action, error, accountId
+        case server, state, job, coalesced, account, setup, action, error, accountId
     }
 }
 

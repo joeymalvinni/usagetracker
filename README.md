@@ -129,7 +129,9 @@ Provider errors include a retry or login-repair action. Account names can be cha
 
 Cost values derived from local Codex or Claude logs are estimates at API rates, not billing statements. The app labels estimated and partial totals and exposes their source in the UI.
 
-The Unix-socket protocol is API version 2. Every request and response carries `api_version`, clients negotiate capabilities through `get_server_info`, and failures use stable machine-readable codes. Usage responses contain typed daily activity, cost, pricing coverage, provenance, and reset-credit summaries built once by the daemon. Provider-specific raw JSON is optional diagnostic data only; clients do not use it to calculate dashboard values. Refreshes are coalesced background jobs, and a repeated request joins matching in-flight work instead of queuing duplicate provider calls.
+The Unix-socket protocol is API version 3. Every request and response carries `api_version`, and daemon and client versions must match exactly. Clients receive provider capabilities through `get_server_info` or the combined `get_state` snapshot, and failures use stable machine-readable codes. Usage responses contain typed daily activity, cost, pricing coverage, provenance, and reset-credit summaries built once by the daemon. Refreshes are coalesced background jobs, and a repeated request joins matching in-flight work instead of queuing duplicate provider calls.
+
+Raw provider responses are never persisted. Operational diagnostics are limited to sanitized structured metadata, bounded fingerprints and counters, and provider health errors that exclude credentials and response bodies.
 
 Cross-provider totals always retain their coverage context. The menu app and CLI distinguish account-wide data from this-Mac data, estimates from provider-reported values, and partial pricing coverage from complete totals. Local OpenCode history reports observed spend and activity only—it does not invent quota limits, percentages, or reset dates.
 
@@ -196,8 +198,7 @@ The config file controls which providers are enabled:
         }
       ]
     }
-  },
-  "debug_capture_raw_payloads": false
+  }
 }
 ```
 
@@ -263,8 +264,7 @@ Example multi-account config:
         }
       ]
     }
-  },
-  "debug_capture_raw_payloads": false
+  }
 }
 ```
 
@@ -338,7 +338,7 @@ cargo run -p usage-cli -- usage --details
 cargo run -p usage-cli -- usage --all-providers
 cargo run -p usage-cli -- --max-width 72
 cargo run -p usage-cli -- --color always
-cargo run -p usage-cli -- --style compact
+cargo run -p usage-cli -- --style dashboard
 cargo run -p usage-cli -- --style json
 cargo run -p usage-cli -- refresh
 cargo run -p usage-cli -- refresh --provider codex
@@ -359,7 +359,8 @@ cargo run -p usage-cli -- providers repair codex --account ACCOUNT_ID
 cargo run -p usage-cli -- config set --poll-interval 300 --notifications on
 ```
 
-All commands support `--style dashboard`, `--style compact`, and `--style json`.
+All commands support `--style dashboard` and `--style json`.
+The former `--style compact` mode was removed in API v3. Use the width-aware dashboard for human-readable output and JSON for scripts or stable machine-readable output.
 The dashboard fits its boxes to the terminal width, capped at 80 columns by default. Use `--max-width COLUMNS` or `USAGE_TRACKER_MAX_WIDTH` to change the cap (minimum 60 columns). `usage --details` adds per-window sub-limits, credits, forecast, and identity to each panel, and `accounts list --verbose` adds the profile and external-ID columns.
 Color defaults to `--color auto`, can be forced with `--color always`, disabled with `--color never`, and respects `NO_COLOR`.
 `--style json` emits the daemon's stable response shape for scripting. `usage --provider` and `--account` are repeatable. Account listings include the stable account IDs used by the management commands; `accounts remove` retains history, while `accounts delete --yes` permanently deletes it.

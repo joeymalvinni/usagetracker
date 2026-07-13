@@ -52,13 +52,12 @@ pub struct GrokCollector {
     config: ProviderConfig,
     profiles: Vec<GrokProfile>,
     client: reqwest::Client,
-    capture_raw_payloads: bool,
     source_mode: SourceMode,
     discovered_browser_sessions: Mutex<BrowserSessionCache>,
 }
 
 impl GrokCollector {
-    pub fn new(config: ProviderConfig, capture_raw_payloads: bool) -> anyhow::Result<Self> {
+    pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
         let source_mode = SourceMode::parse(config.source_mode.as_deref())
             .map_err(|error| anyhow::anyhow!(error.short_message().to_string()))?;
         let profiles = profile::resolve(&config)?;
@@ -72,7 +71,6 @@ impl GrokCollector {
             config,
             profiles,
             client,
-            capture_raw_payloads,
             source_mode,
             discovered_browser_sessions: Mutex::new(BrowserSessionCache::default()),
         })
@@ -290,9 +288,6 @@ impl GrokCollector {
             usage.metadata["local_sessions"] = summary.metadata();
         }
         ProviderCollectionResult {
-            raw_payload: self
-                .capture_raw_payloads
-                .then(|| normalized_raw(&data, collection_mode)),
             usage,
             daily_usage: Vec::new(),
             collection_mode: collection_mode.to_string(),
@@ -508,19 +503,6 @@ fn should_fallback_after_cli(error: &ProviderError) -> bool {
     error.kind() != ProviderErrorKind::RateLimited
 }
 
-fn normalized_raw(data: &BillingData, source: &str) -> serde_json::Value {
-    json!({
-        "source": source,
-        "used_percent": data.used_percent,
-        "period_start": data.period_start,
-        "resets_at": data.resets_at,
-        "used_usd": data.used_usd,
-        "limit_usd": data.limit_usd,
-        "on_demand_used_usd": data.on_demand_used_usd,
-        "on_demand_limit_usd": data.on_demand_limit_usd,
-    })
-}
-
 pub(crate) async fn clear_cached_cookie_cache() -> anyhow::Result<()> {
     tokio::task::spawn_blocking(cookies::clear_cache).await?;
     Ok(())
@@ -583,14 +565,11 @@ mod tests {
         let work = root.join("work");
         write_auth(&personal, "user-personal", "personal@example.com");
         write_auth(&work, "user-work", "work@example.com");
-        let collector = GrokCollector::new(
-            ProviderConfig {
-                profiles: vec![profile("personal", personal), profile("work", work)],
-                source_mode: Some("cli".to_string()),
-                ..ProviderConfig::default()
-            },
-            false,
-        )
+        let collector = GrokCollector::new(ProviderConfig {
+            profiles: vec![profile("personal", personal), profile("work", work)],
+            source_mode: Some("cli".to_string()),
+            ..ProviderConfig::default()
+        })
         .unwrap();
 
         let discovery = collector.discover_accounts().await.unwrap();
@@ -611,14 +590,11 @@ mod tests {
         let duplicate = root.join("duplicate");
         write_auth(&first, "same-user", "same@example.com");
         write_auth(&duplicate, "same-user", "same@example.com");
-        let collector = GrokCollector::new(
-            ProviderConfig {
-                profiles: vec![profile("first", first), profile("duplicate", duplicate)],
-                source_mode: Some("cli".to_string()),
-                ..ProviderConfig::default()
-            },
-            false,
-        )
+        let collector = GrokCollector::new(ProviderConfig {
+            profiles: vec![profile("first", first), profile("duplicate", duplicate)],
+            source_mode: Some("cli".to_string()),
+            ..ProviderConfig::default()
+        })
         .unwrap();
 
         let discovery = collector.discover_accounts().await.unwrap();
@@ -634,17 +610,14 @@ mod tests {
         let root = std::env::temp_dir().join(format!("grok-profiles-{}", uuid::Uuid::new_v4()));
         let healthy = root.join("healthy");
         write_auth(&healthy, "healthy-user", "healthy@example.com");
-        let collector = GrokCollector::new(
-            ProviderConfig {
-                profiles: vec![
-                    profile("healthy", healthy),
-                    profile("broken", root.join("broken")),
-                ],
-                source_mode: Some("cli".to_string()),
-                ..ProviderConfig::default()
-            },
-            false,
-        )
+        let collector = GrokCollector::new(ProviderConfig {
+            profiles: vec![
+                profile("healthy", healthy),
+                profile("broken", root.join("broken")),
+            ],
+            source_mode: Some("cli".to_string()),
+            ..ProviderConfig::default()
+        })
         .unwrap();
 
         let discovery = collector.discover_accounts().await.unwrap();
@@ -662,16 +635,13 @@ mod tests {
     #[test]
     fn rejects_duplicate_canonical_profile_ids() {
         let root = std::env::temp_dir().join(format!("grok-profiles-{}", uuid::Uuid::new_v4()));
-        let error = GrokCollector::new(
-            ProviderConfig {
-                profiles: vec![
-                    profile("work", root.join("first")),
-                    profile(" work ", root.join("second")),
-                ],
-                ..ProviderConfig::default()
-            },
-            false,
-        )
+        let error = GrokCollector::new(ProviderConfig {
+            profiles: vec![
+                profile("work", root.join("first")),
+                profile(" work ", root.join("second")),
+            ],
+            ..ProviderConfig::default()
+        })
         .err()
         .unwrap();
 
@@ -695,16 +665,13 @@ mod tests {
 
     #[test]
     fn non_default_profile_requires_an_explicit_home() {
-        let error = GrokCollector::new(
-            ProviderConfig {
-                profiles: vec![ProviderProfileConfig {
-                    id: Some("work".to_string()),
-                    ..ProviderProfileConfig::default()
-                }],
-                ..ProviderConfig::default()
-            },
-            false,
-        )
+        let error = GrokCollector::new(ProviderConfig {
+            profiles: vec![ProviderProfileConfig {
+                id: Some("work".to_string()),
+                ..ProviderProfileConfig::default()
+            }],
+            ..ProviderConfig::default()
+        })
         .err()
         .unwrap();
 

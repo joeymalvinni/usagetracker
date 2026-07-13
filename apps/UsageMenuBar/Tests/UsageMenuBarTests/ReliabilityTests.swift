@@ -3,8 +3,58 @@ import XCTest
 @testable import UsageMenuBar
 
 final class DaemonClientTests: XCTestCase {
+    func testProviderCapabilitiesRemainIndependent() {
+        let providers = ["fixture": ServerProviderDescriptor(
+            id: "fixture",
+            displayName: "Fixture",
+            minimumRefreshIntervalSeconds: 60,
+            capabilities: ProviderCapabilities(
+                multipleAccounts: false,
+                addAccount: true,
+                repair: false,
+                launchAccount: true,
+                workspaceSetup: false
+            )
+        )]
+
+        XCTAssertFalse(providerSupports("fixture", capability: \.multipleAccounts, in: providers))
+        XCTAssertTrue(providerSupports("fixture", capability: \.addAccount, in: providers))
+        XCTAssertFalse(providerSupports("fixture", capability: \.repair, in: providers))
+        XCTAssertTrue(providerSupports("fixture", capability: \.launchAccount, in: providers))
+        XCTAssertFalse(providerSupports("fixture", capability: \.workspaceSetup, in: providers))
+    }
+
+    func testResponseLineBufferRejectsDataBeyondItsLimit() throws {
+        var buffer = ResponseLineBuffer(maxBytes: 4)
+        try buffer.append([1, 2, 3, 4])
+        XCTAssertEqual(buffer.bytes, [1, 2, 3, 4])
+
+        XCTAssertThrowsError(try buffer.append([5])) { error in
+            XCTAssertEqual(error as? DaemonError, .responseTooLarge(4))
+        }
+        XCTAssertEqual(buffer.bytes, [1, 2, 3, 4])
+    }
+
+    func testStateUsesOneCombinedRequest() async throws {
+        let response = try String(contentsOf: rustWireFixture("state_v3.json"), encoding: .utf8)
+        let transport = RecordingTransport(response: response)
+        let client = DaemonClient(socketPath: "/tmp/usage.sock", transport: transport)
+
+        let state = try await client.state()
+
+        XCTAssertEqual(state.config.pollIntervalSeconds, 300)
+        let recordedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(recordedRequest)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["method"] as? String, "get_state")
+        let requests = await transport.allRequests()
+        XCTAssertEqual(requests.count, 1)
+    }
+
     func testDecodesCheckedInRustWireFixtures() throws {
-        let usageURL = rustWireFixture("usage_v2.json")
+        let usageURL = rustWireFixture("usage_v3.json")
         let usage = try JSONDecoder.usage.decode(DaemonResponse.self, from: Data(contentsOf: usageURL))
         guard case let .usage(response) = usage else {
             return XCTFail("expected usage fixture")
@@ -14,12 +64,47 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(response.dashboard.pricing.unpricedModels, [])
         XCTAssertEqual(response.windowProvenance.first?.authoritative, true)
 
-        let errorURL = rustWireFixture("error_v2.json")
+        let errorURL = rustWireFixture("error_v3.json")
         let error = try JSONDecoder.usage.decode(DaemonResponse.self, from: Data(contentsOf: errorURL))
         guard case let .error(apiError) = error else {
             return XCTFail("expected error fixture")
         }
         XCTAssertEqual(apiError.code, "unsupported_method")
+
+        let serverInfoURL = rustWireFixture("server_info_v3.json")
+        let serverInfo = try JSONDecoder.usage.decode(
+            DaemonResponse.self,
+            from: Data(contentsOf: serverInfoURL)
+        )
+        guard case let .serverInfo(info) = serverInfo else {
+            return XCTFail("expected server info fixture")
+        }
+        let providers = Dictionary(uniqueKeysWithValues: info.providers.map { ($0.id, $0) })
+        let codex = try XCTUnwrap(providers["codex"]?.capabilities)
+        XCTAssertTrue(codex.multipleAccounts)
+        XCTAssertTrue(codex.addAccount)
+        XCTAssertTrue(codex.repair)
+        XCTAssertTrue(codex.launchAccount)
+        XCTAssertFalse(codex.workspaceSetup)
+
+        let openCode = try XCTUnwrap(providers["opencode_go"]?.capabilities)
+        XCTAssertFalse(openCode.multipleAccounts)
+        XCTAssertFalse(openCode.addAccount)
+        XCTAssertTrue(openCode.repair)
+        XCTAssertFalse(openCode.launchAccount)
+        XCTAssertTrue(openCode.workspaceSetup)
+
+        let stateURL = rustWireFixture("state_v3.json")
+        let state = try JSONDecoder.usage.decode(
+            DaemonResponse.self,
+            from: Data(contentsOf: stateURL)
+        )
+        guard case let .state(snapshot) = state else {
+            return XCTFail("expected state fixture")
+        }
+        XCTAssertEqual(snapshot.config.pollIntervalSeconds, 300)
+        XCTAssertEqual(snapshot.config.providers["codex"]?.enabled, true)
+        XCTAssertEqual(snapshot.dashboard.pricing.coveredPercent, 100)
     }
 
     private func rustWireFixture(_ name: String) -> URL {
@@ -35,7 +120,7 @@ final class DaemonClientTests: XCTestCase {
 
     func testPreservesStructuredAPIErrorAndWritesProtocolVersion() async throws {
         let transport = RecordingTransport(response: """
-            {"api_version":2,"type":"error","error":{"code":"unknown_account","message":"Account missing","retryable":false}}
+            {"api_version":3,"type":"error","error":{"code":"unknown_account","message":"Account missing","retryable":false}}
             """)
         let client = DaemonClient(socketPath: "/tmp/usage.sock", transport: transport)
 
@@ -51,7 +136,7 @@ final class DaemonClientTests: XCTestCase {
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any]
         )
-        XCTAssertEqual(object["api_version"] as? Int, 2)
+        XCTAssertEqual(object["api_version"] as? Int, 3)
         XCTAssertEqual(object["method"] as? String, "delete_account")
         let timeout = await transport.lastTimeout()
         XCTAssertEqual(timeout, 10)
@@ -93,10 +178,10 @@ final class DaemonClientTests: XCTestCase {
     func testPollsRefreshJobWithoutHoldingTheRefreshSocketOpen() async throws {
         let transport = RecordingTransport(responses: [
             """
-            {"api_version":2,"type":"refresh_started","coalesced":true,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            {"api_version":3,"type":"refresh_started","coalesced":true,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
             """,
             """
-            {"api_version":2,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"completed","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":"2026-07-11T12:00:01Z","provider_results":[{"provider_id":"codex","account_id":"account-1","status":"ok","collection_mode":"provider_api","collected_at":"2026-07-11T12:00:01Z","message":null}],"failure_message":null}}
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"completed","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":"2026-07-11T12:00:01Z","provider_results":[{"provider_id":"codex","account_id":"account-1","status":"ok","collection_mode":"provider_api","collected_at":"2026-07-11T12:00:01Z","message":null}],"failure_message":null}}
             """,
         ])
         let client = DaemonClient(

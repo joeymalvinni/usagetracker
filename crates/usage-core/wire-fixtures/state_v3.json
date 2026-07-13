@@ -1,0 +1,42 @@
+{
+  "api_version": 3,
+  "type": "state",
+  "state": {
+    "generated_at": "2026-07-11T12:00:00Z",
+    "server": {
+      "api_version": 3,
+      "capabilities": ["typed_errors", "usage_provenance", "refresh_jobs", "refresh_coalescing", "combined_state"],
+      "providers": []
+    },
+    "config": {
+      "poll_interval_seconds": 300,
+      "notifications": {
+        "enabled": true,
+        "thresholds_percent_remaining": [50, 25, 10, 5, 0],
+        "reset_alerts": true,
+        "predictive_alerts": false,
+        "cooldown_minutes": 15
+      },
+      "config_path": "/Users/fixture/.usagetracker/config.json",
+      "socket_path": "/Users/fixture/.usagetracker/usage.sock",
+      "db_path": "/Users/fixture/.usagetracker/usage.sqlite3",
+      "providers": {"codex": {"enabled": true}}
+    },
+    "accounts": [],
+    "health": [],
+    "snapshots": [],
+    "dashboard": {
+      "accounts": [],
+      "days": [],
+      "pricing": {"priced_tokens": 0, "unpriced_tokens": 0, "covered_percent": 100.0},
+      "provenance": {
+        "scopes": [],
+        "qualities": [],
+        "partial": false,
+        "estimated": false,
+        "mixed_scope": false,
+        "explanation": "No usage data."
+      }
+    }
+  }
+}

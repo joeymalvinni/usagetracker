@@ -36,8 +36,6 @@ pub struct CodexCollector {
     profiles: Vec<CodexProfile>,
     local_codex_home: PathBuf,
     client: reqwest::Client,
-    pricing: CodexPricingManager,
-    capture_raw_payloads: bool,
 }
 
 #[derive(Clone)]
@@ -51,7 +49,7 @@ struct CodexProfile {
 }
 
 impl CodexCollector {
-    pub fn new(config: ProviderConfig, capture_raw_payloads: bool) -> anyhow::Result<Self> {
+    pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Codex auth"))?;
         let client = reqwest::Client::builder()
@@ -59,15 +57,12 @@ impl CodexCollector {
             .timeout(HTTP_REQUEST_TIMEOUT)
             .user_agent("codex-cli")
             .build()?;
-        let pricing = CodexPricingManager::new(client.clone());
         let local_codex_home = local_codex_home(&home);
         let profiles = codex_profiles(config, &local_codex_home);
         Ok(Self {
             profiles,
             local_codex_home,
             client,
-            pricing,
-            capture_raw_payloads,
         })
     }
 
@@ -235,7 +230,6 @@ impl CodexCollector {
             account_activity_available: false,
             collection_mode: "wham_usage_api".to_string(),
             account_display_name,
-            raw_payload: payload,
             warnings: Vec::new(),
         })
     }
@@ -453,10 +447,7 @@ impl ProviderCollector for CodexCollector {
             collected.usage.metadata["profile_display_name"] = json!(display_name);
         }
 
-        let (pricing, pricing_warning) = self.pricing.catalog().await;
-        if let Some(warning) = pricing_warning {
-            collected.warnings.push(warning);
-        }
+        let pricing = CodexPricingCatalog::bundled();
 
         let cost_cache = profile.cost_cache.clone();
         let local_codex_home = self.local_codex_home.clone();
@@ -502,7 +493,6 @@ impl ProviderCollector for CodexCollector {
             daily_usage: collected.daily_usage,
             collection_mode: collected.collection_mode,
             account_email: collected.account_display_name,
-            raw_payload: self.capture_raw_payloads.then_some(collected.raw_payload),
             warnings: collected.warnings,
         })
     }
@@ -515,7 +505,6 @@ struct CodexCollectedUsage {
     account_activity_available: bool,
     collection_mode: String,
     account_display_name: Option<String>,
-    raw_payload: Value,
     warnings: Vec<String>,
 }
 
@@ -659,7 +648,7 @@ mod rate_limits;
 
 use app_server::collect_usage_from_app_server;
 use cost::{codex_session_roots, scan_codex_local_costs_cached, CodexCostCache, CodexUsageCostExt};
-use pricing::CodexPricingManager;
+use pricing::CodexPricingCatalog;
 use rate_limits::{normalize_usage, number_from_json_value};
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use aes::Aes128;
@@ -18,6 +19,11 @@ use sha1::Sha1;
 use uuid::Uuid;
 
 use super::{ProviderError, ProviderErrorKind};
+
+type ChromiumKey = [u8; 16];
+type ChromiumKeyCache = BTreeMap<(&'static str, &'static str), ChromiumKey>;
+
+static CHROMIUM_KEY_CACHE: OnceLock<Mutex<ChromiumKeyCache>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct ImportedCookieSession {
@@ -471,12 +477,7 @@ fn decrypt_chromium_cookie(
     if !encrypted_value.starts_with(b"v10") && !encrypted_value.starts_with(b"v11") {
         return String::from_utf8(encrypted_value.to_vec()).ok();
     }
-    let password = Entry::new(browser.keychain_service, browser.keychain_account)
-        .ok()?
-        .get_password()
-        .ok()?;
-    let mut key = [0_u8; 16];
-    pbkdf2_hmac::<Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
+    let key = chromium_decryption_key(browser)?;
     let mut buffer = encrypted_value[3..].to_vec();
     let plaintext = cbc::Decryptor::<Aes128>::new(&key.into(), &[b' '; 16].into())
         .decrypt_padded_mut::<Pkcs7>(&mut buffer)
@@ -486,6 +487,28 @@ fn decrypt_chromium_cookie(
         .filter_map(|bytes| String::from_utf8(bytes.to_vec()).ok())
         .find(|value| plausible_cookie_value(value));
     value
+}
+
+fn chromium_decryption_key(browser: BrowserCookieStore) -> Option<ChromiumKey> {
+    let cache = CHROMIUM_KEY_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache_key = (browser.keychain_service, browser.keychain_account);
+    if let Some(key) = cache.get(&cache_key) {
+        return Some(*key);
+    }
+
+    // Keep this lock while reading Keychain so concurrent provider imports cannot
+    // trigger duplicate authorization prompts for the same browser credential.
+    let password = Entry::new(browser.keychain_service, browser.keychain_account)
+        .ok()?
+        .get_password()
+        .ok()?;
+    let mut key = [0_u8; 16];
+    pbkdf2_hmac::<Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
+    cache.insert(cache_key, key);
+    Some(key)
 }
 
 fn plausible_cookie_name(value: &str) -> bool {

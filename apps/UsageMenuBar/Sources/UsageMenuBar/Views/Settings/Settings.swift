@@ -294,19 +294,21 @@ private struct ProviderAccountCard: View {
                 }
             }
 
-            if provider.providerId == "opencode_go" { workspaceControl }
+            if state.supportsWorkspaceSetup(provider.providerId) { workspaceControl }
 
-            HStack(spacing: Theme.Spacing.sm) {
-                Button(actionLabel) { Task { await primaryAction() } }
-                    .buttonStyle(.chipProminent)
-                    .disabled(busy || state.daemon == .offline)
-                if busy { ProgressView().controlSize(.small) }
-                Spacer()
+            if hasPrimaryAction {
+                HStack(spacing: Theme.Spacing.sm) {
+                    Button(actionLabel) { Task { await primaryAction() } }
+                        .buttonStyle(.chipProminent)
+                        .disabled(busy || state.daemon == .offline)
+                    if busy { ProgressView().controlSize(.small) }
+                    Spacer()
+                }
             }
         }
         .surfaceCard()
         .task {
-            if provider.providerId == "opencode_go", setup == nil {
+            if state.supportsWorkspaceSetup(provider.providerId), setup == nil {
                 await state.loadProviderSetup(provider.providerId)
             }
         }
@@ -339,17 +341,21 @@ private struct ProviderAccountCard: View {
     }
 
     private var actionLabel: String {
-        if ProviderCatalog.supportsMultipleAccounts(provider.providerId) {
+        if state.supportsAddAccount(provider.providerId) {
             accounts.isEmpty ? "Connect account" : "Add account"
         } else {
             accounts.isEmpty ? "Sign in" : "Reconnect"
         }
     }
 
+    private var hasPrimaryAction: Bool {
+        state.supportsAddAccount(provider.providerId) || state.supportsRepair(provider.providerId)
+    }
+
     private func primaryAction() async {
-        if ProviderCatalog.supportsMultipleAccounts(provider.providerId) {
+        if state.supportsAddAccount(provider.providerId) {
             await state.addProviderAccount(provider.providerId)
-        } else {
+        } else if state.supportsRepair(provider.providerId) {
             await state.repairProvider(provider.providerId, accountId: accounts.first?.id)
         }
     }
@@ -394,7 +400,7 @@ private struct AccountSettingsRow: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
             } else {
-                if needsSignIn {
+                if needsSignIn, state.supportsRepair(account.providerId) {
                     Button("Reconnect") {
                         Task { await state.repairProvider(account.providerId, accountId: account.id) }
                     }
@@ -443,8 +449,8 @@ private struct AccountSettingsRow: View {
 
     private var accountMenu: some View {
         Menu {
-            if account.providerId == "claude" && !isRemoved {
-                Button("Open Claude session") {
+            if state.supportsLaunchAccount(account.providerId), !isRemoved {
+                Button("Open \(ProviderCatalog.name(for: account.providerId)) session") {
                     Task { await state.launchProviderAccount(account.id) }
                 }
                 Divider()
@@ -459,8 +465,10 @@ private struct AccountSettingsRow: View {
             Button(account.hidden ? "Show in summary" : "Hide from summary") {
                 Task { await state.setAccountHidden(account.id, !account.hidden) }
             }
-            Button("Reconnect") {
-                Task { await state.repairProvider(account.providerId, accountId: account.id) }
+            if state.supportsRepair(account.providerId) {
+                Button("Reconnect") {
+                    Task { await state.repairProvider(account.providerId, accountId: account.id) }
+                }
             }
             Divider()
             Button("Remove account…", role: .destructive) { showsRemovalOptions = true }

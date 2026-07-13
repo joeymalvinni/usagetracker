@@ -67,7 +67,6 @@ async fn main() -> anyhow::Result<()> {
         socket = %config.paths.socket.display(),
         poll_interval_seconds = config.poll_interval_seconds,
         notifications_enabled = config.notifications.enabled,
-        debug_capture_raw_payloads = config.debug_capture_raw_payloads,
         enabled_providers = ?config.enabled_provider_ids(),
         "daemon config loaded"
     );
