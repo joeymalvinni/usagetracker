@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -55,7 +56,7 @@ pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDER_SPECS.iter().find(|provider| provider.id == id)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct RequestEnvelope {
     pub api_version: u16,
     #[serde(flatten)]
@@ -71,7 +72,7 @@ impl RequestEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ResponseEnvelope {
     pub api_version: u16,
     #[serde(flatten)]
@@ -91,7 +92,7 @@ impl ResponseEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ApiRequest {
     GetServerInfo,
@@ -183,12 +184,12 @@ impl ApiRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderToggle {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct NotificationConfig {
     #[serde(default = "default_notifications_enabled")]
     pub enabled: bool,
@@ -250,7 +251,7 @@ impl NotificationConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct NotificationQuietHours {
     pub start_hour_local: u8,
     pub end_hour_local: u8,
@@ -268,7 +269,7 @@ impl NotificationQuietHours {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct NotificationRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<AccountId>,
@@ -318,7 +319,7 @@ fn default_notification_cooldown_minutes() -> u32 {
     15
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResponse {
     ServerInfo {
@@ -377,7 +378,7 @@ pub enum ApiResponse {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct StateSnapshot {
     pub generated_at: DateTime<Utc>,
     pub server: ServerInfo,
@@ -392,7 +393,7 @@ pub struct StateSnapshot {
     pub window_provenance: Vec<UsageWindowProvenance>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct ServerInfo {
     pub api_version: u16,
     pub capabilities: Vec<ApiCapability>,
@@ -418,7 +419,9 @@ impl ServerInfo {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, JsonSchema, Eq, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiCapability {
     CombinedState,
@@ -428,7 +431,7 @@ pub enum ApiCapability {
     RefreshCoalescing,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
@@ -447,7 +450,7 @@ impl From<&ProviderSpec> for ProviderDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct ProviderCapabilities {
     pub multiple_accounts: bool,
     pub add_account: bool,
@@ -478,7 +481,7 @@ impl ProviderCapabilities {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct RefreshScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub providers: Option<Vec<ProviderId>>,
@@ -498,14 +501,14 @@ impl RefreshScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefreshTrigger {
     Manual,
     System,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefreshJobStatus {
     Queued,
@@ -520,7 +523,7 @@ impl RefreshJobStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct RefreshJob {
     pub id: RefreshJobId,
     pub scope: RefreshScope,
@@ -535,7 +538,7 @@ pub struct RefreshJob {
     pub failure_message: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct AddProviderAccountResponse {
     pub provider_id: ProviderId,
     pub profile_id: String,
@@ -543,7 +546,7 @@ pub struct AddProviderAccountResponse {
     pub profile_path: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderSetupResponse {
     pub provider_id: ProviderId,
     pub profiles: Vec<ProviderProfileResponse>,
@@ -552,20 +555,20 @@ pub struct ProviderSetupResponse {
     pub discovery_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderProfileResponse {
     pub id: String,
     pub display_name: Option<String>,
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderActionResponse {
     pub provider_id: ProviderId,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderRefreshResult {
     pub provider_id: ProviderId,
     pub account_id: Option<AccountId>,
@@ -575,7 +578,7 @@ pub struct ProviderRefreshResult {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRefreshStatus {
     Ok,
@@ -590,7 +593,7 @@ pub enum ProviderRefreshStatus {
     Disabled,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureCode {
     CredentialsMissing,
@@ -630,7 +633,7 @@ impl From<ProviderFailureCode> for ProviderRefreshStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ConfigResponse {
     pub poll_interval_seconds: u64,
     #[serde(default)]
@@ -641,7 +644,7 @@ pub struct ConfigResponse {
     pub providers: BTreeMap<String, ProviderToggle>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct PendingNotification {
     pub id: i64,
     pub title: String,
@@ -649,7 +652,7 @@ pub struct PendingNotification {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiErrorCode {
     InvalidJson,
@@ -697,7 +700,7 @@ impl fmt::Display for ApiErrorCode {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ApiErrorResponse {
     pub code: ApiErrorCode,
     pub message: String,
@@ -838,5 +841,18 @@ mod tests {
         };
         assert_eq!(snapshots.len(), 1);
         assert!(window_provenance[0].authoritative);
+    }
+
+    #[test]
+    fn checked_in_protocol_schemas_are_current() {
+        let request: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/api/schemas/v3/request.json"))
+                .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/api/schemas/v3/response.json"))
+                .unwrap();
+
+        assert_eq!(request, crate::request_schema_v3());
+        assert_eq!(response, crate::response_schema_v3());
     }
 }

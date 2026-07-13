@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{AccountId, ProviderId};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountDisplayNameSource {
     Provider,
@@ -14,7 +15,7 @@ pub enum AccountDisplayNameSource {
     User,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Account {
     pub id: AccountId,
     pub provider_id: ProviderId,
@@ -38,7 +39,7 @@ fn default_collection_enabled() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct UsageSnapshot {
     pub provider_id: ProviderId,
     pub account_id: AccountId,
@@ -112,7 +113,7 @@ impl UsageSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageDataSource {
     ProviderReported,
@@ -121,7 +122,7 @@ pub enum UsageDataSource {
     SyntheticLocalEstimate,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageDataScope {
     AccountWide,
@@ -130,7 +131,7 @@ pub enum UsageDataScope {
     Workspace,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageDataQuality {
     Authoritative,
@@ -138,14 +139,14 @@ pub enum UsageDataQuality {
     Estimated,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageDataCompleteness {
     Complete,
     Partial,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageDataConfidence {
     Low,
@@ -153,7 +154,7 @@ pub enum UsageDataConfidence {
     High,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct UsageWindowProvenance {
     pub provider_id: ProviderId,
     pub account_id: AccountId,
@@ -167,7 +168,7 @@ pub struct UsageWindowProvenance {
     pub quota_like: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct DailyUsagePoint {
     pub date: NaiveDate,
     pub tokens: u64,
@@ -179,7 +180,7 @@ pub struct DailyUsagePoint {
     pub unpriced_tokens: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct ActivitySummary {
     pub provenance: DataProvenance,
     pub days: Vec<DailyUsagePoint>,
@@ -189,7 +190,7 @@ pub struct ActivitySummary {
     pub lifetime_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct CostSummary {
     pub provenance: DataProvenance,
     pub days: Vec<DailyUsagePoint>,
@@ -198,7 +199,7 @@ pub struct CostSummary {
     pub pricing: PricingCoverage,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct PricingCoverage {
     pub priced_tokens: u64,
     pub unpriced_tokens: u64,
@@ -213,7 +214,7 @@ pub struct PricingCoverage {
     pub catalog_effective_from: Option<NaiveDate>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct DataProvenance {
     pub source: UsageDataSource,
     pub scope: UsageDataScope,
@@ -222,7 +223,7 @@ pub struct DataProvenance {
     pub confidence: UsageDataConfidence,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct AccountUsageSummary {
     pub provider_id: ProviderId,
     pub account_id: AccountId,
@@ -234,7 +235,7 @@ pub struct AccountUsageSummary {
     pub reset_credits: Option<ResetCreditSummary>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct ResetCreditSummary {
     pub available_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,7 +243,7 @@ pub struct ResetCreditSummary {
     pub credits: Vec<ResetCredit>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct ResetCredit {
     pub id: String,
     pub title: String,
@@ -251,7 +252,7 @@ pub struct ResetCredit {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct AggregateProvenance {
     pub scopes: Vec<UsageDataScope>,
     pub qualities: Vec<UsageDataQuality>,
@@ -261,7 +262,7 @@ pub struct AggregateProvenance {
     pub explanation: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct UsageDashboardSummary {
     pub accounts: Vec<AccountUsageSummary>,
     pub days: Vec<DailyUsagePoint>,
@@ -405,7 +406,7 @@ fn one_or_none<T: Ord>(mut values: BTreeSet<T>) -> Option<T> {
     (values.len() == 1).then(|| values.pop_first()).flatten()
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct UsageWindow {
     pub window_id: String,
     pub label: String,
@@ -418,7 +419,7 @@ pub struct UsageWindow {
     pub reset_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct UsageForecast {
     pub provider_id: ProviderId,
     pub account_id: AccountId,
@@ -438,7 +439,7 @@ pub struct UsageForecast {
     pub confidence: ForecastConfidence,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForecastStatus {
     InsufficientData,
@@ -448,7 +449,7 @@ pub enum ForecastStatus {
     Exhausted,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForecastConfidence {
     Low,
@@ -456,7 +457,7 @@ pub enum ForecastConfidence {
     High,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageWindowKind {
     Session,
@@ -468,13 +469,13 @@ pub enum UsageWindowKind {
     Other(String),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct UsageAmount {
     pub value: f64,
     pub unit: UsageUnit,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageUnit {
     Tokens,
@@ -485,7 +486,7 @@ pub enum UsageUnit {
     Unknown,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHealthStatus {
     Ok,
@@ -498,7 +499,7 @@ pub enum ProviderHealthStatus {
     Disabled,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderHealth {
     pub provider_id: ProviderId,
     pub account_id: Option<AccountId>,

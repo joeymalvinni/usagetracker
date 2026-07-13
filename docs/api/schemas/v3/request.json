@@ -1,0 +1,503 @@
+{
+  "$defs": {
+    "NotificationConfig": {
+      "properties": {
+        "cooldown_minutes": {
+          "default": 15,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "predictive_alerts": {
+          "default": false,
+          "type": "boolean"
+        },
+        "quiet_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NotificationQuietHours"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reset_alerts": {
+          "default": true,
+          "type": "boolean"
+        },
+        "rules": {
+          "items": {
+            "$ref": "#/$defs/NotificationRule"
+          },
+          "type": "array"
+        },
+        "thresholds_percent_remaining": {
+          "default": [
+            50,
+            25,
+            10,
+            5,
+            0
+          ],
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "NotificationQuietHours": {
+      "properties": {
+        "end_hour_local": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_hour_local": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_hour_local",
+        "end_hour_local"
+      ],
+      "type": "object"
+    },
+    "NotificationRule": {
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "predictive_alerts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reset_alerts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "snoozed_until": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thresholds_percent_remaining": {
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProviderToggle": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "properties": {
+        "method": {
+          "const": "get_server_info",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_state",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_usage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "refresh",
+          "type": "string"
+        },
+        "providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "get_refresh_job",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "job_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_provider_health",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_accounts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_config",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_pending_notifications",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "ids": {
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "method": {
+          "const": "acknowledge_notifications",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "ids"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "update_config",
+          "type": "string"
+        },
+        "notifications": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NotificationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "poll_interval_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "providers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProviderToggle"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "const": "add_provider_account",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "provider_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "collection_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hidden": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "method": {
+          "const": "update_account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "remove_account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "delete_account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "get_provider_setup",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "provider_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "update_provider_setup",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "provider_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "const": "repair_provider",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "provider_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "launch_provider_account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "api_version": {
+      "const": 3,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "api_version"
+  ],
+  "title": "RequestEnvelope",
+  "type": "object"
+}

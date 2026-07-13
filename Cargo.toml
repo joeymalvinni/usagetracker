@@ -26,6 +26,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 notify = "8.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 regex = "1"
+schemars = { version = "1.2.1", features = ["chrono04"] }
 pbkdf2 = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

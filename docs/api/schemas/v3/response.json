@@ -1,0 +1,1779 @@
+{
+  "$defs": {
+    "Account": {
+      "properties": {
+        "collection_enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name_source": {
+          "$ref": "#/$defs/AccountDisplayNameSource",
+          "default": "generated"
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "external_account_id": {
+          "type": "string"
+        },
+        "hidden": {
+          "default": false,
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "provider_id",
+        "external_account_id",
+        "created_at",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "AccountDisplayNameSource": {
+      "enum": [
+        "provider",
+        "generated",
+        "user"
+      ],
+      "type": "string"
+    },
+    "AccountUsageSummary": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "activity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActivitySummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CostSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "reset_credits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResetCreditSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "ActivitySummary": {
+      "properties": {
+        "days": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "lifetime_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lookback_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provenance": {
+          "$ref": "#/$defs/DataProvenance"
+        },
+        "today_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "provenance",
+        "days",
+        "today_tokens",
+        "lookback_tokens"
+      ],
+      "type": "object"
+    },
+    "AddProviderAccountResponse": {
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_path": {
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "profile_id",
+        "profile_path"
+      ],
+      "type": "object"
+    },
+    "AggregateProvenance": {
+      "properties": {
+        "estimated": {
+          "type": "boolean"
+        },
+        "explanation": {
+          "type": "string"
+        },
+        "mixed_scope": {
+          "type": "boolean"
+        },
+        "partial": {
+          "type": "boolean"
+        },
+        "qualities": {
+          "items": {
+            "$ref": "#/$defs/UsageDataQuality"
+          },
+          "type": "array"
+        },
+        "scopes": {
+          "items": {
+            "$ref": "#/$defs/UsageDataScope"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "scopes",
+        "qualities",
+        "partial",
+        "estimated",
+        "mixed_scope",
+        "explanation"
+      ],
+      "type": "object"
+    },
+    "ApiCapability": {
+      "enum": [
+        "combined_state",
+        "typed_errors",
+        "usage_provenance",
+        "refresh_jobs",
+        "refresh_coalescing"
+      ],
+      "type": "string"
+    },
+    "ApiErrorCode": {
+      "enum": [
+        "invalid_json",
+        "invalid_request",
+        "request_too_large",
+        "unsupported_method",
+        "incompatible_protocol",
+        "invalid_argument",
+        "unknown_provider",
+        "unknown_account",
+        "unknown_refresh_job",
+        "unsupported_operation",
+        "conflict",
+        "storage_unavailable",
+        "internal"
+      ],
+      "type": "string"
+    },
+    "ApiErrorResponse": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ApiErrorCode"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "ConfigResponse": {
+      "properties": {
+        "config_path": {
+          "type": "string"
+        },
+        "db_path": {
+          "type": "string"
+        },
+        "notifications": {
+          "$ref": "#/$defs/NotificationConfig",
+          "default": {
+            "cooldown_minutes": 15,
+            "enabled": true,
+            "predictive_alerts": false,
+            "reset_alerts": true,
+            "thresholds_percent_remaining": [
+              50,
+              25,
+              10,
+              5,
+              0
+            ]
+          }
+        },
+        "poll_interval_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "providers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProviderToggle"
+          },
+          "type": "object"
+        },
+        "socket_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "poll_interval_seconds",
+        "config_path",
+        "socket_path",
+        "db_path",
+        "providers"
+      ],
+      "type": "object"
+    },
+    "CostSummary": {
+      "properties": {
+        "days": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "lookback_cost_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "pricing": {
+          "$ref": "#/$defs/PricingCoverage"
+        },
+        "provenance": {
+          "$ref": "#/$defs/DataProvenance"
+        },
+        "today_cost_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "provenance",
+        "days",
+        "today_cost_usd",
+        "lookback_cost_usd",
+        "pricing"
+      ],
+      "type": "object"
+    },
+    "DailyUsagePoint": {
+      "properties": {
+        "cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "date": {
+          "format": "date",
+          "type": "string"
+        },
+        "priced_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unpriced_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "date",
+        "tokens"
+      ],
+      "type": "object"
+    },
+    "DataProvenance": {
+      "properties": {
+        "completeness": {
+          "$ref": "#/$defs/UsageDataCompleteness"
+        },
+        "confidence": {
+          "$ref": "#/$defs/UsageDataConfidence"
+        },
+        "quality": {
+          "$ref": "#/$defs/UsageDataQuality"
+        },
+        "scope": {
+          "$ref": "#/$defs/UsageDataScope"
+        },
+        "source": {
+          "$ref": "#/$defs/UsageDataSource"
+        }
+      },
+      "required": [
+        "source",
+        "scope",
+        "quality",
+        "completeness",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "ForecastConfidence": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "ForecastStatus": {
+      "enum": [
+        "insufficient_data",
+        "safe",
+        "on_pace",
+        "at_risk",
+        "exhausted"
+      ],
+      "type": "string"
+    },
+    "NotificationConfig": {
+      "properties": {
+        "cooldown_minutes": {
+          "default": 15,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "predictive_alerts": {
+          "default": false,
+          "type": "boolean"
+        },
+        "quiet_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NotificationQuietHours"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reset_alerts": {
+          "default": true,
+          "type": "boolean"
+        },
+        "rules": {
+          "items": {
+            "$ref": "#/$defs/NotificationRule"
+          },
+          "type": "array"
+        },
+        "thresholds_percent_remaining": {
+          "default": [
+            50,
+            25,
+            10,
+            5,
+            0
+          ],
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "NotificationQuietHours": {
+      "properties": {
+        "end_hour_local": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_hour_local": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_hour_local",
+        "end_hour_local"
+      ],
+      "type": "object"
+    },
+    "NotificationRule": {
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "predictive_alerts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reset_alerts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "snoozed_until": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thresholds_percent_remaining": {
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PendingNotification": {
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "body",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "PricingCoverage": {
+      "properties": {
+        "catalog_effective_from": {
+          "format": "date",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalog_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "covered_percent": {
+          "format": "double",
+          "type": "number"
+        },
+        "priced_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unpriced_models": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unpriced_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "priced_tokens",
+        "unpriced_tokens",
+        "covered_percent"
+      ],
+      "type": "object"
+    },
+    "ProviderActionResponse": {
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ProviderCapabilities": {
+      "properties": {
+        "add_account": {
+          "type": "boolean"
+        },
+        "launch_account": {
+          "type": "boolean"
+        },
+        "multiple_accounts": {
+          "type": "boolean"
+        },
+        "repair": {
+          "type": "boolean"
+        },
+        "workspace_setup": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "multiple_accounts",
+        "add_account",
+        "repair",
+        "launch_account",
+        "workspace_setup"
+      ],
+      "type": "object"
+    },
+    "ProviderDescriptor": {
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/ProviderCapabilities"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "minimum_refresh_interval_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "minimum_refresh_interval_seconds",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "ProviderHealth": {
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collection_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_failure_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_success_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ProviderHealthStatus"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "status",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "ProviderHealthStatus": {
+      "enum": [
+        "ok",
+        "credentials_missing",
+        "auth_failed",
+        "rate_limited",
+        "provider_error",
+        "parse_error",
+        "backing_off",
+        "disabled"
+      ],
+      "type": "string"
+    },
+    "ProviderProfileResponse": {
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "ProviderRefreshResult": {
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collected_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collection_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ProviderRefreshStatus"
+        }
+      },
+      "required": [
+        "provider_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ProviderRefreshStatus": {
+      "enum": [
+        "ok",
+        "credentials_missing",
+        "credentials_invalid",
+        "unauthorized",
+        "rate_limited",
+        "network",
+        "parse",
+        "provider_unavailable",
+        "storage_error",
+        "disabled"
+      ],
+      "type": "string"
+    },
+    "ProviderSetupResponse": {
+      "properties": {
+        "discovery_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profiles": {
+          "items": {
+            "$ref": "#/$defs/ProviderProfileResponse"
+          },
+          "type": "array"
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "selected_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_options": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider_id",
+        "profiles",
+        "workspace_options"
+      ],
+      "type": "object"
+    },
+    "ProviderToggle": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "RefreshJob": {
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "failure_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "provider_results": {
+          "items": {
+            "$ref": "#/$defs/ProviderRefreshResult"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "$ref": "#/$defs/RefreshScope"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/RefreshJobStatus"
+        },
+        "trigger": {
+          "$ref": "#/$defs/RefreshTrigger"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "trigger",
+        "status",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "RefreshJobStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "RefreshScope": {
+      "properties": {
+        "providers": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RefreshTrigger": {
+      "enum": [
+        "manual",
+        "system"
+      ],
+      "type": "string"
+    },
+    "ResetCredit": {
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ResetCreditSummary": {
+      "properties": {
+        "available_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "credits": {
+          "items": {
+            "$ref": "#/$defs/ResetCredit"
+          },
+          "type": "array"
+        },
+        "next_expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "available_count",
+        "credits"
+      ],
+      "type": "object"
+    },
+    "ServerInfo": {
+      "properties": {
+        "api_version": {
+          "const": 3,
+          "type": "integer"
+        },
+        "capabilities": {
+          "items": {
+            "$ref": "#/$defs/ApiCapability"
+          },
+          "type": "array"
+        },
+        "providers": {
+          "items": {
+            "$ref": "#/$defs/ProviderDescriptor"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "api_version",
+        "capabilities",
+        "providers"
+      ],
+      "type": "object"
+    },
+    "StateSnapshot": {
+      "properties": {
+        "accounts": {
+          "items": {
+            "$ref": "#/$defs/Account"
+          },
+          "type": "array"
+        },
+        "config": {
+          "$ref": "#/$defs/ConfigResponse"
+        },
+        "dashboard": {
+          "$ref": "#/$defs/UsageDashboardSummary"
+        },
+        "forecasts": {
+          "items": {
+            "$ref": "#/$defs/UsageForecast"
+          },
+          "type": "array"
+        },
+        "generated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "health": {
+          "items": {
+            "$ref": "#/$defs/ProviderHealth"
+          },
+          "type": "array"
+        },
+        "server": {
+          "$ref": "#/$defs/ServerInfo"
+        },
+        "snapshots": {
+          "items": {
+            "$ref": "#/$defs/UsageSnapshot"
+          },
+          "type": "array"
+        },
+        "window_provenance": {
+          "items": {
+            "$ref": "#/$defs/UsageWindowProvenance"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "generated_at",
+        "server",
+        "config",
+        "accounts",
+        "health",
+        "snapshots",
+        "dashboard"
+      ],
+      "type": "object"
+    },
+    "UsageAmount": {
+      "properties": {
+        "unit": {
+          "$ref": "#/$defs/UsageUnit"
+        },
+        "value": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "value",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "UsageDashboardSummary": {
+      "properties": {
+        "accounts": {
+          "items": {
+            "$ref": "#/$defs/AccountUsageSummary"
+          },
+          "type": "array"
+        },
+        "days": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "pricing": {
+          "$ref": "#/$defs/PricingCoverage"
+        },
+        "provenance": {
+          "$ref": "#/$defs/AggregateProvenance"
+        }
+      },
+      "required": [
+        "accounts",
+        "days",
+        "pricing",
+        "provenance"
+      ],
+      "type": "object"
+    },
+    "UsageDataCompleteness": {
+      "enum": [
+        "complete",
+        "partial"
+      ],
+      "type": "string"
+    },
+    "UsageDataConfidence": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "UsageDataQuality": {
+      "enum": [
+        "authoritative",
+        "observed",
+        "estimated"
+      ],
+      "type": "string"
+    },
+    "UsageDataScope": {
+      "enum": [
+        "account_wide",
+        "this_device",
+        "selected_local_roots",
+        "workspace"
+      ],
+      "type": "string"
+    },
+    "UsageDataSource": {
+      "enum": [
+        "provider_reported",
+        "local_logs",
+        "local_database",
+        "synthetic_local_estimate"
+      ],
+      "type": "string"
+    },
+    "UsageForecast": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "confidence": {
+          "$ref": "#/$defs/ForecastConfidence"
+        },
+        "current_percent_used": {
+          "format": "double",
+          "type": "number"
+        },
+        "expected_percent_used": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "generated_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "pace_delta_percent": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "predicted_exhaustion_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projected_percent_at_reset": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "projected_percent_remaining_at_reset": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "rate_percent_per_hour": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "reset_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sample_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/ForecastStatus"
+        },
+        "window_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id",
+        "window_id",
+        "generated_at",
+        "current_percent_used",
+        "status",
+        "sample_count",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "UsageSnapshot": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "collected_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "diagnostics": true,
+        "provider_id": {
+          "type": "string"
+        },
+        "windows": {
+          "items": {
+            "$ref": "#/$defs/UsageWindow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id",
+        "collected_at",
+        "windows"
+      ],
+      "type": "object"
+    },
+    "UsageUnit": {
+      "enum": [
+        "tokens",
+        "requests",
+        "credits",
+        "usd",
+        "percent",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "UsageWindow": {
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/UsageWindowKind"
+        },
+        "label": {
+          "type": "string"
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageAmount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "percent_remaining": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "percent_used": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "remaining": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageAmount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reset_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "used": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageAmount"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "window_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "window_id",
+        "label",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "UsageWindowKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "session",
+            "daily",
+            "weekly",
+            "monthly",
+            "credits",
+            "tokens"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "other": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "other"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UsageWindowProvenance": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "authoritative": {
+          "type": "boolean"
+        },
+        "completeness": {
+          "$ref": "#/$defs/UsageDataCompleteness"
+        },
+        "confidence": {
+          "$ref": "#/$defs/UsageDataConfidence"
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "quality": {
+          "$ref": "#/$defs/UsageDataQuality"
+        },
+        "quota_like": {
+          "type": "boolean"
+        },
+        "scope": {
+          "$ref": "#/$defs/UsageDataScope"
+        },
+        "source": {
+          "$ref": "#/$defs/UsageDataSource"
+        },
+        "window_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id",
+        "window_id",
+        "source",
+        "scope",
+        "quality",
+        "completeness",
+        "confidence",
+        "authoritative",
+        "quota_like"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "properties": {
+        "server": {
+          "$ref": "#/$defs/ServerInfo"
+        },
+        "type": {
+          "const": "server_info",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "server"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/StateSnapshot"
+        },
+        "type": {
+          "const": "state",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "state"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "dashboard": {
+          "$ref": "#/$defs/UsageDashboardSummary"
+        },
+        "forecasts": {
+          "items": {
+            "$ref": "#/$defs/UsageForecast"
+          },
+          "type": "array"
+        },
+        "snapshots": {
+          "items": {
+            "$ref": "#/$defs/UsageSnapshot"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "usage",
+          "type": "string"
+        },
+        "window_provenance": {
+          "items": {
+            "$ref": "#/$defs/UsageWindowProvenance"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "snapshots",
+        "dashboard"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "coalesced": {
+          "type": "boolean"
+        },
+        "job": {
+          "$ref": "#/$defs/RefreshJob"
+        },
+        "type": {
+          "const": "refresh_started",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job",
+        "coalesced"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/RefreshJob"
+        },
+        "type": {
+          "const": "refresh_job",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "health": {
+          "items": {
+            "$ref": "#/$defs/ProviderHealth"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "provider_health",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "health"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "accounts": {
+          "items": {
+            "$ref": "#/$defs/Account"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "accounts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "accounts"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "config": {
+          "$ref": "#/$defs/ConfigResponse"
+        },
+        "type": {
+          "const": "config",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "config"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "notifications": {
+          "items": {
+            "$ref": "#/$defs/PendingNotification"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "pending_notifications",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "notifications"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "ids": {
+          "items": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "notifications_acknowledged",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "ids"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account": {
+          "$ref": "#/$defs/AddProviderAccountResponse"
+        },
+        "type": {
+          "const": "add_provider_account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "account"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account": {
+          "$ref": "#/$defs/Account"
+        },
+        "type": {
+          "const": "account",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "account"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "account_deleted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "setup": {
+          "$ref": "#/$defs/ProviderSetupResponse"
+        },
+        "type": {
+          "const": "provider_setup",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "setup"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ProviderActionResponse"
+        },
+        "type": {
+          "const": "provider_action",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "action"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ApiErrorResponse"
+        },
+        "type": {
+          "const": "error",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "error"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "api_version": {
+      "const": 3,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "api_version"
+  ],
+  "title": "ResponseEnvelope",
+  "type": "object"
+}
