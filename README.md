@@ -32,6 +32,11 @@ usage                 # show your usage dashboard
 
 Everything stays on your machine. There's no account to create and no server to phone home to. UsageTracker never asks for your provider passwords, and it doesn't keep the raw responses it gets back from providers.
 
+<p align="center">
+  <img src="docs/assets/CLI_output.png" alt="UsageTracker CLI usage dashboard" width="49%" />
+  <img src="docs/assets/MacOS_UI.png" alt="UsageTracker macOS menu bar interface" width="49%" />
+</p>
+
 ## What it shows
 
 - Session, weekly, monthly, and credit limits — however each provider slices things up.
@@ -41,17 +46,6 @@ Everything stays on your machine. There's no account to create and no server to 
 - Multiple Codex, Claude, and Grok accounts, each kept neatly separate.
 - Whether a provider is healthy, rate-limited, or having trouble signing in.
 - A desktop heads-up before you run out of a quota that matters.
-
-## Providers
-
-| Provider | What it reads | Multiple accounts? | On by default? |
-| --- | --- | --- | --- |
-| [Codex](docs/codex.md) | The Codex app-server, falling back to ChatGPT usage and local estimates | Yes | Yes |
-| [Claude](docs/claude.md) | Anthropic's usage API, falling back to the Claude CLI and local estimates | Yes | No |
-| [OpenCode Go](docs/opencode.md) | The OpenCode web console, falling back to a local database | One workspace | No |
-| [Grok](docs/grok.md) | Grok's billing service, falling back to grok.com | Yes | No |
-
-UsageTracker uses the credentials you've already set up — Keychain items, config files, or a browser session — so you rarely have to do anything special. Each provider works a little differently; the pages linked above have the full story.
 
 ## Get started
 
@@ -93,6 +87,15 @@ cargo run -p usage-cli -- status # check in from another terminal
 ```
 
 The daemon sets up its config, database, and socket on its own.
+
+## Providers
+
+[Codex](docs/codex.md): The Codex app-server, falling back to ChatGPT usage and local estimates.
+[Claude](docs/claude.md): Anthropic's usage API.
+[OpenCode Go](docs/opencode.md): The OpenCode web console.
+[Grok](docs/grok.md):  Grok's billing service, falling back to grok.com.
+
+UsageTracker uses the credentials you've already set up — Keychain items, config files, or a browser session — so you rarely have to do anything special. Each provider works a little differently; refer to each linked doc for the specifics per provider.
 
 ## Learn more
 
