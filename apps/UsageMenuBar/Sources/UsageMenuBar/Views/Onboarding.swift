@@ -8,16 +8,55 @@ struct Onboarding: View {
             VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                 Text("Welcome to UsageTracker")
                     .font(Theme.Typography.title)
-                Text("Choose the accounts you want to track. Usage stays on this Mac; credentials remain in provider files or Keychain.")
+                Text(introText)
                     .font(Theme.Typography.body)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if state.onboardingDiscoveryStarted {
+                discoveryResults
+            } else {
+                keychainExplanation
+                Spacer()
+                Button("Find my accounts") {
+                    Task { await state.discoverAccountsForOnboarding() }
+                }
+                .buttonStyle(.borderedProminent)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(width: Theme.Popover.width, height: Theme.Popover.height)
+    }
+
+    private var keychainExplanation: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Label("Keychain access is required", systemImage: "key.fill")
+                .font(Theme.Typography.headline)
+            Text("UsageTracker needs access to credentials already stored in your macOS Keychain so it can find your signed-in AI accounts and read their usage.")
+                .font(Theme.Typography.body)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("After you continue, macOS will show a Keychain prompt. Press **Always Allow** so UsageTracker can refresh usage automatically in the background without asking again.")
+                .font(Theme.Typography.body)
+                .fixedSize(horizontal: false, vertical: true)
+            Label("Credentials stay in provider files or Keychain and usage data stays on this Mac.", systemImage: "lock.shield")
+                .font(Theme.Typography.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Theme.Spacing.md)
+        .surfaceCard()
+    }
+
+    private var discoveryResults: some View {
+        Group {
             if let error = state.actionError {
                 SetupNotice(text: error, isError: true)
             } else if let message = state.actionMessage {
                 SetupNotice(text: message, isError: false)
+            } else if state.onboardingDiscoveryRunning {
+                SetupNotice(text: "Finding and enabling signed-in accounts…", isError: false)
             }
 
             ScrollView {
@@ -30,17 +69,22 @@ struct Onboarding: View {
             }
 
             HStack {
-                Label("Cost figures from local logs are estimates and are labeled in the dashboard.", systemImage: "info.circle")
-                    .font(Theme.Typography.micro)
-                    .foregroundStyle(.secondary)
+                Button("Scan again") {
+                    Task { await state.discoverAccountsForOnboarding() }
+                }
+                .disabled(state.onboardingDiscoveryRunning)
                 Spacer()
                 Button("Finish setup") { state.completeOnboarding() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(state.daemon == .offline)
+                    .disabled(state.daemon != .online || state.onboardingDiscoveryRunning)
             }
         }
-        .padding(Theme.Spacing.lg)
-        .frame(width: Theme.Popover.width, height: Theme.Popover.height)
+    }
+
+    private var introText: String {
+        state.onboardingDiscoveryStarted
+            ? "UsageTracker automatically finds signed-in accounts and enables the ones it discovers."
+            : "First, a quick note about the permission needed to find your accounts."
     }
 }
 

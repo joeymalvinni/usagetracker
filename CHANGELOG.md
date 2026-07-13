@@ -4,6 +4,19 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.1 — 2026-07-12
+
+### Onboarding
+
+- Added a Keychain explanation before UsageTracker starts its daemon or triggers macOS permission prompts, including guidance to choose **Always Allow**.
+- Added all-provider account discovery that automatically enables discovered accounts and providers.
+- Added rescanning and clear discovery status and result messages.
+- Preserved the existing startup flow for users who have already completed onboarding.
+
+### Fixed
+
+- Fixed provider switches in Settings so enabling or disabling a provider rebuilds app state, refreshes enabled providers, and reloads configuration correctly.
+
 ## 0.1.0 — 2026-07-12
 
 ### Documentation

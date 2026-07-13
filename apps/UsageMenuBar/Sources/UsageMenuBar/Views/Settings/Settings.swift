@@ -328,7 +328,7 @@ private struct ProviderAccountCard: View {
     private var visibilityBinding: Binding<Bool> {
         Binding(
             get: { provider.visibleInMenu },
-            set: { visible in Task { await state.setVisible(provider.providerId, visible) } }
+            set: { enabled in Task { await state.setProviderEnabled(provider.providerId, enabled) } }
         )
     }
 

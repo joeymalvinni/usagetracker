@@ -46,6 +46,8 @@ private enum PendingAction {
     @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
+    @Published var onboardingDiscoveryStarted = false
+    @Published var onboardingDiscoveryRunning = false
     @Published private(set) var derived = DerivedState.empty
     var providers: [ProviderVM] { derived.providers }
     var settingsProviders: [ProviderVM] { derived.settingsProviders }
@@ -120,6 +122,10 @@ private enum PendingAction {
     }
 
     func bootstrap() async {
+        // First-run onboarding explains Keychain access before any collector can
+        // cause macOS to show its permission prompt. The user starts the daemon
+        // explicitly from the onboarding screen after reading that explanation.
+        guard ui.onboardingCompleted else { return }
         // A bundled daemon can outlive the app that launched it. Check it
         // before the first API request so replacing the app bundle also
         // replaces an older daemon instead of silently serving stale data.
@@ -137,20 +143,24 @@ private enum PendingAction {
         }
     }
     func refreshForPopoverOpen() async {
+        guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         await load()
         await requestStaleDataRecovery(delay: .zero, reloadBeforeChecking: false)
     }
     func refreshAfterWake() async {
+        guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         await requestStaleDataRecovery(delay: wakeRecoveryDelay, reloadBeforeChecking: true)
     }
     func pollLoop() async {
         while !Task.isCancelled {
             let seconds = max(15, Int(config?.pollIntervalSeconds ?? 60))
             try? await Task.sleep(for: .seconds(seconds))
+            guard ui.onboardingCompleted || onboardingDiscoveryStarted else { continue }
             await load()
         }
     }
     func refreshAll() async {
+        guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         let providerIDs = enabledProviderIDs()
         beginRefreshing(providerIDs)
         defer { endRefreshing(providerIDs) }
@@ -175,12 +185,6 @@ private enum PendingAction {
         }
     }
     func visible(_ id: String) -> Bool { config?.providers[id]?.enabled == true }
-    func setVisible(_ id: String, _ on: Bool) async {
-        await perform(.provider(id)) {
-            config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: on])
-        }
-    }
-
     func setProviderEnabled(_ id: String, _ enabled: Bool) async {
         await perform(.provider(id)) {
             config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: enabled])
@@ -431,7 +435,74 @@ private enum PendingAction {
     }
 
     func restartOnboarding() {
+        // The daemon is already running for an existing installation, so rerunning
+        // setup can go straight to account discovery and provider controls.
+        onboardingDiscoveryStarted = true
         ui.onboardingCompleted = false
+    }
+
+    func discoverAccountsForOnboarding() async {
+        guard !onboardingDiscoveryRunning else { return }
+        onboardingDiscoveryStarted = true
+        onboardingDiscoveryRunning = true
+        actionError = nil
+        actionMessage = nil
+        defer { onboardingDiscoveryRunning = false }
+
+        _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
+        await load()
+        guard daemon == .online else {
+            actionError = message ?? "UsageTracker could not start its background service."
+            return
+        }
+
+        do {
+            // A nil filter intentionally asks every collector to discover accounts,
+            // including providers that are not enabled in the menu yet.
+            let firstScan = try await client.refresh(nil)
+            await load()
+
+            let discoveredAccountIDs = Set(firstScan.providerResults.compactMap(\.accountId))
+            let discoveredAccounts = accounts.filter { discoveredAccountIDs.contains($0.id) }
+            for account in discoveredAccounts where !account.collectionEnabled {
+                _ = try await client.updateAccount(
+                    accountId: account.id,
+                    collectionEnabled: true
+                )
+            }
+
+            let providerIDs = Set(discoveredAccounts.map(\.providerId))
+            if !providerIDs.isEmpty {
+                let toggles = Dictionary(uniqueKeysWithValues: providerIDs.map { ($0, true) })
+                config = try await client.updateConfig(
+                    pollIntervalSeconds: nil,
+                    providers: toggles
+                )
+
+                if discoveredAccounts.contains(where: { !$0.collectionEnabled }) {
+                    _ = try await client.refresh(Array(providerIDs).sorted())
+                }
+            }
+            await load()
+
+            if discoveredAccounts.isEmpty {
+                actionError = "No signed-in accounts were found. Sign in to a provider, then scan again."
+            } else {
+                let noun = discoveredAccounts.count == 1 ? "account" : "accounts"
+                let failedProviders = firstScan.providerResults.filter {
+                    switch $0.status {
+                    case .ok, .disabled: false
+                    default: true
+                    }
+                }.map(\.providerId)
+                let suffix = failedProviders.isEmpty
+                    ? ""
+                    : " You can retry any provider that still needs attention below."
+                actionMessage = "Found and enabled \(discoveredAccounts.count) \(noun).\(suffix)"
+            }
+        } catch {
+            actionError = "Account discovery failed: \(describe(error))"
+        }
     }
 
     var lastSuccessfulRefresh: Date? {

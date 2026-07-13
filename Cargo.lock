@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "usage-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2008,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "usage-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "dirs",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "usage-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "anyhow",

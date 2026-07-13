@@ -94,7 +94,7 @@ cargo run -p usage-daemon        # start the daemon
 cargo run -p usage-cli -- status # check in from another terminal
 ```
 
-The daemon sets up its config, database, and socket on its own. Codex is on out of the box; the other providers wait until you turn them on.
+The daemon sets up its config, database, and socket on its own.
 
 ## Learn more
 
