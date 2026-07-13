@@ -24,6 +24,12 @@
 
 UsageTracker is a macOS menu bar app that shows how much of your AI coding tools you've used — and how much you have left. It watches the tools you already use, keeps a tidy history on your Mac, and shows it all in one place.
 
+<p align="center">
+  <img src="docs/assets/MacOS_UI.png" alt="UsageTracker macOS menu bar interface" height="520" />
+  <span>&nbsp;&nbsp;</span>
+  <img src="docs/assets/CLI_output.png" alt="UsageTracker CLI usage dashboard" height="520" />
+</p>
+
 It runs as three pieces that work together: a **menu bar app**, a lightweight **background daemon** that does the collecting, and a **terminal CLI** for when you'd rather stay in the shell.
 
 ```sh
@@ -31,12 +37,6 @@ usage                 # show your usage dashboard
 ```
 
 Everything stays on your machine. There's no account to create and no server to phone home to. UsageTracker never asks for your provider passwords, and it doesn't keep the raw responses it gets back from providers.
-
-<p align="center">
-  <img src="docs/assets/MacOS_UI.png" alt="UsageTracker macOS menu bar interface" height="520" />
-  <span>&nbsp;&nbsp;</span>
-  <img src="docs/assets/CLI_output.png" alt="UsageTracker CLI usage dashboard" height="520" />
-</p>
 
 ## What it shows
 
