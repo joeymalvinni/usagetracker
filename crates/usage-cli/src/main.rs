@@ -359,11 +359,10 @@ async fn run_usage(
     } else {
         println!(
             "{}",
-            render::render_usage_with_summary(
+            render::render_usage_dashboard(
                 &snapshots,
                 &forecasts,
                 &accounts,
-                Some(&dashboard),
                 render::UsageRenderOptions {
                     style,
                     color,

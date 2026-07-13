@@ -4,8 +4,8 @@ use std::fmt::Write;
 use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
 use serde_json::Value;
 use usage_core::{
-    Account, ForecastStatus, UsageAmount, UsageDashboardSummary, UsageForecast, UsageSnapshot,
-    UsageUnit, UsageWindow, UsageWindowKind,
+    Account, ForecastStatus, UsageAmount, UsageForecast, UsageSnapshot, UsageUnit, UsageWindow,
+    UsageWindowKind,
 };
 
 use crate::{
@@ -45,11 +45,10 @@ pub fn render_usage(
     width: usize,
     details: bool,
 ) -> String {
-    render_usage_with_summary(
+    render_usage_dashboard(
         snapshots,
         forecasts,
         accounts,
-        None,
         UsageRenderOptions {
             style,
             color,
@@ -59,11 +58,10 @@ pub fn render_usage(
     )
 }
 
-pub fn render_usage_with_summary(
+pub fn render_usage_dashboard(
     snapshots: &[UsageSnapshot],
     forecasts: &[UsageForecast],
     accounts: &[Account],
-    normalized: Option<&UsageDashboardSummary>,
     options: UsageRenderOptions,
 ) -> String {
     let UsageRenderOptions {
@@ -75,7 +73,7 @@ pub fn render_usage_with_summary(
     let dashboard = Dashboard::from_snapshots(snapshots, forecasts, accounts);
     let theme = Theme::new(color);
     match style {
-        OutputStyle::Dashboard => render_dashboard(&dashboard, normalized, theme, width, details),
+        OutputStyle::Dashboard => render_dashboard(&dashboard, theme, width, details),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -248,13 +246,7 @@ impl ProviderPanel {
     }
 }
 
-fn render_dashboard(
-    dashboard: &Dashboard,
-    normalized: Option<&UsageDashboardSummary>,
-    theme: Theme,
-    width: usize,
-    details: bool,
-) -> String {
+fn render_dashboard(dashboard: &Dashboard, theme: Theme, width: usize, details: bool) -> String {
     let mut output = String::new();
     push_box(
         &mut output,
@@ -264,17 +256,6 @@ fn render_dashboard(
         &overview_lines(&dashboard.overview, theme),
         theme,
     );
-    if let Some(normalized) = normalized {
-        output.push('\n');
-        push_box(
-            &mut output,
-            width,
-            "Coverage",
-            None,
-            &coverage_lines(normalized, theme),
-            theme,
-        );
-    }
     output.push('\n');
     push_box(
         &mut output,
@@ -296,41 +277,6 @@ fn render_dashboard(
         );
     }
     output.trim_end().to_string()
-}
-
-fn coverage_lines(summary: &UsageDashboardSummary, theme: Theme) -> Vec<String> {
-    let scopes = summary
-        .provenance
-        .scopes
-        .iter()
-        .map(|scope| format!("{scope:?}").to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" + ");
-    vec![
-        format!(
-            "{:<width$} {}",
-            "scope",
-            theme.value(if scopes.is_empty() {
-                "unknown"
-            } else {
-                &scopes
-            }),
-            width = LABEL_WIDTH
-        ),
-        format!(
-            "{:<width$} {:.0}% priced · {} unpriced",
-            "pricing",
-            summary.pricing.covered_percent,
-            format_tokens(summary.pricing.unpriced_tokens),
-            width = LABEL_WIDTH
-        ),
-        format!(
-            "{:<width$} {}",
-            "note",
-            summary.provenance.explanation,
-            width = LABEL_WIDTH
-        ),
-    ]
 }
 
 fn overview_lines(overview: &Overview, theme: Theme) -> Vec<String> {
@@ -1111,17 +1057,20 @@ mod tests {
     fn renders_dashboard_sections() {
         let (snapshot, account) = sample_dashboard();
 
-        let rendered = render_usage(
+        let rendered = render_usage_dashboard(
             &[snapshot],
             &[],
             &[account],
-            OutputStyle::Dashboard,
-            false,
-            TEST_WIDTH,
-            false,
+            UsageRenderOptions {
+                style: OutputStyle::Dashboard,
+                color: false,
+                width: TEST_WIDTH,
+                details: false,
+            },
         );
 
         assert!(rendered.contains("Overview"));
+        assert!(!rendered.contains("Coverage"));
         assert!(rendered.contains("Activity · last 7 days"));
         assert!(rendered.contains("Codex · openai-web · Pro Lite"));
         assert!(rendered.contains("Session"));
