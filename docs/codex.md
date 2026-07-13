@@ -1,84 +1,52 @@
-# Codex collection
+# Codex
 
-Codex support lives in the `crates/usage-daemon/src/providers/codex/` module tree and is enabled by
-default.
-Each configured profile runs in its own `CODEX_HOME`, which lets the daemon query multiple
-ChatGPT/Codex accounts without changing the user's active terminal login.
+Codex is on by default.
 
-Account identity comes from the authenticated Codex `account_id`, never from the profile's display
-name. The same account id may only be connected once: when multiple profiles authenticate as the
-same account, the first enabled profile in config order is canonical and later duplicates are not
-collected. Storage enforces the same uniqueness rule and rejects a profile whose authenticated
-account changes, preventing a reconnect from merging two accounts' retained history. To replace the
-account behind a profile, permanently delete the old UsageTracker account first and add a new one.
+## Accounts
 
-## Collection paths
+Codex supports as many profiles as you like. Each one uses its own `CODEX_HOME` (or a specific `auth_path`), and its real identity is the provider's `account_id`. If two profiles point at the same account, the first enabled one wins, and an existing profile can't quietly swap to a different account. Display names are just local labels.
 
-The primary collection path starts `codex app-server` for the profile and requests:
+## Where credentials come from
 
-- `account/read` for account identity and plan metadata.
-- `account/rateLimits/read` for current rate-limit windows and reset credits.
-- `account/usage/read` for account-wide token activity.
+For each profile, UsageTracker reads `auth_path` if you've set it, otherwise `<codex_home>/auth.json`. The legacy default is `$CODEX_HOME/auth.json` or `~/.codex/auth.json`. Whichever file it lands on has to contain a non-empty access token and account ID.
 
-`account/usage/read` is the authoritative activity source. It returns lifetime summary fields and
-daily token buckets for the account, including activity produced on other computers. The daemon
-stores every returned bucket in `provider_daily_usage`, keyed by provider, account, and date. Rows
-are updated when Codex revises a day but are never removed merely because a later response omits an
-older day. This preserves history beyond any upstream response-retention window.
+## How usage is collected
 
-The daemon keeps every retained row, but socket responses include only the latest 30 days under
-`metadata.codex_activity.by_day`, which is the range consumed by the Swift charts. An incrementally
-maintained SQLite summary keeps `lifetime_tokens` and `daily_bucket_count` exact without scanning or
-serializing the entire history on every UI refresh. Summary fields from the latest provider response
-remain under `metadata.codex_activity`, including peak daily tokens, streaks, and longest turn.
+1. Start `codex app-server` in the profile and ask it for the account identity, rate limits, reset credits, and account-wide usage.
+2. If the app-server can't give you rate limits, ask `https://chatgpt.com/backend-api/wham/usage` using the bearer token and account ID you already have.
+3. If account-wide activity isn't available at all, keep the history you already have and lean on local session logs for activity and cost estimates.
 
-## WHAM fallback
+Rate-limit trouble can fall through to WHAM, but local logs never stand in for real, provider-reported quota.
 
-If app-server rate-limit collection fails, the daemon requests
-`https://chatgpt.com/backend-api/wham/usage` with the profile's bearer token and account id. WHAM
-provides rate limits, plan metadata, credits, and reset credits; it does not provide daily or
-lifetime token activity.
+## How the numbers are normalized
 
-If only `account/usage/read` fails or is unavailable in an older Codex version, rate-limit
-collection still succeeds. The daemon records a warning and uses local activity as a fallback while
-continuing to serve the last successfully retained account-wide history.
+Provider windows become percent, credit, or amount windows, each with a stable ID and a UTC reset time. The daily buckets from `account/usage/read` are account-wide. Tokens from your local logs are treated as this-Mac observations, and their cost is estimated from a bundled, versioned price catalog — models that aren't in the catalog stay clearly marked as unpriced.
 
-## Local log estimates
+## Refresh timing and rate limits
 
-Local session logs are not authoritative activity because they cover only one computer and do not
-contain an account id. They remain useful for estimating model-level cost. For managed profiles,
-the daemon scans the profile's own session directory and scans the standard `~/.codex/sessions`
-directory only for the profile marked as its durable default-activity owner. On migration, the
-daemon assigns that ownership once when exactly one managed profile's auth matches the default
-Codex auth, then persists it as `owns_default_codex_activity`. Later changes to the default Codex
-login do not move historical local activity between profiles.
+Refreshes happen at most once a minute. A 429 from the provider starts a shared backoff of 5, 10, 20, 40, then 60 minutes. Local file activity can trigger a (coalesced) refresh, but it can't jump the backoff queue.
 
-Local cost metadata is stored under `metadata.codex_cost` with `estimate=true`, `partial=true`, and
-`complete_lookback=false`. When account activity is available, local token counts are not added to
-account token counts. The Swift dashboard uses account activity for tokens and local logs only for
-directly calculated estimated cost. For account activity that is not represented in local logs, the
-dashboard applies the effective same-day local cost per priced token. When no same-day local row is
-available, it falls back to the provider-wide observed rate, whose denominator excludes unpriced
-tokens. Dates and token counts always come from the selected account's own account-wide history.
+## What's kept in diagnostics
 
-Standard API-equivalent model prices are shipped as a versioned bundled catalog. Updating prices
-requires a daemon release, which keeps historical estimates reproducible and avoids coupling usage
-collection to the layout or availability of a public pricing page. The bundled catalog is used
-when no cache is available and the refresh fails. Refresh failures do not fail provider collection.
-Pricing changes invalidate the local cost scan cache so retained logs are recalculated. Cost rows
-include priced and unpriced token coverage plus unpriced model names. The menu bar app shows one
-dismissible notice when recent chart data includes a model without pricing instead of treating
-those tokens as zero-cost usage.
+Diagnostics can note the collection mode, plan and email, reset-credit summaries, profile ID, account activity summaries, local cost coverage, model names, and the price-catalog version. They never include raw app-server or WHAM payloads, or your bearer token.
 
-Codex daily buckets and local cost rollups use the user's local calendar date. The provider's
-date-only `startDate` values follow that calendar boundary, so timestamped local events are converted
-to the same timezone before aggregation. Local events without a valid timestamp remain in lifetime
-and model totals but are excluded from today, lookback, and per-day totals.
+## What failures mean
 
-## Persistence
+- Auth file missing or unreadable → `credentials_missing` or `credentials_invalid`.
+- HTTP 401/403 → `unauthorized`; a 429 → `rate_limited`.
+- Transport trouble → `network`; a provider surface UsageTracker doesn't support → `provider_unavailable`; shapes it can't read → `parse`.
+- When both the app-server and WHAM fail, you get the more informative of the two, with both paths described safely.
 
-Migration `0002_provider_daily_usage.sql` creates the durable daily table. Permanent account deletion
-also deletes that account's daily history. Hiding or disabling an account does not delete history.
-Daily rows and lifetime aggregates are retained permanently. High-resolution normalized snapshots
-are bounded to 90 days and 10,000 rows per account, preventing polling data from growing without
-limit.
+## A few security notes
+
+UsageTracker launches the Codex executable you've configured, pointed at the profile's home, and reads its known session roots. Separate homes keep managed accounts isolated. A profile marked `owns_default_codex_activity` may additionally read `~/.codex/sessions` — and only one profile can own that.
+
+## Tests and fixtures
+
+Inline tests cover credential parsing, duplicate identities, app-server and WHAM normalization, reset credits, activity, local-log attribution, and price coverage. `just fixture` runs normalized Codex data through the real socket and Swift UI.
+
+## Known limitations
+
+- Local cost is an estimate, not a billing statement.
+- Local logs without valid timestamps count toward lifetime and per-model totals, but not toward any dated total.
+- Daily provider history is kept until you permanently delete the account; normalized snapshots are capped at 90 days and 10,000 rows per account.

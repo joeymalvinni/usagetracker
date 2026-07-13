@@ -1,140 +1,57 @@
-# Grok provider
+# Grok
 
-Grok collection uses two account-wide billing surfaces in order:
+Grok is off by default. You can tell it where to look with `source_mode`: `auto` (try the CLI, then the web), `cli`, or `web`.
 
-1. The official Grok Build CLI's ACP process (`grok --no-auto-update agent stdio`), with the
-   `x.ai/billing` extension method.
-2. The billing gRPC-web method used by grok.com, authenticated with the existing Grok login
-   token and/or a signed-in browser session.
+## Accounts
 
-The CLI and ACP transport are documented by xAI, but `x.ai/billing` and the grok.com billing
-protobuf are not public API contracts. They are isolated behind small parser modules so a wire
-change does not affect account discovery, fallback policy, or the shared daemon protocol.
+Grok supports multiple CLI-backed profiles, each with its own `GROK_HOME`. The default profile uses your normal Grok home and is the only one allowed to use global manual or imported browser cookies. Managed profiles use their own CLI credentials and a bearer-only web fallback, so a single browser session can't accidentally be claimed by several accounts.
 
-## Why this order
+The authenticated Grok user ID is the real identity whenever it's available. If two profiles share an ID, the first one wins — though the default profile is allowed to swap its temporary `grok_default` placeholder for the real ID once it learns it.
 
-The CLI is the strongest first choice: it is an official executable, owns refresh of its OAuth
-credentials, and returns both the billing period and monetary usage totals. The browser path is a
-fallback because it depends on an internal web RPC and cookie formats. Both paths report the same
-account-wide allowance, so either result is authoritative; the browser result is not marked as a
-local estimate.
+## Where credentials come from
 
-`~/.grok/sessions/<encoded-cwd>/<session-id>/signals.json` is scanned over a bounded 30-day
-lookback for diagnostics (session count, local tokens, last activity, and models used). It is
-intentionally not converted into a quota window. Local token counts cover only this Mac and do not
-map to the shared pool's product-weighted usage. A local approximation would make forecasts and
-low-usage alerts look more certain than they are. Local signals also never suppress a missing-auth
-error when neither account-wide billing source succeeds.
+CLI credentials come from `<grok_home>/auth.json`, preferring complete OIDC entries over legacy ones. Set `GROK_CLI_PATH` to name the executable explicitly; otherwise UsageTracker checks the common install paths, your login shell, and the process `PATH`.
 
-## CLI RPC
+For the default profile's web fallback, cookies are resolved in this order: `USAGE_TRACKER_GROK_COOKIE`, `cookie_header`, `~/.usagetracker/grok.cookie`, the Keychain cache, and finally Chrome's `sso` / `sso-rw` cookies. A Grok bearer token can be used alongside cookies or on its own.
 
-`GROK_CLI_PATH` is an authoritative override. Otherwise the daemon resolves `grok` from these
-locations before checking the login-shell and process `PATH`:
+## How usage is collected
 
-- `~/.grok/bin/grok`
-- `~/.local/bin/grok`
-- `/usr/local/bin/grok`
-- `/opt/homebrew/bin/grok`
+1. Run `grok --no-auto-update agent stdio`, set up and authenticate ACP, then call `x.ai/billing`.
+2. In `auto` mode, if the CLI fails for any reason other than rate limiting, fall back to `https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`.
+3. A flaky web request gets up to three tries. Authentication and rate-limit failures don't rotate to other credentials mid-request.
 
-The child uses newline-delimited JSON-RPC with bounded stdout/stderr and a kill-on-drop guard. The
-sequence is:
+The ACP billing extension and the grok.com protobuf are internal surfaces — not stable, public xAI APIs — so they can change without warning.
 
-1. `initialize` with ACP protocol version 1 and no filesystem or terminal capabilities.
-2. `authenticate` with `cached_token` when advertised. `xai.api_key` is used only when the CLI
-   advertises it and `XAI_API_KEY` is present.
-3. `x.ai/billing` with no parameters.
+## How the numbers are normalized
 
-Initialization/authentication have a 4-second budget and billing has a 3-second budget. The
-daemon disables CLI auto-update for collection so a routine poll cannot mutate the installation.
+Billing values become included-usage windows, plus an optional on-demand window, using the billing period and reset that the provider returns. Local `signals.json` files are scanned only for 30 days of diagnostic activity — their tokens never become quota, because they only reflect one Mac and don't map to Grok's product-weighted account billing.
 
-The included window uses `includedUsed / monthlyLimit`; `totalUsed` is accepted only for older
-responses that omit `includedUsed`. Despite the legacy `monthlyLimit` field name, the window kind
-comes from the returned billing-cycle duration. An on-demand cap is exposed as a separate window.
+## Refresh timing and rate limits
 
-## grok.com fallback
+Refreshes happen at most once a minute. A rate limit from either the CLI or the web stops the fallback and starts shared backoff. ACP setup and authentication get four-second budgets; billing gets three. Child-process output is bounded, and the process is killed once collection is done.
 
-The fallback sends an empty gRPC-web protobuf frame to:
+## What's kept in diagnostics
 
-`https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig`
+Diagnostics can note the collection mode, credential source name, safe identity fields, profile ID and label, billing period and source, and bounded counts, models, and timestamps from local sessions. They never include access or refresh tokens, cookie values, ACP messages, or raw protobuf.
 
-It accepts framed and unframed protobuf responses and projects only:
+## What failures mean
 
-- included usage percent;
-- current billing period start, when present;
-- next reset time.
+- Missing binary, login, or cookie → `credentials_missing` or `provider_unavailable`.
+- Malformed credentials or manual cookies → `credentials_invalid`.
+- Rejected auth → `unauthorized`; a provider throttle → `rate_limited`.
+- Process or HTTP transport trouble → `network` or `provider_unavailable`; ACP, protobuf, or billing shapes it can't read → `parse`.
+- When both paths fail, the error leans toward authentication and parse details, and safely summarizes both.
 
-The parser selects protobuf field 1 for the percentage rather than accepting an arbitrary float,
-ignores trailer frames, validates HTTP and gRPC status, and treats a current period with an omitted
-proto3 zero percentage as 0% only when period markers are present.
+## A few security notes
 
-Transient HTTP 408/502/503/504 failures, gRPC deadline failures, and timeout/connection errors use
-a three-attempt bounded retry budget. Authentication and rate-limit failures are never retried with
-another source inside the transport.
+CLI auto-update is disabled while collecting. Managed child processes get their own `GROK_HOME`. Browser requests go to fixed HTTPS endpoints with redirects turned off, and only Grok's authentication cookies are kept. Importing from a browser is limited to the default profile.
 
-Fallback is allowed for missing/invalid CLI credentials, unavailable binaries, unsupported RPC
-methods, timeouts, and parse failures. A CLI rate limit never triggers the browser path: switching
-credentials to bypass provider throttling would be incorrect and could make backoff ineffective.
+## Tests and fixtures
 
-## Credentials and browser sessions
+Inline tests cover binary discovery, the ACP/auth/billing exchange, credential precedence, protobuf framing and status, fallback, rate-limit behavior, profile isolation, and local-session bounds. `just fixture` runs normalized Grok data through the socket and UI.
 
-Identity comes from each profile's `GROK_HOME/auth.json`; the legacy `default` profile uses
-`$GROK_HOME/auth.json` or `~/.grok/auth.json`. The file is a map keyed by auth scope; OIDC entries
-under `https://auth.x.ai::` are preferred over legacy sign-in entries. Access tokens are never
-included in raw-payload captures or logs.
+## Known limitations
 
-For web billing, sources are:
-
-1. `USAGE_TRACKER_GROK_COOKIE`, `providers.grok.cookie_header`, or
-   `~/.usagetracker/grok.cookie`;
-2. a previously validated browser session cached in macOS Keychain;
-3. grok.com sessions imported from Chrome.
-
-Browser database discovery, expiry filtering, and Chromium cookie decryption live in the shared
-`providers/browser_cookies.rs` module and are reused by OpenCode. Grok deliberately limits import
-to Chrome to avoid unrelated Keychain prompts. Each Chrome profile stays a separate candidate, so
-a stale session cannot mask a valid login from another profile. Only `sso` and `sso-rw` are retained
-in the outgoing header. Imported sessions have a five-second in-process cache. Imported cookies are
-sent only to the fixed HTTPS grok.com endpoint, redirects are disabled, and a cached session is
-cleared and re-imported after auth rejection. Unit-test processes do not import browser cookies
-unless `USAGE_TRACKER_ALLOW_BROWSER_COOKIE_IMPORT=1` is set.
-
-When a non-expired legacy-profile Grok login token is available, each browser session is tried with
-the bearer token and then cookie-only. A bearer-only request is the final web attempt. Managed
-profiles never consume global manual, cached, or imported browser cookies: their web fallback is
-bearer-only so one Chrome login cannot be attributed to multiple tracked accounts.
-
-## Account model and UI
-
-Grok supports multiple CLI-backed profiles. The legacy `default` profile uses the normal Grok home;
-additional profiles use `~/.usagetracker/profiles/grok/<profile-id>`. Login and billing subprocesses
-receive that directory through a child-only `GROK_HOME`, so concurrent refreshes cannot cross
-credentials or session files. Duplicate Grok user IDs are retained only through the first configured
-profile.
-
-Before identity is available, the legacy profile's external ID is `grok_default`; storage may
-atomically adopt the later Grok user ID without creating a duplicate account. Browser-only discovery
-remains limited to that profile because Grok cookies do not expose a reliable identity binding.
-Adding a second account therefore requires the Grok Build CLI. Grok is disabled by default.
-
-Collection modes exposed to clients are:
-
-- `grok_cli_billing_rpc`
-- `grok_web_billing_rpc`
-
-The optional `providers.grok.source_mode` setting controls strategy selection:
-
-- `auto` (default): CLI followed by web fallback;
-- `cli`: CLI only;
-- `web`: web only.
-
-## Key modules
-
-- `providers/browser_cookies.rs`: reusable browser discovery and cookie decryption
-- `providers/grok/auth.rs`: credential selection and identity
-- `providers/grok/rpc.rs`: bounded ACP JSON-RPC transport
-- `providers/grok/billing.rs`: provider-neutral billing projection into usage windows
-- `providers/grok/web.rs`: gRPC-web validation and protobuf parsing
-- `providers/grok/cookies.rs`: Grok-specific source/cache policy
-- `providers/grok/local_sessions.rs`: bounded, diagnostic-only local session scan
-- `providers/grok/strategy.rs`: typed source-mode policy
-- `providers/grok/mod.rs`: account discovery and fallback orchestration
+- Extra browser-only accounts aren't supported, because Grok cookies don't reliably tie a browser session to one identity.
+- The CLI and web billing surfaces can change independently of UsageTracker.
+- Local session tokens are diagnostic — not account-wide usage or quota.

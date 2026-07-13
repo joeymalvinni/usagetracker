@@ -1,51 +1,35 @@
-# Production multi-account support plan
+# Multiple accounts
 
-## Account lifecycle
+Codex, Claude, and Grok let you manage as many profiles as you want. OpenCode Go is the exception — it shows one workspace at a time.
 
-- Keep account identity stable in SQLite with a durable `accounts.id`.
-- Preserve usage history when an account is hidden, disabled, or removed.
-- Offer both reversible removal (`hidden = true`, `collection_enabled = false`) and permanent deletion.
-- Keep `GetAccounts` administrative and complete so removed accounts can be re-enabled.
-- Keep normal usage and health surfaces filtered to visible accounts.
-- Keep user labels, generated labels, and provider email addresses as separate account identity fields so refreshes cannot overwrite a rename.
-- Assign short generated labels (`Codex 1`, `Claude 1`, `OpenCode Go`) when a profile has no user label.
-- Enforce one profile per real provider account for Codex, Claude, and Grok, independent of labels.
-- Reject authenticated identity changes on an existing profile so reconnecting cannot merge histories.
+## How identity works
 
-## Collection behavior
+- `Account.id` is UsageTracker's own stable ID for managing an account.
+- The provider identity (`external_account_id`) is what stops the same real account from being added twice.
+- `profile_id` ties an account to its local credentials.
+- Display name and email are just for show — they never establish identity.
+- If a profile's authenticated provider identity ever changes, it's rejected rather than merged, so two histories never get tangled together.
 
-- Filter disabled profile-backed accounts at provider configuration time when possible.
-- Guard refresh at the storage layer as a second line of defense so rediscovered disabled accounts are skipped.
-- Keep provider-wide enablement separate from account-wide enablement.
-- Record disabled account health when refresh skips an account.
-- Continue to support providers that only expose one web identity by relying on storage-level account lifecycle state.
+When two profiles end up pointing at the same provider identity, the first enabled one is the canonical one. That's why the order of your managed profiles matters.
 
-## Settings UX
+## The account lifecycle
 
-- Group provider-wide controls, accounts, and sign-in actions in one provider card.
-- Per account, expose:
-  - collection on/off,
-  - dashboard visibility,
-  - remove while keeping history,
-  - permanent deletion,
-  - restore from a removed state.
-- Keep removed accounts in one collapsed cleanup section.
-- Keep secondary actions in a single account menu.
+| Action | Visible? | Collecting? | History |
+| --- | --- | --- | --- |
+| Hide | No | Yes | Kept |
+| Disable | Yes | No | Kept |
+| Remove | No | No | Kept |
+| Restore / show + enable | Yes | Yes | Kept |
+| Permanent delete | No | No | Deleted |
 
-## Provider-specific gaps
+`get_accounts` is the administrative view, so it still returns hidden and disabled accounts — that's how you bring them back. Your usage and normal health views leave hidden accounts out.
 
-- Codex: account add/remove maps to isolated profile homes; duplicate `account_id` values are rejected.
-- Claude: account creation maps to isolated managed Claude config directories and Keychain services, and `account.uuid` supplies canonical identity; advanced profile field editing remains config-file-only.
-- Grok: account creation maps to isolated managed `GROK_HOME` directories; only the legacy default profile may use global browser cookies because imported cookie sessions lack a reliable account identity binding.
-- OpenCode Go: decide whether account-level disable should clear cached cookies, disable only collection, or support named cookie/workspace profiles.
-- All providers: expose credential/source diagnostics per account, not only per provider.
+Permanent deletion clears the stored usage and tombstones (or removes) the profile. Add the account again later and you get a brand-new UsageTracker account — the deleted history doesn't come back.
 
-## Production hardening
+## Who owns local activity
 
-- Add account-level refresh actions.
-- Add audit metadata such as `hidden_at`, `disabled_at`, and optional user-facing removal reason.
-- Keep irreversible purge behind a second confirmation and delete related snapshots and health.
-- Add migration tests against pre-lifecycle databases.
-- Add socket API compatibility tests for older clients missing lifecycle fields.
-- Add end-to-end menu bar tests for hide, remove, and re-enable flows.
-- Add conflict handling for config-file write failures after database state changes.
+Separate profile homes keep new local activity apart on their own. But shared roots — like `~/.codex/sessions` and `~/.claude/projects` — can only belong to one profile. UsageTracker records `owns_default_codex_activity` or `owns_default_claude_activity` when it can figure out the owner beyond doubt; when several profiles could plausibly claim the same files, it doesn't guess.
+
+Grok's global browser cookies work the same way: only the default profile gets them. Any additional Grok accounts need their own isolated CLI homes.
+
+For the exact fields involved, see the [configuration reference](configuration.md#provider-fields) and each provider's page.
