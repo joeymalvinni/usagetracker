@@ -62,7 +62,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   https://github.com/joeymalvinni/usagetracker/releases/latest/download/install.sh | bash
 ```
 
-The installer verifies published SHA-256 checksums, archive contents, and ad-hoc code-signature integrity, puts the app in `~/Applications`, and installs the `usage` command in `~/.local/bin`. Releases are **not notarized by Apple**, so macOS may require [manual approval](docs/troubleshooting.md#opening-the-unnotarized-app) the first time the app opens. The installer never removes your `~/.usagetracker` data during an install or upgrade. Pass options after `bash -s --`; for example, use `--cli-only`, `--app-only`, `--no-launch`, or `--version v0.1.0`.
+The installer verifies published SHA-256 checksums, archive contents, and ad-hoc code-signature integrity, puts the app in `~/Applications`, and installs the `usage` command in `~/.local/bin`. When a newer stable release is available, the dashboard shows an **Update** button that uses the same verified installer to replace and relaunch the app in place. Releases are **not notarized by Apple**, so macOS may require [manual approval](docs/troubleshooting.md#opening-the-unnotarized-app) the first time the app opens. The installer never removes your `~/.usagetracker` data during an install or upgrade. Pass options after `bash -s --`; for example, use `--cli-only`, `--app-only`, `--no-launch`, or `--version v0.1.0`.
 
 On first launch, pick the tools you use and follow the sign-in steps for each. You can always change this later under **Settings → Connections**.
 

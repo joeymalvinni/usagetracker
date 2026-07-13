@@ -28,7 +28,7 @@ struct Popover: View {
                 .frame(width: 0.5)
             Group {
                 switch navigation.selection {
-                case .summary: Summary(selection: $navigation.selection)
+                case .summary: Summary(updater: state.updater, selection: $navigation.selection)
                 case .provider(let id, let accountId): Detail(providerId: id, initialAccountId: accountId)
                 case .settings: Settings()
                 }

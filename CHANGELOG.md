@@ -4,6 +4,10 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+### App
+
+- Added a compact dashboard update button that appears when a newer stable GitHub release is available, verifies the published installer checksum, and updates the current app bundle in place.
+
 ## 0.1.1 — 2026-07-12
 
 ### Onboarding

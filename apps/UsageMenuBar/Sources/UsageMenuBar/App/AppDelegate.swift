@@ -72,6 +72,7 @@ import UserNotifications
             }
             .store(in: &bag)
         Task { await state.bootstrap(); await state.pollLoop() }
+        Task { await state.updater.checkForUpdates() }
 
         // Force the retained SwiftUI/AppKit tree to load and lay itself out after
         // launch, before the user's first click.
@@ -137,6 +138,7 @@ import UserNotifications
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         configurePopoverWindow()
         Task { await state.refreshForPopoverOpen() }
+        Task { await state.updater.checkForUpdates() }
     }
 
     private func makePopoverController() -> NSViewController {

@@ -23,6 +23,7 @@ private enum PendingAction {
 }
 
 @MainActor final class AppState: ObservableObject {
+    let updater = AppUpdater()
     @Published var daemon: DaemonState = .unknown
     @Published var config: ConfigResponse?
     @Published var accounts = [Account]()
