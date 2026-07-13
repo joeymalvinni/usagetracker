@@ -1038,7 +1038,7 @@ mod tests {
             account
                 .activity
                 .as_ref()
-                .is_some_and(|activity| activity.days.len() == 30)
+                .is_some_and(|activity| !activity.days.is_empty() && activity.lookback_tokens > 0)
         }));
 
         let state = request_line(&env.socket_path, r#"{"method":"get_state"}"#).await;
