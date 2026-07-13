@@ -430,6 +430,11 @@ private enum PendingAction {
     }
 
     func completeOnboarding() {
+        // A clean installation has no "previous version," so its current
+        // release is not presented as something that was just updated.
+        if ui.lastSeenReleaseNotesVersion == nil {
+            ui.lastSeenReleaseNotesVersion = updater.currentVersion
+        }
         ui.onboardingCompleted = true
         actionError = nil
         actionMessage = "Setup complete. Usage will update automatically."
@@ -1031,6 +1036,15 @@ private enum PendingAction {
     func showsAlertBanner(_ vm: ProviderVM) -> Bool {
         guard let sig = vm.alertSignature else { return false }
         return !ui.dismissedAlerts.contains(sig)
+    }
+
+    func showsReleaseNotes(_ notes: ReleaseNotes) -> Bool {
+        ui.lastSeenReleaseNotesVersion != notes.version
+    }
+
+    func dismissReleaseNotes(_ notes: ReleaseNotes) {
+        ui.lastSeenReleaseNotesVersion = notes.version
+        updater.dismissInstalledReleaseNotes(version: notes.version)
     }
 
 }

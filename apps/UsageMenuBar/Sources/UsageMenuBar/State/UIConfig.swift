@@ -44,6 +44,8 @@ struct UIConfig: Codable, Equatable, Sendable {
     var seenAlerts = Set<String>()
     /// Alert signatures whose banner the user has dismissed.
     var dismissedAlerts = Set<String>()
+    /// Marketing version whose post-update highlights the user has dismissed.
+    var lastSeenReleaseNotesVersion: String?
 
     init() {}
 
@@ -65,6 +67,10 @@ struct UIConfig: Codable, Equatable, Sendable {
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
         dismissedAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedAlerts) ?? []
+        lastSeenReleaseNotesVersion = try c.decodeIfPresent(
+            String.self,
+            forKey: .lastSeenReleaseNotesVersion
+        )
     }
 
     static func load() throws -> Self {

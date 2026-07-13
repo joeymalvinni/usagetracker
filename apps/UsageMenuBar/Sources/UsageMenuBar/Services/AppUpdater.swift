@@ -34,17 +34,118 @@ struct SemanticVersion: Comparable, CustomStringConvertible, Equatable, Sendable
 struct AppRelease: Equatable, Sendable {
     let tag: String
     let version: SemanticVersion
+    let releaseNotes: ReleaseNotes?
+}
+
+struct ReleaseNotes: Codable, Equatable, Sendable {
+    let version: String
+    let summary: String
+    let highlights: [String]
+}
+
+enum ReleaseNotesParser {
+    static let maximumHighlights = 6
+    private static let maximumSummaryCharacters = 240
+    private static let maximumHighlightCharacters = 180
+
+    static func parse(body: String?, version: SemanticVersion) -> ReleaseNotes? {
+        guard let body else { return nil }
+        let lines = body.replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard let highlightsHeading = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces)
+                .caseInsensitiveCompare("## Highlights") == .orderedSame
+        }) else { return nil }
+
+        let leadingLines = lines[..<highlightsHeading]
+        guard let summaryStart = leadingLines.firstIndex(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else { return nil }
+
+        var summaryLines = [String]()
+        for line in leadingLines[summaryStart...] {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { break }
+            guard !trimmed.hasPrefix("#") else { return nil }
+            summaryLines.append(trimmed)
+        }
+        let summary = limited(summaryLines.joined(separator: " "), to: maximumSummaryCharacters)
+        guard !summary.isEmpty else { return nil }
+
+        var highlights = [String]()
+        for line in lines.dropFirst(highlightsHeading + 1) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("## ") { break }
+            guard trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") else { continue }
+            let text = limited(
+                String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines),
+                to: maximumHighlightCharacters
+            )
+            if !text.isEmpty { highlights.append(text) }
+            if highlights.count == maximumHighlights { break }
+        }
+        guard !highlights.isEmpty else { return nil }
+
+        return ReleaseNotes(
+            version: version.description,
+            summary: summary,
+            highlights: highlights
+        )
+    }
+
+    private static func limited(_ value: String, to maximum: Int) -> String {
+        guard value.count > maximum else { return value }
+        return String(value.prefix(maximum - 1)) + "…"
+    }
+}
+
+struct ReleaseNotesStore: Sendable {
+    let fileURL: URL
+
+    func load(currentVersion: String) -> ReleaseNotes? {
+        guard let data = try? Data(contentsOf: fileURL),
+              data.count <= 64 * 1024,
+              let notes = try? JSONDecoder().decode(ReleaseNotes.self, from: data),
+              notes.version == currentVersion,
+              !notes.summary.isEmpty,
+              (1...ReleaseNotesParser.maximumHighlights).contains(notes.highlights.count)
+        else { return nil }
+        return notes
+    }
+
+    func save(_ notes: ReleaseNotes) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(notes).write(to: fileURL, options: .atomic)
+    }
+
+    func remove(version: String) {
+        guard let data = try? Data(contentsOf: fileURL),
+              let notes = try? JSONDecoder().decode(ReleaseNotes.self, from: data),
+              notes.version == version
+        else { return }
+        try? FileManager.default.removeItem(at: fileURL)
+    }
 }
 
 enum AppUpdatePolicy {
-    static func newerRelease(currentVersion: String, latestTag: String) -> AppRelease? {
+    static func newerRelease(
+        currentVersion: String,
+        latestTag: String,
+        releaseNotes: ReleaseNotes? = nil
+    ) -> AppRelease? {
         guard let current = SemanticVersion(currentVersion),
               let latest = SemanticVersion(latestTag),
               latestTag == "v\(latest)",
               latest > current else {
             return nil
         }
-        return AppRelease(tag: "v\(latest)", version: latest)
+        return AppRelease(tag: "v\(latest)", version: latest, releaseNotes: releaseNotes)
     }
 }
 
@@ -107,10 +208,11 @@ private struct GitHubReleaseResponse: Decodable {
     let tagName: String
     let draft: Bool
     let prerelease: Bool
+    let body: String?
 
     enum CodingKeys: String, CodingKey {
         case tagName = "tag_name"
-        case draft, prerelease
+        case draft, prerelease, body
     }
 }
 
@@ -123,6 +225,7 @@ private struct GitHubReleaseResponse: Decodable {
     typealias Downloader = @Sendable (URLRequest, Int) async throws -> Data
 
     @Published private(set) var availableRelease: AppRelease?
+    @Published private(set) var installedReleaseNotes: ReleaseNotes?
     @Published private(set) var isInstalling = false
     @Published private(set) var installError: String?
 
@@ -135,6 +238,7 @@ private struct GitHubReleaseResponse: Decodable {
     private let installation: Installation?
     private let downloader: Downloader
     private let isWritable: @Sendable (String) -> Bool
+    private let releaseNotesStore: ReleaseNotesStore?
     private var lastCheckedAt: Date?
     private var isChecking = false
     private var installerProcess: Process?
@@ -155,32 +259,45 @@ private struct GitHubReleaseResponse: Decodable {
         self.init(
             installation: installation,
             downloader: { try await Self.download($0, maximumBytes: $1) },
-            isWritable: { FileManager.default.isWritableFile(atPath: $0) }
+            isWritable: { FileManager.default.isWritableFile(atPath: $0) },
+            releaseNotesStore: ReleaseNotesStore(
+                fileURL: UIPaths.ui.appending(path: "pending-release-notes.json")
+            )
         )
     }
 
-    init(
+    convenience init(
         bundleURL: URL,
         currentVersion: String,
         downloader: @escaping Downloader,
-        isWritable: @escaping @Sendable (String) -> Bool = { _ in true }
+        isWritable: @escaping @Sendable (String) -> Bool = { _ in true },
+        releaseNotesURL: URL? = nil
     ) {
-        self.installation = Installation(bundleURL: bundleURL, currentVersion: currentVersion)
-        self.downloader = downloader
-        self.isWritable = isWritable
-        consumeInstallFailure()
+        self.init(
+            installation: Installation(bundleURL: bundleURL, currentVersion: currentVersion),
+            downloader: downloader,
+            isWritable: isWritable,
+            releaseNotesStore: releaseNotesURL.map(ReleaseNotesStore.init(fileURL:))
+        )
     }
 
     private init(
         installation: Installation?,
         downloader: @escaping Downloader,
-        isWritable: @escaping @Sendable (String) -> Bool
+        isWritable: @escaping @Sendable (String) -> Bool,
+        releaseNotesStore: ReleaseNotesStore?
     ) {
         self.installation = installation
         self.downloader = downloader
         self.isWritable = isWritable
+        self.releaseNotesStore = releaseNotesStore
+        self.installedReleaseNotes = installation.flatMap {
+            releaseNotesStore?.load(currentVersion: $0.currentVersion)
+        }
         consumeInstallFailure()
     }
+
+    var currentVersion: String? { installation?.currentVersion }
 
     func checkForUpdates() async {
         guard let installation, !isChecking, !isInstalling else { return }
@@ -202,9 +319,18 @@ private struct GitHubReleaseResponse: Decodable {
             let release = try JSONDecoder().decode(GitHubReleaseResponse.self, from: data)
             lastCheckedAt = Date()
             guard !release.draft, !release.prerelease else { return }
+            let latestVersion = SemanticVersion(release.tagName)
+            let releaseNotes = latestVersion.flatMap {
+                ReleaseNotesParser.parse(body: release.body, version: $0)
+            }
+            if latestVersion == SemanticVersion(installation.currentVersion),
+               let releaseNotes {
+                installedReleaseNotes = releaseNotes
+            }
             availableRelease = AppUpdatePolicy.newerRelease(
                 currentVersion: installation.currentVersion,
-                latestTag: release.tagName
+                latestTag: release.tagName,
+                releaseNotes: releaseNotes
             )
         } catch {
             // Update checks are opportunistic. A network or GitHub failure should
@@ -244,6 +370,9 @@ private struct GitHubReleaseResponse: Decodable {
             )
             let (installerData, checksumData) = try await (installer, checksums)
             try UpdateIntegrity.verifyInstaller(installerData, checksums: checksumData)
+            if let releaseNotes = release.releaseNotes {
+                try? releaseNotesStore?.save(releaseNotes)
+            }
 
             let directory = FileManager.default.temporaryDirectory
                 .appending(path: "usagetracker-update-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -262,6 +391,7 @@ private struct GitHubReleaseResponse: Decodable {
                 appDirectory: appDirectory
             )
         } catch {
+            releaseNotesStore?.remove(version: release.version.description)
             isInstalling = false
             installError = "Update failed: \(error.localizedDescription)"
         }
@@ -339,6 +469,7 @@ private struct GitHubReleaseResponse: Decodable {
                     self.availableRelease = nil
                     self.installError = nil
                 } else {
+                    self.releaseNotesStore?.remove(version: release.version.description)
                     self.removeInstallFailure()
                     self.installError = Self.installFailureMessage
                 }
@@ -351,6 +482,13 @@ private struct GitHubReleaseResponse: Decodable {
             throw error
         }
         installerProcess = process
+    }
+
+    func dismissInstalledReleaseNotes(version: String) {
+        if installedReleaseNotes?.version == version {
+            installedReleaseNotes = nil
+        }
+        releaseNotesStore?.remove(version: version)
     }
 
     private var installFailureURL: URL? {

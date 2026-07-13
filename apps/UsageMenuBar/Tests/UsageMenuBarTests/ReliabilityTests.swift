@@ -24,7 +24,7 @@ final class AppUpdaterTests: XCTestCase {
             ))
             if path == "latest" {
                 if metadataFailure { throw URLError(.notConnectedToInternet) }
-                return Data(#"{"tag_name":"v0.2.0","draft":false,"prerelease":false}"#.utf8)
+                return Data(#"{"tag_name":"v0.2.0","draft":false,"prerelease":false,"body":"UsageTracker 0.2.0 is faster and clearer.\n\n## Highlights\n\n- Refreshes finish faster.\n- Errors are easier to understand.\n\n## Installation\n\nNot shown in the app."}"#.utf8)
             }
             if path == "install.sh" {
                 return Data("#!/bin/bash\nexit \(installerExitStatus)\n".utf8)
@@ -67,6 +67,38 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertNil(AppUpdatePolicy.newerRelease(currentVersion: "0.2.0", latestTag: "nightly"))
     }
 
+    func testReleaseNotesUseOnlyTheSummaryAndFirstSixHighlights() throws {
+        let body = """
+            UsageTracker 0.2.0 improves everyday refreshes.
+
+            ## Highlights
+
+            - First
+            - Second
+            - Third
+            - Fourth
+            - Fifth
+            - Sixth
+            - Seventh
+
+            ## Installation
+
+            - This is not an in-app highlight.
+            """
+
+        let notes = try XCTUnwrap(ReleaseNotesParser.parse(
+            body: body,
+            version: try XCTUnwrap(SemanticVersion("0.2.0"))
+        ))
+
+        XCTAssertEqual(notes.summary, "UsageTracker 0.2.0 improves everyday refreshes.")
+        XCTAssertEqual(notes.highlights, ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"])
+        XCTAssertNil(ReleaseNotesParser.parse(
+            body: "A summary without the required section.",
+            version: try XCTUnwrap(SemanticVersion("0.2.0"))
+        ))
+    }
+
     func testInstallerMustMatchPublishedChecksum() throws {
         let installer = Data("trusted installer".utf8)
         let digest = SHA256.hash(data: installer)
@@ -98,6 +130,36 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(requests[0].timeout, 10)
         XCTAssertEqual(requests[0].userAgent, "UsageTracker/0.1.0")
         XCTAssertEqual(updater.availableRelease?.tag, "v0.2.0")
+        XCTAssertEqual(updater.availableRelease?.releaseNotes?.highlights.count, 2)
+    }
+
+    @MainActor func testCurrentReleaseNotesAppearAndCanBeDismissed() async throws {
+        let stub = DownloadStub()
+        let bundleURL = try temporaryBundleURL()
+        let directory = bundleURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let notesURL = directory.appending(path: "pending-release-notes.json")
+        let notes = ReleaseNotes(
+            version: "0.2.0",
+            summary: "UsageTracker 0.2.0 is faster and clearer.",
+            highlights: ["Refreshes finish faster."]
+        )
+        try ReleaseNotesStore(fileURL: notesURL).save(notes)
+        let updater = AppUpdater(
+            bundleURL: bundleURL,
+            currentVersion: "0.2.0",
+            downloader: { try await stub.download($0, maximumBytes: $1) },
+            releaseNotesURL: notesURL
+        )
+
+        XCTAssertEqual(updater.installedReleaseNotes, notes)
+        updater.dismissInstalledReleaseNotes(version: "0.2.0")
+        XCTAssertNil(updater.installedReleaseNotes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: notesURL.path))
+
+        await updater.checkForUpdates()
+        XCTAssertEqual(updater.installedReleaseNotes?.highlights.count, 2)
+        XCTAssertNil(updater.availableRelease)
     }
 
     @MainActor func testFailedChecksCanRetryImmediately() async throws {
@@ -123,11 +185,14 @@ final class AppUpdaterTests: XCTestCase {
         await stub.setInstallerExitStatus(1)
         let temporaryDirectories = updaterTemporaryDirectories()
         let bundleURL = try temporaryBundleURL()
-        defer { try? FileManager.default.removeItem(at: bundleURL.deletingLastPathComponent()) }
+        let directory = bundleURL.deletingLastPathComponent()
+        let notesURL = directory.appending(path: "pending-release-notes.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
         let updater = AppUpdater(
             bundleURL: bundleURL,
             currentVersion: "0.1.0",
-            downloader: { try await stub.download($0, maximumBytes: $1) }
+            downloader: { try await stub.download($0, maximumBytes: $1) },
+            releaseNotesURL: notesURL
         )
         await updater.checkForUpdates()
 
@@ -136,6 +201,7 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertFalse(updater.isInstalling)
         XCTAssertNotNil(updater.availableRelease)
         XCTAssertNotNil(updater.installError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: notesURL.path))
 
         await stub.setInstallerExitStatus(0)
         await updater.installAvailableUpdate()
@@ -143,6 +209,10 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertFalse(updater.isInstalling)
         XCTAssertNil(updater.availableRelease)
         XCTAssertNil(updater.installError)
+        XCTAssertEqual(
+            ReleaseNotesStore(fileURL: notesURL).load(currentVersion: "0.2.0")?.highlights.count,
+            2
+        )
         XCTAssertEqual(updaterTemporaryDirectories(), temporaryDirectories)
     }
 
@@ -555,6 +625,7 @@ final class MenuBarPresentationTests: XCTestCase {
 
         let decoded = try JSONDecoder().decode(UIConfig.self, from: Data("{}".utf8))
         XCTAssertTrue(decoded.darkModeEnabled)
+        XCTAssertNil(decoded.lastSeenReleaseNotesVersion)
     }
 
     func testProviderCountControlsBothTooltipAndIconRows() {

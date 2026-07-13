@@ -35,6 +35,24 @@ Only stable `vMAJOR.MINOR.PATCH` tags are accepted. The GitHub Release receives 
 - `install.sh` and `uninstall.sh`
 - `SHA256SUMS`
 
+### In-app release-note format
+
+The menu bar app shows release highlights once, after an update relaunches the new version. It reads the same Markdown body that GitHub publishes, so do not maintain a separate in-app changelog.
+
+For each new release, start the body with one short summary paragraph, followed by an exact `## Highlights` heading and one to six single-line bullets:
+
+```markdown
+UsageTracker 0.2.0 makes provider refreshes faster and easier to understand.
+
+## Highlights
+
+- Refresh individual providers without waiting on unrelated accounts.
+- See clearer recovery guidance when credentials expire.
+- Keep menu bar status current after your Mac wakes.
+```
+
+The app ignores later sections such as installation instructions and downloads. It caps display text and shows at most the first six highlight bullets, so put the most useful user-visible changes first. A missing summary, heading, or bullet makes the in-app card unavailable but never blocks installation.
+
 ## Test packaging locally
 
 Build an ad-hoc-signed artifact without release credentials:

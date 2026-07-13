@@ -17,6 +17,13 @@ struct Summary: View {
             }
             ScrollView {
                 LazyVStack(spacing: Theme.Spacing.xs + 2) {
+                    if let notes = updater.installedReleaseNotes,
+                       state.showsReleaseNotes(notes) {
+                        ReleaseNotesCard(notes: notes) {
+                            state.dismissReleaseNotes(notes)
+                        }
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                     if state.providers.isEmpty {
                         EmptyState(
                             text: state.daemon == .offline ? "Daemon unavailable" : "No providers enabled",
@@ -43,6 +50,7 @@ struct Summary: View {
                 }
                 .padding(.bottom, Theme.Spacing.sm)
                 .animation(.spring(duration: 0.35), value: state.providers.map(\.id))
+                .animation(.spring(duration: 0.3), value: updater.installedReleaseNotes?.version)
             }
         }
         .padding(Theme.Spacing.lg)
