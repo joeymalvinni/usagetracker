@@ -34,6 +34,7 @@ Everything stays on your machine. There's no account to create and no server to 
 
 <p align="center">
   <img src="docs/assets/MacOS_UI.png" alt="UsageTracker macOS menu bar interface" height="520" />
+  <span>&nbsp;&nbsp;</span>
   <img src="docs/assets/CLI_output.png" alt="UsageTracker CLI usage dashboard" height="520" />
 </p>
 
