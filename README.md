@@ -91,10 +91,10 @@ The daemon sets up its config, database, and socket on its own.
 
 ## Providers
 
-[Codex](docs/codex.md): The Codex app-server, falling back to ChatGPT usage and local estimates.
-[Claude](docs/claude.md): Anthropic's usage API.
-[OpenCode Go](docs/opencode.md): The OpenCode web console.
-[Grok](docs/grok.md):  Grok's billing service, falling back to grok.com.
+- [Codex](docs/codex.md): The Codex app-server, falling back to ChatGPT usage and local estimates.
+- [Claude](docs/claude.md): Anthropic's usage API.
+- [OpenCode Go](docs/opencode.md): The OpenCode web console.
+- [Grok](docs/grok.md): Grok's billing service, falling back to grok.com.
 
 UsageTracker uses the credentials you've already set up — Keychain items, config files, or a browser session — so you rarely have to do anything special. Each provider works a little differently; refer to each linked doc for the specifics per provider.
 
