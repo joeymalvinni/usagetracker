@@ -2032,6 +2032,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "keyring",
+ "libc",
  "notify",
  "pbkdf2",
  "regex",

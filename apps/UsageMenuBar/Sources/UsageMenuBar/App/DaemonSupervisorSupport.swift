@@ -67,6 +67,7 @@ protocol DaemonProcessHandle: AnyObject, Sendable {
     var processIdentifier: pid_t { get }
     var isRunning: Bool { get }
     func terminate()
+    func forceTerminate()
 }
 
 protocol DaemonProcessLaunching: Sendable {
@@ -138,6 +139,17 @@ private final class FoundationDaemonProcessHandle: DaemonProcessHandle, @uncheck
         let shouldTerminate = process.isRunning
         lock.unlock()
         if shouldTerminate { process.terminate() }
+    }
+
+    func forceTerminate() {
+        lock.lock()
+        let pid = process.processIdentifier
+        let shouldTerminate = process.isRunning
+        lock.unlock()
+        if shouldTerminate {
+            Darwin.kill(pid, SIGKILL)
+            process.waitUntilExit()
+        }
     }
 
     func closeOutput() {

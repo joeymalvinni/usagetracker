@@ -1,10 +1,11 @@
 //! OpenCode-specific manual/cache policy layered on shared browser import.
 
-use keyring::Entry;
-
-use crate::providers::{
-    browser_cookies::{self, ImportedCookieSession},
-    ProviderError,
+use crate::{
+    keychain,
+    providers::{
+        browser_cookies::{self, ImportedCookieSession},
+        ProviderError,
+    },
 };
 
 use super::{COOKIE_CACHE_SERVICE, COOKIE_NAMES, OPENCODE_GO_PROVIDER_ID};
@@ -22,23 +23,17 @@ pub(super) fn read_cookie_file(provider_id: &str) -> Option<String> {
 }
 
 pub(super) fn load_cached_cookie_header(provider_id: &str) -> Option<String> {
-    Entry::new(COOKIE_CACHE_SERVICE, provider_id)
-        .ok()?
-        .get_password()
+    keychain::get_password(COOKIE_CACHE_SERVICE, provider_id)
         .ok()
         .and_then(|value| normalize_cookie_header(&value))
 }
 
 pub(super) fn store_cached_cookie_header(provider_id: &str, cookie_header: &str) {
-    if let Ok(entry) = Entry::new(COOKIE_CACHE_SERVICE, provider_id) {
-        let _ = entry.set_password(cookie_header);
-    }
+    let _ = keychain::set_password_if_changed(COOKIE_CACHE_SERVICE, provider_id, cookie_header);
 }
 
 pub(super) fn clear_cached_cookie_header(provider_id: &str) {
-    if let Ok(entry) = Entry::new(COOKIE_CACHE_SERVICE, provider_id) {
-        let _ = entry.delete_credential();
-    }
+    let _ = keychain::delete_password(COOKIE_CACHE_SERVICE, provider_id);
 }
 
 pub(crate) async fn clear_cached_cookie_cache() -> anyhow::Result<()> {

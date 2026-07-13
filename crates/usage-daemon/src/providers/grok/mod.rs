@@ -133,7 +133,7 @@ impl GrokCollector {
         billing::from_rpc(&value)
     }
 
-    fn initial_cookie_candidates(&self) -> Vec<CookieCandidate> {
+    async fn initial_cookie_candidates(&self) -> Vec<CookieCandidate> {
         if let Some(manual) = cookies::manual_candidate(&self.config) {
             return vec![manual];
         }
@@ -151,7 +151,7 @@ impl GrokCollector {
         if !discovered.is_empty() {
             return discovered;
         }
-        cookies::cached_candidate().into_iter().collect()
+        cookies::cached_candidate().await.into_iter().collect()
     }
 
     async fn import_browser_candidates(&self) -> Result<Vec<CookieCandidate>, ProviderError> {
@@ -189,7 +189,7 @@ impl GrokCollector {
                 .await
                 .map(|data| (data, "grok_profile_auth_token".to_string()));
         }
-        let mut candidates = self.initial_cookie_candidates();
+        let mut candidates = self.initial_cookie_candidates().await;
         if candidates.is_empty() && cookies::manual_is_configured(&self.config) {
             return Err(ProviderError::new(
                 ProviderErrorKind::CredentialsInvalid,
@@ -210,7 +210,7 @@ impl GrokCollector {
                 match web::fetch(&self.client, auth, Some(&candidate.header)).await {
                     Ok(data) => {
                         if candidate.browser_imported {
-                            cookies::store(candidate);
+                            cookies::store(candidate).await;
                         }
                         return Ok((data, candidate.source.clone()));
                     }
@@ -235,12 +235,12 @@ impl GrokCollector {
                 .iter()
                 .any(|candidate| candidate.source == "keychain_cache")
         {
-            cookies::clear_cache();
+            cookies::clear_cache().await;
             for candidate in self.import_browser_candidates().await.unwrap_or_default() {
                 for auth in web_auth_attempts(bearer) {
                     match web::fetch(&self.client, auth, Some(&candidate.header)).await {
                         Ok(data) => {
-                            cookies::store(&candidate);
+                            cookies::store(&candidate).await;
                             return Ok((data, candidate.source));
                         }
                         Err(err) if err.kind() == ProviderErrorKind::RateLimited => {
@@ -340,7 +340,7 @@ impl ProviderCollector for GrokCollector {
             if !already_discovered {
                 let configured_auth = self.source_mode.uses_web()
                     && (cookies::manual_candidate(&self.config).is_some()
-                        || cookies::cached_candidate().is_some());
+                        || cookies::cached_candidate().await.is_some());
                 let api_key_auth = self.source_mode.uses_cli()
                     && std::env::var_os("XAI_API_KEY").is_some()
                     && rpc::find_grok_binary().is_some();
@@ -504,7 +504,7 @@ fn should_fallback_after_cli(error: &ProviderError) -> bool {
 }
 
 pub(crate) async fn clear_cached_cookie_cache() -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(cookies::clear_cache).await?;
+    cookies::clear_cache().await;
     Ok(())
 }
 

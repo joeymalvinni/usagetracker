@@ -1,9 +1,8 @@
 //! Grok cookie-source policy built on the provider-neutral browser importer.
 
-use keyring::Entry;
-
 use crate::{
     config::ProviderConfig,
+    keychain,
     providers::{browser_cookies, ProviderError},
 };
 
@@ -48,11 +47,12 @@ fn manual_raw(config: &ProviderConfig) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-pub(super) fn cached_candidate() -> Option<CookieCandidate> {
-    let raw = Entry::new(CACHE_SERVICE, super::PROVIDER_ID)
-        .ok()?
-        .get_password()
-        .ok()?;
+pub(super) async fn cached_candidate() -> Option<CookieCandidate> {
+    let raw = tokio::task::spawn_blocking(|| {
+        keychain::get_password(CACHE_SERVICE, super::PROVIDER_ID).ok()
+    })
+    .await
+    .ok()??;
     normalize(&raw).map(|header| CookieCandidate {
         header,
         source: "keychain_cache".to_string(),
@@ -86,16 +86,19 @@ pub(super) fn import_browser_candidates() -> Result<Vec<CookieCandidate>, Provid
     })
 }
 
-pub(super) fn store(candidate: &CookieCandidate) {
-    if let Ok(entry) = Entry::new(CACHE_SERVICE, super::PROVIDER_ID) {
-        let _ = entry.set_password(&candidate.header);
-    }
+pub(super) async fn store(candidate: &CookieCandidate) {
+    let header = candidate.header.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        keychain::set_password_if_changed(CACHE_SERVICE, super::PROVIDER_ID, &header)
+    })
+    .await;
 }
 
-pub(super) fn clear_cache() {
-    if let Ok(entry) = Entry::new(CACHE_SERVICE, super::PROVIDER_ID) {
-        let _ = entry.delete_credential();
-    }
+pub(super) async fn clear_cache() {
+    let _ = tokio::task::spawn_blocking(|| {
+        keychain::delete_password(CACHE_SERVICE, super::PROVIDER_ID)
+    })
+    .await;
 }
 
 fn normalize(raw: &str) -> Option<String> {

@@ -4,6 +4,7 @@ mod dashboard;
 mod fixtures;
 mod forecast;
 mod health;
+mod keychain;
 mod local_logs;
 mod notifications;
 mod polling;
@@ -36,11 +37,17 @@ struct Args {
     /// Run against a reset, synthetic development database.
     #[arg(long, env = "USAGE_TRACKER_FIXTURE", value_enum)]
     fixture: Option<fixtures::FixtureScenario>,
+    /// Internal one-operation Keychain subprocess.
+    #[arg(long, hide = true)]
+    keychain_helper: bool,
 }
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.keychain_helper {
+        return keychain::run_helper();
+    }
     init_tracing(&args.log_level)?;
 
     let (config_path, db_path, socket_path) = fixture_path_overrides(&args)?;

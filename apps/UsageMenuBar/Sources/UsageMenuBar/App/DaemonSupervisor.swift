@@ -146,30 +146,22 @@ actor DaemonSupervisor {
         startupTask?.cancel()
         if let startupTask { _ = await startupTask.value }
 
-        if let ownedProcess, ownedProcess.isRunning {
-            ownedProcess.terminate()
+        let runningOwnedProcess = ownedProcess?.isRunning == true ? ownedProcess : nil
+        let pids: [pid_t]
+        if runningOwnedProcess != nil {
+            pids = []
         } else {
-            let pids = await Task.detached(priority: .utility) {
+            pids = await Task.detached(priority: .utility) {
                 Self.daemonPIDs(listeningOn: socketPath)
             }.value
-            for pid in pids { Darwin.kill(pid, SIGTERM) }
         }
-
-        for check in 0..<policy.shutdownChecks {
-            let connected = await transport.canConnect(
-                path: socketPath,
-                timeout: policy.shutdownProbeTimeout
-            )
-            if !connected { break }
-            guard check + 1 < policy.shutdownChecks else {
-                enterBackoff()
-                return false
-            }
-            do {
-                try await sleep(policy.shutdownPollInterval)
-            } catch {
-                return false
-            }
+        guard await stopDaemons(
+            ownedProcess: runningOwnedProcess,
+            pids: pids,
+            socketPath: socketPath
+        ) else {
+            enterBackoff()
+            return false
         }
 
         return await beginStartup(socketPath: socketPath)
@@ -223,7 +215,11 @@ actor DaemonSupervisor {
                 )
 
                 guard isCurrent(startupGeneration), !Task.isCancelled else {
-                    process.terminate()
+                    _ = await stopDaemons(
+                        ownedProcess: process,
+                        pids: [],
+                        socketPath: socketPath
+                    )
                     return false
                 }
                 if await waitUntilReady(
@@ -232,7 +228,11 @@ actor DaemonSupervisor {
                     generation: startupGeneration
                 ) {
                     guard isCurrent(startupGeneration), !Task.isCancelled else {
-                        process.terminate()
+                        _ = await stopDaemons(
+                            ownedProcess: process,
+                            pids: [],
+                            socketPath: socketPath
+                        )
                         return false
                     }
                     state = .running(RunningDaemon(
@@ -244,7 +244,11 @@ actor DaemonSupervisor {
                     startStabilityMonitoring(generation: startupGeneration)
                     return true
                 }
-                process.terminate()
+                _ = await stopDaemons(
+                    ownedProcess: process,
+                    pids: [],
+                    socketPath: socketPath
+                )
             } catch {
                 // A later bounded attempt may recover from a transient launch or log error.
             }
@@ -259,6 +263,69 @@ actor DaemonSupervisor {
 
         guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
         enterBackoff()
+        return false
+    }
+
+    private func stopDaemons(
+        ownedProcess: (any DaemonProcessHandle)?,
+        pids: [pid_t],
+        socketPath: String
+    ) async -> Bool {
+        if let ownedProcess {
+            ownedProcess.terminate()
+        } else {
+            for pid in pids { Darwin.kill(pid, SIGTERM) }
+        }
+        if await waitUntilStopped(
+            ownedProcess: ownedProcess,
+            pids: pids,
+            socketPath: socketPath
+        ) {
+            return true
+        }
+
+        if let ownedProcess {
+            ownedProcess.forceTerminate()
+        } else {
+            await Task.detached(priority: .utility) {
+                for pid in pids where Self.isUsageDaemon(pid) {
+                    Darwin.kill(pid, SIGKILL)
+                }
+            }.value
+        }
+        return await waitUntilStopped(
+            ownedProcess: ownedProcess,
+            pids: pids,
+            socketPath: socketPath
+        )
+    }
+
+    private func waitUntilStopped(
+        ownedProcess: (any DaemonProcessHandle)?,
+        pids: [pid_t],
+        socketPath: String
+    ) async -> Bool {
+        for check in 0..<policy.shutdownChecks {
+            let connected = await transport.canConnect(
+                path: socketPath,
+                timeout: policy.shutdownProbeTimeout
+            )
+            let processRunning: Bool
+            if let ownedProcess {
+                processRunning = ownedProcess.isRunning
+            } else {
+                processRunning = await Task.detached(priority: .utility) {
+                    pids.contains(where: Self.isUsageDaemon)
+                }.value
+            }
+            if !connected && !processRunning { return true }
+            guard check + 1 < policy.shutdownChecks else { return false }
+            do {
+                try await sleep(policy.shutdownPollInterval)
+            } catch {
+                return false
+            }
+        }
         return false
     }
 

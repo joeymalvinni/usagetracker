@@ -29,6 +29,7 @@ See [Apple's official app-opening safety guide](https://support.apple.com/102445
 | Socket missing | Start the app or run `cargo run -p usage-daemon`. Make sure the CLI and daemon share the same `USAGE_TRACKER_HOME` or socket override. |
 | Connection refused | The file may be stale after a crash. Starting the daemon clears stale socket files automatically — though it won't remove a path that isn't a socket. |
 | Another daemon is running | Startup won't take over a socket that's still accepting connections. Stop the existing app/daemon, or use a different socket. |
+| Restart never finishes | The app waits for both the socket and old daemon process to stop. After the bounded graceful shutdown period it sends `SIGKILL`, confirms the process exited, and only then launches a replacement. |
 | Incompatible protocol | Rebuild and upgrade the CLI, app, and daemon together. Only protocol v3 is accepted. |
 | Socket path too long | Use a short absolute override like `/tmp/usage-$UID.sock` — macOS caps Unix socket paths via `sockaddr_un`. |
 | Permission denied | The default directory should be `0700` and socket/config `0600`. Check ownership before changing modes, and don't make the socket world-readable. |
@@ -45,6 +46,8 @@ See [Apple's official app-opening safety guide](https://support.apple.com/102445
 | `disabled` | Enable the provider or account if you want collection to resume. |
 
 Each provider's sources and fallbacks are spelled out on its own page: [Codex](codex.md), [Claude](claude.md), [OpenCode Go](opencode.md), and [Grok](grok.md).
+
+Keychain work is serialized across providers and daemon instances. If a Keychain call hangs, its isolated helper is killed after 20 seconds; later refreshes can continue without leaving an unkillable Keychain thread inside the daemon. Repeated failures after that usually mean macOS denied Keychain access or the source item is unavailable, so repair the provider login and check `usage-daemon.log`.
 
 ## Configuration problems
 

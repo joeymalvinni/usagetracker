@@ -6,11 +6,13 @@ use std::{
 };
 
 use chrono::Utc;
-use keyring::{Entry, Error as KeyringError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::providers::{ProviderError, ProviderErrorKind};
+use crate::{
+    keychain::{self, Error as KeychainError},
+    providers::{ProviderError, ProviderErrorKind},
+};
 
 pub(super) const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
@@ -124,22 +126,18 @@ fn load_keychain_credentials(
     keychain_service: &str,
     keychain_account: &str,
 ) -> Result<ClaudeCredentials, ProviderError> {
-    let entry = Entry::new(keychain_service, keychain_account).map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::CredentialsInvalid,
-            "failed to create Claude Keychain entry",
-        )
-    })?;
-
-    let password = entry.get_password().map_err(|err| match err {
-        KeyringError::NoEntry => ProviderError::new(
-            ProviderErrorKind::CredentialsMissing,
-            "Claude Code credentials are missing from macOS Keychain",
-        ),
-        _ => ProviderError::new(
-            ProviderErrorKind::CredentialsInvalid,
-            "failed to read Claude Code credentials from macOS Keychain",
-        ),
+    let password = keychain::get_password(keychain_service, keychain_account).map_err(|err| {
+        if err == KeychainError::Missing {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsMissing,
+                "Claude Code credentials are missing from macOS Keychain",
+            )
+        } else {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "failed to read Claude Code credentials from macOS Keychain",
+            )
+        }
     })?;
 
     parse_credentials(
@@ -155,13 +153,7 @@ fn save_keychain_credentials(
     keychain_account: &str,
     contents: &str,
 ) -> Result<(), ProviderError> {
-    let entry = Entry::new(keychain_service, keychain_account).map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::CredentialsInvalid,
-            "failed to create Claude Keychain entry",
-        )
-    })?;
-    entry.set_password(contents).map_err(|_| {
+    keychain::set_password(keychain_service, keychain_account, contents).map_err(|_| {
         ProviderError::new(
             ProviderErrorKind::CredentialsInvalid,
             "failed to save Claude Code credentials to macOS Keychain",

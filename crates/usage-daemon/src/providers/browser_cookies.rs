@@ -12,11 +12,12 @@ use std::{
 
 use aes::Aes128;
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-use keyring::Entry;
 use pbkdf2::pbkdf2_hmac;
 use rusqlite::Connection;
 use sha1::Sha1;
 use uuid::Uuid;
+
+use crate::keychain;
 
 use super::{ProviderError, ProviderErrorKind};
 
@@ -501,10 +502,8 @@ fn chromium_decryption_key(browser: BrowserCookieStore) -> Option<ChromiumKey> {
 
     // Keep this lock while reading Keychain so concurrent provider imports cannot
     // trigger duplicate authorization prompts for the same browser credential.
-    let password = Entry::new(browser.keychain_service, browser.keychain_account)
-        .ok()?
-        .get_password()
-        .ok()?;
+    let password =
+        keychain::get_password(browser.keychain_service, browser.keychain_account).ok()?;
     let mut key = [0_u8; 16];
     pbkdf2_hmac::<Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
     cache.insert(cache_key, key);

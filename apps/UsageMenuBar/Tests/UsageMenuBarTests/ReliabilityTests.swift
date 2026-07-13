@@ -501,6 +501,25 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertEqual(status, .running)
     }
 
+    func testRestartForceTerminatesAStuckDaemonBeforeRelaunching() async throws {
+        let transport = LockedTransport()
+        let launcher = FakeProcessLauncher(ignoresTermination: { $0 == 0 }) {
+            transport.setConnected(true)
+        }
+        let supervisor = makeSupervisor(transport: transport, launcher: launcher)
+        let initiallyRunning = await supervisor.ensureRunning(socketPath: "/tmp/usage-test.sock")
+        XCTAssertTrue(initiallyRunning)
+
+        let stuckProcess = try XCTUnwrap(launcher.latestProcess)
+        transport.setConnected(false)
+        let restarted = await supervisor.restart(socketPath: "/tmp/usage-test.sock")
+        XCTAssertTrue(restarted)
+
+        XCTAssertEqual(stuckProcess.forceTerminationCount, 1)
+        XCTAssertFalse(stuckProcess.isRunning)
+        XCTAssertEqual(launcher.launchCount, 2)
+    }
+
     func testTerminationTransitionsThroughBackoffAndRelaunches() async throws {
         let transport = LockedTransport()
         let launcher = FakeProcessLauncher { transport.setConnected(true) }
@@ -558,6 +577,9 @@ final class DaemonSupervisorTests: XCTestCase {
         policy.readinessChecks = 5
         policy.readinessProbeTimeout = 0.01
         policy.readinessPollInterval = 0.01
+        policy.shutdownChecks = 3
+        policy.shutdownProbeTimeout = 0.01
+        policy.shutdownPollInterval = 0.01
         policy.initialBackoff = 0.01
         policy.maximumBackoff = 0.02
         policy.maximumAutomaticRestarts = maximumAutomaticRestarts
@@ -800,10 +822,17 @@ private final class FakeProcess: DaemonProcessHandle, @unchecked Sendable {
     let processIdentifier: pid_t
     private let lock = NSLock()
     private var running = true
+    private var forcedTerminations = 0
+    private let ignoresTermination: Bool
     private let terminationHandler: @Sendable (pid_t) -> Void
 
-    init(processIdentifier: pid_t, terminationHandler: @escaping @Sendable (pid_t) -> Void) {
+    init(
+        processIdentifier: pid_t,
+        ignoresTermination: Bool,
+        terminationHandler: @escaping @Sendable (pid_t) -> Void
+    ) {
         self.processIdentifier = processIdentifier
+        self.ignoresTermination = ignoresTermination
         self.terminationHandler = terminationHandler
     }
 
@@ -813,7 +842,22 @@ private final class FakeProcess: DaemonProcessHandle, @unchecked Sendable {
         return running
     }
 
-    func terminate() { crash() }
+    var forceTerminationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return forcedTerminations
+    }
+
+    func terminate() {
+        if !ignoresTermination { crash() }
+    }
+
+    func forceTerminate() {
+        lock.lock()
+        forcedTerminations += 1
+        lock.unlock()
+        crash()
+    }
 
     func crash() {
         lock.lock()
@@ -830,9 +874,14 @@ private final class FakeProcess: DaemonProcessHandle, @unchecked Sendable {
 private final class FakeProcessLauncher: DaemonProcessLaunching, @unchecked Sendable {
     private let lock = NSLock()
     private var processes = [FakeProcess]()
+    private let ignoresTermination: @Sendable (Int) -> Bool
     private let onLaunch: @Sendable () -> Void
 
-    init(onLaunch: @escaping @Sendable () -> Void) {
+    init(
+        ignoresTermination: @escaping @Sendable (Int) -> Bool = { _ in false },
+        onLaunch: @escaping @Sendable () -> Void
+    ) {
+        self.ignoresTermination = ignoresTermination
         self.onLaunch = onLaunch
     }
 
@@ -857,6 +906,7 @@ private final class FakeProcessLauncher: DaemonProcessLaunching, @unchecked Send
         lock.lock()
         let process = FakeProcess(
             processIdentifier: pid_t(1_000 + processes.count),
+            ignoresTermination: ignoresTermination(processes.count),
             terminationHandler: terminationHandler
         )
         processes.append(process)

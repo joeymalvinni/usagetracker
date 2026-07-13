@@ -19,6 +19,12 @@ Credentials only ever go to their fixed provider endpoint or provider CLI. On se
 
 A manual `cookie_header` is a secret, stored as plaintext in the owner-only config file. Environment variables can also be read by other processes running as you. When you have the choice, prefer provider login and Keychain-backed sources.
 
+### Keychain isolation
+
+Every Keychain read, write, and delete — including provider credentials, cached cookie headers, and browser Safe Storage keys — goes through a one-operation helper process. A cross-process lock at `~/.usagetracker/keychain.lock` lets only one UsageTracker helper enter Keychain at a time, even if multiple daemons or providers refresh concurrently. OpenCode Go's cache update reads and conditionally writes under that same lock, so concurrent refreshes don't issue duplicate writes.
+
+Requests and responses travel through private pipes; secrets are never placed in process arguments. The daemon gives each helper 20 seconds, then kills and reaps it if macOS Keychain hangs. A helper also exits if its owning daemon disappears, and the lock is released automatically when the helper exits.
+
 ## Diagnostics and permissions
 
 Normalized snapshots can carry sanitized diagnostics — source names, counts, timestamps, model names, plan metadata, and bounded fingerprints. These come back over the socket by default; they aren't a separate, more-privileged surface.
