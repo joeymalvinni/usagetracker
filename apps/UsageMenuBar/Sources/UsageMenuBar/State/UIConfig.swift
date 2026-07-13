@@ -17,10 +17,10 @@ enum UIPaths {
     static let config = ui.appending(path: "config.json")
 }
 
-struct UIConfig: Codable, Equatable {
+struct UIConfig: Codable, Equatable, Sendable {
     static let menuProviderCountRange = 1...2
 
-    enum MenuMetric: String, Codable, CaseIterable {
+    enum MenuMetric: String, Codable, CaseIterable, Sendable {
         case remaining, used
         var label: String { self == .remaining ? "% left" : "% used" }
     }

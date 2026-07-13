@@ -1,5 +1,5 @@
 import Foundation
-import UserNotifications
+@preconcurrency import UserNotifications
 
 struct NotificationDeliveryResult: Sendable {
     let deliveredIDs: [Int64]

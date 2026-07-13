@@ -83,7 +83,7 @@ extension ProviderHealthStatus {
     }
 }
 
-struct ProviderVM: Identifiable, Equatable {
+struct ProviderVM: Identifiable, Equatable, Sendable {
     let id, providerId: String
     let accountId: String?
     let name, short, symbol, primary, detail: String
@@ -110,7 +110,7 @@ struct ProviderVM: Identifiable, Equatable {
     var accountEmail: String? = nil
 }
 
-struct MenuBarProviderVM: Identifiable, Equatable {
+struct MenuBarProviderVM: Identifiable, Equatable, Sendable {
     let id: String
     let providerId: String
     let short: String
@@ -118,7 +118,7 @@ struct MenuBarProviderVM: Identifiable, Equatable {
     let status: DisplayStatus
 }
 
-struct WindowVM: Identifiable, Equatable {
+struct WindowVM: Identifiable, Equatable, Sendable {
     let id, label, value, reset: String
     let providerId, providerName: String
     let absolute: String?
@@ -130,13 +130,13 @@ struct WindowVM: Identifiable, Equatable {
     var forecast: WindowForecastVM? = nil
 }
 
-struct WindowForecastVM: Equatable {
+struct WindowForecastVM: Equatable, Sendable {
     let summary: String
     let detail: String
     let projectedPercentRemaining: Double?
 }
 
-struct ResetCreditVM: Identifiable, Equatable {
+struct ResetCreditVM: Identifiable, Equatable, Sendable {
     let id: String
     let title: String
     let status: String
@@ -144,7 +144,7 @@ struct ResetCreditVM: Identifiable, Equatable {
     let expiresText: String
 }
 
-struct CostDashboardVM: Equatable {
+struct CostDashboardVM: Equatable, Sendable {
     static let empty = CostDashboardVM(days: [], providers: [])
     let days: [CostDayVM]
     let providers: [CostProviderVM]
@@ -156,9 +156,9 @@ struct CostDashboardVM: Equatable {
     var tokens30d: UInt64 { days.reduce(0) { $0.saturatingAdd($1.totalTokens) } }
 }
 
-struct CostProviderVM: Identifiable, Equatable { let id, name, symbol: String }
+struct CostProviderVM: Identifiable, Equatable, Sendable { let id, name, symbol: String }
 
-struct CostDayVM: Identifiable, Equatable {
+struct CostDayVM: Identifiable, Equatable, Sendable {
     let id: String
     let date: Date
     let providers: [CostProviderDayVM]
@@ -167,7 +167,7 @@ struct CostDayVM: Identifiable, Equatable {
     var totalTokens: UInt64 { providers.reduce(0) { $0.saturatingAdd($1.tokens) } }
 }
 
-struct CostProviderDayVM: Identifiable, Equatable {
+struct CostProviderDayVM: Identifiable, Equatable, Sendable {
     var id: String { providerId }
     let providerId, providerName, symbol: String
     let date: Date

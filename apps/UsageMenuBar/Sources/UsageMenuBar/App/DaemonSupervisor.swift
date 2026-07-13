@@ -213,7 +213,7 @@ actor DaemonSupervisor {
                     arguments: arguments,
                     logURL: logURL,
                     terminationHandler: { [weak self] pid in
-                        Task {
+                        Task { [weak self] in
                             await self?.daemonTerminated(
                                 pid: pid,
                                 generation: startupGeneration

@@ -112,7 +112,12 @@ struct Detail: View {
 
     private var subtitleStyle: HeaderSubtitleStyle {
         let success = activeProvider.lastSuccessAt.map { "success \(DateFormats.relative.localizedString(for: $0, relativeTo: Date()))" }
-        let parts = [selectedAccount?.account, success ?? activeProvider.detail, activeProvider.healthText].compactMap(\.self)
+        let subtitleParts: [String?] = [
+            selectedAccount?.account,
+            success ?? activeProvider.detail,
+            activeProvider.healthText,
+        ]
+        let parts = subtitleParts.compactMap { $0 }
         return .custom(parts.joined(separator: " · "))
     }
 
