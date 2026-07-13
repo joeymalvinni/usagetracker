@@ -19,14 +19,14 @@ struct Header: View {
                 Button(action: updateAction.perform) {
                     HStack(spacing: Theme.Spacing.xs) {
                         if updateAction.isInstalling {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Image(systemName: "arrow.down.circle.fill")
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
                         }
                         Text(updateAction.isInstalling ? "Updating…" : "Update")
                     }
                 }
-                .buttonStyle(.chipProminent)
+                .buttonStyle(HeaderUpdateButtonStyle())
                 .disabled(updateAction.isInstalling)
                 .help("Install UsageTracker \(updateAction.version)")
             }
@@ -55,6 +55,31 @@ struct Header: View {
                     .lineLimit(1)
             }
         }
+    }
+}
+
+private struct HeaderUpdateButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(Theme.Typography.caption.bold())
+            .foregroundStyle(.white)
+            .padding(.horizontal, Theme.Spacing.sm + 2)
+            .padding(.vertical, Theme.Spacing.xs + 1)
+            .background(
+                Capsule()
+                    .fill(Color(
+                        .displayP3,
+                        red: 99.0 / 255.0,
+                        green: 130.0 / 255.0,
+                        blue: 240.0 / 255.0,
+                        opacity: 1
+                    ))
+            )
+            .contentShape(Capsule())
+            .opacity(isEnabled ? (configuration.isPressed ? 0.8 : 1) : 0.55)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 
