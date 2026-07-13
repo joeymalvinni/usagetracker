@@ -14,8 +14,10 @@ The installer verifies the published checksums, expected archive contents, Usage
 
 1. Update `version` under `[workspace.package]` in `Cargo.toml`.
 2. Update `CFBundleShortVersionString` in `apps/UsageMenuBar/Info.plist` to the same version.
-3. Update `CHANGELOG.md`, commit the release, and run the normal local checks.
-4. Create and push a matching tag:
+3. Move the user-visible changes into a versioned section in `CHANGELOG.md`.
+4. Add the reviewed GitHub release body at `docs/releases/vMAJOR.MINOR.PATCH.md`. The release workflow publishes this file verbatim.
+5. Commit the release preparation and run the normal local checks.
+6. Create and push a matching tag:
 
 ```sh
 git tag -a v0.1.0 -m "UsageTracker 0.1.0"

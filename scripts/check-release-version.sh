@@ -36,5 +36,9 @@ if [[ "$plist_version" != "$version" ]]; then
   echo "App version is $plist_version, but the release tag is $tag" >&2
   exit 1
 fi
+if [[ ! -f "$repo_dir/docs/releases/$tag.md" ]]; then
+  echo "Release notes are missing: docs/releases/$tag.md" >&2
+  exit 1
+fi
 
-echo "Release versions agree: $version"
+echo "Release version and notes agree: $version"

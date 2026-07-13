@@ -109,6 +109,5 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag \
-            --generate-notes \
-            --notes "This release is ad-hoc signed and is **not notarized by Apple**. macOS may require you to approve UsageTracker manually the first time it opens. See the [installation troubleshooting guide](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/troubleshooting.md#opening-the-unnotarized-app)." \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
             --title "UsageTracker ${GITHUB_REF_NAME#v}"
