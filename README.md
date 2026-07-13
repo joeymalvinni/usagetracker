@@ -42,8 +42,6 @@ Everything stays on your machine. There's no account to create and no server to 
 - Whether a provider is healthy, rate-limited, or having trouble signing in.
 - A desktop heads-up before you run out of a quota that matters.
 
-UsageTracker is careful about what its numbers mean. It tells you when usage is account-wide versus just what happened on this Mac, and it never dresses up an estimated cost as an official bill.
-
 ## Providers
 
 | Provider | What it reads | Multiple accounts? | On by default? |
