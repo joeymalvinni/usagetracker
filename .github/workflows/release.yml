@@ -32,12 +32,6 @@ jobs:
             target: aarch64-apple-darwin
           - arch: x86_64
             target: x86_64-apple-darwin
-    env:
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -68,58 +62,11 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
-      - name: Require release credentials
-        run: |
-          for name in \
-            APPLE_ID \
-            APPLE_TEAM_ID \
-            APPLE_APP_SPECIFIC_PASSWORD \
-            MACOS_CERTIFICATE_P12 \
-            MACOS_CERTIFICATE_PASSWORD
-          do
-            if [[ -z "${!name:-}" ]]; then
-              echo "Missing required GitHub Actions secret: $name" >&2
-              exit 1
-            fi
-          done
-
-      - name: Import Developer ID certificate
-        env:
-          KEYCHAIN_PATH: ${{ runner.temp }}/release-signing.keychain-db
-        run: |
-          keychain_password="$(openssl rand -hex 24)"
-          certificate_path="${RUNNER_TEMP}/developer-id.p12"
-          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$certificate_path"
-
-          security create-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
-          security import "$certificate_path" \
-            -k "$KEYCHAIN_PATH" \
-            -P "$MACOS_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/security
-          security set-key-partition-list \
-            -S apple-tool:,apple: \
-            -s \
-            -k "$keychain_password" \
-            "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH"
-
-          identity="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | \
-            awk '/Developer ID Application/ { print $2; exit }')"
-          if [[ -z "$identity" ]]; then
-            echo "The certificate does not contain a Developer ID Application identity" >&2
-            exit 1
-          fi
-          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
-
-      - name: Build, sign, and notarize artifacts
+      - name: Build and ad-hoc sign artifacts
         env:
           BUNDLE_VERSION: ${{ github.run_number }}
+          CODESIGN_IDENTITY: "-"
           RELEASE_VERSION: ${{ github.ref_name }}
-          REQUIRE_NOTARIZATION: "1"
-          REQUIRE_SIGNING: "1"
         run: ./scripts/package-release.sh "${{ matrix.target }}" dist
 
       - name: Upload release artifacts
@@ -163,4 +110,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --verify-tag \
             --generate-notes \
+            --notes "This release is ad-hoc signed and is **not notarized by Apple**. macOS may require you to approve UsageTracker manually the first time it opens. See the [installation troubleshooting guide](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/troubleshooting.md#opening-the-unnotarized-app)." \
             --title "UsageTracker ${GITHUB_REF_NAME#v}"

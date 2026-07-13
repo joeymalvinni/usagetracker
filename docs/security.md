@@ -25,6 +25,12 @@ Normalized snapshots can carry sanitized diagnostics — source names, counts, t
 
 A few things may prompt macOS: browser cookie import can ask for Safe Storage keys, and notification delivery needs notification permission. Login and launch actions you trigger may open Terminal. UsageTracker never needs Screen Recording or Accessibility permission.
 
+## Release integrity
+
+GitHub releases are ad-hoc signed and are not notarized by Apple. The installer checks SHA-256 hashes from the release, verifies expected archive contents and identifiers, and uses `codesign --verify` to detect changes after packaging. An ad-hoc signature does not establish a verified publisher identity, and the checksum file shares GitHub as its trust boundary with the artifacts. Protecting the GitHub repository and release workflow is therefore part of protecting the distribution channel.
+
+macOS may require manual approval before opening a downloaded release. Follow the bounded [Open Anyway instructions](troubleshooting.md#opening-the-unnotarized-app) rather than disabling Gatekeeper globally.
+
 When you report a problem, share logs and normalized diagnostics only after checking them for email addresses, account IDs, local paths, workspace IDs, and plan info. Never share cookie headers, bearer tokens, refresh tokens, or credential files.
 
 ## What's out of scope
@@ -34,4 +40,4 @@ UsageTracker doesn't protect against:
 - a compromised same-user process or provider CLI;
 - a compromised provider endpoint or account;
 - root access, or anyone who can read your Keychain or session;
-- tampering with a locally built, ad-hoc-signed development app.
+- a compromised GitHub repository or release that replaces both an artifact and its checksum.

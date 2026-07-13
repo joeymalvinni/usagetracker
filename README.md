@@ -57,14 +57,14 @@ UsageTracker uses the credentials you've already set up — Keychain items, conf
 
 ## Get started
 
-On a Mac running macOS 14 or newer, install the signed app and CLI from the latest release:
+On a Mac running macOS 14 or newer, install the app and CLI from the latest release:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://github.com/joeymalvinni/usagetracker/releases/latest/download/install.sh | bash
 ```
 
-The installer verifies published checksums and Apple signatures, puts the app in `~/Applications`, and installs the `usage` command in `~/.local/bin`. It never removes your `~/.usagetracker` data during an install or upgrade. Pass options after `bash -s --`; for example, use `--cli-only`, `--app-only`, `--no-launch`, or `--version v0.1.0`.
+The installer verifies published SHA-256 checksums, archive contents, and ad-hoc code-signature integrity, puts the app in `~/Applications`, and installs the `usage` command in `~/.local/bin`. Releases are **not notarized by Apple**, so macOS may require [manual approval](docs/troubleshooting.md#opening-the-unnotarized-app) the first time the app opens. The installer never removes your `~/.usagetracker` data during an install or upgrade. Pass options after `bash -s --`; for example, use `--cli-only`, `--app-only`, `--no-launch`, or `--version v0.1.0`.
 
 On first launch, pick the tools you use and follow the sign-in steps for each. You can always change this later under **Settings → Connections**.
 

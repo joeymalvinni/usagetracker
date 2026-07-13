@@ -12,7 +12,10 @@ force=0
 
 usage() {
   cat <<'EOF'
-Install UsageTracker from a signed GitHub release.
+Install UsageTracker from a checksum-verified GitHub release.
+
+Release binaries have ad-hoc code signatures and are not notarized by Apple.
+macOS may require manual approval the first time the app opens.
 
 Usage: install.sh [options]
 
@@ -129,7 +132,7 @@ case "$machine" in
     ;;
 esac
 
-for command in curl ditto shasum tar; do
+for command in curl ditto shasum tar unzip; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command not found: $command" >&2
     exit 1
@@ -187,10 +190,22 @@ signature_field() {
     awk -F= -v field="$field" '$1 == field { print $2; exit }'
 }
 
+expected_app_identifier="engineering.super.usagetracker"
+expected_cli_identifier="$expected_app_identifier.cli"
+
 if [[ "$install_app" == "1" ]]; then
   app_asset="UsageTracker-macos-$release_arch.zip"
   download "$app_asset"
   verify_download "$app_asset"
+  if ! unzip -Z1 "$work_dir/$app_asset" | awk '
+    BEGIN { valid = 1; found_app = 0 }
+    /^UsageTracker\.app\// { found_app = 1; next }
+    { valid = 0 }
+    END { exit !(valid && found_app) }
+  '; then
+    echo "$app_asset contains files outside UsageTracker.app" >&2
+    exit 1
+  fi
   mkdir -p "$work_dir/app"
   ditto -x -k "$work_dir/$app_asset" "$work_dir/app"
   source_app="$work_dir/app/UsageTracker.app"
@@ -199,18 +214,17 @@ if [[ "$install_app" == "1" ]]; then
     exit 1
   fi
   codesign --verify --deep --strict --verbose=2 "$source_app"
+  app_bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+    "$source_app/Contents/Info.plist")"
   app_identifier="$(signature_field "$source_app" Identifier)"
-  if [[ -z "$app_identifier" ]]; then
-    echo "The app does not have a signing identifier" >&2
+  app_signature="$(signature_field "$source_app" Signature)"
+  if [[ "$app_bundle_identifier" != "$expected_app_identifier" || \
+        "$app_identifier" != "$expected_app_identifier" ]]; then
+    echo "The app bundle or signing identifier is not UsageTracker" >&2
     exit 1
   fi
-  if ! spctl --assess --type execute --verbose=2 "$source_app"; then
-    echo "Gatekeeper rejected the downloaded app" >&2
-    exit 1
-  fi
-  app_team="$(signature_field "$source_app" TeamIdentifier)"
-  if [[ -z "$app_team" || "$app_team" == "not set" ]]; then
-    echo "The app does not have a Developer ID team identifier" >&2
+  if [[ "$app_signature" != "adhoc" ]]; then
+    echo "The app does not have the expected ad-hoc signature" >&2
     exit 1
   fi
 fi
@@ -219,30 +233,26 @@ if [[ "$install_cli" == "1" ]]; then
   cli_asset="usage-macos-$release_arch.tar.gz"
   download "$cli_asset"
   verify_download "$cli_asset"
+  if [[ "$(tar -tzf "$work_dir/$cli_asset")" != "usage" ]]; then
+    echo "$cli_asset does not contain exactly one usage executable" >&2
+    exit 1
+  fi
   mkdir -p "$work_dir/cli"
   tar -xzf "$work_dir/$cli_asset" -C "$work_dir/cli"
   source_cli="$work_dir/cli/usage"
-  if [[ ! -x "$source_cli" ]]; then
+  if [[ ! -f "$source_cli" || -L "$source_cli" || ! -x "$source_cli" ]]; then
     echo "$cli_asset does not contain an executable usage command" >&2
     exit 1
   fi
   codesign --verify --strict --verbose=2 "$source_cli"
   cli_identifier="$(signature_field "$source_cli" Identifier)"
-  if [[ -z "$cli_identifier" ]]; then
-    echo "The usage command does not have a signing identifier" >&2
+  cli_signature="$(signature_field "$source_cli" Signature)"
+  if [[ "$cli_identifier" != "$expected_cli_identifier" ]]; then
+    echo "The command signing identifier is not UsageTracker" >&2
     exit 1
   fi
-  cli_team="$(signature_field "$source_cli" TeamIdentifier)"
-  if [[ -z "$cli_team" || "$cli_team" == "not set" ]]; then
-    echo "The usage command does not have a Developer ID team identifier" >&2
-    exit 1
-  fi
-  if [[ "$install_app" == "1" && "$cli_identifier" != "$app_identifier.cli" ]]; then
-    echo "The app and CLI signing identifiers do not belong to the same release" >&2
-    exit 1
-  fi
-  if [[ "$install_app" == "1" && "$cli_team" != "$app_team" ]]; then
-    echo "The app and CLI were signed by different Apple Developer teams" >&2
+  if [[ "$cli_signature" != "adhoc" ]]; then
+    echo "The usage command does not have the expected ad-hoc signature" >&2
     exit 1
   fi
 fi
@@ -252,9 +262,9 @@ if [[ "$install_app" == "1" ]]; then
   if [[ -e "$app_path" ]]; then
     installed_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
       "$app_path/Contents/Info.plist" 2>/dev/null || true)"
-    installed_app_team="$(signature_field "$app_path" TeamIdentifier || true)"
+    installed_app_identifier="$(signature_field "$app_path" Identifier || true)"
     if [[ "$force" != "1" && \
-          ( "$installed_bundle_id" != "$app_identifier" || "$installed_app_team" != "$app_team" ) ]]; then
+          ( "$installed_bundle_id" != "$app_identifier" || "$installed_app_identifier" != "$app_identifier" ) ]]; then
       echo "Refusing to replace an unrelated app at $app_path; pass --force to override" >&2
       exit 1
     fi
@@ -265,9 +275,7 @@ if [[ "$install_cli" == "1" ]]; then
   cli_path="$bin_dir/usage"
   if [[ -e "$cli_path" ]]; then
     installed_cli_id="$(signature_field "$cli_path" Identifier || true)"
-    installed_cli_team="$(signature_field "$cli_path" TeamIdentifier || true)"
-    if [[ "$force" != "1" && \
-          ( "$installed_cli_id" != "$cli_identifier" || "$installed_cli_team" != "$cli_team" ) ]]; then
+    if [[ "$force" != "1" && "$installed_cli_id" != "$cli_identifier" ]]; then
       echo "Refusing to replace an unrelated command at $cli_path; pass --force to override" >&2
       exit 1
     fi
@@ -310,7 +318,7 @@ if [[ "$install_app" == "1" ]]; then
     rm -rf "$backup_app"
     backup_app=""
   fi
-  printf '%s\n%s\n' "$app_identifier" "$app_team" \
+  printf '%s\n%s\n' "$app_identifier" "$app_signature" \
     > "$app_dir/.UsageTracker.app.install-receipt"
   chmod 0600 "$app_dir/.UsageTracker.app.install-receipt"
   echo "Installed $app_path"
@@ -321,7 +329,7 @@ if [[ "$install_cli" == "1" ]]; then
   cli_temp="$bin_dir/.usage.install.$$"
   install -m 0755 "$source_cli" "$cli_temp"
   mv -f "$cli_temp" "$cli_path"
-  printf '%s\n%s\n' "$cli_identifier" "$cli_team" \
+  printf '%s\n%s\n' "$cli_identifier" "$cli_signature" \
     > "$bin_dir/.usage.install-receipt"
   chmod 0600 "$bin_dir/.usage.install-receipt"
   echo "Installed $cli_path"
@@ -332,7 +340,8 @@ if [[ "$install_cli" == "1" ]]; then
 fi
 
 if [[ "$install_app" == "1" && "$launch_app" == "1" ]]; then
-  open "$app_dir/UsageTracker.app"
+  open "$app_dir/UsageTracker.app" || true
+  echo "If macOS blocks the app, open System Settings → Privacy & Security and click Open Anyway."
 fi
 
 echo "UsageTracker installation complete. Existing ~/.usagetracker data was left untouched."

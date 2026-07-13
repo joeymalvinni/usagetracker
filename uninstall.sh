@@ -65,16 +65,16 @@ signature_field() {
 
 if [[ -d "$app_path" ]]; then
   bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist" 2>/dev/null || true)"
-  app_team="$(signature_field "$app_path" TeamIdentifier || true)"
+  app_signature="$(signature_field "$app_path" Signature || true)"
   if [[ -f "$app_receipt" ]]; then
     expected_bundle_id="$(sed -n '1p' "$app_receipt")"
-    expected_app_team="$(sed -n '2p' "$app_receipt")"
+    expected_app_signature="$(sed -n '2p' "$app_receipt")"
   else
     expected_bundle_id=""
-    expected_app_team=""
+    expected_app_signature=""
   fi
   if [[ "$force" != "1" && \
-        ( -z "$expected_bundle_id" || "$bundle_id" != "$expected_bundle_id" || "$app_team" != "$expected_app_team" ) ]]; then
+        ( -z "$expected_bundle_id" || "$bundle_id" != "$expected_bundle_id" || "$app_signature" != "$expected_app_signature" ) ]]; then
     echo "Refusing to remove an app without a matching UsageTracker install receipt: $app_path" >&2
     echo "Pass --force to override." >&2
     exit 1
@@ -83,16 +83,16 @@ fi
 
 if [[ -f "$cli_path" ]]; then
   cli_id="$(signature_field "$cli_path" Identifier || true)"
-  cli_team="$(signature_field "$cli_path" TeamIdentifier || true)"
+  cli_signature="$(signature_field "$cli_path" Signature || true)"
   if [[ -f "$cli_receipt" ]]; then
     expected_cli_id="$(sed -n '1p' "$cli_receipt")"
-    expected_cli_team="$(sed -n '2p' "$cli_receipt")"
+    expected_cli_signature="$(sed -n '2p' "$cli_receipt")"
   else
     expected_cli_id=""
-    expected_cli_team=""
+    expected_cli_signature=""
   fi
   if [[ "$force" != "1" && \
-        ( -z "$expected_cli_id" || "$cli_id" != "$expected_cli_id" || "$cli_team" != "$expected_cli_team" ) ]]; then
+        ( -z "$expected_cli_id" || "$cli_id" != "$expected_cli_id" || "$cli_signature" != "$expected_cli_signature" ) ]]; then
     echo "Refusing to remove a command without a matching UsageTracker install receipt: $cli_path" >&2
     echo "Pass --force to override." >&2
     exit 1

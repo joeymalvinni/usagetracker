@@ -8,6 +8,20 @@ cargo run -p usage-cli -- status
 
 When the menu app launches the daemon, logs land in `~/.usagetracker/usage-daemon.log` (with numbered rotated archives). A daemon you run in the foreground logs straight to the terminal — add `RUST_LOG=debug` for more detail.
 
+## Opening the unnotarized app
+
+GitHub releases are ad-hoc signed and are not notarized by Apple. Depending on how the app was downloaded, macOS may say that Apple cannot check it for malicious software or that the developer cannot be verified.
+
+First try to open UsageTracker once. If macOS blocks it:
+
+1. Open **System Settings → Privacy & Security**.
+2. Scroll to **Security** and find the message about UsageTracker.
+3. Click **Open Anyway**, authenticate if asked, and confirm **Open**.
+
+Only approve a copy you intentionally downloaded from the official GitHub repository. Do not disable Gatekeeper globally or run commands that strip security metadata from unrelated apps. The approval is normally required only on first launch after downloading a release.
+
+See [Apple's official app-opening safety guide](https://support.apple.com/102445) for the current macOS instructions and warning meanings.
+
 ## Socket problems
 
 | Symptom | What to check |

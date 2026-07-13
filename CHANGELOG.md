@@ -13,7 +13,8 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 ### Distribution
 
 - Added checksum-verifying app and CLI installer and uninstaller scripts.
-- Added signed, notarized Apple Silicon and Intel artifacts for tagged GitHub releases.
+- Added checksum-verified, ad-hoc-signed Apple Silicon and Intel artifacts for tagged GitHub releases.
+- Documented that releases are not Apple-notarized and how to approve the app safely in Gatekeeper.
 
 ## Protocol v3 — 2026-07-12
 

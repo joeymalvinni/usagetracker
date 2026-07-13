@@ -12,7 +12,7 @@ When you need the details, these pages have them.
 - [Security](security.md) — the trust boundary, how credentials are handled, file permissions, and what's out of scope.
 - [Data and privacy](data-and-privacy.md) — what's stored, how long it's kept, and how to delete it.
 - [Socket API](api/index.md) — the v3 protocol, its methods, models, errors, jobs, and schemas.
-- [Releasing](releasing.md) — signed and notarized GitHub releases, required secrets, and local packaging.
+- [Releasing](releasing.md) — ad-hoc-signed GitHub releases, checksums, Gatekeeper, and local packaging.
 
 ## Providers
 
