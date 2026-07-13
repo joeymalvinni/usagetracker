@@ -44,7 +44,6 @@ const CLAUDE_CLI_PARSE_RETRY_DELAY: Duration = Duration::from_millis(500);
 pub struct ClaudeCollector {
     profiles: Vec<Arc<ClaudeProfile>>,
     api: ClaudeApiClient,
-    capture_raw_payloads: bool,
 }
 
 struct ClaudeProfile {
@@ -62,14 +61,13 @@ struct ClaudeProfile {
 }
 
 impl ClaudeCollector {
-    pub fn new(config: ProviderConfig, capture_raw_payloads: bool) -> anyhow::Result<Self> {
+    pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Claude data"))?;
         let profiles = claude_profiles(config, &home);
         Ok(Self {
             profiles,
             api: ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?,
-            capture_raw_payloads,
         })
     }
 
@@ -516,72 +514,63 @@ impl ProviderCollector for ClaudeCollector {
         let profile = self.profile_for_account(account).await?;
 
         let mut warnings = Vec::new();
-        let (mut usage, collection_mode, raw_payload) =
-            match self.collect_usage_with_api(&profile).await {
-                Ok((usage, payload)) => (
-                    usage,
-                    CLAUDE_COLLECTION_MODE.to_string(),
-                    self.capture_raw_payloads.then_some(payload),
-                ),
-                Err(api_err) if should_use_cli_fallback(profile.cli_enabled, &api_err) => {
-                    warn!(
-                        provider_id = PROVIDER_ID,
-                        profile_id = profile.id,
-                        credential_account = account.external_account_id,
-                        recovery_stage = "cli_fallback_started",
-                        oauth_error_code = api_err.kind().as_str(),
-                        oauth_error = %api_err,
-                        "Claude OAuth usage unavailable; starting CLI fallback"
-                    );
-                    let fallback_started = Instant::now();
-                    match self.collect_usage_with_cli(&profile).await {
-                        Ok(cli_usage) => {
-                            info!(
-                                provider_id = PROVIDER_ID,
-                                profile_id = profile.id,
-                                credential_account = account.external_account_id,
-                                recovery_stage = "cli_fallback_succeeded",
-                                windows = cli_usage.usage.windows.len(),
-                                elapsed_ms = fallback_started.elapsed().as_millis(),
-                                collection_mode = CLAUDE_CLI_COLLECTION_MODE,
-                                "Claude CLI usage fallback succeeded"
-                            );
-                            warnings.push(format!(
-                                "Claude OAuth usage API failed; used CLI fallback: {}",
-                                api_err.short_message()
-                            ));
-                            (
-                                cli_usage.usage,
-                                CLAUDE_CLI_COLLECTION_MODE.to_string(),
-                                self.capture_raw_payloads.then_some(cli_usage.raw_output),
-                            )
-                        }
-                        Err(cli_err) => {
-                            warn!(
-                                provider_id = PROVIDER_ID,
-                                profile_id = profile.id,
-                                credential_account = account.external_account_id,
-                                recovery_stage = "cli_fallback_failed",
-                                elapsed_ms = fallback_started.elapsed().as_millis(),
-                                oauth_error_code = api_err.kind().as_str(),
-                                oauth_error = %api_err,
-                                cli_error_code = cli_err.kind().as_str(),
-                                cli_error = %cli_err,
-                                "Claude OAuth usage and CLI fallback both failed"
-                            );
-                            return Err(ProviderError::new(
-                                api_err.kind(),
-                                format!(
-                                    "Claude OAuth usage API failed ({}); CLI fallback failed ({})",
-                                    api_err.short_message(),
-                                    cli_err.short_message()
-                                ),
-                            ));
-                        }
+        let (mut usage, collection_mode) = match self.collect_usage_with_api(&profile).await {
+            Ok((usage, _payload)) => (usage, CLAUDE_COLLECTION_MODE.to_string()),
+            Err(api_err) if should_use_cli_fallback(profile.cli_enabled, &api_err) => {
+                warn!(
+                    provider_id = PROVIDER_ID,
+                    profile_id = profile.id,
+                    credential_account = account.external_account_id,
+                    recovery_stage = "cli_fallback_started",
+                    oauth_error_code = api_err.kind().as_str(),
+                    oauth_error = %api_err,
+                    "Claude OAuth usage unavailable; starting CLI fallback"
+                );
+                let fallback_started = Instant::now();
+                match self.collect_usage_with_cli(&profile).await {
+                    Ok(cli_usage) => {
+                        info!(
+                            provider_id = PROVIDER_ID,
+                            profile_id = profile.id,
+                            credential_account = account.external_account_id,
+                            recovery_stage = "cli_fallback_succeeded",
+                            windows = cli_usage.usage.windows.len(),
+                            elapsed_ms = fallback_started.elapsed().as_millis(),
+                            collection_mode = CLAUDE_CLI_COLLECTION_MODE,
+                            "Claude CLI usage fallback succeeded"
+                        );
+                        warnings.push(format!(
+                            "Claude OAuth usage API failed; used CLI fallback: {}",
+                            api_err.short_message()
+                        ));
+                        (cli_usage.usage, CLAUDE_CLI_COLLECTION_MODE.to_string())
+                    }
+                    Err(cli_err) => {
+                        warn!(
+                            provider_id = PROVIDER_ID,
+                            profile_id = profile.id,
+                            credential_account = account.external_account_id,
+                            recovery_stage = "cli_fallback_failed",
+                            elapsed_ms = fallback_started.elapsed().as_millis(),
+                            oauth_error_code = api_err.kind().as_str(),
+                            oauth_error = %api_err,
+                            cli_error_code = cli_err.kind().as_str(),
+                            cli_error = %cli_err,
+                            "Claude OAuth usage and CLI fallback both failed"
+                        );
+                        return Err(ProviderError::new(
+                            api_err.kind(),
+                            format!(
+                                "Claude OAuth usage API failed ({}); CLI fallback failed ({})",
+                                api_err.short_message(),
+                                cli_err.short_message()
+                            ),
+                        ));
                     }
                 }
-                Err(api_err) => return Err(api_err),
-            };
+            }
+            Err(api_err) => return Err(api_err),
+        };
 
         if profile.cli_enabled {
             let project_roots = profile.project_roots.clone();
@@ -623,7 +612,6 @@ impl ProviderCollector for ClaudeCollector {
             daily_usage: Vec::new(),
             collection_mode,
             account_email: account.email.clone(),
-            raw_payload,
             warnings,
         })
     }

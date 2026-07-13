@@ -10,8 +10,8 @@ use crate::{
     render::{
         labels::identity_labels,
         style::{
-            format_collection_mode, format_local_time, format_provider_name, relative_time_opt,
-            Theme,
+            format_collection_mode, format_local_time, format_provider_name, json_name, push_kv,
+            relative_time_opt, Theme,
         },
         table::Table,
     },
@@ -222,7 +222,6 @@ pub fn render_status(status: &StatusView, style: OutputStyle, color: bool) -> St
     let theme = Theme::new(color);
     match style {
         OutputStyle::Dashboard => render_status_dashboard(status, theme),
-        OutputStyle::Compact => render_status_compact(status, theme),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -269,49 +268,6 @@ fn render_status_dashboard(status: &StatusView, theme: Theme) -> String {
     }
     output.push_str(&table.render(theme));
     output.trim_end().to_string()
-}
-
-fn render_status_compact(status: &StatusView, theme: Theme) -> String {
-    let mut lines = vec![format!(
-        "{} {} · poll {}s · providers {} enabled · updated {}",
-        theme.title("Daemon"),
-        theme.good(status.daemon),
-        status.poll_interval_seconds,
-        status.enabled_provider_count,
-        format_local_time(status.updated_at)
-    )];
-    lines.extend(status.providers.iter().map(|row| {
-        let identity = row
-            .identity
-            .as_ref()
-            .map(|identity| format!(" · {identity}"))
-            .unwrap_or_default();
-        let plan = row
-            .plan
-            .as_ref()
-            .map(|plan| format!(" · {plan}"))
-            .unwrap_or_default();
-        let detail = row
-            .detail
-            .as_ref()
-            .map(|detail| format!(" · {detail}"))
-            .unwrap_or_default();
-        format!(
-            "{}{}{}: {} · {}{} · updated {}",
-            theme.title(&format_provider_name(&row.provider_id)),
-            identity,
-            plan,
-            theme.status(&row.state),
-            freshness_text(row.usage, theme),
-            detail,
-            relative_time_opt(row.last_success_at.max(row.last_update_at))
-        )
-    }));
-    lines.join("\n")
-}
-
-fn push_kv(output: &mut String, theme: Theme, key: &str, value: &str) {
-    let _ = writeln!(output, "{}  {}", theme.label(&format!("{key:<9}")), value);
 }
 
 fn freshness_text(freshness: UsageFreshness, theme: Theme) -> String {
@@ -397,23 +353,11 @@ fn is_enabled_provider(provider_id: &str, config: &ConfigResponse) -> bool {
         .providers
         .get(provider_id)
         .is_some_and(|provider| provider.enabled)
-        || config
-            .enabled_providers
-            .iter()
-            .any(|id| id.as_str() == provider_id)
-}
-
-fn json_name(value: &impl Serialize) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "\"unknown\"".to_string())
-        .trim_matches('"')
-        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeDelta;
     use serde_json::json;
     use usage_core::{AccountId, ProviderHealthStatus, ProviderId, ProviderToggle, UsageWindow};
 
@@ -429,15 +373,6 @@ mod tests {
         assert!(rendered.contains("joey"));
         assert!(rendered.contains("Team"));
         assert!(!rendered.contains("Claude team"));
-    }
-
-    #[test]
-    fn renders_status_compact_with_stale_provider() {
-        let status = sample_status(Utc::now() - TimeDelta::seconds(700));
-        let rendered = render_status(&status, OutputStyle::Compact, false);
-
-        assert!(rendered.contains("Daemon ok"));
-        assert!(rendered.contains("stale"));
     }
 
     #[test]
@@ -477,7 +412,6 @@ mod tests {
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
-                enabled_providers: vec![ProviderId::new("claude")],
                 providers,
             },
         );
@@ -524,7 +458,6 @@ mod tests {
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
-                enabled_providers: vec![],
                 providers,
             },
         );
@@ -560,7 +493,6 @@ mod tests {
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
-                enabled_providers: vec![ProviderId::new("codex")],
                 providers,
             },
         );
@@ -664,7 +596,6 @@ mod tests {
             config_path: "/tmp/config.json".to_string(),
             socket_path: "/tmp/usage.sock".to_string(),
             db_path: "/tmp/usage.sqlite3".to_string(),
-            enabled_providers: vec![ProviderId::new("codex")],
             providers,
         };
 
@@ -737,7 +668,6 @@ mod tests {
             config_path: "/tmp/config.json".to_string(),
             socket_path: "/tmp/usage.sock".to_string(),
             db_path: "/tmp/usage.sqlite3".to_string(),
-            enabled_providers: vec![ProviderId::new("claude")],
             providers,
         };
 

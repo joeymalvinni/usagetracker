@@ -25,7 +25,6 @@ struct UIConfig: Codable, Equatable {
         var label: String { self == .remaining ? "% left" : "% used" }
     }
 
-    var hiddenProviders = Set<String>()
     /// Individually hidden progress bars (windows), keyed by `providerId|windowId`
     /// with the value holding the window's display label so the Settings restore
     /// list can name a bar that has been filtered out of all live view models.
@@ -50,7 +49,6 @@ struct UIConfig: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        hiddenProviders = try c.decodeIfPresent(Set<String>.self, forKey: .hiddenProviders) ?? []
         hiddenWindows = try c.decodeIfPresent([String: String].self, forKey: .hiddenWindows) ?? [:]
         providerOrder = try c.decodeIfPresent([String].self, forKey: .providerOrder) ?? []
         menuMetric = try c.decodeIfPresent(MenuMetric.self, forKey: .menuMetric) ?? .remaining

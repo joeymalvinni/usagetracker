@@ -61,8 +61,9 @@ dashboard applies the effective same-day local cost per priced token. When no sa
 available, it falls back to the provider-wide observed rate, whose denominator excludes unpriced
 tokens. Dates and token counts always come from the selected account's own account-wide history.
 
-Standard API-equivalent model prices are refreshed from OpenAI's official pricing page once every
-24 hours and cached in `~/.usagetracker/openai-pricing.json`. A validated bundled catalog is used
+Standard API-equivalent model prices are shipped as a versioned bundled catalog. Updating prices
+requires a daemon release, which keeps historical estimates reproducible and avoids coupling usage
+collection to the layout or availability of a public pricing page. The bundled catalog is used
 when no cache is available and the refresh fails. Refresh failures do not fail provider collection.
 Pricing changes invalidate the local cost scan cache so retained logs are recalculated. Cost rows
 include priced and unpriced token coverage plus unpriced model names. The menu bar app shows one
@@ -79,5 +80,5 @@ and model totals but are excluded from today, lookback, and per-day totals.
 Migration `0002_provider_daily_usage.sql` creates the durable daily table. Permanent account deletion
 also deletes that account's daily history. Hiding or disabling an account does not delete history.
 Daily rows and lifetime aggregates are retained permanently. High-resolution normalized snapshots
-are bounded to 90 days and 10,000 rows per account, and debug raw payloads are bounded to 100 per
-account, preventing polling data from growing without limit.
+are bounded to 90 days and 10,000 rows per account, preventing polling data from growing without
+limit.

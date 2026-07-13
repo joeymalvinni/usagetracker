@@ -8,7 +8,6 @@ use crate::render::style::{format_provider_name, title_case};
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IdentityLabels {
     pub identity: Option<String>,
-    pub identity_kind: Option<&'static str>,
     pub plan: Option<String>,
 }
 
@@ -78,20 +77,10 @@ pub(crate) fn identity_labels(
         .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "subscription_type")))
         .map(plan_label);
 
-    let profile = nonempty(profile);
-    let (identity, identity_kind) = account_label
-        .as_ref()
-        .map(|account| (Some(account.clone()), Some("account")))
-        .or_else(|| {
-            profile
-                .as_ref()
-                .map(|profile| (Some(profile.clone()), Some("profile")))
-        })
-        .unwrap_or((None, None));
+    let identity = account_label.or_else(|| nonempty(profile));
 
     IdentityLabels {
         identity,
-        identity_kind,
         plan: nonempty(plan),
     }
 }

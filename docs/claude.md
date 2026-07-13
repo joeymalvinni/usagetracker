@@ -196,9 +196,8 @@ extra_usage_enabled
 top_level_keys
 ```
 
-Identity discovery uses the neighboring OAuth profile endpoint and is not stored as a raw payload.
-
-Raw provider payloads are only stored when `debug_capture_raw_payloads` is enabled.
+Identity discovery uses the neighboring OAuth profile endpoint. Provider payloads are normalized in
+memory and are never persisted.
 
 ## Claude CLI Fallback
 
@@ -228,7 +227,7 @@ Resets 9:40pm (America/Los_Angeles)
 
 Parsed windows are stored as percent windows with stable ids like `claude_cli_usage_current_session`. Reset text is converted to UTC when it uses Claude Code's current formats, including `9:40pm (America/Los_Angeles)` and `Jul 7 at 6pm (America/Los_Angeles)`.
 
-The collector records a warning when this fallback is needed. If `debug_capture_raw_payloads` is enabled, the raw Claude print-mode JSON is stored.
+The collector records a warning when this fallback is needed; raw Claude print-mode JSON is never stored.
 
 ## Activity-triggered Refresh
 

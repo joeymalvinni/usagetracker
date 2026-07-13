@@ -111,16 +111,18 @@ struct ProviderSetupControls: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             HStack(spacing: Theme.Spacing.sm) {
-                Button(repairLabel) {
-                    Task { await repair() }
+                if canConnectOrRepair {
+                    Button(repairLabel) {
+                        Task { await connectOrRepair() }
+                    }
+                    .disabled(busy || state.daemon == .offline)
                 }
-                .disabled(busy || state.daemon == .offline)
 
-                if ProviderCatalog.supportsMultipleAccounts(providerId), !accounts.isEmpty {
+                if state.supportsAddAccount(providerId), !accounts.isEmpty {
                     Button("Add another account") { Task { await state.addProviderAccount(providerId) } }
                         .disabled(busy)
                 }
-                if providerId == "opencode_go" {
+                if state.supportsWorkspaceSetup(providerId) {
                     Button(setup == nil ? "Discover workspaces" : "Discover again") {
                         Task { await state.loadProviderSetup(providerId) }
                     }
@@ -131,7 +133,7 @@ struct ProviderSetupControls: View {
             }
             .controlSize(.small)
 
-            if providerId == "opencode_go", let setup {
+            if state.supportsWorkspaceSetup(providerId), let setup {
                 if !setup.workspaceOptions.isEmpty {
                     Picker("Workspace", selection: workspaceBinding(setup)) {
                         ForEach(setup.workspaceOptions, id: \.self) { Text($0).tag($0) }
@@ -152,16 +154,22 @@ struct ProviderSetupControls: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .task {
-            if state.providerSetups[providerId] == nil, providerId != "opencode_go" {
+            if state.providerSetups[providerId] == nil, state.supportsWorkspaceSetup(providerId) {
                 await state.loadProviderSetup(providerId)
             }
         }
     }
 
-    private func repair() async {
-        if ProviderCatalog.supportsMultipleAccounts(providerId), accounts.isEmpty {
+    private var canConnectOrRepair: Bool {
+        accounts.isEmpty
+            ? state.supportsAddAccount(providerId) || state.supportsRepair(providerId)
+            : state.supportsRepair(providerId)
+    }
+
+    private func connectOrRepair() async {
+        if accounts.isEmpty, state.supportsAddAccount(providerId) {
             await state.addProviderAccount(providerId)
-        } else {
+        } else if state.supportsRepair(providerId) {
             await state.repairProvider(providerId, accountId: accounts.first?.id)
         }
     }

@@ -35,11 +35,10 @@ const COOKIE_NAMES: [&str; 2] = ["auth", "__Host-auth"];
 pub struct OpenCodeCollector {
     config: ProviderConfig,
     client: reqwest::Client,
-    capture_raw_payloads: bool,
 }
 
 impl OpenCodeCollector {
-    pub fn new(config: ProviderConfig, capture_raw_payloads: bool) -> anyhow::Result<Self> {
+    pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
@@ -60,11 +59,7 @@ impl OpenCodeCollector {
                 }
             }))
             .build()?;
-        Ok(Self {
-            config,
-            client,
-            capture_raw_payloads,
-        })
+        Ok(Self { config, client })
     }
 
     async fn collect_web_usage(
@@ -162,12 +157,6 @@ impl OpenCodeCollector {
             daily_usage: Vec::new(),
             collection_mode: "opencode_go_web_console".to_string(),
             account_email,
-            raw_payload: self.capture_raw_payloads.then_some(json!({
-                "workspace_id": workspace_id,
-                "zen_balance_usd": zen_balance,
-                "body": body,
-                "usage_history_pages": history_body.map(|history| history.raw_pages),
-            })),
             warnings: Vec::new(),
         })
     }
@@ -248,7 +237,6 @@ impl OpenCodeCollector {
         workspace_id: &str,
     ) -> Result<UsageHistoryCollection, ProviderError> {
         let mut rows = Vec::new();
-        let mut raw_pages = Vec::new();
         let mut account_email = None;
         let lookback_start = usage_history_lookback_start(Local::now());
         let mut complete_lookback = false;
@@ -271,9 +259,6 @@ impl OpenCodeCollector {
             }
             let page_rows = parse_usage_history_rows(&body);
             let row_count = page_rows.len();
-            if self.capture_raw_payloads {
-                raw_pages.push(body);
-            }
             if row_count == 0 {
                 complete_lookback = true;
                 break;
@@ -304,7 +289,6 @@ impl OpenCodeCollector {
         );
         Ok(UsageHistoryCollection {
             report,
-            raw_pages,
             account_email,
         })
     }
@@ -383,14 +367,8 @@ impl OpenCodeCollector {
         let body = response_text(response, "OpenCode usage history page").await?;
         let account_email = account_email_from_text(&body);
         let report = parse_usage_history_report(&body);
-        let raw_pages = self
-            .capture_raw_payloads
-            .then_some(body)
-            .into_iter()
-            .collect();
         Ok(UsageHistoryCollection {
             report,
-            raw_pages,
             account_email,
         })
     }

@@ -74,7 +74,6 @@ struct PricingCoverage: Decodable, Equatable {
         unpricedModels: [],
         catalogVersion: nil,
         catalogSource: nil,
-        fetchedAt: nil,
         catalogEffectiveFrom: nil
     )
 
@@ -84,7 +83,6 @@ struct PricingCoverage: Decodable, Equatable {
     let unpricedModels: [String]
     let catalogVersion: String?
     let catalogSource: String?
-    let fetchedAt: Date?
     let catalogEffectiveFrom: String?
 
     init(
@@ -94,7 +92,6 @@ struct PricingCoverage: Decodable, Equatable {
         unpricedModels: [String],
         catalogVersion: String?,
         catalogSource: String?,
-        fetchedAt: Date?,
         catalogEffectiveFrom: String?
     ) {
         self.pricedTokens = pricedTokens
@@ -103,7 +100,6 @@ struct PricingCoverage: Decodable, Equatable {
         self.unpricedModels = unpricedModels
         self.catalogVersion = catalogVersion
         self.catalogSource = catalogSource
-        self.fetchedAt = fetchedAt
         self.catalogEffectiveFrom = catalogEffectiveFrom
     }
 
@@ -118,7 +114,6 @@ struct PricingCoverage: Decodable, Equatable {
         ) ?? []
         catalogVersion = try container.decodeIfPresent(String.self, forKey: .catalogVersion)
         catalogSource = try container.decodeIfPresent(String.self, forKey: .catalogSource)
-        fetchedAt = try container.decodeIfPresent(Date.self, forKey: .fetchedAt)
         catalogEffectiveFrom = try container.decodeIfPresent(
             String.self,
             forKey: .catalogEffectiveFrom
@@ -127,7 +122,7 @@ struct PricingCoverage: Decodable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case pricedTokens, unpricedTokens, coveredPercent, unpricedModels
-        case catalogVersion, catalogSource, fetchedAt, catalogEffectiveFrom
+        case catalogVersion, catalogSource, catalogEffectiveFrom
     }
 
     var label: String {

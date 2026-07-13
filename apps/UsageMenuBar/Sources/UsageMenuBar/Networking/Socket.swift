@@ -2,13 +2,15 @@ import Darwin
 import Foundation
 
 enum Socket {
+    // Keep aligned with usage_core::MAX_RESPONSE_BYTES.
+    static let maxResponseBytes = 8 * 1024 * 1024
+
     static func canConnect(
         path: String,
         timeout: TimeInterval,
         isCancelled: @escaping @Sendable () -> Bool = { false }
     ) -> Bool {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
+        guard let fd = try? open() else { return false }
         defer { close(fd) }
         do {
             try connect(
@@ -29,19 +31,21 @@ enum Socket {
         timeout: TimeInterval,
         isCancelled: @escaping @Sendable () -> Bool = { false }
     ) throws -> String {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw DaemonError.transport(errno) }
+        let fd = try open()
         defer { close(fd) }
         let deadline = Date().addingTimeInterval(timeout)
 
         try connect(fd: fd, path: path, deadline: deadline, isCancelled: isCancelled)
 
-        var out = Array(request.utf8)
-        while !out.isEmpty {
+        let out = Array(request.utf8)
+        var offset = 0
+        while offset < out.count {
             if isCancelled() { throw CancellationError() }
-            let sent = out.withUnsafeBytes { write(fd, $0.baseAddress!, out.count) }
+            let sent = out.withUnsafeBytes { bytes in
+                write(fd, bytes.baseAddress!.advanced(by: offset), out.count - offset)
+            }
             if sent > 0 {
-                out.removeFirst(sent)
+                offset += sent
             } else if errno == EAGAIN || errno == EWOULDBLOCK {
                 try wait(
                     fd: fd,
@@ -54,13 +58,18 @@ enum Socket {
             }
         }
 
-        var data = [UInt8](), buf = [UInt8](repeating: 0, count: 4096)
+        var response = ResponseLineBuffer(maxBytes: maxResponseBytes)
+        var buf = [UInt8](repeating: 0, count: 4096)
         while true {
             if isCancelled() { throw CancellationError() }
             let n = read(fd, &buf, buf.count)
             if n > 0 {
-                if let i = buf[..<n].firstIndex(of: 10) { data += buf[..<i]; break }
-                data += buf[..<n]
+                let chunk = buf[..<n]
+                if let newline = chunk.firstIndex(of: 10) {
+                    try response.append(chunk[..<newline])
+                    break
+                }
+                try response.append(chunk)
             } else if n == 0 {
                 throw DaemonError.closed
             } else if errno == EAGAIN || errno == EWOULDBLOCK {
@@ -74,7 +83,25 @@ enum Socket {
                 throw DaemonError.transport(errno)
             }
         }
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: response.bytes, as: UTF8.self)
+    }
+
+    private static func open() throws -> Int32 {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw DaemonError.transport(errno) }
+        var enabled: Int32 = 1
+        guard setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &enabled,
+            socklen_t(MemoryLayout.size(ofValue: enabled))
+        ) == 0 else {
+            let code = errno
+            close(fd)
+            throw DaemonError.transport(code)
+        }
+        return fd
     }
 
     private static func connect(
@@ -94,7 +121,9 @@ enum Socket {
         guard pathBytes.count <= maxPathBytes else { throw DaemonError.pathTooLong(path, maxPathBytes) }
         let bytes = pathBytes + [0]
         withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
-        let len = socklen_t(MemoryLayout<sa_family_t>.size + bytes.count)
+        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
+        let len = socklen_t(pathOffset + bytes.count)
+        addr.sun_len = UInt8(len)
         let connected = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, len) } }
         if connected != 0 {
             let code = errno
@@ -135,5 +164,17 @@ enum Socket {
         let remaining = deadline.timeIntervalSinceNow
         guard remaining > 0 else { return 0 }
         return min(Int32.max, max(1, Int32((remaining * 1000).rounded(.up))))
+    }
+}
+
+struct ResponseLineBuffer {
+    let maxBytes: Int
+    private(set) var bytes = [UInt8]()
+
+    mutating func append<C: Collection>(_ chunk: C) throws where C.Element == UInt8 {
+        guard chunk.count <= maxBytes - bytes.count else {
+            throw DaemonError.responseTooLarge(maxBytes)
+        }
+        bytes.append(contentsOf: chunk)
     }
 }

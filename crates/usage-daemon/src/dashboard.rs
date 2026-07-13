@@ -8,17 +8,40 @@ use usage_core::{
     UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource, UsageSnapshot,
 };
 
-pub(crate) fn build_usage_dashboard(snapshots: &[UsageSnapshot]) -> UsageDashboardSummary {
+use crate::storage::StoredDailyUsageHistory;
+
+pub(crate) fn build_usage_dashboard(
+    snapshots: &[UsageSnapshot],
+    daily_usage: &[StoredDailyUsageHistory],
+) -> UsageDashboardSummary {
     let codex_reference_rate = codex_reference_cost_per_token(snapshots);
+    let history = daily_usage
+        .iter()
+        .map(|history| {
+            (
+                (history.provider_id.as_str(), history.account_id.as_str()),
+                history,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let accounts = snapshots
         .iter()
-        .filter_map(|snapshot| account_summary(snapshot, codex_reference_rate))
+        .filter_map(|snapshot| {
+            account_summary(
+                snapshot,
+                history
+                    .get(&(snapshot.provider_id.as_str(), snapshot.account_id.as_str()))
+                    .copied(),
+                codex_reference_rate,
+            )
+        })
         .collect::<Vec<_>>();
     usage_core::aggregate_usage_dashboard(accounts)
 }
 
 fn account_summary(
     snapshot: &UsageSnapshot,
+    retained_activity: Option<&StoredDailyUsageHistory>,
     codex_reference_rate: Option<f64>,
 ) -> Option<AccountUsageSummary> {
     let provider_id = snapshot.provider_id.as_str();
@@ -30,26 +53,47 @@ fn account_summary(
         .metadata
         .get(format!("{provider_id}_activity"))
         .and_then(Value::as_object);
-    if cost.is_none() && activity.is_none() {
+    if cost.is_none() && activity.is_none() && retained_activity.is_none() {
         return None;
     }
 
     let cost_source = cost
         .and_then(|value| value.get("source"))
         .and_then(Value::as_str);
-    let activity_source = activity
-        .and_then(|value| value.get("source"))
-        .and_then(Value::as_str)
+    let activity_source = retained_activity
+        .and_then(|history| history.recent.last())
+        .map(|row| row.source.as_str())
+        .or_else(|| {
+            activity
+                .and_then(|value| value.get("source"))
+                .and_then(Value::as_str)
+        })
         .or(cost_source);
     let mut cost_days = cost
         .and_then(|value| value.get("by_day"))
         .and_then(Value::as_array)
         .map(|rows| daily_points(rows))
         .unwrap_or_else(|| synthesized_today_point(cost));
-    let activity_days = activity
-        .and_then(|value| value.get("by_day"))
-        .and_then(Value::as_array)
-        .map(|rows| daily_points(rows))
+    let activity_days = retained_activity
+        .map(|history| {
+            history
+                .recent
+                .iter()
+                .map(|row| DailyUsagePoint {
+                    date: row.date,
+                    tokens: row.tokens,
+                    cost_usd: row.cost_usd,
+                    priced_tokens: 0,
+                    unpriced_tokens: 0,
+                })
+                .collect()
+        })
+        .or_else(|| {
+            activity
+                .and_then(|value| value.get("by_day"))
+                .and_then(Value::as_array)
+                .map(|rows| daily_points(rows))
+        })
         .unwrap_or_else(|| cost_days.clone());
 
     if provider_id == "codex" && !activity_days.is_empty() {
@@ -67,9 +111,13 @@ fn account_summary(
             lookback_tokens: activity_days
                 .iter()
                 .fold(0_u64, |total, point| total.saturating_add(point.tokens)),
-            lifetime_tokens: activity
-                .and_then(|value| value.get("lifetime_tokens"))
-                .and_then(Value::as_u64),
+            lifetime_tokens: retained_activity
+                .map(|history| history.total_tokens)
+                .or_else(|| {
+                    activity
+                        .and_then(|value| value.get("lifetime_tokens"))
+                        .and_then(Value::as_u64)
+                }),
             days: activity_days,
         }
     });
@@ -97,9 +145,6 @@ fn account_summary(
                 unpriced_models: unpriced_models(metadata),
                 catalog_version: string(metadata, "pricing_version"),
                 catalog_source: string(metadata, "pricing_source"),
-                fetched_at: string(metadata, "pricing_fetched_at")
-                    .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-                    .map(|value| value.with_timezone(&Utc)),
                 catalog_effective_from: string(metadata, "pricing_effective_from")
                     .and_then(|value| NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()),
             },
@@ -431,6 +476,8 @@ mod tests {
     use serde_json::json;
     use usage_core::{AccountId, ProviderId};
 
+    use crate::storage::StoredDailyUsage;
+
     #[test]
     fn builds_typed_mixed_scope_dashboard_and_honest_pricing_coverage() {
         let collected_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
@@ -456,7 +503,7 @@ mod tests {
             },
         ];
 
-        let dashboard = build_usage_dashboard(&snapshots);
+        let dashboard = build_usage_dashboard(&snapshots, &[]);
 
         assert_eq!(dashboard.accounts.len(), 2);
         assert!(dashboard.provenance.mixed_scope);
@@ -498,5 +545,50 @@ mod tests {
 
         assert_eq!(summary.available_count, 3);
         assert_eq!(summary.credits.len(), 1);
+    }
+
+    #[test]
+    fn retained_daily_activity_overrides_stale_snapshot_activity() {
+        let provider_id = ProviderId::new("opencode_go");
+        let account_id = AccountId::new("account");
+        let retained_date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let snapshot = UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account_id.clone(),
+            collected_at: Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap(),
+            windows: Vec::new(),
+            metadata: json!({
+                "opencode_go_activity": {
+                    "source": "provider_reported",
+                    "lifetime_tokens": 1,
+                    "by_day": [{"date": "2026-07-09", "tokens": 1}]
+                }
+            }),
+        };
+        let retained = StoredDailyUsageHistory {
+            provider_id,
+            account_id,
+            bucket_count: 4,
+            total_tokens: 150,
+            recent: vec![StoredDailyUsage {
+                provider_id: ProviderId::new("opencode_go"),
+                account_id: AccountId::new("account"),
+                date: retained_date,
+                tokens: 75,
+                cost_usd: Some(0.25),
+                source: "opencode_local_sqlite".to_string(),
+            }],
+        };
+
+        let dashboard = build_usage_dashboard(&[snapshot], &[retained]);
+
+        let activity = dashboard.accounts[0].activity.as_ref().unwrap();
+        assert_eq!(activity.provenance.source, UsageDataSource::LocalDatabase);
+        assert_eq!(activity.lifetime_tokens, Some(150));
+        assert_eq!(activity.lookback_tokens, 75);
+        assert_eq!(activity.days.len(), 1);
+        assert_eq!(activity.days[0].date, retained_date);
+        assert_eq!(activity.days[0].tokens, 75);
+        assert_eq!(activity.days[0].cost_usd, Some(0.25));
     }
 }

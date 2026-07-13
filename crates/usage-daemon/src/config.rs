@@ -16,7 +16,6 @@ use usage_core::{
 use crate::providers::paths::expand_home_path;
 
 const POLL_INTERVAL_ENV: &str = "USAGE_TRACKER_POLL_INTERVAL_SECONDS";
-const SUPPORTED_PROVIDER_IDS: [&str; 4] = ["codex", "claude", "opencode_go", "grok"];
 pub const MIN_POLL_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Clone, Debug)]
@@ -24,7 +23,6 @@ pub struct Config {
     pub poll_interval_seconds: u64,
     pub notifications: NotificationConfig,
     pub providers: BTreeMap<String, ProviderConfig>,
-    pub debug_capture_raw_payloads: bool,
     pub paths: Paths,
 }
 
@@ -40,12 +38,13 @@ pub struct Paths {
 pub struct FileConfig {
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
+    /// Accepted only to migrate older config files; raw payload capture was removed.
+    #[serde(default, rename = "debug_capture_raw_payloads", skip_serializing)]
+    _legacy_debug_capture_raw_payloads: bool,
     #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
-    #[serde(default)]
-    pub debug_capture_raw_payloads: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -145,7 +144,16 @@ impl Config {
         socket_override: Option<PathBuf>,
         discover_local_activity_owners: bool,
     ) -> anyhow::Result<Self> {
+        let uses_default_app_directory =
+            config_override.is_none() || db_override.is_none() || socket_override.is_none();
         let paths = default_paths()?;
+        if uses_default_app_directory {
+            let app_directory = paths
+                .config
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("default config path has no parent directory"))?;
+            ensure_private_directory(app_directory)?;
+        }
         let config_path = config_override.unwrap_or(paths.config);
         let db_path = db_override.unwrap_or(paths.db);
         let socket_path = socket_override.unwrap_or(paths.socket);
@@ -169,7 +177,6 @@ impl Config {
             poll_interval_seconds,
             notifications: file_config.notifications,
             providers: file_config.providers,
-            debug_capture_raw_payloads: file_config.debug_capture_raw_payloads,
             paths: Paths {
                 config: config_path,
                 db: db_path,
@@ -204,11 +211,6 @@ impl Config {
             config_path: self.paths.config.display().to_string(),
             socket_path: self.paths.socket.display().to_string(),
             db_path: self.paths.db.display().to_string(),
-            enabled_providers: self
-                .enabled_provider_ids()
-                .into_iter()
-                .filter(|id| provider_visible(id.as_str(), visible_providers))
-                .collect(),
             providers: self
                 .providers
                 .iter()
@@ -262,12 +264,29 @@ impl Config {
     pub fn persist(&self) -> anyhow::Result<()> {
         let file_config = FileConfig {
             poll_interval_seconds: self.poll_interval_seconds,
+            _legacy_debug_capture_raw_payloads: false,
             notifications: self.notifications.clone(),
             providers: self.providers.clone(),
-            debug_capture_raw_payloads: self.debug_capture_raw_payloads,
         };
         write_config_atomically(&self.paths.config, &file_config)
     }
+}
+
+fn ensure_private_directory(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create private directory {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect private directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "private directory path {} is not a directory",
+            path.display()
+        );
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("failed to secure private directory {}", path.display()))
 }
 
 fn provider_visible(provider_id: &str, visible_providers: Option<&BTreeSet<String>>) -> bool {
@@ -279,7 +298,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
-    SUPPORTED_PROVIDER_IDS.contains(&provider_id)
+    usage_core::provider_spec(provider_id).is_some()
 }
 
 fn add_missing_default_providers(config: &mut FileConfig) {
@@ -449,52 +468,23 @@ fn parse_poll_interval_env(value: &str) -> anyhow::Result<u64> {
 
 impl Default for FileConfig {
     fn default() -> Self {
-        let mut providers = BTreeMap::new();
-        providers.insert(
-            "codex".to_string(),
-            ProviderConfig {
-                enabled: true,
-                profiles: Vec::new(),
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
-            },
-        );
-        providers.insert(
-            "claude".to_string(),
-            ProviderConfig {
-                enabled: false,
-                profiles: Vec::new(),
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
-            },
-        );
-        providers.insert(
-            "opencode_go".to_string(),
-            ProviderConfig {
-                enabled: false,
-                profiles: Vec::new(),
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
-            },
-        );
-        providers.insert(
-            "grok".to_string(),
-            ProviderConfig {
-                enabled: false,
-                profiles: Vec::new(),
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
-            },
-        );
+        let providers = usage_core::PROVIDER_SPECS
+            .iter()
+            .map(|spec| {
+                (
+                    spec.id.to_string(),
+                    ProviderConfig {
+                        enabled: spec.default_visible,
+                        ..ProviderConfig::default()
+                    },
+                )
+            })
+            .collect();
         Self {
             poll_interval_seconds: default_poll_interval_seconds(),
+            _legacy_debug_capture_raw_payloads: false,
             notifications: NotificationConfig::default(),
             providers,
-            debug_capture_raw_payloads: false,
         }
     }
 }
@@ -579,6 +569,14 @@ mod tests {
         let config: FileConfig =
             serde_json::from_str(r#"{"poll_interval_seconds":300,"providers":{}}"#).unwrap();
         assert!(config.notifications.enabled);
+    }
+
+    #[test]
+    fn accepts_but_drops_removed_raw_payload_setting() {
+        let config: FileConfig =
+            serde_json::from_str(r#"{"debug_capture_raw_payloads":true,"providers":{}}"#).unwrap();
+        let encoded = serde_json::to_value(config).unwrap();
+        assert!(encoded.get("debug_capture_raw_payloads").is_none());
     }
 
     #[test]
@@ -696,6 +694,39 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_and_tightens_private_directory_permissions() {
+        let root = std::env::temp_dir().join(format!("usage-private-{}", uuid::Uuid::new_v4()));
+        let path = root.join(".usagetracker");
+        fs::create_dir_all(&path).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        ensure_private_directory(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_symlink_for_the_private_directory() {
+        let root = std::env::temp_dir().join(format!("usage-private-{}", uuid::Uuid::new_v4()));
+        let target = root.join("target");
+        let path = root.join(".usagetracker");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error = ensure_private_directory(&path).unwrap_err();
+
+        assert!(error.to_string().contains("is not a directory"));
+        assert!(target.is_dir());
         fs::remove_dir_all(root).unwrap();
     }
 

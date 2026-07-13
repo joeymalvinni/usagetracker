@@ -20,6 +20,17 @@ enum DisplayStatus: Equatable, Sendable {
         }
     }
 
+    var severity: Int {
+        switch self {
+        case .normal: 0
+        case .disabled: 1
+        case .stale, .refreshing: 2
+        case .warning: 3
+        case .critical: 4
+        case .error, .offline: 5
+        }
+    }
+
     /// An actionable alert the user should acknowledge (as opposed to stale/disabled/off).
     var isAlert: Bool {
         switch self {

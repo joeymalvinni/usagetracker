@@ -1,11 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::unix::net::UnixStream as StdUnixStream,
+    os::unix::{fs::FileTypeExt, net::UnixStream as StdUnixStream},
     path::Path,
     sync::Arc,
     time::Duration,
 };
 
+use anyhow::Context;
 use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{info, warn};
 use usage_core::{
@@ -112,7 +113,7 @@ impl ConfigUpdateChanges {
 impl Daemon {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let storage = Storage::open(&config.paths.db)?;
-        let providers = provider_registry::build_enabled(&config, &storage).await?;
+        let providers = provider_registry::build_collectors(&config, &storage).await?;
         let notifications = NotificationManager::new(storage.clone(), config.notifications.clone());
         let refresh = Arc::new(RefreshCoordinator::with_notifications(
             storage.clone(),
@@ -248,31 +249,43 @@ impl DaemonRuntime {
     }
 
     pub async fn config_response(&self) -> anyhow::Result<ConfigResponse> {
-        let visible_providers = self.visible_provider_ids().await?;
+        let data_provider_ids = self
+            .storage
+            .provider_data_ids()
+            .await?
+            .into_iter()
+            .map(|id| id.as_str().to_string())
+            .collect();
         Ok(self
-            .config
-            .read()
+            .config_response_for_provider_data(data_provider_ids)
             .await
-            .response_with_visible_providers(Some(&visible_providers)))
+            .0)
+    }
+
+    pub async fn config_response_for_provider_data(
+        &self,
+        mut data_provider_ids: BTreeSet<String>,
+    ) -> (ConfigResponse, BTreeSet<String>) {
+        let config = self.config.read().await;
+        data_provider_ids.extend(
+            config
+                .enabled_provider_ids()
+                .into_iter()
+                .map(|id| id.as_str().to_string()),
+        );
+        let response = config.response_with_visible_providers(Some(&data_provider_ids));
+        (response, data_provider_ids)
     }
 
     pub async fn visible_provider_ids(&self) -> anyhow::Result<BTreeSet<String>> {
-        let mut providers = self
+        let providers = self
             .storage
             .provider_data_ids()
             .await?
             .into_iter()
             .map(|id| id.as_str().to_string())
             .collect::<BTreeSet<_>>();
-        providers.extend(
-            self.config
-                .read()
-                .await
-                .enabled_provider_ids()
-                .into_iter()
-                .map(|id| id.as_str().to_string()),
-        );
-        Ok(providers)
+        Ok(self.config_response_for_provider_data(providers).await.1)
     }
 
     async fn collectors_for_config(
@@ -282,7 +295,7 @@ impl DaemonRuntime {
         if self.fixture_mode {
             Ok(Vec::new())
         } else {
-            provider_registry::build_enabled(config, &self.storage).await
+            provider_registry::build_collectors(config, &self.storage).await
         }
     }
 
@@ -678,8 +691,7 @@ impl DaemonRuntime {
 
         let (mut workspace_options, discovery_error) =
             if provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
-                let collector =
-                    OpenCodeCollector::new(provider.clone(), config.debug_capture_raw_payloads)?;
+                let collector = OpenCodeCollector::new(provider.clone())?;
                 match collector.discover_workspace_options().await {
                     Ok(options) => (options, None),
                     Err(err) => (Vec::new(), Some(err.short_message().to_string())),
@@ -1092,29 +1104,31 @@ fn prepare_socket_path(socket_path: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    if socket_path.exists() {
-        match StdUnixStream::connect(socket_path) {
-            Ok(_) => {
-                anyhow::bail!(
-                    "daemon socket {} is already accepting connections; refusing to replace a live daemon socket",
-                    socket_path.display()
-                );
-            }
-            Err(err) => {
-                info!(
-                    socket = %socket_path.display(),
-                    error = %err,
-                    "removing stale daemon socket"
-                );
-            }
-        }
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if !metadata.file_type().is_socket() {
+        anyhow::bail!(
+            "refusing to remove non-socket path {}",
+            socket_path.display()
+        );
     }
 
-    match std::fs::remove_file(socket_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
+    match StdUnixStream::connect(socket_path) {
+        Ok(_) => anyhow::bail!(
+            "daemon socket {} is already accepting connections; refusing to replace a live daemon socket",
+            socket_path.display()
+        ),
+        Err(err) => info!(
+            socket = %socket_path.display(),
+            error = %err,
+            "removing stale daemon socket"
+        ),
     }
+    std::fs::remove_file(socket_path)
+        .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))
 }
 
 #[cfg(test)]
@@ -1179,7 +1193,6 @@ mod tests {
             poll_interval_seconds: 300,
             notifications: NotificationConfig::default(),
             providers,
-            debug_capture_raw_payloads: false,
             paths: crate::config::Paths {
                 config: root.join("config.json"),
                 db: root.join("usage.sqlite3"),
@@ -1191,6 +1204,56 @@ mod tests {
     fn test_storage_at(root: &Path) -> Storage {
         std::fs::create_dir_all(root).unwrap();
         Storage::open(&root.join("usage.sqlite3")).unwrap()
+    }
+
+    fn short_socket_test_root() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp").join(format!(
+            "ut-sock-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ))
+    }
+
+    #[test]
+    fn stale_socket_cleanup_removes_only_socket_files() {
+        let root = short_socket_test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let socket_path = root.join("usage.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+
+        prepare_socket_path(&socket_path).unwrap();
+
+        assert!(!socket_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_socket_cleanup_preserves_non_socket_paths() {
+        let root = short_socket_test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let socket_path = root.join("usage.sock");
+        std::fs::write(&socket_path, b"keep me").unwrap();
+
+        let error = prepare_socket_path(&socket_path).unwrap_err();
+
+        assert!(error.to_string().contains("refusing to remove non-socket"));
+        assert_eq!(std::fs::read(&socket_path).unwrap(), b"keep me");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_socket_cleanup_refuses_a_live_daemon_socket() {
+        let root = short_socket_test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let socket_path = root.join("usage.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+        let error = prepare_socket_path(&socket_path).unwrap_err();
+
+        assert!(error.to_string().contains("already accepting connections"));
+        assert!(socket_path.exists());
+        std::fs::remove_file(socket_path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

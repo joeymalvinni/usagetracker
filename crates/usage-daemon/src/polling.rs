@@ -754,7 +754,6 @@ impl RefreshCoordinator {
             .storage
             .record_success(
                 &snapshot,
-                result.raw_payload.as_ref(),
                 &result.daily_usage,
                 &ok_health,
                 result.account_email.as_deref(),
@@ -920,7 +919,7 @@ fn provider_error_result(
     ProviderRefreshResult {
         provider_id,
         account_id,
-        status: refresh_status_for_provider_error(error.kind()),
+        status: error.kind().into(),
         collection_mode: None,
         collected_at: None,
         message: Some(error.short_message().to_string()),
@@ -939,18 +938,6 @@ fn storage_error_result(
         collection_mode: None,
         collected_at: None,
         message: Some(message),
-    }
-}
-
-fn refresh_status_for_provider_error(kind: ProviderErrorKind) -> ProviderRefreshStatus {
-    match kind {
-        ProviderErrorKind::CredentialsMissing => ProviderRefreshStatus::CredentialsMissing,
-        ProviderErrorKind::CredentialsInvalid => ProviderRefreshStatus::CredentialsInvalid,
-        ProviderErrorKind::Unauthorized => ProviderRefreshStatus::Unauthorized,
-        ProviderErrorKind::RateLimited => ProviderRefreshStatus::RateLimited,
-        ProviderErrorKind::Network => ProviderRefreshStatus::Network,
-        ProviderErrorKind::Parse => ProviderRefreshStatus::Parse,
-        ProviderErrorKind::ProviderUnavailable => ProviderRefreshStatus::ProviderUnavailable,
     }
 }
 
@@ -1028,7 +1015,6 @@ mod tests {
                 daily_usage: Vec::new(),
                 collection_mode: "live".to_string(),
                 account_email: Some("claude@example.com".to_string()),
-                raw_payload: None,
                 warnings: vec![],
             })
         }
@@ -1112,7 +1098,6 @@ mod tests {
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
                 account_email: account.email.clone(),
-                raw_payload: None,
                 warnings: vec![],
             })
         }
@@ -1155,7 +1140,6 @@ mod tests {
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
                 account_email: None,
-                raw_payload: None,
                 warnings: Vec::new(),
             })
         }
@@ -1210,7 +1194,6 @@ mod tests {
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
                 account_email: None,
-                raw_payload: None,
                 warnings: Vec::new(),
             })
         }
@@ -1275,7 +1258,6 @@ mod tests {
                 daily_usage: Vec::new(),
                 collection_mode: "test".to_string(),
                 account_email: None,
-                raw_payload: None,
                 warnings: Vec::new(),
             })
         }

@@ -245,11 +245,6 @@ impl Storage {
         self.with_connection(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             transaction.execute(
-                "DELETE FROM raw_payloads
-                 WHERE snapshot_id IN (SELECT id FROM usage_snapshots WHERE account_id = ?1)",
-                params![account_id.as_str()],
-            )?;
-            transaction.execute(
                 "DELETE FROM usage_snapshots WHERE account_id = ?1",
                 params![account_id.as_str()],
             )?;

@@ -1,7 +1,6 @@
 use std::fmt::Write;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use serde::Serialize;
 use usage_core::{
     Account, AddProviderAccountResponse, ConfigResponse, ProviderActionResponse,
     ProviderRefreshResult, ProviderSetupResponse, UsageSnapshot,
@@ -11,8 +10,8 @@ use crate::{
     render::{
         labels::{identity_labels, latest_snapshots_by_account},
         style::{
-            format_collection_mode, format_local_time, format_provider_name, relative_time,
-            relative_time_opt, Theme,
+            format_collection_mode, format_local_time, format_provider_name, json_name, push_kv,
+            relative_time, relative_time_opt, Theme,
         },
         table::Table,
     },
@@ -29,7 +28,6 @@ pub fn render_accounts(
     let theme = Theme::new(color);
     match style {
         OutputStyle::Dashboard => render_accounts_dashboard(accounts, snapshots, theme, verbose),
-        OutputStyle::Compact => render_accounts_compact(accounts, snapshots, theme, verbose),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -38,7 +36,6 @@ pub fn render_config(config: &ConfigResponse, style: OutputStyle, color: bool) -
     let theme = Theme::new(color);
     match style {
         OutputStyle::Dashboard => render_config_dashboard(config, theme),
-        OutputStyle::Compact => render_config_compact(config, theme),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -55,14 +52,6 @@ pub fn render_refresh(
     let theme = Theme::new(color);
     match style {
         OutputStyle::Dashboard => render_refresh_dashboard(
-            started_at,
-            finished_at,
-            provider_results,
-            accounts,
-            snapshots,
-            theme,
-        ),
-        OutputStyle::Compact => render_refresh_compact(
             started_at,
             finished_at,
             provider_results,
@@ -145,69 +134,6 @@ fn render_refresh_dashboard(
     output.trim_end().to_string()
 }
 
-fn render_refresh_compact(
-    started_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
-    provider_results: &[ProviderRefreshResult],
-    accounts: &[Account],
-    snapshots: &[UsageSnapshot],
-    theme: Theme,
-) -> String {
-    let account_by_id = account_by_id(accounts);
-    let latest_by_account = latest_snapshots_by_account(snapshots);
-    let mut lines = vec![format!(
-        "{} in {}",
-        theme.title("Refresh complete"),
-        format_duration(finished_at - started_at)
-    )];
-    lines.extend(provider_results.iter().map(|result| {
-        let labels = result
-            .account_id
-            .as_ref()
-            .map(|id| {
-                identity_labels(
-                    account_by_id.get(id.as_str()).copied(),
-                    latest_by_account.get(id.as_str()).copied(),
-                )
-            })
-            .unwrap_or_default();
-        let identity = labels
-            .identity
-            .map(|value| format!(" · {value}"))
-            .unwrap_or_default();
-        let plan = labels
-            .plan
-            .map(|value| format!(" · {value}"))
-            .unwrap_or_default();
-        let mode = result
-            .collection_mode
-            .as_deref()
-            .map(|mode| {
-                format!(
-                    " · {}",
-                    format_collection_mode(result.provider_id.as_str(), mode)
-                )
-            })
-            .unwrap_or_default();
-        let message = result
-            .message
-            .as_ref()
-            .map(|message| format!(" · {message}"))
-            .unwrap_or_default();
-        format!(
-            "{}{}{}: {}{} · collected {}{}",
-            theme.title(&format_provider_name(result.provider_id.as_str())),
-            identity,
-            plan,
-            theme.status(&json_name(&result.status)),
-            mode,
-            relative_time_opt(result.collected_at),
-            message
-        )
-    }));
-    lines.join("\n")
-}
-
 fn render_accounts_dashboard(
     accounts: &[Account],
     snapshots: &[UsageSnapshot],
@@ -254,47 +180,6 @@ fn render_accounts_dashboard(
     output.trim_end().to_string()
 }
 
-fn render_accounts_compact(
-    accounts: &[Account],
-    snapshots: &[UsageSnapshot],
-    theme: Theme,
-    verbose: bool,
-) -> String {
-    let latest_by_account = latest_snapshots_by_account(snapshots);
-    accounts
-        .iter()
-        .map(|account| {
-            let labels = identity_labels(
-                Some(account),
-                latest_by_account.get(account.id.as_str()).copied(),
-            );
-            let mut parts = Vec::new();
-            if let Some(identity) = labels.identity {
-                let kind = labels.identity_kind.unwrap_or("identity");
-                parts.push(format!("{kind} {identity}"));
-            }
-            if let Some(plan) = labels.plan {
-                parts.push(format!("plan {plan}"));
-            }
-            parts.push(format!("id {}", account.id));
-            parts.push(format!("state {}", account_state_plain(account)));
-            if verbose {
-                if let Some(profile) = &account.profile_id {
-                    parts.push(format!("profile {profile}"));
-                }
-                parts.push(format!("external {}", account.external_account_id));
-            }
-            parts.push(format!("updated {}", relative_time(account.updated_at)));
-            format!(
-                "{}: {}",
-                theme.title(&format_provider_name(account.provider_id.as_str())),
-                parts.join(" · ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 pub fn render_account_action(account: &Account, style: OutputStyle, color: bool) -> String {
     let theme = Theme::new(color);
     match style {
@@ -324,13 +209,6 @@ pub fn render_account_action(account: &Account, style: OutputStyle, color: bool)
             push_kv(&mut output, theme, "State", account_state_plain(account));
             output.trim_end().to_string()
         }
-        OutputStyle::Compact => format!(
-            "{} account {} · {} · {}",
-            format_provider_name(account.provider_id.as_str()),
-            account.id,
-            account.display_name.as_deref().unwrap_or("unnamed"),
-            account_state_plain(account)
-        ),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -367,12 +245,6 @@ pub fn render_added_account(
             );
             output.trim_end().to_string()
         }
-        OutputStyle::Compact => format!(
-            "Created {} profile {} · {}",
-            format_provider_name(account.provider_id.as_str()),
-            account.profile_id,
-            account.profile_path
-        ),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -434,38 +306,6 @@ pub fn render_provider_setup(
             output.push_str(&table.render(theme));
             output.trim_end().to_string()
         }
-        OutputStyle::Compact => {
-            let profiles = setup
-                .profiles
-                .iter()
-                .map(|profile| {
-                    format!(
-                        "{}={}",
-                        profile.id,
-                        if profile.enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "{} setup · workspace {} · profiles [{}]{}",
-                format_provider_name(setup.provider_id.as_str()),
-                setup
-                    .selected_workspace_id
-                    .as_deref()
-                    .unwrap_or("automatic"),
-                profiles,
-                setup
-                    .discovery_error
-                    .as_ref()
-                    .map(|error| format!(" · discovery {error}"))
-                    .unwrap_or_default()
-            )
-        }
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -520,43 +360,6 @@ fn render_config_dashboard(config: &ConfigResponse, theme: Theme) -> String {
     output.trim_end().to_string()
 }
 
-fn render_config_compact(config: &ConfigResponse, theme: Theme) -> String {
-    let providers = config
-        .providers
-        .iter()
-        .map(|(provider, toggle)| {
-            format!(
-                "{}={}",
-                provider,
-                if toggle.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{} poll={}s · notifications={} · providers [{}] · config {} · socket {} · db {}",
-        theme.title("Config"),
-        config.poll_interval_seconds,
-        if config.notifications.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        providers,
-        config.config_path,
-        config.socket_path,
-        config.db_path
-    )
-}
-
-fn push_kv(output: &mut String, theme: Theme, key: &str, value: &str) {
-    let _ = writeln!(output, "{}  {}", theme.label(&format!("{key:<14}")), value);
-}
-
 fn format_duration(duration: TimeDelta) -> String {
     let seconds = duration.num_seconds().max(0);
     if seconds < 60 {
@@ -599,13 +402,6 @@ fn account_state_plain(account: &Account) -> &'static str {
     }
 }
 
-fn json_name(value: &impl Serialize) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "\"unknown\"".to_string())
-        .trim_matches('"')
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,7 +438,6 @@ mod tests {
                 config_path: "/tmp/config.json".to_string(),
                 socket_path: "/tmp/usage.sock".to_string(),
                 db_path: "/tmp/usage.sqlite3".to_string(),
-                enabled_providers: vec![ProviderId::new("claude")],
                 providers,
             },
             OutputStyle::Dashboard,
@@ -676,26 +471,6 @@ mod tests {
         assert!(rendered.contains("terminal"));
         assert!(rendered.contains("ok"));
         assert!(!rendered.contains("Claude team"));
-    }
-
-    #[test]
-    fn render_refresh_compact_includes_failure_message() {
-        let rendered = render_refresh(
-            Utc.with_ymd_and_hms(2026, 7, 8, 18, 5, 57).unwrap(),
-            Utc.with_ymd_and_hms(2026, 7, 8, 18, 6, 4).unwrap(),
-            &[sample_refresh_result(
-                ProviderRefreshStatus::CredentialsMissing,
-                Some("Claude credentials not found".to_string()),
-            )],
-            &[sample_account()],
-            &[sample_snapshot()],
-            OutputStyle::Compact,
-            false,
-        );
-
-        assert!(rendered.contains("Refresh complete in 7s"));
-        assert!(rendered.contains("credentials_missing"));
-        assert!(rendered.contains("Claude credentials not found"));
     }
 
     fn sample_account() -> Account {

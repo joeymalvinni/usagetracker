@@ -186,18 +186,15 @@ async fn discovers_each_codex_identity_once_regardless_of_profile_nickname() {
     write_codex_auth(&duplicate_auth, "shared-account");
     write_codex_auth(&distinct_auth, "distinct-account");
 
-    let collector = CodexCollector::new(
-        ProviderConfig {
-            enabled: true,
-            profiles: vec![
-                codex_test_profile("first", "Personal", first_auth),
-                codex_test_profile("duplicate", "Renamed copy", duplicate_auth),
-                codex_test_profile("distinct", "Work", distinct_auth),
-            ],
-            ..ProviderConfig::default()
-        },
-        false,
-    )
+    let collector = CodexCollector::new(ProviderConfig {
+        enabled: true,
+        profiles: vec![
+            codex_test_profile("first", "Personal", first_auth),
+            codex_test_profile("duplicate", "Renamed copy", duplicate_auth),
+            codex_test_profile("distinct", "Work", distinct_auth),
+        ],
+        ..ProviderConfig::default()
+    })
     .unwrap();
 
     let discovery = collector.discover_accounts().await.unwrap();
@@ -224,17 +221,14 @@ async fn rejects_collection_through_a_later_duplicate_codex_profile() {
     write_codex_auth(&canonical_auth, "same-account");
     write_codex_auth(&duplicate_auth, "same-account");
 
-    let collector = CodexCollector::new(
-        ProviderConfig {
-            enabled: true,
-            profiles: vec![
-                codex_test_profile("canonical", "First nickname", canonical_auth),
-                codex_test_profile("duplicate", "Different nickname", duplicate_auth),
-            ],
-            ..ProviderConfig::default()
-        },
-        false,
-    )
+    let collector = CodexCollector::new(ProviderConfig {
+        enabled: true,
+        profiles: vec![
+            codex_test_profile("canonical", "First nickname", canonical_auth),
+            codex_test_profile("duplicate", "Different nickname", duplicate_auth),
+        ],
+        ..ProviderConfig::default()
+    })
     .unwrap();
     let duplicate = DiscoveredAccount {
         external_account_id: "same-account".to_string(),

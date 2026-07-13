@@ -3,7 +3,6 @@ struct ConfigResponse: Decodable, Equatable {
     let pollIntervalSeconds: UInt64
     let notifications: NotificationConfig
     let configPath, socketPath, dbPath: String
-    let enabledProviders: [String]
     let providers: [String: ProviderToggle]
 }
 

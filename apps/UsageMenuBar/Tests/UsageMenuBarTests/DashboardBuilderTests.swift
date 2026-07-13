@@ -155,7 +155,6 @@ final class DashboardBuilderTests: XCTestCase {
             configPath: "/tmp/config.json",
             socketPath: "/tmp/usage.sock",
             dbPath: "/tmp/usage.sqlite3",
-            enabledProviders: providers.compactMap { $0.value ? $0.key : nil },
             providers: providers.mapValues { ProviderToggle(enabled: $0) }
         )
     }

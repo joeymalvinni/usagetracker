@@ -96,7 +96,6 @@ pub(super) fn collect_usage_from_app_server(
         account_activity_available,
         collection_mode: "codex_app_server_rate_limits".to_string(),
         account_display_name,
-        raw_payload: payload,
         warnings,
     })
 }

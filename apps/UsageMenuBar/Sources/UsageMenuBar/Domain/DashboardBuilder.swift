@@ -211,8 +211,8 @@ struct DashboardBuilder {
         let allSparklines = accountVMs.map(\.sparkline)
         let aggregatedSparkline = mergeSparklines(allSparklines)
         let worstPercent = accountVMs.compactMap(\.percent).min()
-        let worstStatus = accountVMs.map(\.status).max { severity($0) < severity($1) } ?? .stale
-        let worstAccount = accountVMs.max { severity($0.status) < severity($1.status) }
+        let worstStatus = accountVMs.map(\.status).max { $0.severity < $1.severity } ?? .stale
+        let worstAccount = accountVMs.max { $0.status.severity < $1.status.severity }
         let totalTokens = aggregatedSparkline.reduce(UInt64(0)) { $0.saturatingAdd(UInt64($1.rounded())) }
         let primary = worstPercent.map { "\(Int($0.rounded()))%" } ?? allWindows.compactMap { $0.percent != nil ? nil : ($0.value.isEmpty ? nil : $0.value) }.first ?? accountVMs.first?.primary ?? "No data"
         let latestCollected = snapshotsByProvider[providerId]?.map(\.collectedAt).max()
@@ -455,7 +455,7 @@ struct DashboardBuilder {
     }
 
     private func providerIds(includeKnownProviders: Bool = false) -> Set<String> {
-        var ids = Set((config?.enabledProviders ?? []).filter(isSupportedProvider) + health.map(\.providerId).filter(isSupportedProvider) + snapshots.map(\.providerId).filter(isSupportedProvider))
+        var ids = Set(health.map(\.providerId).filter(isSupportedProvider) + snapshots.map(\.providerId).filter(isSupportedProvider))
         ids.formUnion(accounts.map(\.providerId).filter(isSupportedProvider))
         if let config { ids.formUnion(config.providers.keys.filter(isSupportedProvider)) }
         if includeKnownProviders { ids.formUnion(knownProviderIds) }
@@ -500,8 +500,7 @@ struct DashboardBuilder {
     }
 
     private func isEnabledProvider(_ id: String) -> Bool {
-        if let enabled = config?.providers[id]?.enabled { return enabled }
-        return config?.enabledProviders.contains(id) == true
+        config?.providers[id]?.enabled == true
     }
 
     private func isUnavailableProvider(_ id: String) -> Bool {
@@ -763,16 +762,6 @@ struct DashboardBuilder {
         DateFormats.expiry.string(from: d)
     }
     private func relative(_ d: Date) -> String { DateFormats.relative.localizedString(for: d, relativeTo: Date()) }
-    private func severity(_ status: DisplayStatus) -> Int {
-        switch status {
-        case .normal: 0
-        case .disabled: 1
-        case .stale, .refreshing: 2
-        case .warning: 3
-        case .critical: 4
-        case .error, .offline: 5
-        }
-    }
 }
 
 func formatUsd(_ value: Double) -> String {

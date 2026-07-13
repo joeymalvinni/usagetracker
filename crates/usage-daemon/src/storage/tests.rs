@@ -46,10 +46,7 @@ async fn stores_and_reads_accounts_snapshots_and_health() {
         }],
         metadata: json!({"collection_mode": "test"}),
     };
-    storage
-        .insert_snapshot(&snapshot, Some(&json!({"raw": true})))
-        .await
-        .unwrap();
+    storage.insert_snapshot(&snapshot).await.unwrap();
 
     storage
         .upsert_health(&ProviderHealth {
@@ -100,7 +97,7 @@ async fn recent_usage_is_bounded_filtered_and_newest_first() {
     };
     for offset in [0, 5, 10] {
         snapshot.collected_at = start + chrono::TimeDelta::minutes(offset);
-        storage.insert_snapshot(&snapshot, None).await.unwrap();
+        storage.insert_snapshot(&snapshot).await.unwrap();
     }
 
     let recent = storage
@@ -142,24 +139,21 @@ async fn usage_dashboard_reads_bounded_compact_forecast_history() {
     let reset_at = start + chrono::TimeDelta::hours(5);
     for (offset, percent) in [(0, 10.0), (5, 20.0), (10, 30.0)] {
         storage
-            .insert_snapshot(
-                &UsageSnapshot {
-                    provider_id: provider_id.clone(),
-                    account_id: account.id.clone(),
-                    collected_at: start + chrono::TimeDelta::minutes(offset),
-                    windows: vec![
-                        percentage_window(
-                            "codex_session",
-                            UsageWindowKind::Session,
-                            percent,
-                            Some(reset_at),
-                        ),
-                        percentage_window("codex_tokens", UsageWindowKind::Tokens, percent, None),
-                    ],
-                    metadata: json!({"large": "metadata is already in normalized_json"}),
-                },
-                None,
-            )
+            .insert_snapshot(&UsageSnapshot {
+                provider_id: provider_id.clone(),
+                account_id: account.id.clone(),
+                collected_at: start + chrono::TimeDelta::minutes(offset),
+                windows: vec![
+                    percentage_window(
+                        "codex_session",
+                        UsageWindowKind::Session,
+                        percent,
+                        Some(reset_at),
+                    ),
+                    percentage_window("codex_tokens", UsageWindowKind::Tokens, percent, None),
+                ],
+                metadata: json!({"large": "metadata is already in normalized_json"}),
+            })
             .await
             .unwrap();
     }
@@ -431,21 +425,18 @@ async fn permanently_deletes_account_and_related_data() {
         .await
         .unwrap();
     storage
-        .insert_snapshot(
-            &UsageSnapshot {
-                provider_id: provider_id.clone(),
-                account_id: account.id.clone(),
-                collected_at: Utc::now(),
-                windows: vec![percentage_window(
-                    "codex_session",
-                    UsageWindowKind::Session,
-                    25.0,
-                    None,
-                )],
-                metadata: json!({}),
-            },
-            Some(&json!({"raw": true})),
-        )
+        .insert_snapshot(&UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id.clone(),
+            collected_at: Utc::now(),
+            windows: vec![percentage_window(
+                "codex_session",
+                UsageWindowKind::Session,
+                25.0,
+                None,
+            )],
+            metadata: json!({}),
+        })
         .await
         .unwrap();
     storage
@@ -506,16 +497,13 @@ async fn returns_provider_ids_with_account_or_snapshot_data() {
         .unwrap();
 
     storage
-        .insert_snapshot(
-            &UsageSnapshot {
-                provider_id: provider_id.clone(),
-                account_id: account.id,
-                collected_at: Utc::now(),
-                windows: Vec::new(),
-                metadata: json!({}),
-            },
-            None,
-        )
+        .insert_snapshot(&UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id,
+            collected_at: Utc::now(),
+            windows: Vec::new(),
+            metadata: json!({}),
+        })
         .await
         .unwrap();
 
@@ -774,16 +762,13 @@ async fn latest_usage_breaks_timestamp_ties_deterministically() {
     let collected_at = Utc::now();
     for version in [1, 2] {
         storage
-            .insert_snapshot(
-                &UsageSnapshot {
-                    provider_id: provider_id.clone(),
-                    account_id: account.id.clone(),
-                    collected_at,
-                    windows: Vec::new(),
-                    metadata: json!({"version": version}),
-                },
-                None,
-            )
+            .insert_snapshot(&UsageSnapshot {
+                provider_id: provider_id.clone(),
+                account_id: account.id.clone(),
+                collected_at,
+                windows: Vec::new(),
+                metadata: json!({"version": version}),
+            })
             .await
             .unwrap();
     }
@@ -795,7 +780,7 @@ async fn latest_usage_breaks_timestamp_ties_deterministically() {
 }
 
 #[tokio::test]
-async fn prunes_bounded_snapshot_and_raw_payload_history() {
+async fn prunes_bounded_snapshot_history() {
     let storage = test_storage();
     let provider_id = ProviderId::new("codex");
     let account = storage
@@ -804,21 +789,18 @@ async fn prunes_bounded_snapshot_and_raw_payload_history() {
         .unwrap();
     for version in 1..=3 {
         storage
-            .insert_snapshot(
-                &UsageSnapshot {
-                    provider_id: provider_id.clone(),
-                    account_id: account.id.clone(),
-                    collected_at: Utc::now(),
-                    windows: vec![percentage_window(
-                        "codex_session",
-                        UsageWindowKind::Session,
-                        f64::from(version),
-                        None,
-                    )],
-                    metadata: json!({"version": version}),
-                },
-                Some(&json!({"version": version})),
-            )
+            .insert_snapshot(&UsageSnapshot {
+                provider_id: provider_id.clone(),
+                account_id: account.id.clone(),
+                collected_at: Utc::now(),
+                windows: vec![percentage_window(
+                    "codex_session",
+                    UsageWindowKind::Session,
+                    f64::from(version),
+                    None,
+                )],
+                metadata: json!({"version": version}),
+            })
             .await
             .unwrap();
     }
@@ -833,33 +815,29 @@ async fn prunes_bounded_snapshot_and_raw_payload_history() {
                 &prune_account_id,
                 Utc::now() - chrono::TimeDelta::days(90),
                 2,
-                1,
             )
         })
         .await
         .unwrap();
 
     let account_id = account.id.clone();
-    let (snapshots, raw_payloads, observations) = storage
+    let (snapshots, observations) = storage
         .with_connection(move |conn| {
             let snapshots: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM usage_snapshots WHERE account_id = ?1",
                 params![account_id.as_str()],
                 |row| row.get(0),
             )?;
-            let raw_payloads: i64 =
-                conn.query_row("SELECT COUNT(*) FROM raw_payloads", [], |row| row.get(0))?;
             let observations: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM usage_window_observations WHERE account_id = ?1",
                 params![account_id.as_str()],
                 |row| row.get(0),
             )?;
-            Ok((snapshots, raw_payloads, observations))
+            Ok((snapshots, observations))
         })
         .await
         .unwrap();
     assert_eq!(snapshots, 2);
-    assert_eq!(raw_payloads, 1);
     assert_eq!(observations, 2);
     assert_eq!(
         storage.latest_usage().await.unwrap()[0].metadata["version"],

@@ -44,7 +44,7 @@
 
 - Add account-level refresh actions.
 - Add audit metadata such as `hidden_at`, `disabled_at`, and optional user-facing removal reason.
-- Keep irreversible purge behind a second confirmation and delete related snapshots, raw payloads, and health.
+- Keep irreversible purge behind a second confirmation and delete related snapshots and health.
 - Add migration tests against pre-lifecycle databases.
 - Add socket API compatibility tests for older clients missing lifecycle fields.
 - Add end-to-end menu bar tests for hide, remove, and re-enable flows.
