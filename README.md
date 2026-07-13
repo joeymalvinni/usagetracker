@@ -33,8 +33,8 @@ usage                 # show your usage dashboard
 Everything stays on your machine. There's no account to create and no server to phone home to. UsageTracker never asks for your provider passwords, and it doesn't keep the raw responses it gets back from providers.
 
 <p align="center">
-  <img src="docs/assets/CLI_output.png" alt="UsageTracker CLI usage dashboard" width="49%" />
-  <img src="docs/assets/MacOS_UI.png" alt="UsageTracker macOS menu bar interface" width="49%" />
+  <img src="docs/assets/MacOS_UI.png" alt="UsageTracker macOS menu bar interface" height="520" />
+  <img src="docs/assets/CLI_output.png" alt="UsageTracker CLI usage dashboard" height="520" />
 </p>
 
 ## What it shows
