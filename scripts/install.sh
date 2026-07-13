@@ -9,6 +9,8 @@ install_app=1
 install_cli=1
 launch_app=1
 force=0
+app_was_running=0
+update_status_file="${USAGETRACKER_UPDATE_STATUS_FILE:-}"
 
 usage() {
   cat <<'EOF'
@@ -149,11 +151,20 @@ work_dir="$(mktemp -d "${TMPDIR:-/tmp}/usagetracker-install.XXXXXX")"
 new_app=""
 backup_app=""
 cleanup() {
+  local status=$?
+  set +e
+  if [[ "$status" != "0" && -n "$update_status_file" ]]; then
+    printf '%s\n' "$status" > "$update_status_file" 2>/dev/null || true
+  fi
   rm -rf "$work_dir"
   if [[ -n "$new_app" ]]; then rm -rf "$new_app"; fi
   if [[ -n "$backup_app" && -e "$backup_app" ]]; then
     echo "A previous app was preserved at $backup_app" >&2
   fi
+  if [[ "$status" != "0" && "$app_was_running" == "1" && -d "${app_path:-}" ]]; then
+    open "$app_path" >/dev/null 2>&1 || true
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 
@@ -188,6 +199,18 @@ signature_field() {
   local field="$2"
   codesign -dv --verbose=4 "$path" 2>&1 | \
     awk -F= -v field="$field" '$1 == field { print $2; exit }'
+}
+
+app_is_running() {
+  local pid executable
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    executable="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    if [[ "$executable" == "$app_path/Contents/MacOS/UsageMenuBar" ]]; then
+      return 0
+    fi
+  done < <(pgrep -x UsageMenuBar 2>/dev/null || true)
+  return 1
 }
 
 expected_app_identifier="engineering.super.usagetracker"
@@ -283,14 +306,15 @@ if [[ "$install_cli" == "1" ]]; then
 fi
 
 if [[ "$install_app" == "1" ]]; then
-  if pgrep -x UsageMenuBar >/dev/null 2>&1; then
+  if app_is_running; then
+    app_was_running=1
     echo "Asking UsageTracker to quit before updating..."
     osascript -e "tell application id \"$app_identifier\" to quit" >/dev/null 2>&1 || true
     for _ in {1..20}; do
-      if ! pgrep -x UsageMenuBar >/dev/null 2>&1; then break; fi
+      if ! app_is_running; then break; fi
       sleep 0.25
     done
-    if pgrep -x UsageMenuBar >/dev/null 2>&1; then
+    if app_is_running; then
       echo "UsageTracker is still running. Quit it and run the installer again." >&2
       exit 1
     fi

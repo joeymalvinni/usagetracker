@@ -10,6 +10,8 @@ An ad-hoc signature lets `codesign` detect changes after packaging, but it does 
 
 The installer verifies the published checksums, expected archive contents, UsageTracker bundle and signing identifiers, and ad-hoc signature integrity. Checksums and artifacts are hosted by the same GitHub Release, so users still rely on GitHub and the repository account as the distribution trust boundary.
 
+The dashboard's in-app updater checks GitHub's latest stable release, verifies the release's `install.sh` against `SHA256SUMS`, and runs that installer in app-only mode against the current app directory. Keep both files in every release; they are part of the update path as well as the command-line installation path.
+
 ## Publish a release
 
 1. Update `version` under `[workspace.package]` in `Cargo.toml`.

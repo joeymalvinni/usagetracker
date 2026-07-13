@@ -5,6 +5,7 @@ struct Header: View {
     let title: String
     var subtitleStyle: HeaderSubtitleStyle = .custom("")
     var showsRefresh = true
+    var updateAction: HeaderUpdateAction?
     var refreshAction: (() -> Void)?
 
     var body: some View {
@@ -14,6 +15,21 @@ struct Header: View {
                 statusPill
             }
             Spacer()
+            if let updateAction {
+                Button(action: updateAction.perform) {
+                    HStack(spacing: Theme.Spacing.xs) {
+                        if updateAction.isInstalling {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.down.circle.fill")
+                        }
+                        Text(updateAction.isInstalling ? "Updating…" : "Update")
+                    }
+                }
+                .buttonStyle(.chipProminent)
+                .disabled(updateAction.isInstalling)
+                .help("Install UsageTracker \(updateAction.version)")
+            }
             if showsRefresh {
                 RefreshRing(refreshing: state.refreshing) {
                     if let refreshAction {
@@ -40,6 +56,12 @@ struct Header: View {
             }
         }
     }
+}
+
+struct HeaderUpdateAction {
+    let version: String
+    let isInstalling: Bool
+    let perform: () -> Void
 }
 
 enum HeaderSubtitleStyle {

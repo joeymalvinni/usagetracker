@@ -1,6 +1,211 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import UsageMenuBar
+
+final class AppUpdaterTests: XCTestCase {
+    private actor DownloadStub {
+        struct Request: Sendable {
+            let path: String
+            let timeout: TimeInterval
+            let userAgent: String?
+        }
+
+        var requests = [Request]()
+        var metadataFailure = false
+        var installerExitStatus = 0
+
+        func download(_ request: URLRequest, maximumBytes _: Int) throws -> Data {
+            let path = try XCTUnwrap(request.url?.lastPathComponent)
+            requests.append(Request(
+                path: path,
+                timeout: request.timeoutInterval,
+                userAgent: request.value(forHTTPHeaderField: "User-Agent")
+            ))
+            if path == "latest" {
+                if metadataFailure { throw URLError(.notConnectedToInternet) }
+                return Data(#"{"tag_name":"v0.2.0","draft":false,"prerelease":false}"#.utf8)
+            }
+            if path == "install.sh" {
+                return Data("#!/bin/bash\nexit \(installerExitStatus)\n".utf8)
+            }
+            if path == "SHA256SUMS" {
+                let installer = Data("#!/bin/bash\nexit \(installerExitStatus)\n".utf8)
+                let digest = SHA256.hash(data: installer)
+                    .map { String(format: "%02x", $0) }
+                    .joined()
+                return Data("\(digest)  install.sh\n".utf8)
+            }
+            throw URLError(.badURL)
+        }
+
+        func setMetadataFailure(_ value: Bool) { metadataFailure = value }
+        func setInstallerExitStatus(_ value: Int) { installerExitStatus = value }
+    }
+
+    func testSemanticVersionsCompareNumerically() throws {
+        let current = try XCTUnwrap(SemanticVersion("0.9.12"))
+        let latest = try XCTUnwrap(SemanticVersion("v0.10.2"))
+
+        XCTAssertLessThan(current, latest)
+        XCTAssertEqual(latest.description, "0.10.2")
+        XCTAssertNil(SemanticVersion("0.10"))
+        XCTAssertNil(SemanticVersion("v0.10.2-beta"))
+    }
+
+    func testOnlyOffersStrictlyNewerStableRelease() throws {
+        let release = try XCTUnwrap(AppUpdatePolicy.newerRelease(
+            currentVersion: "0.1.1",
+            latestTag: "v0.2.0"
+        ))
+
+        XCTAssertEqual(release.tag, "v0.2.0")
+        XCTAssertEqual(release.version, SemanticVersion("0.2.0"))
+        XCTAssertNil(AppUpdatePolicy.newerRelease(currentVersion: "0.2.0", latestTag: "v0.2.0"))
+        XCTAssertNil(AppUpdatePolicy.newerRelease(currentVersion: "0.2.0", latestTag: "v0.1.9"))
+        XCTAssertNil(AppUpdatePolicy.newerRelease(currentVersion: "0.1.0", latestTag: "0.2.0"))
+        XCTAssertNil(AppUpdatePolicy.newerRelease(currentVersion: "0.2.0", latestTag: "nightly"))
+    }
+
+    func testInstallerMustMatchPublishedChecksum() throws {
+        let installer = Data("trusted installer".utf8)
+        let digest = SHA256.hash(data: installer)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let checksums = Data("\(digest)  install.sh\n".utf8)
+
+        XCTAssertNoThrow(try UpdateIntegrity.verifyInstaller(installer, checksums: checksums))
+        XCTAssertThrowsError(try UpdateIntegrity.verifyInstaller(Data("changed".utf8), checksums: checksums))
+        XCTAssertThrowsError(try UpdateIntegrity.verifyInstaller(installer, checksums: Data()))
+    }
+
+    @MainActor func testSuccessfulChecksPreserveRequestConfigurationAndUseCooldown() async throws {
+        let stub = DownloadStub()
+        let bundleURL = try temporaryBundleURL()
+        defer { try? FileManager.default.removeItem(at: bundleURL.deletingLastPathComponent()) }
+        let updater = AppUpdater(
+            bundleURL: bundleURL,
+            currentVersion: "0.1.0",
+            downloader: { try await stub.download($0, maximumBytes: $1) }
+        )
+
+        await updater.checkForUpdates()
+        await updater.checkForUpdates()
+
+        let requests = await stub.requests
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests[0].path, "latest")
+        XCTAssertEqual(requests[0].timeout, 10)
+        XCTAssertEqual(requests[0].userAgent, "UsageTracker/0.1.0")
+        XCTAssertEqual(updater.availableRelease?.tag, "v0.2.0")
+    }
+
+    @MainActor func testFailedChecksCanRetryImmediately() async throws {
+        let stub = DownloadStub()
+        await stub.setMetadataFailure(true)
+        let bundleURL = try temporaryBundleURL()
+        defer { try? FileManager.default.removeItem(at: bundleURL.deletingLastPathComponent()) }
+        let updater = AppUpdater(
+            bundleURL: bundleURL,
+            currentVersion: "0.1.0",
+            downloader: { try await stub.download($0, maximumBytes: $1) }
+        )
+
+        await updater.checkForUpdates()
+        await updater.checkForUpdates()
+
+        let requests = await stub.requests
+        XCTAssertEqual(requests.count, 2)
+    }
+
+    @MainActor func testInstallerSuccessAndFailureResetState() async throws {
+        let stub = DownloadStub()
+        await stub.setInstallerExitStatus(1)
+        let temporaryDirectories = updaterTemporaryDirectories()
+        let bundleURL = try temporaryBundleURL()
+        defer { try? FileManager.default.removeItem(at: bundleURL.deletingLastPathComponent()) }
+        let updater = AppUpdater(
+            bundleURL: bundleURL,
+            currentVersion: "0.1.0",
+            downloader: { try await stub.download($0, maximumBytes: $1) }
+        )
+        await updater.checkForUpdates()
+
+        await updater.installAvailableUpdate()
+        try await waitForInstaller(updater)
+        XCTAssertFalse(updater.isInstalling)
+        XCTAssertNotNil(updater.availableRelease)
+        XCTAssertNotNil(updater.installError)
+
+        await stub.setInstallerExitStatus(0)
+        await updater.installAvailableUpdate()
+        try await waitForInstaller(updater)
+        XCTAssertFalse(updater.isInstalling)
+        XCTAssertNil(updater.availableRelease)
+        XCTAssertNil(updater.installError)
+        XCTAssertEqual(updaterTemporaryDirectories(), temporaryDirectories)
+    }
+
+    @MainActor func testUnwritableInstallLocationIsRejected() async throws {
+        let stub = DownloadStub()
+        let bundleURL = try temporaryBundleURL()
+        defer { try? FileManager.default.removeItem(at: bundleURL.deletingLastPathComponent()) }
+        let updater = AppUpdater(
+            bundleURL: bundleURL,
+            currentVersion: "0.1.0",
+            downloader: { try await stub.download($0, maximumBytes: $1) },
+            isWritable: { _ in false }
+        )
+        await updater.checkForUpdates()
+
+        await updater.installAvailableUpdate()
+
+        XCTAssertFalse(updater.isInstalling)
+        XCTAssertEqual(updater.installError, AppUpdateError.unsupportedInstallLocation.localizedDescription)
+        let requests = await stub.requests
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    @MainActor func testRelaunchedAppConsumesPersistedInstallFailure() throws {
+        let stub = DownloadStub()
+        let bundleURL = try temporaryBundleURL()
+        let directory = bundleURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let marker = directory.appending(path: ".UsageTracker.update-failed")
+        try Data("1\n".utf8).write(to: marker)
+
+        let updater = AppUpdater(
+            bundleURL: bundleURL,
+            currentVersion: "0.1.0",
+            downloader: { try await stub.download($0, maximumBytes: $1) }
+        )
+
+        XCTAssertNotNil(updater.installError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    private func temporaryBundleURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "usagetracker-updater-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appending(path: "UsageTracker.app", directoryHint: .isDirectory)
+    }
+
+    @MainActor private func waitForInstaller(_ updater: AppUpdater) async throws {
+        for _ in 0..<100 where updater.isInstalling {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(updater.isInstalling, "installer did not terminate")
+    }
+
+    private func updaterTemporaryDirectories() -> Set<String> {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: FileManager.default.temporaryDirectory,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        return Set(urls.map(\.lastPathComponent).filter { $0.hasPrefix("usagetracker-update-") })
+    }
+}
 
 final class DaemonClientTests: XCTestCase {
     func testProviderCapabilitiesRemainIndependent() {

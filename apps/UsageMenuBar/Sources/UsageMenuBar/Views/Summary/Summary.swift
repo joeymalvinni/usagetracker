@@ -2,11 +2,19 @@ import SwiftUI
 
 struct Summary: View {
     @EnvironmentObject var state: AppState
+    @ObservedObject var updater: AppUpdater
     @Binding var selection: Selection
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg - 2) {
-            Header(title: "UsageTracker", subtitleStyle: summarySubtitle)
+            Header(
+                title: "UsageTracker",
+                subtitleStyle: summarySubtitle,
+                updateAction: updateAction
+            )
+            if let error = updater.installError {
+                SetupNotice(text: error, isError: true)
+            }
             ScrollView {
                 LazyVStack(spacing: Theme.Spacing.xs + 2) {
                     if state.providers.isEmpty {
@@ -38,6 +46,15 @@ struct Summary: View {
             }
         }
         .padding(Theme.Spacing.lg)
+    }
+
+    private var updateAction: HeaderUpdateAction? {
+        guard let release = updater.availableRelease else { return nil }
+        return HeaderUpdateAction(
+            version: release.version.description,
+            isInstalling: updater.isInstalling,
+            perform: { Task { await updater.installAvailableUpdate() } }
+        )
     }
 
     private var summarySubtitle: HeaderSubtitleStyle {
