@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-release-version.sh "${GITHUB_REF_NAME}"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: validate
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            target: x86_64-apple-darwin
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          xcode_path="$(python3 - <<'PY'
+          from pathlib import Path
+
+          candidates = list(Path("/Applications").glob("Xcode_26*.app"))
+          if not candidates:
+              raise SystemExit("The runner does not provide Xcode 26")
+
+          def version(path):
+              return tuple(int(part) for part in path.stem.removeprefix("Xcode_").split("."))
+
+          print(max(candidates, key=version))
+          PY
+          )"
+          sudo xcode-select --switch "$xcode_path/Contents/Developer"
+          xcodebuild -version
+          test -x "$(dirname "$(xcode-select -p)")/Applications/Icon Composer.app/Contents/Executables/ictool"
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Require release credentials
+        run: |
+          for name in \
+            APPLE_ID \
+            APPLE_TEAM_ID \
+            APPLE_APP_SPECIFIC_PASSWORD \
+            MACOS_CERTIFICATE_P12 \
+            MACOS_CERTIFICATE_PASSWORD
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Import Developer ID certificate
+        env:
+          KEYCHAIN_PATH: ${{ runner.temp }}/release-signing.keychain-db
+        run: |
+          keychain_password="$(openssl rand -hex 24)"
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$certificate_path"
+
+          security create-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$keychain_password" "$KEYCHAIN_PATH"
+          security import "$certificate_path" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          identity="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | \
+            awk '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "The certificate does not contain a Developer ID Application identity" >&2
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Build, sign, and notarize artifacts
+        env:
+          BUNDLE_VERSION: ${{ github.run_number }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+          REQUIRE_NOTARIZATION: "1"
+          REQUIRE_SIGNING: "1"
+        run: ./scripts/package-release.sh "${{ matrix.target }}" dist
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Add installer and checksums
+        run: |
+          cp install.sh uninstall.sh dist/
+          cd dist
+          sha256sum \
+            UsageTracker-macos-arm64.zip \
+            UsageTracker-macos-x86_64.zip \
+            usage-macos-arm64.tar.gz \
+            usage-macos-x86_64.tar.gz \
+            install.sh \
+            uninstall.sh > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "UsageTracker ${GITHUB_REF_NAME#v}"

@@ -6,22 +6,47 @@ repo_dir="$(cd "$app_dir/../.." && pwd)"
 build_dir="$app_dir/.build"
 configuration="${1:-debug}"
 cargo_args=(build)
+target_triple="${USAGE_TARGET_TRIPLE:-}"
+codesign_identity="${CODESIGN_IDENTITY:--}"
+swift_args=(swift build -c "$configuration" --package-path "$app_dir")
+base_bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_dir/Info.plist")"
+
+if [[ "${CARGO_LOCKED:-0}" == "1" ]]; then
+  cargo_args+=(--locked)
+fi
+
+if [[ -n "$target_triple" ]]; then
+  case "$target_triple" in
+    aarch64-apple-darwin)
+      swift_triple="arm64-apple-macosx14.0"
+      ;;
+    x86_64-apple-darwin)
+      swift_triple="x86_64-apple-macosx14.0"
+      ;;
+    *)
+      echo "Unsupported release target: $target_triple" >&2
+      exit 2
+      ;;
+  esac
+  cargo_args+=(--target "$target_triple")
+  swift_args+=(--triple "$swift_triple")
+fi
 
 case "$configuration" in
   debug)
     app="$build_dir/UsageMenuBar-dev.app"
     cargo_profile="debug"
-    bundle_identifier="engineering.super.usagetracker.dev"
+    bundle_identifier="$base_bundle_identifier.dev"
     # Launch Services and Notification Center cache icons by bundle identity
     # and version. Give each fixture build a new version so it cannot retain a
     # low-resolution icon from an earlier package.
     bundle_version="$(date +%Y%m%d%H%M%S)"
     ;;
   release)
-    app="$build_dir/UsageMenuBar.app"
+    app="${APP_OUTPUT_PATH:-$build_dir/UsageMenuBar.app}"
     cargo_profile="release"
-    bundle_identifier="engineering.super.usagetracker"
-    bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_dir/Info.plist")"
+    bundle_identifier="$base_bundle_identifier"
+    bundle_version="${BUNDLE_VERSION:-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_dir/Info.plist")}"
     cargo_args+=(--release)
     ;;
   *)
@@ -30,19 +55,27 @@ case "$configuration" in
     ;;
 esac
 
-swift build -c "$configuration" --package-path "$app_dir"
+bundle_short_version="${BUNDLE_SHORT_VERSION:-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_dir/Info.plist")}"
+
+"${swift_args[@]}"
 CARGO_TARGET_DIR="$repo_dir/target" \
   cargo "${cargo_args[@]}" --manifest-path "$repo_dir/Cargo.toml" -p usage-daemon
 
-swift_bin_dir="$(swift build -c "$configuration" --package-path "$app_dir" --show-bin-path)"
+swift_bin_dir="$("${swift_args[@]}" --show-bin-path)"
+if [[ -n "$target_triple" ]]; then
+  cargo_bin_dir="$repo_dir/target/$target_triple/$cargo_profile"
+else
+  cargo_bin_dir="$repo_dir/target/$cargo_profile"
+fi
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$app_dir/Info.plist" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_identifier" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $bundle_version" "$app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $bundle_short_version" "$app/Contents/Info.plist"
 cp "$swift_bin_dir/UsageMenuBar" "$app/Contents/MacOS/UsageMenuBar"
-cp "$repo_dir/target/$cargo_profile/usage-daemon" "$app/Contents/MacOS/usage-daemon"
+cp "$cargo_bin_dir/usage-daemon" "$app/Contents/MacOS/usage-daemon"
 cp -R "$swift_bin_dir/UsageMenuBar_UsageMenuBar.bundle" "$app/Contents/Resources/"
 xcrun actool "$app_dir/AppIcon.icon" \
   --compile "$app/Contents/Resources" \
@@ -94,8 +127,16 @@ cp "$icon_source" "$iconset_dir/icon_512x512@2x.png"
 iconutil -c icns "$iconset_dir" -o "$app/Contents/Resources/AppIcon.icns"
 rm -rf "$iconset_dir" "$icon_source"
 
-codesign --force --sign - --identifier "$bundle_identifier.daemon" \
-  "$app/Contents/MacOS/usage-daemon"
-codesign --force --sign - "$app"
+if [[ "$codesign_identity" == "-" ]]; then
+  codesign --force --sign - --identifier "$bundle_identifier.daemon" \
+    "$app/Contents/MacOS/usage-daemon"
+  codesign --force --sign - "$app"
+else
+  codesign --force --timestamp --options runtime --sign "$codesign_identity" \
+    --identifier "$bundle_identifier.daemon" "$app/Contents/MacOS/usage-daemon"
+  codesign --force --timestamp --options runtime --sign "$codesign_identity" "$app"
+fi
+
+codesign --verify --deep --strict --verbose=2 "$app"
 
 echo "Built $configuration app at $app"
