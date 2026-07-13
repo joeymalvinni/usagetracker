@@ -526,6 +526,7 @@ private final class GlassPopoverHostingController<Content: View>: NSViewControll
         host.wantsLayer = true
         host.layer?.backgroundColor = NSColor.clear.cgColor
 
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             let glass = NSGlassEffectView(frame: frame)
             glass.cornerRadius = Theme.Radius.xl
@@ -540,16 +541,18 @@ private final class GlassPopoverHostingController<Content: View>: NSViewControll
             }
             glass.contentView = host
             view = glass
-        } else {
-            let effect = NSVisualEffectView(frame: frame)
-            effect.material = .popover
-            effect.state = .active
-            effect.blendingMode = .behindWindow
-            effect.wantsLayer = true
-            effect.layer?.cornerRadius = Theme.Radius.xl
-            effect.layer?.masksToBounds = true
-            effect.addSubview(host)
-            view = effect
+            return
         }
+        #endif
+
+        let effect = NSVisualEffectView(frame: frame)
+        effect.material = .popover
+        effect.state = .active
+        effect.blendingMode = .behindWindow
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = Theme.Radius.xl
+        effect.layer?.masksToBounds = true
+        effect.addSubview(host)
+        view = effect
     }
 }

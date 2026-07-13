@@ -1,10 +1,10 @@
 import Combine
 import Foundation
-import UserNotifications
+@preconcurrency import UserNotifications
 
 enum DaemonState: Equatable, Sendable { case unknown, online, offline }
 
-struct DerivedState: Equatable {
+struct DerivedState: Equatable, Sendable {
     static let empty = DerivedState(
         providers: [], settingsProviders: [], cost: .empty,
         menuPreview: "Usage", menuStatus: .stale, menuBars: []
