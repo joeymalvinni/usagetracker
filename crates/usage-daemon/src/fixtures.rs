@@ -42,20 +42,26 @@ pub fn reset_database(path: &Path) -> anyhow::Result<()> {
 pub async fn seed(storage: &Storage, scenario: FixtureScenario) -> anyhow::Result<()> {
     let now = Utc::now();
     let accounts = [
-        FixtureAccount::new("codex", "personal", "Personal", "alex@example.test", 62.0),
-        FixtureAccount::new("codex", "work", "Work", "alex@work.example", 8.0),
-        FixtureAccount::new("claude", "team", "Team", "alex@team.example", 71.0),
-        FixtureAccount::new(
-            "opencode_go",
-            "sandbox",
-            "Sandbox",
-            "alex@sandbox.example",
-            46.0,
-        )
-        .with_health(
-            ProviderHealthStatus::RateLimited,
-            "Fixture: retry available in 8 minutes",
+        FixtureAccount::new("codex", 4.0),
+        FixtureAccount::additional(
+            "codex",
+            "work",
+            "Acme Engineering",
+            "joey@acme.example",
+            -24.0,
+            0.0,
         ),
+        FixtureAccount::new("claude", 9.0),
+        FixtureAccount::additional(
+            "claude",
+            "work",
+            "Acme Research",
+            "joey@research.example",
+            -31.0,
+            5.0,
+        ),
+        FixtureAccount::new("opencode_go", 7.0),
+        FixtureAccount::new("grok", 3.0),
     ];
 
     let notification_manager = NotificationManager::new(storage.clone(), true);
@@ -66,7 +72,7 @@ pub async fn seed(storage: &Storage, scenario: FixtureScenario) -> anyhow::Resul
                 &format!("fixture-{}-{}", fixture.provider_id, fixture.profile_id),
                 Some(fixture.profile_id),
                 Some(fixture.display_name),
-                Some(fixture.email),
+                fixture.email,
             )
             .await?;
         let latest = seed_account(storage, &account, fixture, scenario, now, index).await?;
@@ -87,29 +93,27 @@ async fn seed_account(
     now: DateTime<Utc>,
     account_index: usize,
 ) -> anyhow::Result<UsageSnapshot> {
-    let latest_remaining = match scenario {
-        FixtureScenario::Demo => fixture.percent_remaining,
-        FixtureScenario::Notifications => [4.0, 0.0, 9.0, 5.0][account_index],
-    };
-    let session_reset = now + TimeDelta::hours(3);
-    let weekly_reset = now + TimeDelta::days(5);
+    let notification_remaining =
+        (scenario == FixtureScenario::Notifications).then_some(fixture.notification_remaining);
     let daily_usage = daily_usage(fixture.provider_id, account_index, now);
-    let metadata = fixture_metadata(fixture.provider_id, &daily_usage, now);
+    let cost_usage = cost_usage(fixture.provider_id, now);
+    let metadata = fixture_metadata(fixture.provider_id, &cost_usage, now);
     let mut latest = None;
 
     for sample in 0..6 {
         let hours_ago = i64::from(5 - sample) * 2;
         let collected_at = now - TimeDelta::hours(hours_ago) - TimeDelta::minutes(2);
-        let historical_remaining = (latest_remaining + f64::from(5 - sample) * 3.5).min(100.0);
+        let historical_boost = f64::from(5 - sample) * 3.5;
         let snapshot = UsageSnapshot {
             provider_id: account.provider_id.clone(),
             account_id: account.id.clone(),
             collected_at,
             windows: fixture_windows(
                 fixture.provider_id,
-                historical_remaining,
-                session_reset,
-                weekly_reset,
+                historical_boost,
+                fixture.percent_adjustment,
+                notification_remaining,
+                now,
             ),
             metadata: metadata.clone(),
         };
@@ -120,7 +124,7 @@ async fn seed_account(
             &[]
         };
         storage
-            .record_success(&snapshot, buckets, &health, Some(fixture.email))
+            .record_success(&snapshot, buckets, &health, fixture.email)
             .await?;
         latest = Some(snapshot);
     }
@@ -130,42 +134,179 @@ async fn seed_account(
 
 fn fixture_windows(
     provider_id: &str,
-    percent_remaining: f64,
-    session_reset: DateTime<Utc>,
-    weekly_reset: DateTime<Utc>,
+    historical_boost: f64,
+    percent_adjustment: f64,
+    notification_remaining: Option<f64>,
+    now: DateTime<Utc>,
 ) -> Vec<UsageWindow> {
-    let session_remaining = percent_remaining.clamp(0.0, 100.0);
-    let weekly_remaining = (percent_remaining + 17.0).clamp(0.0, 100.0);
-    let mut windows = vec![
-        quota_window(
-            "session",
-            "Session",
-            UsageWindowKind::Session,
-            session_remaining,
-            session_reset,
-        ),
-        quota_window(
-            "weekly",
-            "Weekly",
+    let percent = |value: f64| {
+        notification_remaining
+            .unwrap_or(value + historical_boost + percent_adjustment)
+            .clamp(0.0, 100.0)
+    };
+    match provider_id {
+        "claude" => vec![
+            quota_window(
+                "claude_usage_utilization_five_hour",
+                "Claude five hour",
+                UsageWindowKind::Session,
+                percent(68.0),
+                None,
+            ),
+            quota_window(
+                "claude_usage_utilization_seven_day",
+                "Claude seven day",
+                UsageWindowKind::Daily,
+                percent(75.0),
+                Some(now + TimeDelta::hours(42)),
+            ),
+            metric_window(
+                "claude_estimated_spend_today",
+                "Claude spend today",
+                UsageWindowKind::Credits,
+                2.4705995,
+                UsageUnit::Usd,
+            ),
+            metric_window(
+                "claude_tokens_today",
+                "Claude tokens today",
+                UsageWindowKind::Daily,
+                1_828_162.0,
+                UsageUnit::Tokens,
+            ),
+            metric_window(
+                "claude_estimated_spend_30d",
+                "Claude spend 30 days",
+                UsageWindowKind::Credits,
+                138.283568,
+                UsageUnit::Usd,
+            ),
+            metric_window(
+                "claude_tokens_30d",
+                "Claude tokens 30 days",
+                UsageWindowKind::Monthly,
+                100_084_986.0,
+                UsageUnit::Tokens,
+            ),
+        ],
+        "codex" => vec![
+            quota_window(
+                "codex_session",
+                "Codex session",
+                UsageWindowKind::Session,
+                percent(56.0),
+                Some(now + TimeDelta::minutes(9_366)),
+            ),
+            quota_window(
+                "codex_additional_0_session",
+                "GPT-5.3-Codex-Spark session",
+                UsageWindowKind::Session,
+                percent(91.0),
+                Some(now + TimeDelta::hours(168)),
+            ),
+            balance_window("codex_credits", "Codex credits", 0.0, UsageUnit::Credits),
+            metric_window(
+                "codex_tokens_today",
+                "Codex tokens today",
+                UsageWindowKind::Daily,
+                125_177_016.0,
+                UsageUnit::Tokens,
+            ),
+            metric_window(
+                "codex_tokens_30d",
+                "Codex tokens 30 days",
+                UsageWindowKind::Monthly,
+                1_092_768_692.0,
+                UsageUnit::Tokens,
+            ),
+            metric_window(
+                "codex_tokens_lifetime",
+                "Codex lifetime tokens",
+                UsageWindowKind::Other("lifetime".to_string()),
+                2_373_310_905.0,
+                UsageUnit::Tokens,
+            ),
+            metric_window(
+                "codex_estimated_spend_today",
+                "Codex estimated cost today",
+                UsageWindowKind::Credits,
+                129.57697885,
+                UsageUnit::Usd,
+            ),
+            metric_window(
+                "codex_estimated_spend_30d",
+                "Codex estimated cost 30 days",
+                UsageWindowKind::Credits,
+                1_005.4623066,
+                UsageUnit::Usd,
+            ),
+        ],
+        "grok" => vec![quota_window(
+            "grok_included_usage",
+            "Grok weekly",
             UsageWindowKind::Weekly,
-            weekly_remaining,
-            weekly_reset,
-        ),
-    ];
-    if provider_id == "opencode_go" {
-        windows.push(UsageWindow {
-            window_id: "credits".to_string(),
-            label: "Zen credits".to_string(),
-            kind: UsageWindowKind::Credits,
-            used: Some(amount(13.75, UsageUnit::Credits)),
-            limit: Some(amount(25.0, UsageUnit::Credits)),
-            remaining: Some(amount(11.25, UsageUnit::Credits)),
-            percent_used: Some(55.0),
-            percent_remaining: Some(45.0),
-            reset_at: None,
-        });
+            percent(100.0),
+            Some(now + TimeDelta::minutes(2_490)),
+        )],
+        "opencode_go" => vec![
+            quota_window(
+                "opencode_go_session",
+                "OpenCode Go session",
+                UsageWindowKind::Session,
+                percent(72.0),
+                Some(now + TimeDelta::hours(5)),
+            ),
+            quota_window(
+                "opencode_go_weekly",
+                "OpenCode Go weekly",
+                UsageWindowKind::Weekly,
+                percent(100.0),
+                Some(now + TimeDelta::hours(161)),
+            ),
+            quota_window(
+                "opencode_go_monthly",
+                "OpenCode Go monthly",
+                UsageWindowKind::Monthly,
+                percent(89.0),
+                Some(now + TimeDelta::hours(492)),
+            ),
+            balance_window(
+                "opencode_go_zen_balance",
+                "OpenCode Go Zen balance",
+                0.0,
+                UsageUnit::Credits,
+            ),
+            metric_window(
+                "opencode_go_spend_today",
+                "OpenCode Go spend today",
+                UsageWindowKind::Credits,
+                0.18463836,
+                UsageUnit::Usd,
+            ),
+            metric_window(
+                "opencode_go_tokens_today",
+                "OpenCode Go tokens today",
+                UsageWindowKind::Daily,
+                250_682.0,
+                UsageUnit::Tokens,
+            ),
+            metric_window(
+                "opencode_go_spend_30d",
+                "OpenCode Go spend 30 days",
+                UsageWindowKind::Credits,
+                7.05145503,
+                UsageUnit::Usd,
+            ),
+            metric_window(
+                "opencode_go_tokens_30d",
+                "OpenCode Go tokens 30 days",
+                UsageWindowKind::Monthly,
+                18_583_277.0,
+                UsageUnit::Tokens,
+            ),
+        ],
+        _ => vec![],
     }
-    windows
 }
 
 fn quota_window(
@@ -173,7 +314,7 @@ fn quota_window(
     label: &str,
     kind: UsageWindowKind,
     percent_remaining: f64,
-    reset_at: DateTime<Utc>,
+    reset_at: Option<DateTime<Utc>>,
 ) -> UsageWindow {
     UsageWindow {
         window_id: id.to_string(),
@@ -184,7 +325,41 @@ fn quota_window(
         remaining: Some(amount(percent_remaining, UsageUnit::Percent)),
         percent_used: Some(100.0 - percent_remaining),
         percent_remaining: Some(percent_remaining),
-        reset_at: Some(reset_at),
+        reset_at,
+    }
+}
+
+fn metric_window(
+    id: &str,
+    label: &str,
+    kind: UsageWindowKind,
+    value: f64,
+    unit: UsageUnit,
+) -> UsageWindow {
+    UsageWindow {
+        window_id: id.to_string(),
+        label: label.to_string(),
+        kind,
+        used: Some(amount(value, unit)),
+        limit: None,
+        remaining: None,
+        percent_used: None,
+        percent_remaining: None,
+        reset_at: None,
+    }
+}
+
+fn balance_window(id: &str, label: &str, value: f64, unit: UsageUnit) -> UsageWindow {
+    UsageWindow {
+        window_id: id.to_string(),
+        label: label.to_string(),
+        kind: UsageWindowKind::Credits,
+        used: None,
+        limit: None,
+        remaining: Some(amount(value, unit)),
+        percent_used: None,
+        percent_remaining: None,
+        reset_at: None,
     }
 }
 
@@ -194,26 +369,115 @@ fn amount(value: f64, unit: UsageUnit) -> UsageAmount {
 
 fn daily_usage(
     provider_id: &str,
-    account_index: usize,
+    _account_index: usize,
     now: DateTime<Utc>,
 ) -> Vec<DailyUsageBucket> {
     let today = now.date_naive();
-    (0_u64..30)
-        .map(|days_ago| {
-            let date = today
-                .checked_sub_days(Days::new(29 - days_ago))
-                .unwrap_or(today);
-            let wave = ((days_ago * 37 + account_index as u64 * 19) % 11) + 2;
-            let tokens = wave * 115_000 * (account_index as u64 + 1);
-            let rate = match provider_id {
-                "claude" => 0.000_004_5,
-                "opencode_go" => 0.000_001_2,
-                _ => 0.000_003,
-            };
+    let rows: &[(u64, u64)] = match provider_id {
+        "codex" => &[
+            (0, 125_177_016),
+            (1, 294_085_085),
+            (2, 200_266_476),
+            (3, 165_189_394),
+            (4, 48_166_440),
+            (5, 30_876_970),
+            (6, 5_851_953),
+            (7, 13_967_530),
+            (8, 4_560_589),
+            (9, 37_105_778),
+            (10, 34_949_981),
+            (11, 1_519_493),
+            (12, 952_034),
+            (13, 154_162),
+            (14, 3_874_492),
+            (15, 3_350_238),
+            (16, 3_268_115),
+            (17, 758_269),
+            (18, 9_080_755),
+            (19, 11_303_581),
+            (27, 16_641_805),
+            (28, 40_848_936),
+            (29, 40_819_600),
+            (30, 46_333_178),
+            (31, 63_247_540),
+            (32, 42_400_525),
+            (33, 53_293_941),
+            (34, 36_735_277),
+            (35, 27_748_690),
+            (36, 21_373_376),
+        ],
+        _ => &[],
+    };
+    rows.iter()
+        .map(|&(days_ago, tokens)| DailyUsageBucket {
+            date: today.checked_sub_days(Days::new(days_ago)).unwrap_or(today),
+            tokens,
+            cost_usd: None,
+            source: "development_fixture".to_string(),
+        })
+        .collect()
+}
+
+fn cost_usage(provider_id: &str, now: DateTime<Utc>) -> Vec<DailyUsageBucket> {
+    let today = now.date_naive();
+    let rows: &[(u64, u64, f64)] = match provider_id {
+        "claude" => &[
+            (28, 4_243_844, 3.859996),
+            (9, 17_420_333, 24.413996),
+            (8, 1_581_767, 2.101908),
+            (5, 24_364_583, 49.79609875),
+            (3, 18_825_024, 22.07300375),
+            (2, 18_294_406, 20.3673225),
+            (1, 13_526_867, 13.2006435),
+            (0, 1_828_162, 2.4705995),
+        ],
+        "codex" => &[
+            (29, 30_723_250, 33.524919),
+            (28, 47_587_379, 48.725849),
+            (27, 753_713, 0.477775),
+            (20, 2_511_914, 3.072646),
+            (19, 13_246_516, 14.687046),
+            (18, 4_712_581, 4.581964),
+            (17, 720_592, 1.197307),
+            (15, 3_124_330, 4.506302),
+            (14, 442_889, 0.607034),
+            (12, 56_120, 0.235862),
+            (11, 899_023, 1.764509),
+            (10, 42_393_794, 42.320906),
+            (9, 7_267_955, 9.590157),
+            (6, 65_305, 0.164905),
+            (5, 42_626_924, 47.158127),
+            (4, 47_871_934, 48.439674),
+            (3, 210_919_063, 177.637233),
+            (2, 329_746_264, 253.2681166),
+            (1, 242_521_874, 183.92499615),
+            (0, 147_696_220, 129.86053985),
+        ],
+        "opencode_go" => &[
+            (31, 1_064_164, 0.16532331),
+            (30, 3_762_023, 0.86840012),
+            (20, 53_233, 0.04686621),
+            (17, 53_094, 0.05446812),
+            (16, 34_118, 0.0300238),
+            (15, 27_659, 0.04511284),
+            (10, 523_464, 0.247344),
+            (9, 423_608, 0.2545648),
+            (5, 7_176_189, 3.10123818),
+            (4, 1_560_493, 0.41136594),
+            (3, 5_687_731, 1.25099482),
+            (2, 2_357_220, 1.18971953),
+            (1, 435_786, 0.23511843),
+            (0, 250_682, 0.18463836),
+        ],
+        _ => &[],
+    };
+    rows.iter()
+        .map(|&(days_ago, tokens, cost_usd)| {
+            let date = today.checked_sub_days(Days::new(days_ago)).unwrap_or(today);
             DailyUsageBucket {
                 date,
                 tokens,
-                cost_usd: Some(tokens as f64 * rate),
+                cost_usd: Some(cost_usd),
                 source: "development_fixture".to_string(),
             }
         })
@@ -236,16 +500,19 @@ fn fixture_metadata(
             })
         })
         .collect::<Vec<_>>();
-    let mut metadata = serde_json::json!({
-        format!("{provider_id}_cost"): {
-            "source": "development_fixture",
-            "estimate": true,
-            "partial": false,
-            "complete_lookback": true,
-            "by_day": rows,
-        },
-        "fixture": true,
-    });
+    let mut metadata = serde_json::json!({ "fixture": true });
+    if !rows.is_empty() {
+        metadata.as_object_mut().unwrap().insert(
+            format!("{provider_id}_cost"),
+            serde_json::json!({
+                "source": "development_fixture",
+                "estimate": true,
+                "partial": false,
+                "complete_lookback": true,
+                "by_day": rows,
+            }),
+        );
+    }
     // Codex is the only provider that exposes rate-limit reset credits, so seed
     // a small pool here to exercise the "N resets" summary and Resets detail.
     if provider_id == "codex" {
@@ -307,41 +574,83 @@ struct FixtureAccount {
     provider_id: &'static str,
     profile_id: &'static str,
     display_name: &'static str,
-    email: &'static str,
-    percent_remaining: f64,
+    email: Option<&'static str>,
     health: ProviderHealthStatus,
     error_message: Option<&'static str>,
+    percent_adjustment: f64,
+    notification_remaining: f64,
 }
 
 impl FixtureAccount {
-    fn new(
+    fn new(provider_id: &'static str, notification_remaining: f64) -> Self {
+        Self {
+            provider_id,
+            profile_id: "joeymalvinni",
+            display_name: "joeymalvinni",
+            email: None,
+            health: ProviderHealthStatus::Ok,
+            error_message: None,
+            percent_adjustment: 0.0,
+            notification_remaining,
+        }
+    }
+
+    fn additional(
         provider_id: &'static str,
         profile_id: &'static str,
         display_name: &'static str,
         email: &'static str,
-        percent_remaining: f64,
+        percent_adjustment: f64,
+        notification_remaining: f64,
     ) -> Self {
         Self {
             provider_id,
             profile_id,
             display_name,
-            email,
-            percent_remaining,
+            email: Some(email),
             health: ProviderHealthStatus::Ok,
             error_message: None,
+            percent_adjustment,
+            notification_remaining,
         }
-    }
-
-    fn with_health(mut self, health: ProviderHealthStatus, message: &'static str) -> Self {
-        self.health = health;
-        self.error_message = Some(message);
-        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_fixture_gives_providers_and_accounts_distinct_session_limits() {
+        let now = Utc::now();
+        let expected = [
+            ("claude", "claude_usage_utilization_five_hour", 68.0),
+            ("codex", "codex_session", 56.0),
+            ("codex", "codex_additional_0_session", 91.0),
+            ("opencode_go", "opencode_go_session", 72.0),
+        ];
+
+        for (provider_id, window_id, percent_remaining) in expected {
+            let windows = fixture_windows(provider_id, 0.0, 0.0, None, now);
+            let window = windows
+                .iter()
+                .find(|window| window.window_id == window_id)
+                .unwrap();
+            assert_eq!(window.percent_remaining, Some(percent_remaining));
+        }
+
+        for (provider_id, window_id, adjustment, percent_remaining) in [
+            ("claude", "claude_usage_utilization_five_hour", -31.0, 37.0),
+            ("codex", "codex_session", -24.0, 32.0),
+        ] {
+            let windows = fixture_windows(provider_id, 0.0, adjustment, None, now);
+            let window = windows
+                .iter()
+                .find(|window| window.window_id == window_id)
+                .unwrap();
+            assert_eq!(window.percent_remaining, Some(percent_remaining));
+        }
+    }
 
     #[tokio::test]
     async fn notification_fixture_populates_real_storage_models() {
@@ -353,12 +662,28 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(storage.accounts().await.unwrap().len(), 4);
-        assert_eq!(storage.latest_usage().await.unwrap().len(), 4);
-        assert_eq!(storage.provider_health().await.unwrap().len(), 4);
-        assert_eq!(storage.daily_usage_history().await.unwrap().len(), 120);
+        let accounts = storage.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 6);
+        for provider_id in ["claude", "codex"] {
+            let provider_accounts = accounts
+                .iter()
+                .filter(|account| account.provider_id.as_str() == provider_id)
+                .collect::<Vec<_>>();
+            assert_eq!(provider_accounts.len(), 2);
+            assert!(provider_accounts.iter().any(|account| {
+                account.profile_id.as_deref() == Some("joeymalvinni")
+                    && account.display_name.as_deref() == Some("joeymalvinni")
+                    && account.email.is_none()
+            }));
+            assert!(provider_accounts.iter().any(|account| {
+                account.profile_id.as_deref() == Some("work") && account.email.is_some()
+            }));
+        }
+        assert_eq!(storage.latest_usage().await.unwrap().len(), 6);
+        assert_eq!(storage.provider_health().await.unwrap().len(), 6);
+        assert_eq!(storage.daily_usage_history().await.unwrap().len(), 60);
         let notifications = storage.pending_notifications().await.unwrap();
-        assert!(notifications.len() >= 4);
+        assert!(notifications.len() >= 6);
         assert!(notifications
             .iter()
             .any(|item| item.title.contains("exhausted")));

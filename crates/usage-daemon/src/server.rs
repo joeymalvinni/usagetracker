@@ -1020,7 +1020,16 @@ mod tests {
         let ApiResponse::Accounts { accounts } = accounts else {
             panic!("unexpected accounts response")
         };
-        assert_eq!(accounts.len(), 4);
+        assert_eq!(accounts.len(), 6);
+        for provider_id in ["claude", "codex"] {
+            assert_eq!(
+                accounts
+                    .iter()
+                    .filter(|account| account.provider_id.as_str() == provider_id)
+                    .count(),
+                2
+            );
+        }
 
         let usage = request_line(&env.socket_path, r#"{"method":"get_usage"}"#).await;
         let ApiResponse::Usage {
@@ -1032,21 +1041,21 @@ mod tests {
         else {
             panic!("unexpected usage response")
         };
-        assert_eq!(snapshots.len(), 4);
+        assert_eq!(snapshots.len(), 6);
         assert!(!forecasts.is_empty());
         assert!(dashboard.accounts.iter().any(|account| {
             account
                 .activity
                 .as_ref()
-                .is_some_and(|activity| activity.days.len() == 30)
+                .is_some_and(|activity| !activity.days.is_empty() && activity.lookback_tokens > 0)
         }));
 
         let state = request_line(&env.socket_path, r#"{"method":"get_state"}"#).await;
         let ApiResponse::State { state } = state else {
             panic!("unexpected state response")
         };
-        assert_eq!(state.accounts.len(), 4);
-        assert_eq!(state.snapshots.len(), 4);
+        assert_eq!(state.accounts.len(), 6);
+        assert_eq!(state.snapshots.len(), 6);
         assert_eq!(state.server.api_version, API_VERSION);
         assert!(state
             .server
@@ -1061,7 +1070,7 @@ mod tests {
         let ApiResponse::PendingNotifications { notifications } = pending else {
             panic!("unexpected notifications response")
         };
-        assert!(notifications.len() >= 4);
+        assert!(notifications.len() >= 6);
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);

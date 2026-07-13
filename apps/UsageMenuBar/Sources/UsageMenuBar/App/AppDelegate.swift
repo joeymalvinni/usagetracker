@@ -473,7 +473,7 @@ import UserNotifications
     private var debugWindow: NSWindow?
     private func showDebugWindow() {
         let size = NSSize(width: Theme.Popover.width, height: Theme.Popover.height)
-        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
+        let window = PopoverDebugWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isOpaque = false
         window.backgroundColor = .clear
         window.level = .floating
@@ -481,9 +481,17 @@ import UserNotifications
         if let screen = NSScreen.main {
             window.setFrameTopLeftPoint(NSPoint(x: 60, y: screen.frame.maxY - 60))
         }
-        window.orderFrontRegardless()
         debugWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
+}
+
+/// Borderless windows cannot become key by default. The debug window needs to
+/// accept focus so its controls remain interactive and its glass stays active.
+private final class PopoverDebugWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
 
 enum StatusMenuProviderSelection {

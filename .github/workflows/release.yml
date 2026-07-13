@@ -95,7 +95,7 @@ jobs:
 
       - name: Add installer and checksums
         run: |
-          cp install.sh uninstall.sh dist/
+          cp scripts/install.sh scripts/uninstall.sh dist/
           cd dist
           sha256sum \
             UsageTracker-macos-arm64.zip \
