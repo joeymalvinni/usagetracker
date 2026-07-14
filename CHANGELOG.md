@@ -4,6 +4,19 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.3 — 2026-07-13
+
+### App
+
+- Made onboarding, Settings, and dashboard provider details follow the capabilities and setup fields advertised by the daemon.
+- Improved app and installer restarts so an old daemon is fully stopped before its replacement starts.
+
+### Reliability
+
+- Serialized Keychain access in isolated, time-bounded helper processes so a stalled credential request cannot wedge the daemon.
+- Cached successful Keychain reads briefly to prevent overlapping discovery and refresh work from showing duplicate authorization prompts.
+- Reworked provider collection behind a shared adapter model with stricter provider-owned configuration validation and more consistent account lifecycle behavior.
+
 ## 0.1.2 — 2026-07-13
 
 ### App
