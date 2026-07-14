@@ -19,9 +19,8 @@ struct ProviderDescriptor: Equatable, Sendable {
     }
 }
 
-/// The menu app has provider-specific presentation assets and must therefore
-/// opt in to each provider explicitly. Unknown daemon IDs stay off every UI
-/// surface until a matching descriptor is added here.
+/// Optional presentation polish for built-in providers. The daemon registry is
+/// authoritative; unknown IDs use the generic fallbacks below automatically.
 enum ProviderCatalog {
     static let providers: [ProviderDescriptor] = [
         ProviderDescriptor(id: "codex", name: "Codex", shortName: "Cdx", symbol: "terminal"),

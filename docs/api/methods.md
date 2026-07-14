@@ -28,7 +28,7 @@ A reminder on trust: read methods can surface account emails, local paths, usage
 | `remove_account` | `{"method":"remove_account","account_id":"ACCOUNT"}` | `account` |
 | `delete_account` | `{"method":"delete_account","account_id":"ACCOUNT"}` | `account_deleted` |
 | `get_provider_setup` | `{"method":"get_provider_setup","provider_id":"opencode_go"}` | `provider_setup` |
-| `update_provider_setup` | `{"method":"update_provider_setup","provider_id":"opencode_go","workspace_id":"wrk_123"}` | `provider_setup` |
+| `update_provider_setup` | `{"method":"update_provider_setup","provider_id":"opencode_go","settings":{"workspace_id":"wrk_123"}}` | `provider_setup` |
 | `repair_provider` | `{"method":"repair_provider","provider_id":"codex"}` | `provider_action` |
 | `launch_provider_account` | `{"method":"launch_provider_account","account_id":"ACCOUNT"}` | `provider_action` |
 
@@ -52,7 +52,7 @@ The exact shapes come from the [schemas](index.md) and [models](models.md).
 | `get_provider_health` | Health for visible supported providers and accounts, ordered by provider then account. | `storage_unavailable` | 3s |
 | `get_accounts` | Every supported account — including hidden, disabled, and removed — ordered by provider, profile, then external ID. | `storage_unavailable` | 3s |
 | `get_config` | Effective paths, polling, notifications, and visible provider toggles. Credential and profile details are deliberately left out. | `storage_unavailable` | 3s |
-| `get_provider_setup` | Safe profile summaries; OpenCode may run workspace discovery. A `discovery_error` can ride along with an otherwise successful response. | `unknown_provider`, `internal` | 20s |
+| `get_provider_setup` | Safe profile summaries and provider-owned declarative setup fields. Discovery failures can ride along in `discovery_error` with an otherwise successful response. | `unknown_provider`, `internal` | 20s |
 
 Read results reflect storage at the moment each method reads it. They aren't subscriptions, and separate requests don't add up to one consistent snapshot.
 
@@ -74,7 +74,7 @@ See [refresh jobs](refresh-jobs.md) for polling and failure details.
 | `update_account` | The account must exist. Omitted or `null` `display_name`, `hidden`, or `collection_enabled` leaves that field alone. A blank name also leaves the name alone — v3 can't clear a name to null. | Set-like and persistent. | `unknown_account`, `storage_unavailable`, `internal` |
 | `remove_account` | Sets `hidden: true` and `collection_enabled: false` and keeps the history. | Idempotent and persistent. | `unknown_account`, `storage_unavailable`, `internal` |
 | `delete_account` | Deletes the database history and tombstones or removes the profile. Irreversible. | Not response-idempotent: retry after success and you get `unknown_account`. | `unknown_account`, `storage_unavailable`, `internal` |
-| `update_provider_setup` | Only OpenCode supports `workspace_setup`. An omitted, `null`, or blank `workspace_id` restores automatic discovery; anything explicit must start with `wrk_`. Rebuilds collectors. | Set-like and persistent. | `unknown_provider`, `unsupported_operation`, `invalid_argument` |
+| `update_provider_setup` | Sends provider-owned `settings` string/null values to any provider advertising `setup`. The legacy `workspace_id` field remains accepted for v3 OpenCode clients. Rebuilds collectors. | Set-like and persistent. | `unknown_provider`, `unsupported_operation`, `invalid_argument` |
 
 ## External action methods
 

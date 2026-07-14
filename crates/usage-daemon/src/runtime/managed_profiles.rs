@@ -10,9 +10,6 @@ use uuid::Uuid;
 
 const PROFILES_DIR: &str = "profiles";
 const QUARANTINE_DIR: &str = ".quarantine";
-const CODEX_PROVIDER_ID: &str = "codex";
-const CLAUDE_PROVIDER_ID: &str = "claude";
-const GROK_PROVIDER_ID: &str = "grok";
 
 /// Returns the only directory that may represent a managed provider profile.
 ///
@@ -163,12 +160,11 @@ fn profile_home_in(
 }
 
 fn provider_root(app_root: &Path, provider_id: &str) -> anyhow::Result<PathBuf> {
-    if !matches!(
-        provider_id,
-        CODEX_PROVIDER_ID | CLAUDE_PROVIDER_ID | GROK_PROVIDER_ID
-    ) {
-        bail!("provider '{provider_id}' does not have managed profiles");
-    }
+    validate_path_component("provider id", provider_id)?;
+    anyhow::ensure!(
+        crate::runtime::provider_registry::is_supported(provider_id),
+        "managed profiles require a registered provider id: {provider_id}"
+    );
     Ok(app_root.join(PROFILES_DIR).join(provider_id))
 }
 
@@ -176,10 +172,17 @@ fn validate_profile_id(profile_id: &str) -> anyhow::Result<()> {
     if profile_id.is_empty() || profile_id == QUARANTINE_DIR {
         bail!("managed profile id is empty or reserved");
     }
-    let mut components = Path::new(profile_id).components();
+    validate_path_component("managed profile id", profile_id)
+}
+
+fn validate_path_component(label: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value == "." || value == ".." {
+        bail!("{label} is empty or reserved");
+    }
+    let mut components = Path::new(value).components();
     match (components.next(), components.next()) {
-        (Some(Component::Normal(value)), None) if value == OsStr::new(profile_id) => Ok(()),
-        _ => bail!("managed profile id must be one ordinary path component"),
+        (Some(Component::Normal(component)), None) if component == OsStr::new(value) => Ok(()),
+        _ => bail!("{label} must be one ordinary path component"),
     }
 }
 
@@ -196,6 +199,9 @@ fn reject_ambiguous_components(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CODEX_PROVIDER_ID: &str = "codex";
+    const GROK_PROVIDER_ID: &str = "grok";
 
     fn root() -> PathBuf {
         std::env::temp_dir().join(format!("managed-profile-test-{}", Uuid::new_v4()))
@@ -223,6 +229,7 @@ mod tests {
         ] {
             assert!(profile_home_in(&root, CODEX_PROVIDER_ID, invalid).is_err());
         }
+        assert!(profile_home_in(&root, "typoed-provider", "work").is_err());
     }
 
     #[test]

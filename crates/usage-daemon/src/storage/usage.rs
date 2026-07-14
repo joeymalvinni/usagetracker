@@ -9,10 +9,12 @@ use crate::providers::DailyUsageBucket;
 
 use super::{
     accounts::{accounts_from_conn, looks_like_email},
+    backoff::{delete_provider_backoff_conn, upsert_provider_backoff_conn},
     health::{health_status_to_sql, provider_health_from_conn},
     parse_time_sql, Storage, StoredDailyUsage, StoredDailyUsageHistory, StoredForecastHistory,
-    StoredUsageDashboard, StoredWindowObservation, FORECAST_OBSERVATIONS_QUERY,
-    MAX_SNAPSHOTS_PER_ACCOUNT, SNAPSHOT_RETENTION_DAYS, UPSERT_DAILY_USAGE_QUERY,
+    StoredProviderBackoff, StoredUsageDashboard, StoredWindowObservation,
+    FORECAST_OBSERVATIONS_QUERY, MAX_SNAPSHOTS_PER_ACCOUNT, SNAPSHOT_RETENTION_DAYS,
+    UPSERT_DAILY_USAGE_QUERY,
 };
 
 impl Storage {
@@ -168,16 +170,19 @@ impl Storage {
         .await
     }
 
-    pub async fn record_success(
+    pub async fn record_collection(
         &self,
         snapshot: &UsageSnapshot,
         daily_usage: &[DailyUsageBucket],
         health: &ProviderHealth,
         email: Option<&str>,
+        backoff: Option<&StoredProviderBackoff>,
+        clear_backoff: bool,
     ) -> anyhow::Result<()> {
         let snapshot = snapshot.clone();
         let daily_usage = daily_usage.to_vec();
         let health = health.clone();
+        let backoff = backoff.cloned();
         let email = email
             .map(str::trim)
             .filter(|value| looks_like_email(value))
@@ -257,6 +262,15 @@ impl Storage {
                         Utc::now().to_rfc3339(),
                         snapshot.account_id.as_str()
                     ],
+                )?;
+            }
+            if let Some(backoff) = backoff.as_ref() {
+                upsert_provider_backoff_conn(&transaction, backoff)?;
+            } else if clear_backoff {
+                delete_provider_backoff_conn(
+                    &transaction,
+                    &snapshot.provider_id,
+                    &snapshot.account_id,
                 )?;
             }
             let retention_cutoff = Utc::now()

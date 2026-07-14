@@ -3,8 +3,11 @@ use std::{collections::BTreeSet, path::PathBuf};
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
-        claude::{keychain_service_for_config_dir, PROVIDER_ID as CLAUDE_PROVIDER_ID},
-        codex::PROVIDER_ID as CODEX_PROVIDER_ID,
+        claude::{
+            keychain_service_for_config_dir, settings as claude_settings,
+            PROVIDER_ID as CLAUDE_PROVIDER_ID,
+        },
+        codex::{settings as codex_settings, PROVIDER_ID as CODEX_PROVIDER_ID},
         paths::expand_home_path,
     },
     runtime::managed_profiles,
@@ -32,11 +35,12 @@ pub(crate) fn pending_codex_profile(
             return None;
         }
         let profile_id = profile.id.clone()?;
-        let profile_path = expand_home_path(profile.codex_home.clone()?);
+        let settings = codex_settings::profile(profile).ok()?;
+        let profile_path = expand_home_path(settings.codex_home?);
         if !managed_profiles::is_managed_profile(&profile_path, CODEX_PROVIDER_ID) {
             return None;
         }
-        let auth_path = profile
+        let auth_path = settings
             .auth_path
             .clone()
             .map(expand_home_path)
@@ -48,12 +52,15 @@ pub(crate) fn pending_codex_profile(
 pub(crate) fn default_codex_profile() -> anyhow::Result<ProviderProfileConfig> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?;
-    Ok(ProviderProfileConfig {
+    let mut profile = ProviderProfileConfig {
         id: Some("default".to_string()),
         display_name: None,
-        codex_home: Some(home.join(".codex")),
         ..ProviderProfileConfig::default()
-    })
+    };
+    codex_settings::update_profile(&mut profile, |settings| {
+        settings.codex_home = Some(home.join(".codex"));
+    })?;
+    Ok(profile)
 }
 
 pub(crate) fn ensure_claude_login_profile(
@@ -117,18 +124,21 @@ pub(crate) fn push_managed_claude_profile(
         .any(|profile| profile.enabled && !profile.deleted);
     std::fs::create_dir_all(&config_dir)?;
     let keychain_service = keychain_service_for_config_dir(&config_dir);
-    provider.profiles.push(ProviderProfileConfig {
+    let mut profile = ProviderProfileConfig {
         id: Some(profile_id.clone()),
         display_name: display_name.clone(),
-        keychain_account: Some(keychain_account),
-        keychain_service: Some(keychain_service),
-        credentials_file: Some(config_dir.join(".credentials.json")),
-        claude_config_dir: Some(config_dir.clone()),
-        cli_enabled: Some(true),
-        project_roots: vec![config_dir.join("projects")],
-        owns_default_claude_activity,
         ..ProviderProfileConfig::default()
-    });
+    };
+    claude_settings::update_profile(&mut profile, |settings| {
+        settings.keychain_account = Some(keychain_account);
+        settings.keychain_service = Some(keychain_service);
+        settings.credentials_file = Some(config_dir.join(".credentials.json"));
+        settings.claude_config_dir = Some(config_dir.clone());
+        settings.cli_enabled = Some(true);
+        settings.project_roots = vec![config_dir.join("projects")];
+        settings.owns_default_claude_activity = owns_default_claude_activity;
+    })?;
+    provider.profiles.push(profile);
     Ok(ClaudeLoginTarget {
         profile_id,
         display_name,
@@ -169,10 +179,14 @@ fn claude_login_target(profile: &ProviderProfileConfig, index: usize) -> ClaudeL
                 format!("profile-{}", index + 1)
             }
         });
+    let config_dir = claude_settings::profile(profile)
+        .ok()
+        .and_then(|settings| settings.claude_config_dir)
+        .map(expand_home_path);
     ClaudeLoginTarget {
         profile_id,
         display_name: profile.display_name.clone(),
-        config_dir: profile.claude_config_dir.clone().map(expand_home_path),
+        config_dir,
     }
 }
 

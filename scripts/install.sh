@@ -11,6 +11,8 @@ launch_app=1
 force=0
 app_was_running=0
 update_status_file="${USAGETRACKER_UPDATE_STATUS_FILE:-}"
+daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
+daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
 
 usage() {
   cat <<'EOF'
@@ -213,7 +215,67 @@ app_is_running() {
   return 1
 }
 
+daemon_pids() {
+  local source pid executable command_line identifier
+  {
+    /usr/sbin/lsof -t -- "$daemon_socket.lock" 2>/dev/null | awk '{ print "lock " $1 }' || true
+    pgrep -x usage-daemon 2>/dev/null | awk '{ print "scan " $1 }' || true
+  } | sort -u -k2,2 | while read -r source pid; do
+    [[ -n "$pid" ]] || continue
+    executable="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    executable="${executable#${executable%%[![:space:]]*}}"
+    [[ "${executable##*/}" == "usage-daemon" ]] || continue
+    if [[ "$source" == "scan" ]]; then
+      command_line="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
+      case "$command_line" in
+        *" --socket-path $daemon_socket"|*" --socket-path $daemon_socket "*) ;;
+        *) continue ;;
+      esac
+    fi
+    if [[ "$source" != "lock" && "$executable" != "$app_path/Contents/MacOS/usage-daemon" ]]; then
+      identifier="$(signature_field "$executable" Identifier 2>/dev/null || true)"
+      [[ "$identifier" == "$expected_daemon_identifier" ]] || continue
+    fi
+    printf '%s\n' "$pid"
+  done
+}
+
+stop_daemons() {
+  local pid
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(daemon_pids)
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  echo "Stopping UsageTracker background service..."
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  if wait_for_processes 20 "${pids[@]}"; then return 0; fi
+
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+  done
+  if wait_for_processes 20 "${pids[@]}"; then return 0; fi
+  echo "UsageTracker background service could not be stopped." >&2
+  return 1
+}
+
+wait_for_processes() {
+  local attempts="$1" attempt pid running
+  shift
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    running=0
+    for pid in "$@"; do
+      if kill -0 "$pid" 2>/dev/null; then running=1; fi
+    done
+    [[ "$running" == "0" ]] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
 expected_app_identifier="engineering.super.usagetracker"
+expected_daemon_identifier="$expected_app_identifier.daemon"
 expected_cli_identifier="$expected_app_identifier.cli"
 
 if [[ "$install_app" == "1" ]]; then
@@ -320,6 +382,10 @@ if [[ "$install_app" == "1" ]]; then
     fi
   fi
 
+  if ! stop_daemons; then
+    exit 1
+  fi
+
   mkdir -p "$app_dir"
   new_app="$app_dir/.UsageTracker.app.install.$$"
   backup_app="$app_dir/.UsageTracker.app.backup.$$"
@@ -368,4 +434,4 @@ if [[ "$install_app" == "1" && "$launch_app" == "1" ]]; then
   echo "If macOS blocks the app, open System Settings → Privacy & Security and click Open Anyway."
 fi
 
-echo "UsageTracker installation complete. Existing ~/.usagetracker data was left untouched."
+echo "UsageTracker installation complete. Existing $daemon_home data was left untouched."

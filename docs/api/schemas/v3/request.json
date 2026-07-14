@@ -437,7 +437,18 @@
         "provider_id": {
           "type": "string"
         },
+        "settings": {
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": "Generic provider-owned setup values. A null value clears a setting.",
+          "type": "object"
+        },
         "workspace_id": {
+          "description": "Deprecated v3 compatibility field. New clients should send\n`settings.workspace_id` instead.",
           "type": [
             "string",
             "null"

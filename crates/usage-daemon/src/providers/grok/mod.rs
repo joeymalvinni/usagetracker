@@ -5,6 +5,7 @@ mod billing;
 mod cookies;
 mod local_sessions;
 mod profile;
+pub(crate) mod profile_service;
 mod rpc;
 mod strategy;
 mod web;
@@ -23,9 +24,9 @@ use usage_core::ProviderId;
 use crate::{
     config::ProviderConfig,
     providers::{
-        AccountDiscovery, AccountDiscoveryFailure, DiscoveredAccount, ProviderCollectionResult,
-        ProviderCollector, ProviderError, ProviderErrorKind, HTTP_CONNECT_TIMEOUT,
-        HTTP_REQUEST_TIMEOUT,
+        AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome, DiscoveredAccount,
+        ProviderCollectionResult, ProviderCollector, ProviderError, ProviderErrorKind,
+        HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -35,6 +36,9 @@ use profile::{deduplicate_accounts, GrokProfile};
 use strategy::SourceMode;
 
 pub const PROVIDER_ID: &str = "grok";
+
+pub(crate) mod adapter;
+pub(crate) mod settings;
 pub(crate) use profile::{
     default_home as default_grok_home, normalized_id as normalized_profile_id, DEFAULT_PROFILE_ID,
 };
@@ -58,7 +62,8 @@ pub struct GrokCollector {
 
 impl GrokCollector {
     pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
-        let source_mode = SourceMode::parse(config.source_mode.as_deref())
+        let provider_settings = settings::provider(&config)?;
+        let source_mode = SourceMode::parse(provider_settings.source_mode.as_deref())
             .map_err(|error| anyhow::anyhow!(error.short_message().to_string()))?;
         let profiles = profile::resolve(&config)?;
         let client = reqwest::Client::builder()
@@ -307,6 +312,13 @@ impl ProviderCollector for GrokCollector {
         ProviderId::new(PROVIDER_ID)
     }
 
+    fn configured_profile_ids(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect()
+    }
+
     async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
         if self.profiles.is_empty() {
             return Err(ProviderError::new(
@@ -372,33 +384,15 @@ impl ProviderCollector for GrokCollector {
                     account.profile_id.as_deref() == Some(failure.profile_id.as_str())
                 })
             });
-            return Ok(AccountDiscovery { accounts, failures });
         }
-        if let Some(error) = failures
-            .into_iter()
-            .map(|failure| failure.error)
-            .find(|error| error.kind() != ProviderErrorKind::CredentialsMissing)
-        {
-            return Err(error);
-        }
-        Err(ProviderError::new(
-            ProviderErrorKind::CredentialsMissing,
-            match self.source_mode {
-                SourceMode::Cli => "Grok CLI is not connected; run `grok login`",
-                SourceMode::Web => {
-                    "Grok web billing is not connected; run `grok login` or sign in at grok.com in Chrome"
-                }
-                SourceMode::Auto => {
-                    "Grok is not connected; run `grok login` or sign in at grok.com in Chrome"
-                }
-            },
-        ))
+        deduplicate_discovery_failures(&mut failures);
+        Ok(AccountDiscovery::from_parts(accounts, failures))
     }
 
     async fn collect_usage(
         &self,
         account: &DiscoveredAccount,
-    ) -> Result<ProviderCollectionResult, ProviderError> {
+    ) -> Result<CollectionOutcome, ProviderError> {
         let profile = self.profile_for_account(account)?;
         let credentials = auth::load_credentials(&profile.grok_home).ok();
         if let Some(credentials) = credentials.as_ref() {
@@ -419,8 +413,8 @@ impl ProviderCollector for GrokCollector {
         if self.source_mode.uses_cli() {
             match self.cli_billing(profile).await {
                 Ok(data) => {
-                    return Ok(self
-                        .collection_result(
+                    return Ok(CollectionOutcome::collected(
+                        self.collection_result(
                             data,
                             BillingSource::CliRpc,
                             None,
@@ -428,7 +422,8 @@ impl ProviderCollector for GrokCollector {
                             profile,
                             Vec::new(),
                         )
-                        .await)
+                        .await,
+                    ))
                 }
                 Err(error)
                     if self.source_mode.permits_fallback() && should_fallback_after_cli(&error) =>
@@ -458,8 +453,8 @@ impl ProviderCollector for GrokCollector {
                         )]
                     })
                     .unwrap_or_default();
-                Ok(self
-                    .collection_result(
+                Ok(CollectionOutcome::collected(
+                    self.collection_result(
                         data,
                         BillingSource::GrokWeb,
                         Some(cookie_source),
@@ -467,7 +462,8 @@ impl ProviderCollector for GrokCollector {
                         profile,
                         warnings,
                     )
-                    .await)
+                    .await,
+                ))
             }
             Err(web_error) if web_error.kind() == ProviderErrorKind::RateLimited => Err(web_error),
             Err(web_error) => match cli_error {
@@ -483,6 +479,25 @@ impl ProviderCollector for GrokCollector {
             },
         }
     }
+}
+
+fn deduplicate_discovery_failures(failures: &mut Vec<AccountDiscoveryFailure>) {
+    let mut deduplicated: Vec<AccountDiscoveryFailure> = Vec::with_capacity(failures.len());
+    for failure in failures.drain(..) {
+        if let Some(existing) = deduplicated
+            .iter_mut()
+            .find(|existing| existing.profile_id == failure.profile_id)
+        {
+            if existing.error.kind() == ProviderErrorKind::CredentialsMissing
+                && failure.error.kind() != ProviderErrorKind::CredentialsMissing
+            {
+                *existing = failure;
+            }
+        } else {
+            deduplicated.push(failure);
+        }
+    }
+    *failures = deduplicated;
 }
 
 fn preferred_error_kind(cli: &ProviderError, web: &ProviderError) -> ProviderErrorKind {
@@ -515,6 +530,29 @@ mod tests {
 
     use crate::config::ProviderProfileConfig;
 
+    #[test]
+    fn duplicate_profile_failures_keep_the_more_specific_error() {
+        let mut failures = vec![
+            AccountDiscoveryFailure {
+                profile_id: "default".to_string(),
+                error: ProviderError::new(ProviderErrorKind::CredentialsMissing, "missing"),
+            },
+            AccountDiscoveryFailure {
+                profile_id: "default".to_string(),
+                error: ProviderError::new(ProviderErrorKind::CredentialsInvalid, "invalid"),
+            },
+        ];
+
+        deduplicate_discovery_failures(&mut failures);
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].profile_id, "default");
+        assert_eq!(
+            failures[0].error.kind(),
+            ProviderErrorKind::CredentialsInvalid
+        );
+    }
+
     fn write_auth(home: &std::path::Path, user_id: &str, email: &str) {
         fs::create_dir_all(home).unwrap();
         let payload = serde_json::json!({
@@ -532,12 +570,25 @@ mod tests {
     }
 
     fn profile(id: &str, home: PathBuf) -> ProviderProfileConfig {
-        ProviderProfileConfig {
+        let mut profile = ProviderProfileConfig {
             id: Some(id.to_string()),
             display_name: Some(id.to_string()),
-            grok_home: Some(home),
             ..ProviderProfileConfig::default()
-        }
+        };
+        settings::update_profile(&mut profile, |settings| settings.grok_home = Some(home)).unwrap();
+        profile
+    }
+
+    fn cli_config(profiles: Vec<ProviderProfileConfig>) -> ProviderConfig {
+        let mut config = ProviderConfig {
+            profiles,
+            ..ProviderConfig::default()
+        };
+        settings::update_provider(&mut config, |settings| {
+            settings.source_mode = Some("cli".to_string());
+        })
+        .unwrap();
+        config
     }
 
     #[test]
@@ -565,15 +616,14 @@ mod tests {
         let work = root.join("work");
         write_auth(&personal, "user-personal", "personal@example.com");
         write_auth(&work, "user-work", "work@example.com");
-        let collector = GrokCollector::new(ProviderConfig {
-            profiles: vec![profile("personal", personal), profile("work", work)],
-            source_mode: Some("cli".to_string()),
-            ..ProviderConfig::default()
-        })
+        let collector = GrokCollector::new(cli_config(vec![
+            profile("personal", personal),
+            profile("work", work),
+        ]))
         .unwrap();
 
         let discovery = collector.discover_accounts().await.unwrap();
-        let accounts = discovery.accounts;
+        let (accounts, _) = discovery.into_parts();
 
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[0].external_account_id, "user-personal");
@@ -590,15 +640,14 @@ mod tests {
         let duplicate = root.join("duplicate");
         write_auth(&first, "same-user", "same@example.com");
         write_auth(&duplicate, "same-user", "same@example.com");
-        let collector = GrokCollector::new(ProviderConfig {
-            profiles: vec![profile("first", first), profile("duplicate", duplicate)],
-            source_mode: Some("cli".to_string()),
-            ..ProviderConfig::default()
-        })
+        let collector = GrokCollector::new(cli_config(vec![
+            profile("first", first),
+            profile("duplicate", duplicate),
+        ]))
         .unwrap();
 
         let discovery = collector.discover_accounts().await.unwrap();
-        let accounts = discovery.accounts;
+        let (accounts, _) = discovery.into_parts();
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].profile_id.as_deref(), Some("first"));
@@ -610,26 +659,45 @@ mod tests {
         let root = std::env::temp_dir().join(format!("grok-profiles-{}", uuid::Uuid::new_v4()));
         let healthy = root.join("healthy");
         write_auth(&healthy, "healthy-user", "healthy@example.com");
-        let collector = GrokCollector::new(ProviderConfig {
-            profiles: vec![
-                profile("healthy", healthy),
-                profile("broken", root.join("broken")),
-            ],
-            source_mode: Some("cli".to_string()),
-            ..ProviderConfig::default()
-        })
+        let collector = GrokCollector::new(cli_config(vec![
+            profile("healthy", healthy),
+            profile("broken", root.join("broken")),
+        ]))
         .unwrap();
 
         let discovery = collector.discover_accounts().await.unwrap();
+        let (accounts, failures) = discovery.into_parts();
 
-        assert_eq!(discovery.accounts.len(), 1);
-        assert_eq!(discovery.failures.len(), 1);
-        assert_eq!(discovery.failures[0].profile_id, "broken");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].profile_id, "broken");
         assert_eq!(
-            discovery.failures[0].error.kind(),
+            failures[0].error.kind(),
             ProviderErrorKind::CredentialsMissing
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn returns_one_failure_for_each_grok_profile_when_all_discovery_fails() {
+        let root = std::env::temp_dir().join(format!("grok-profiles-{}", uuid::Uuid::new_v4()));
+        let collector = GrokCollector::new(cli_config(vec![
+            profile("personal", root.join("personal")),
+            profile("work", root.join("work")),
+        ]))
+        .unwrap();
+
+        let discovery = collector.discover_accounts().await.unwrap();
+        let (accounts, failures) = discovery.into_parts();
+
+        assert!(accounts.is_empty());
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.profile_id.as_str())
+                .collect::<Vec<_>>(),
+            ["personal", "work"]
+        );
     }
 
     #[test]

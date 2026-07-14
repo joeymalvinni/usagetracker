@@ -103,7 +103,7 @@ fn account_summary(
     let activity_summary = (!activity_days.is_empty()).then(|| {
         let today = Local::now().date_naive();
         ActivitySummary {
-            provenance: provenance_for(activity_source, false, activity),
+            provenance: typed_or_legacy_provenance(snapshot, activity_source, false, activity),
             today_tokens: activity_days
                 .iter()
                 .find(|point| point.date == today)
@@ -131,7 +131,7 @@ fn account_summary(
         });
         let today = Local::now().date_naive();
         CostSummary {
-            provenance: provenance_for(cost_source, true, Some(metadata)),
+            provenance: typed_or_legacy_provenance(snapshot, cost_source, true, Some(metadata)),
             today_cost_usd: cost_days
                 .iter()
                 .find(|point| point.date == today)
@@ -363,7 +363,20 @@ fn synthesized_today_point(
     }]
 }
 
-fn provenance_for(
+fn typed_or_legacy_provenance(
+    snapshot: &UsageSnapshot,
+    source: Option<&str>,
+    cost: bool,
+    metadata: Option<&serde_json::Map<String, Value>>,
+) -> DataProvenance {
+    source
+        .and_then(|source| snapshot.daily_provenance(source))
+        .unwrap_or_else(|| legacy_provenance_for(source, cost, metadata))
+}
+
+/// Compatibility for snapshots written before datasets carried typed source
+/// mappings. New providers never need to add cases here.
+fn legacy_provenance_for(
     source: Option<&str>,
     cost: bool,
     metadata: Option<&serde_json::Map<String, Value>>,
@@ -590,5 +603,39 @@ mod tests {
         assert_eq!(activity.days[0].date, retained_date);
         assert_eq!(activity.days[0].tokens, 75);
         assert_eq!(activity.days[0].cost_usd, Some(0.25));
+    }
+
+    #[test]
+    fn dashboard_uses_typed_daily_provenance_without_knowing_provider_labels() {
+        let snapshot = UsageSnapshot {
+            provider_id: ProviderId::new("future_provider"),
+            account_id: AccountId::new("account"),
+            collected_at: Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap(),
+            windows: Vec::new(),
+            metadata: json!({
+                "future_provider_activity": {
+                    "source": "future_stream_v9",
+                    "by_day": [{"date": "2026-07-11", "tokens": 42}]
+                },
+                "dataset_provenance": [{
+                    "authoritative": false,
+                    "provenance": {
+                        "source": "local_database",
+                        "scope": "workspace",
+                        "quality": "observed",
+                        "completeness": "complete",
+                        "confidence": "medium"
+                    },
+                    "daily_sources": ["future_stream_v9"]
+                }]
+            }),
+        };
+
+        let dashboard = build_usage_dashboard(&[snapshot], &[]);
+        let provenance = &dashboard.accounts[0].activity.as_ref().unwrap().provenance;
+
+        assert_eq!(provenance.source, UsageDataSource::LocalDatabase);
+        assert_eq!(provenance.scope, UsageDataScope::Workspace);
+        assert_eq!(provenance.completeness, UsageDataCompleteness::Complete);
     }
 }

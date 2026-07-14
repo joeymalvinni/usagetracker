@@ -198,7 +198,7 @@ async fn discovers_each_codex_identity_once_regardless_of_profile_nickname() {
     .unwrap();
 
     let discovery = collector.discover_accounts().await.unwrap();
-    let accounts = discovery.accounts;
+    let (accounts, failures) = discovery.into_parts();
 
     assert_eq!(accounts.len(), 2);
     assert_eq!(accounts[0].external_account_id, "shared-account");
@@ -206,7 +206,78 @@ async fn discovers_each_codex_identity_once_regardless_of_profile_nickname() {
     assert_eq!(accounts[0].display_name.as_deref(), Some("Personal"));
     assert_eq!(accounts[1].external_account_id, "distinct-account");
     assert_eq!(accounts[1].profile_id.as_deref(), Some("distinct"));
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].profile_id, "duplicate");
+    assert_eq!(
+        failures[0].error.kind(),
+        ProviderErrorKind::CredentialsInvalid
+    );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn preserves_a_broken_codex_profile_alongside_a_healthy_profile() {
+    let root = std::env::temp_dir().join(format!(
+        "usagetracker-codex-partial-discovery-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let healthy_auth = root.join("healthy-auth.json");
+    let broken_auth = root.join("broken-auth.json");
+    write_codex_auth(&healthy_auth, "healthy-account");
+    std::fs::write(&broken_auth, b"not json").unwrap();
+
+    let collector = CodexCollector::new(ProviderConfig {
+        enabled: true,
+        profiles: vec![
+            codex_test_profile("healthy", "Healthy", healthy_auth),
+            codex_test_profile("broken", "Broken", broken_auth),
+        ],
+        ..ProviderConfig::default()
+    })
+    .unwrap();
+
+    let discovery = collector.discover_accounts().await.unwrap();
+    let (accounts, failures) = discovery.into_parts();
+
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].profile_id.as_deref(), Some("healthy"));
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].profile_id, "broken");
+    assert_eq!(
+        failures[0].error.kind(),
+        ProviderErrorKind::CredentialsInvalid
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn returns_one_failure_for_each_codex_profile_when_all_discovery_fails() {
+    let root = std::env::temp_dir().join(format!(
+        "usagetracker-codex-failed-discovery-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let collector = CodexCollector::new(ProviderConfig {
+        enabled: true,
+        profiles: vec![
+            codex_test_profile("personal", "Personal", root.join("personal.json")),
+            codex_test_profile("work", "Work", root.join("work.json")),
+        ],
+        ..ProviderConfig::default()
+    })
+    .unwrap();
+
+    let discovery = collector.discover_accounts().await.unwrap();
+    let (accounts, failures) = discovery.into_parts();
+
+    assert!(accounts.is_empty());
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.profile_id.as_str())
+            .collect::<Vec<_>>(),
+        ["personal", "work"]
+    );
 }
 
 #[tokio::test]
@@ -251,12 +322,16 @@ async fn rejects_collection_through_a_later_duplicate_codex_profile() {
 }
 
 fn codex_test_profile(id: &str, display_name: &str, auth_path: PathBuf) -> ProviderProfileConfig {
-    ProviderProfileConfig {
+    let mut profile = ProviderProfileConfig {
         id: Some(id.to_string()),
         display_name: Some(display_name.to_string()),
-        auth_path: Some(auth_path),
         ..ProviderProfileConfig::default()
-    }
+    };
+    super::settings::update_profile(&mut profile, |settings| {
+        settings.auth_path = Some(auth_path);
+    })
+    .unwrap();
+    profile
 }
 
 fn write_codex_auth(path: &Path, account_id: &str) {

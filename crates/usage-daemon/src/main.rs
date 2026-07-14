@@ -4,6 +4,7 @@ mod dashboard;
 mod fixtures;
 mod forecast;
 mod health;
+mod instance;
 mod keychain;
 mod local_logs;
 mod notifications;
@@ -56,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
         None => Config::load(config_path, db_path, socket_path),
     }
     .context("failed to load daemon config")?;
+    let _instance = instance::InstanceGuard::acquire(&config.paths.socket)
+        .context("failed to acquire daemon instance lock")?;
     if let Some(scenario) = args.fixture {
         fixtures::reset_database(&config.paths.db).context("failed to reset fixture database")?;
         for provider in config.providers.values_mut() {

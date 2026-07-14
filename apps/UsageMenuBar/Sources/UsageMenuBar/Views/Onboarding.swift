@@ -61,10 +61,9 @@ struct Onboarding: View {
 
             ScrollView {
                 VStack(spacing: Theme.Spacing.sm) {
-                    OnboardingProviderCard(providerId: "codex")
-                    OnboardingProviderCard(providerId: "claude")
-                    OnboardingProviderCard(providerId: "opencode_go")
-                    OnboardingProviderCard(providerId: "grok")
+                    ForEach(state.settingsProviders) { provider in
+                        OnboardingProviderCard(providerId: provider.providerId)
+                    }
                 }
             }
 
@@ -127,19 +126,13 @@ private struct OnboardingProviderCard: View {
     }
 
     private var name: String {
-        ProviderCatalog.name(for: providerId)
+        provider?.name ?? ProviderCatalog.name(for: providerId)
     }
     private var symbol: String {
-        ProviderCatalog.symbol(for: providerId)
+        provider?.symbol ?? ProviderCatalog.symbol(for: providerId)
     }
     private var description: String {
-        switch providerId {
-        case "codex": "Rate limits plus estimated local token activity"
-        case "claude": "Claude Code limits plus estimated local activity"
-        case "opencode_go": "Workspace usage, balance, and local fallback"
-        case "grok": "Shared Grok usage from Grok Build or grok.com"
-        default: "Provider usage and limits"
-        }
+        "Usage, limits, and account health"
     }
 }
 
@@ -166,8 +159,8 @@ struct ProviderSetupControls: View {
                     Button("Add another account") { Task { await state.addProviderAccount(providerId) } }
                         .disabled(busy)
                 }
-                if state.supportsWorkspaceSetup(providerId) {
-                    Button(setup == nil ? "Discover workspaces" : "Discover again") {
+                if state.supportsSetup(providerId) {
+                    Button(setup == nil ? "Load setup" : "Reload setup") {
                         Task { await state.loadProviderSetup(providerId) }
                     }
                     .disabled(busy)
@@ -177,19 +170,8 @@ struct ProviderSetupControls: View {
             }
             .controlSize(.small)
 
-            if state.supportsWorkspaceSetup(providerId), let setup {
-                if !setup.workspaceOptions.isEmpty {
-                    Picker("Workspace", selection: workspaceBinding(setup)) {
-                        ForEach(setup.workspaceOptions, id: \.self) { Text($0).tag($0) }
-                    }
-                    .pickerStyle(.menu)
-                    .disabled(busy)
-                } else if let error = setup.discoveryError {
-                    Text(error)
-                        .font(Theme.Typography.micro)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            if state.supportsSetup(providerId), let setup {
+                ProviderSetupFields(providerId: providerId, setup: setup, disabled: busy)
             }
 
             Text(helpText)
@@ -198,7 +180,7 @@ struct ProviderSetupControls: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .task {
-            if state.providerSetups[providerId] == nil, state.supportsWorkspaceSetup(providerId) {
+            if state.providerSetups[providerId] == nil, state.supportsSetup(providerId) {
                 await state.loadProviderSetup(providerId)
             }
         }
@@ -218,31 +200,99 @@ struct ProviderSetupControls: View {
         }
     }
 
-    private func workspaceBinding(_ setup: ProviderSetupResponse) -> Binding<String> {
-        let fallback = setup.selectedWorkspaceId ?? setup.workspaceOptions.first ?? ""
-        return Binding(
-            get: { state.providerSetups[providerId]?.selectedWorkspaceId ?? fallback },
-            set: { workspace in Task { await state.selectWorkspace(providerId: providerId, workspaceId: workspace) } }
-        )
-    }
-
     private var repairLabel: String {
-        switch providerId {
-        case "codex": accounts.isEmpty ? "Connect Codex" : "Sign in again"
-        case "claude": accounts.isEmpty ? "Connect Claude" : "Sign in to Claude again"
-        case "opencode_go": "Open OpenCode login"
-        case "grok": accounts.isEmpty ? "Connect Grok" : "Sign in to Grok again"
-        default: "Connect provider"
-        }
+        accounts.isEmpty
+            ? "Connect \(state.settingsProviders.first { $0.providerId == providerId }?.name ?? ProviderCatalog.name(for: providerId))"
+            : "Sign in again"
     }
 
     private var helpText: String {
-        switch providerId {
-        case "codex": "Each account uses an isolated Codex profile. Finish the browser sign-in; the account appears automatically."
-        case "claude": "Each account uses an isolated Claude profile. After sign-in, open its profile terminal from Settings to keep activity separate."
-        case "opencode_go": "Sign in at opencode.ai, then discover and choose the workspace to track."
-        case "grok": "Each CLI-backed account uses an isolated Grok profile. Browser-only sign-in remains available for the default account."
-        default: "Connect the provider, then refresh usage."
+        state.supportsSetup(providerId)
+            ? "Connect the provider, review its setup options, then refresh usage."
+            : "Finish sign-in; the account appears automatically after the next refresh."
+    }
+}
+
+struct ProviderSetupFields: View {
+    @EnvironmentObject var state: AppState
+    let providerId: String
+    let setup: ProviderSetupResponse
+    let disabled: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            ForEach(setup.fields) { field in
+                ProviderSetupFieldControl(providerId: providerId, field: field, disabled: disabled)
+                    .id("\(field.key):\(field.value ?? "")")
+            }
+            if let error = setup.discoveryError {
+                Text(error)
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+private struct ProviderSetupFieldControl: View {
+    @EnvironmentObject var state: AppState
+    let providerId: String
+    let field: ProviderSetupField
+    let disabled: Bool
+    @State private var draft: String
+
+    init(providerId: String, field: ProviderSetupField, disabled: Bool) {
+        self.providerId = providerId
+        self.field = field
+        self.disabled = disabled
+        _draft = State(initialValue: field.value ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            if field.kind == "select" {
+                Picker(field.label, selection: selectionBinding) {
+                    if !field.required { Text("Automatic").tag("") }
+                    ForEach(field.options, id: \.self) { Text($0).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .disabled(disabled)
+            } else {
+                HStack {
+                    if field.kind == "secret" {
+                        SecureField(field.label, text: $draft)
+                    } else {
+                        TextField(field.label, text: $draft)
+                    }
+                    Button("Apply") { update(draft) }
+                        .disabled(disabled || (field.required && draft.isEmpty))
+                }
+                .controlSize(.small)
+            }
+            if let help = field.helpText {
+                Text(help)
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var selectionBinding: Binding<String> {
+        Binding(
+            get: { field.value ?? "" },
+            set: { update($0) }
+        )
+    }
+
+    private func update(_ value: String) {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            await state.updateProviderSetup(
+                providerId: providerId,
+                key: field.key,
+                value: normalized.isEmpty ? nil : normalized
+            )
         }
     }
 }

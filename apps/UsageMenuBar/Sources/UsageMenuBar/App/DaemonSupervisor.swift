@@ -124,6 +124,21 @@ actor DaemonSupervisor {
             if case .starting(_, let task) = state { return await task.value }
         }
 
+        let orphanPIDs = await Task.detached(priority: .utility) {
+            Self.daemonPIDs(associatedWith: socketPath)
+        }.value
+        if !orphanPIDs.isEmpty {
+            let stopped = await stopDaemons(
+                ownedProcess: nil,
+                pids: orphanPIDs,
+                socketPath: socketPath
+            )
+            if !stopped {
+                enterBackoff()
+                return false
+            }
+        }
+
         return await beginStartup(socketPath: socketPath)
     }
 
@@ -149,10 +164,12 @@ actor DaemonSupervisor {
         let runningOwnedProcess = ownedProcess?.isRunning == true ? ownedProcess : nil
         let pids: [pid_t]
         if runningOwnedProcess != nil {
+            // The owned process is authoritative and can be stopped directly;
+            // avoid two lsof subprocesses on the common explicit-restart path.
             pids = []
         } else {
             pids = await Task.detached(priority: .utility) {
-                Self.daemonPIDs(listeningOn: socketPath)
+                Self.daemonPIDs(associatedWith: socketPath)
             }.value
         }
         guard await stopDaemons(
@@ -271,11 +288,13 @@ actor DaemonSupervisor {
         pids: [pid_t],
         socketPath: String
     ) async -> Bool {
-        if let ownedProcess {
-            ownedProcess.terminate()
-        } else {
-            for pid in pids { Darwin.kill(pid, SIGTERM) }
-        }
+        let ownedPID = ownedProcess?.processIdentifier
+        ownedProcess?.terminate()
+        await Task.detached(priority: .utility) {
+            for pid in pids where pid != ownedPID && Self.isUsageDaemon(pid) {
+                Darwin.kill(pid, SIGTERM)
+            }
+        }.value
         if await waitUntilStopped(
             ownedProcess: ownedProcess,
             pids: pids,
@@ -284,15 +303,12 @@ actor DaemonSupervisor {
             return true
         }
 
-        if let ownedProcess {
-            ownedProcess.forceTerminate()
-        } else {
-            await Task.detached(priority: .utility) {
-                for pid in pids where Self.isUsageDaemon(pid) {
-                    Darwin.kill(pid, SIGKILL)
-                }
-            }.value
-        }
+        ownedProcess?.forceTerminate()
+        await Task.detached(priority: .utility) {
+            for pid in pids where pid != ownedPID && Self.isUsageDaemon(pid) {
+                Darwin.kill(pid, SIGKILL)
+            }
+        }.value
         return await waitUntilStopped(
             ownedProcess: ownedProcess,
             pids: pids,
@@ -310,14 +326,11 @@ actor DaemonSupervisor {
                 path: socketPath,
                 timeout: policy.shutdownProbeTimeout
             )
-            let processRunning: Bool
-            if let ownedProcess {
-                processRunning = ownedProcess.isRunning
-            } else {
-                processRunning = await Task.detached(priority: .utility) {
-                    pids.contains(where: Self.isUsageDaemon)
-                }.value
-            }
+            let ownedPID = ownedProcess?.processIdentifier
+            let discoveredProcessRunning = await Task.detached(priority: .utility) {
+                pids.contains { $0 != ownedPID && Self.isUsageDaemon($0) }
+            }.value
+            let processRunning = ownedProcess?.isRunning == true || discoveredProcessRunning
             if !connected && !processRunning { return true }
             guard check + 1 < policy.shutdownChecks else { return false }
             do {
@@ -496,7 +509,7 @@ actor DaemonSupervisor {
         }
 
         return await Task.detached(priority: .utility) {
-            Self.daemonPIDs(listeningOn: socketPath).contains { pid in
+            Self.daemonPIDs(associatedWith: socketPath).contains { pid in
                 guard let running = Self.mappedExecutableIdentity(for: pid) else { return false }
                 return running != expected
             }
@@ -575,11 +588,16 @@ actor DaemonSupervisor {
         return UInt64(value)
     }
 
-    private static func daemonPIDs(listeningOn socketPath: String) -> [pid_t] {
+    private static func daemonPIDs(associatedWith socketPath: String) -> [pid_t] {
+        let paths = [socketPath, socketPath + ".lock"]
+        return Array(Set(paths.flatMap { daemonPIDs(opening: $0) })).sorted()
+    }
+
+    private static func daemonPIDs(opening path: String) -> [pid_t] {
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-t", "--", socketPath]
+        process.arguments = ["-t", "--", path]
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         do {

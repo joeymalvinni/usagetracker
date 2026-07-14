@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     hash::{Hash, Hasher},
     panic::AssertUnwindSafe,
     sync::Arc,
@@ -7,34 +7,46 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures_util::{future::join_all, FutureExt};
+use futures_util::{future::join_all, stream, FutureExt, StreamExt};
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     time::timeout,
 };
 use tracing::{debug, info, warn};
 use usage_core::{
-    AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus, RefreshJob, RefreshJobId,
-    RefreshJobStatus, RefreshScope, RefreshTrigger,
+    AccountId, DatasetProvenance, ProviderId, ProviderRefreshResult, ProviderRefreshStatus,
+    RefreshJob, RefreshJobId, RefreshJobStatus, RefreshScope, RefreshTrigger,
 };
 
 use crate::{
     health,
     notifications::NotificationManager,
     providers::{
-        AccountDiscoveryFailure, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
-        ProviderError, ProviderErrorKind,
+        AccountDiscoveryFailure, AuthoritativeOutcome, CollectionOutcome, DiscoveredAccount,
+        ProviderCollectionResult, ProviderCollector, ProviderError, ProviderErrorKind,
+        UsageDataset,
     },
+    runtime::provider_registry,
     storage::{Storage, StoredProviderBackoff},
 };
 
 const RATE_LIMIT_BACKOFF_SECONDS: [i64; 5] = [5 * 60, 10 * 60, 20 * 60, 40 * 60, 60 * 60];
-const PROVIDER_DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
-const DEFAULT_ACCOUNT_COLLECTION_BUDGET: Duration = Duration::from_secs(60);
-const CLAUDE_ACCOUNT_COLLECTION_BUDGET: Duration = Duration::from_secs(75);
 const RETAINED_REFRESH_JOBS: usize = 64;
 
 type RateLimitBackoff = StoredProviderBackoff;
+
+enum CollectionBackoff {
+    Preserve,
+    Clear,
+    Set(RateLimitBackoff),
+}
+
+struct CollectionState {
+    health: usage_core::ProviderHealth,
+    status: ProviderRefreshStatus,
+    message: Option<String>,
+    backoff: CollectionBackoff,
+}
 
 #[derive(Clone)]
 pub struct RefreshCoordinator {
@@ -371,7 +383,21 @@ impl RefreshCoordinator {
         );
         let discovery_started = Instant::now();
 
-        let discovery = match timeout(PROVIDER_DISCOVERY_BUDGET, provider.discover_accounts()).await
+        let policy = match provider_registry::execution_policy(&provider_id) {
+            Ok(policy) => policy,
+            Err(err) => {
+                return vec![
+                    self.record_failure(
+                        provider_id,
+                        None,
+                        ProviderError::new(ProviderErrorKind::ProviderUnavailable, err.to_string()),
+                    )
+                    .await,
+                ];
+            }
+        };
+
+        let discovery = match timeout(policy.discovery_timeout, provider.discover_accounts()).await
         {
             Ok(Ok(discovery)) => discovery,
             Ok(Err(err)) => return vec![self.record_failure(provider_id, None, err).await],
@@ -388,20 +414,35 @@ impl RefreshCoordinator {
             }
         };
 
+        if let Err(error) = validate_discovery(&provider.configured_profile_ids(), &discovery) {
+            return vec![self.record_failure(provider_id, None, error).await];
+        }
+
+        let profile_count = discovery.profiles.len();
+        let (accounts, failures) = discovery.into_parts();
         info!(
             provider_id = provider_id.as_str(),
-            account_count = discovery.accounts.len(),
-            failure_count = discovery.failures.len(),
+            profile_count,
+            account_count = accounts.len(),
+            failure_count = failures.len(),
             elapsed_ms = discovery_started.elapsed().as_millis(),
             "provider account discovery completed"
         );
 
-        let mut results = join_all(discovery.accounts.into_iter().map(|discovered| {
-            self.refresh_account(provider.as_ref(), provider_id.clone(), discovered)
-        }))
-        .await;
+        let mut results = stream::iter(accounts)
+            .map(|discovered| {
+                self.refresh_account_with_budget(
+                    provider.as_ref(),
+                    provider_id.clone(),
+                    discovered,
+                    policy.collection_timeout,
+                )
+            })
+            .buffer_unordered(policy.max_parallel_accounts)
+            .collect::<Vec<_>>()
+            .await;
         results.extend(
-            self.record_account_discovery_failures(&provider_id, discovery.failures)
+            self.record_account_discovery_failures(&provider_id, failures)
                 .await,
         );
         results
@@ -452,17 +493,6 @@ impl RefreshCoordinator {
             );
         }
         results
-    }
-
-    async fn refresh_account(
-        &self,
-        provider: &dyn ProviderCollector,
-        provider_id: ProviderId,
-        discovered: DiscoveredAccount,
-    ) -> ProviderRefreshResult {
-        let collection_budget = account_collection_budget(&provider_id);
-        self.refresh_account_with_budget(provider, provider_id, discovered, collection_budget)
-            .await
     }
 
     async fn refresh_account_with_budget(
@@ -546,18 +576,14 @@ impl RefreshCoordinator {
         let collect_started = Instant::now();
 
         match timeout(collection_budget, provider.collect_usage(&discovered)).await {
-            Ok(Ok(result)) => {
-                self.clear_rate_limit_backoff(&provider_id, &account.id)
-                    .await;
-                info!(
-                    provider_id = provider_id.as_str(),
-                    account_id = account.id.as_str(),
-                    collection_mode = result.collection_mode.as_str(),
-                    elapsed_ms = collect_started.elapsed().as_millis(),
-                    warnings = result.warnings.len(),
-                    "provider usage collection completed"
-                );
-                self.store_success(provider_id, account, result).await
+            Ok(Ok(outcome)) => {
+                self.handle_collection_outcome(
+                    provider_id,
+                    account,
+                    outcome,
+                    collect_started.elapsed(),
+                )
+                .await
             }
             Ok(Err(err)) => {
                 let backoff = if err.kind() == ProviderErrorKind::RateLimited {
@@ -612,6 +638,151 @@ impl RefreshCoordinator {
         }
     }
 
+    async fn handle_collection_outcome(
+        &self,
+        provider_id: ProviderId,
+        account: usage_core::Account,
+        outcome: CollectionOutcome,
+        elapsed: Duration,
+    ) -> ProviderRefreshResult {
+        match outcome.authoritative {
+            AuthoritativeOutcome::Collected(authoritative) => {
+                let result = merge_datasets(
+                    std::iter::once(authoritative)
+                        .chain(outcome.supplemental)
+                        .collect(),
+                )
+                .expect("authoritative collection always contains a dataset");
+                info!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account.id.as_str(),
+                    collection_mode = result.collection_mode.as_str(),
+                    elapsed_ms = elapsed.as_millis(),
+                    warnings = result.warnings.len(),
+                    "provider usage collection completed"
+                );
+                let health = health::ok(
+                    provider_id.clone(),
+                    account.id.clone(),
+                    result.collection_mode.clone(),
+                );
+                self.store_collection(
+                    provider_id,
+                    account,
+                    result,
+                    CollectionState {
+                        health,
+                        status: ProviderRefreshStatus::Ok,
+                        message: None,
+                        backoff: CollectionBackoff::Clear,
+                    },
+                )
+                .await
+            }
+            AuthoritativeOutcome::NotApplicable => {
+                let Some(result) = merge_datasets(outcome.supplemental) else {
+                    return self
+                        .record_failure(
+                            provider_id,
+                            Some(account.id),
+                            ProviderError::new(
+                                ProviderErrorKind::Parse,
+                                "provider returned no usage datasets",
+                            ),
+                        )
+                        .await;
+                };
+                let health = health::ok(
+                    provider_id.clone(),
+                    account.id.clone(),
+                    result.collection_mode.clone(),
+                );
+                self.store_collection(
+                    provider_id,
+                    account,
+                    result,
+                    CollectionState {
+                        health,
+                        status: ProviderRefreshStatus::Ok,
+                        message: None,
+                        backoff: CollectionBackoff::Clear,
+                    },
+                )
+                .await
+            }
+            AuthoritativeOutcome::Failed(error) => {
+                let Some(result) = merge_datasets(outcome.supplemental) else {
+                    return self
+                        .record_collection_error(provider_id, account.id, error)
+                        .await;
+                };
+                let backoff = if error.kind() == ProviderErrorKind::RateLimited {
+                    Some(
+                        self.next_rate_limit_backoff(
+                            &provider_id,
+                            &account.id,
+                            Utc::now(),
+                            error.short_message(),
+                            error.retry_at(),
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                let status = error.kind().into();
+                let message = error.short_message().to_string();
+                let provider_health = health::from_provider_error(
+                    provider_id.clone(),
+                    Some(account.id.clone()),
+                    &error,
+                );
+                warn!(
+                    provider_id = provider_id.as_str(),
+                    account_id = account.id.as_str(),
+                    error_code = error.kind().as_str(),
+                    supplemental_mode = result.collection_mode.as_str(),
+                    elapsed_ms = elapsed.as_millis(),
+                    "authoritative collection failed; supplemental usage retained"
+                );
+                self.store_collection(
+                    provider_id,
+                    account,
+                    result,
+                    CollectionState {
+                        health: provider_health,
+                        status,
+                        message: Some(message),
+                        backoff: backoff
+                            .map(CollectionBackoff::Set)
+                            .unwrap_or(CollectionBackoff::Preserve),
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn record_collection_error(
+        &self,
+        provider_id: ProviderId,
+        account_id: AccountId,
+        error: ProviderError,
+    ) -> ProviderRefreshResult {
+        if error.kind() == ProviderErrorKind::RateLimited {
+            self.note_rate_limit(
+                &provider_id,
+                &account_id,
+                Utc::now(),
+                error.short_message(),
+                error.retry_at(),
+            )
+            .await;
+        }
+        self.record_failure(provider_id, Some(account_id), error)
+            .await
+    }
+
     async fn active_rate_limit_backoff(
         &self,
         provider_id: &ProviderId,
@@ -628,6 +799,29 @@ impl RefreshCoordinator {
     }
 
     async fn note_rate_limit(
+        &self,
+        provider_id: &ProviderId,
+        account_id: &AccountId,
+        now: DateTime<Utc>,
+        error_message: &str,
+        provider_retry_at: Option<DateTime<Utc>>,
+    ) -> RateLimitBackoff {
+        let backoff = self
+            .next_rate_limit_backoff(
+                provider_id,
+                account_id,
+                now,
+                error_message,
+                provider_retry_at,
+            )
+            .await;
+        if let Err(err) = self.storage.upsert_provider_backoff(&backoff).await {
+            warn!(error = %err, "failed to persist provider backoff");
+        }
+        backoff
+    }
+
+    async fn next_rate_limit_backoff(
         &self,
         provider_id: &ProviderId,
         account_id: &AccountId,
@@ -656,7 +850,7 @@ impl RefreshCoordinator {
                 account_id,
                 consecutive_failures,
             ));
-        let backoff = RateLimitBackoff {
+        RateLimitBackoff {
             provider_id: provider_id.clone(),
             account_id: account_id.clone(),
             consecutive_failures,
@@ -665,11 +859,7 @@ impl RefreshCoordinator {
                 .unwrap_or(default_retry_at),
             last_failure_at: now,
             error_message: error_message.to_string(),
-        };
-        if let Err(err) = self.storage.upsert_provider_backoff(&backoff).await {
-            warn!(error = %err, "failed to persist provider backoff");
         }
-        backoff
     }
 
     async fn clear_rate_limit_backoff(&self, provider_id: &ProviderId, account_id: &AccountId) {
@@ -719,11 +909,12 @@ impl RefreshCoordinator {
         }
     }
 
-    async fn store_success(
+    async fn store_collection(
         &self,
         provider_id: ProviderId,
         account: usage_core::Account,
         result: ProviderCollectionResult,
+        state: CollectionState,
     ) -> ProviderRefreshResult {
         let daily_usage_days = result.daily_usage.len();
         let snapshot = result.usage.into_snapshot(account.id.clone());
@@ -734,29 +925,31 @@ impl RefreshCoordinator {
                 account_id = account.id.as_str(),
                 "provider returned usage for a different provider id"
             );
-            return provider_error_result(
-                provider_id,
-                Some(account.id),
-                ProviderError::new(
-                    ProviderErrorKind::Parse,
-                    "provider usage payload had a mismatched provider id",
-                ),
-            );
+            return self
+                .record_failure(
+                    provider_id,
+                    Some(account.id),
+                    ProviderError::new(
+                        ProviderErrorKind::Parse,
+                        "provider usage payload had a mismatched provider id",
+                    ),
+                )
+                .await;
         }
 
         let store_started = Instant::now();
-        let ok_health = health::ok(
-            provider_id.clone(),
-            account.id.clone(),
-            result.collection_mode.clone(),
-        );
         if let Err(err) = self
             .storage
-            .record_success(
+            .record_collection(
                 &snapshot,
                 &result.daily_usage,
-                &ok_health,
+                &state.health,
                 result.account_email.as_deref(),
+                match &state.backoff {
+                    CollectionBackoff::Set(backoff) => Some(backoff),
+                    CollectionBackoff::Preserve | CollectionBackoff::Clear => None,
+                },
+                matches!(state.backoff, CollectionBackoff::Clear),
             )
             .await
         {
@@ -809,10 +1002,10 @@ impl RefreshCoordinator {
         ProviderRefreshResult {
             provider_id,
             account_id: Some(account.id),
-            status: ProviderRefreshStatus::Ok,
+            status: state.status,
             collection_mode: Some(result.collection_mode),
             collected_at: Some(snapshot.collected_at),
-            message: result.warnings.first().cloned(),
+            message: state.message.or_else(|| result.warnings.first().cloned()),
         }
     }
 
@@ -836,6 +1029,107 @@ impl RefreshCoordinator {
         }
         provider_error_result(provider_id, account_id, error)
     }
+}
+
+fn validate_discovery(
+    configured_profile_ids: &[String],
+    discovery: &crate::providers::AccountDiscovery,
+) -> Result<(), ProviderError> {
+    let mut discovered = BTreeSet::new();
+    for profile in &discovery.profiles {
+        if profile.profile_id.trim().is_empty() || !discovered.insert(profile.profile_id.as_str()) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Parse,
+                "provider discovery returned an empty or duplicate profile id",
+            ));
+        }
+        if let Ok(account) = &profile.result {
+            if account
+                .profile_id
+                .as_deref()
+                .is_some_and(|id| id != profile.profile_id)
+            {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Parse,
+                    "provider discovery changed profile identity",
+                ));
+            }
+        }
+    }
+    if !configured_profile_ids.is_empty() {
+        let expected = configured_profile_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if expected != discovered {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Parse,
+                "provider discovery must return exactly one outcome per configured profile",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResult> {
+    let mut datasets = datasets.into_iter();
+    let first = datasets.next()?;
+    let mut provenance = vec![dataset_provenance(&first)];
+    let mut result = first.collection;
+    let mut modes = BTreeSet::from([result.collection_mode.clone()]);
+
+    for dataset in datasets {
+        provenance.push(dataset_provenance(&dataset));
+        let incoming = dataset.collection;
+        result.usage.collected_at = result.usage.collected_at.max(incoming.usage.collected_at);
+        result.usage.windows.extend(incoming.usage.windows);
+        if let (Some(target), Some(source)) = (
+            result.usage.metadata.as_object_mut(),
+            incoming.usage.metadata.as_object(),
+        ) {
+            for (key, value) in source {
+                target.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        result.daily_usage.extend(incoming.daily_usage);
+        result.warnings.extend(incoming.warnings);
+        if result.account_email.is_none() {
+            result.account_email = incoming.account_email;
+        }
+        modes.insert(incoming.collection_mode);
+    }
+
+    result.collection_mode = modes.into_iter().collect::<Vec<_>>().join("+");
+    if let Some(metadata) = result.usage.metadata.as_object_mut() {
+        metadata.insert(
+            "dataset_provenance".to_string(),
+            serde_json::Value::Array(provenance),
+        );
+    }
+    Some(result)
+}
+
+fn dataset_provenance(dataset: &UsageDataset) -> serde_json::Value {
+    serde_json::to_value(DatasetProvenance {
+        authoritative: dataset.authoritative,
+        provenance: dataset.provenance.clone(),
+        window_ids: dataset
+            .collection
+            .usage
+            .windows
+            .iter()
+            .map(|window| window.window_id.clone())
+            .collect(),
+        daily_sources: dataset
+            .collection
+            .daily_usage
+            .iter()
+            .map(|bucket| bucket.source.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    })
+    .expect("dataset provenance is serializable")
 }
 
 fn jittered_backoff_seconds(
@@ -900,13 +1194,6 @@ async fn wait_for_provider_refresh(
     }
 }
 
-fn account_collection_budget(provider_id: &ProviderId) -> Duration {
-    match provider_id.as_str() {
-        "claude" => CLAUDE_ACCOUNT_COLLECTION_BUDGET,
-        _ => DEFAULT_ACCOUNT_COLLECTION_BUDGET,
-    }
-}
-
 fn should_refresh_provider(provider_id: &ProviderId, filter: Option<&[ProviderId]>) -> bool {
     filter.is_none_or(|filter| filter.iter().any(|id| id == provider_id))
 }
@@ -956,20 +1243,32 @@ mod tests {
         time::timeout,
     };
     use usage_core::{
-        ProviderHealth, ProviderHealthStatus, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+        ProviderHealth, ProviderHealthStatus, UsageAmount, UsageDataCompleteness, UsageDataQuality,
+        UsageDataScope, UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
     };
     use uuid::Uuid;
 
     use crate::providers::{
-        AccountDiscovery, AccountDiscoveryFailure, ProviderCollectionResult, ProviderUsage,
+        AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome, ProviderCollectionResult,
+        ProviderUsage,
     };
 
+    fn successful(result: ProviderCollectionResult) -> Result<CollectionOutcome, ProviderError> {
+        Ok(CollectionOutcome::collected(result))
+    }
+
     struct FakeProvider;
+
+    struct MismatchedProvider;
 
     #[async_trait]
     impl ProviderCollector for FakeProvider {
         fn provider_id(&self) -> ProviderId {
             ProviderId::new("claude")
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
         }
 
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
@@ -985,8 +1284,8 @@ mod tests {
         async fn collect_usage(
             &self,
             _account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
-            Ok(ProviderCollectionResult {
+        ) -> Result<CollectionOutcome, ProviderError> {
+            successful(ProviderCollectionResult {
                 usage: ProviderUsage {
                     provider_id: ProviderId::new("claude"),
                     collected_at: Utc::now(),
@@ -1020,6 +1319,45 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ProviderCollector for MismatchedProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("claude")
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
+            Ok(vec![DiscoveredAccount {
+                external_account_id: "mismatched-account".to_string(),
+                display_name: None,
+                email: None,
+                profile_id: None,
+            }]
+            .into())
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<CollectionOutcome, ProviderError> {
+            successful(ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new("grok"),
+                    collected_at: Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({}),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "test".to_string(),
+                account_email: None,
+                warnings: Vec::new(),
+            })
+        }
+    }
+
     struct MultiAccountProvider;
 
     struct MixedDiscoveryProvider;
@@ -1030,31 +1368,44 @@ mod tests {
             ProviderId::new("grok")
         }
 
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
-            Ok(AccountDiscovery {
-                accounts: vec![DiscoveredAccount {
+            Ok(AccountDiscovery::from_parts(
+                vec![DiscoveredAccount {
                     external_account_id: "healthy-user".to_string(),
                     display_name: None,
                     email: Some("healthy@example.com".to_string()),
                     profile_id: Some("healthy".to_string()),
                 }],
-                failures: vec![AccountDiscoveryFailure {
+                vec![AccountDiscoveryFailure {
                     profile_id: "broken".to_string(),
                     error: ProviderError::new(
                         ProviderErrorKind::CredentialsInvalid,
                         "broken Grok credentials",
                     ),
                 }],
-            })
+            ))
         }
 
         async fn collect_usage(
             &self,
             account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
-            let mut result = FakeProvider.collect_usage(account).await?;
-            result.usage.provider_id = ProviderId::new("grok");
-            Ok(result)
+        ) -> Result<CollectionOutcome, ProviderError> {
+            successful(ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new("grok"),
+                    collected_at: Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({}),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "test".to_string(),
+                account_email: account.email.clone(),
+                warnings: vec![],
+            })
         }
     }
 
@@ -1062,6 +1413,10 @@ mod tests {
     impl ProviderCollector for MultiAccountProvider {
         fn provider_id(&self) -> ProviderId {
             ProviderId::new("codex")
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
         }
 
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
@@ -1085,8 +1440,8 @@ mod tests {
         async fn collect_usage(
             &self,
             account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
-            Ok(ProviderCollectionResult {
+        ) -> Result<CollectionOutcome, ProviderError> {
+            successful(ProviderCollectionResult {
                 usage: ProviderUsage {
                     provider_id: ProviderId::new("codex"),
                     collected_at: Utc::now(),
@@ -1113,6 +1468,10 @@ mod tests {
             ProviderId::new("codex")
         }
 
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(["personal", "work"]
                 .into_iter()
@@ -1128,9 +1487,9 @@ mod tests {
         async fn collect_usage(
             &self,
             _account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
+        ) -> Result<CollectionOutcome, ProviderError> {
             self.barrier.wait().await;
-            Ok(ProviderCollectionResult {
+            successful(ProviderCollectionResult {
                 usage: ProviderUsage {
                     provider_id: ProviderId::new("codex"),
                     collected_at: Utc::now(),
@@ -1154,6 +1513,10 @@ mod tests {
         attempts: Arc<AtomicUsize>,
     }
 
+    struct DegradedRateLimitedProvider {
+        attempts: Arc<AtomicUsize>,
+    }
+
     struct BlockingProvider {
         provider_id: &'static str,
         attempts: Arc<AtomicUsize>,
@@ -1165,6 +1528,10 @@ mod tests {
     impl ProviderCollector for BlockingProvider {
         fn provider_id(&self) -> ProviderId {
             ProviderId::new(self.provider_id)
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
         }
 
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
@@ -1180,11 +1547,11 @@ mod tests {
         async fn collect_usage(
             &self,
             _account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
+        ) -> Result<CollectionOutcome, ProviderError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             self.started.notify_waiters();
             self.release.notified().await;
-            Ok(ProviderCollectionResult {
+            successful(ProviderCollectionResult {
                 usage: ProviderUsage {
                     provider_id: ProviderId::new(self.provider_id),
                     collected_at: Utc::now(),
@@ -1205,6 +1572,10 @@ mod tests {
             ProviderId::new("claude")
         }
 
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
             Ok(vec![DiscoveredAccount {
                 external_account_id: "rate-limited-account".to_string(),
@@ -1218,7 +1589,7 @@ mod tests {
         async fn collect_usage(
             &self,
             _account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
+        ) -> Result<CollectionOutcome, ProviderError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(ProviderError::new(
                 ProviderErrorKind::RateLimited,
@@ -1228,9 +1599,73 @@ mod tests {
     }
 
     #[async_trait]
+    impl ProviderCollector for DegradedRateLimitedProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("opencode_go")
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
+            Ok(vec![DiscoveredAccount {
+                external_account_id: "workspace".to_string(),
+                display_name: None,
+                email: None,
+                profile_id: None,
+            }]
+            .into())
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<CollectionOutcome, ProviderError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let supplemental = UsageDataset::supplemental(
+                ProviderCollectionResult {
+                    usage: ProviderUsage {
+                        provider_id: ProviderId::new("opencode_go"),
+                        collected_at: Utc::now(),
+                        windows: vec![UsageWindow {
+                            window_id: "local_activity".to_string(),
+                            label: "Local activity".to_string(),
+                            kind: UsageWindowKind::Tokens,
+                            used: None,
+                            limit: None,
+                            remaining: None,
+                            percent_used: None,
+                            percent_remaining: None,
+                            reset_at: None,
+                        }],
+                        metadata: json!({}),
+                    },
+                    daily_usage: Vec::new(),
+                    collection_mode: "local".to_string(),
+                    account_email: None,
+                    warnings: Vec::new(),
+                },
+                UsageDataSource::LocalDatabase,
+                UsageDataScope::ThisDevice,
+                UsageDataQuality::Observed,
+                UsageDataCompleteness::Partial,
+            );
+            Ok(CollectionOutcome::degraded(
+                ProviderError::new(ProviderErrorKind::RateLimited, "slow down"),
+                vec![supplemental],
+            ))
+        }
+    }
+
+    #[async_trait]
     impl ProviderCollector for ConcurrentDiscoveryProvider {
         fn provider_id(&self) -> ProviderId {
             ProviderId::new(self.provider_id)
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
         }
 
         async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
@@ -1247,8 +1682,8 @@ mod tests {
         async fn collect_usage(
             &self,
             _account: &DiscoveredAccount,
-        ) -> Result<ProviderCollectionResult, ProviderError> {
-            Ok(ProviderCollectionResult {
+        ) -> Result<CollectionOutcome, ProviderError> {
+            successful(ProviderCollectionResult {
                 usage: ProviderUsage {
                     provider_id: ProviderId::new(self.provider_id),
                     collected_at: Utc::now(),
@@ -1450,6 +1885,26 @@ mod tests {
         assert_eq!(report.provider_results.len(), 2);
         assert_eq!(codex_attempts.load(Ordering::SeqCst), 1);
         assert_eq!(claude_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_id_mismatch_is_recorded_as_failure_without_storing_usage() {
+        let storage = test_storage();
+        let coordinator =
+            RefreshCoordinator::new(storage.clone(), vec![Arc::new(MismatchedProvider)]);
+
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(report.provider_results.len(), 1);
+        assert_eq!(
+            report.provider_results[0].status,
+            ProviderRefreshStatus::Parse
+        );
+        assert!(report.provider_results[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("mismatched provider id")));
+        assert!(storage.latest_usage().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1725,6 +2180,55 @@ mod tests {
         let health = storage.provider_health().await.unwrap();
         assert_eq!(health.len(), 1);
         assert!(matches!(health[0].status, ProviderHealthStatus::BackingOff));
+    }
+
+    #[tokio::test]
+    async fn supplemental_success_preserves_authoritative_rate_limit_backoff() {
+        let storage = test_storage();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let coordinator = RefreshCoordinator::new(
+            storage.clone(),
+            vec![Arc::new(DegradedRateLimitedProvider {
+                attempts: attempts.clone(),
+            })],
+        );
+
+        let first = coordinator.refresh(None).await;
+        assert_eq!(
+            first.provider_results[0].status,
+            ProviderRefreshStatus::RateLimited
+        );
+        let account = storage.accounts().await.unwrap().remove(0);
+        assert!(storage
+            .provider_backoff(&ProviderId::new("opencode_go"), &account.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let snapshot = storage.latest_usage().await.unwrap().remove(0);
+        let provenance = snapshot.window_provenance(&snapshot.windows[0]);
+        assert!(!provenance.authoritative);
+        assert_eq!(provenance.source, UsageDataSource::LocalDatabase);
+
+        coordinator.refresh(None).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn discovery_requires_one_identity_stable_outcome_per_profile() {
+        let discovery = AccountDiscovery::from_parts(
+            vec![DiscoveredAccount {
+                external_account_id: "account".to_string(),
+                display_name: None,
+                email: None,
+                profile_id: Some("personal".to_string()),
+            }],
+            Vec::new(),
+        );
+        assert!(validate_discovery(&["personal".to_string()], &discovery).is_ok());
+        assert!(
+            validate_discovery(&["personal".to_string(), "work".to_string()], &discovery).is_err()
+        );
     }
 
     #[tokio::test]

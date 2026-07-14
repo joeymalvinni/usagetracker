@@ -42,6 +42,8 @@ struct DashboardBuilder {
     let forecasts: [UsageForecast]
     let dashboard: UsageDashboardSummary
     let windowProvenance: [UsageWindowProvenance]
+    let serverProviders: [String: ServerProviderDescriptor]
+    let serverProviderOrder: [String]
     let ui: UIConfig
     let refreshingProviderIDs: Set<String>
     let visible: (String) -> Bool
@@ -62,6 +64,8 @@ struct DashboardBuilder {
         forecasts: [UsageForecast],
         dashboard: UsageDashboardSummary,
         windowProvenance: [UsageWindowProvenance],
+        serverProviders: [String: ServerProviderDescriptor] = [:],
+        serverProviderOrder: [String] = [],
         ui: UIConfig,
         refreshingProviderIDs: Set<String> = [],
         visible: @escaping (String) -> Bool
@@ -73,6 +77,8 @@ struct DashboardBuilder {
         self.forecasts = forecasts
         self.dashboard = dashboard
         self.windowProvenance = windowProvenance
+        self.serverProviders = serverProviders
+        self.serverProviderOrder = serverProviderOrder
         self.ui = ui
         self.refreshingProviderIDs = refreshingProviderIDs
         self.visible = visible
@@ -422,7 +428,11 @@ struct DashboardBuilder {
         return CostDashboardVM(days: days, providers: providers)
     }
 
-    private var knownProviderIds: [String] { ProviderCatalog.supportedIDs }
+    private var knownProviderIds: [String] {
+        if serverProviders.isEmpty { return ProviderCatalog.supportedIDs }
+        if !serverProviderOrder.isEmpty { return serverProviderOrder }
+        return serverProviders.keys.sorted()
+    }
 
     private func orderedAccountKeys() -> [ProviderAccountKey] {
         var keys = Set<ProviderAccountKey>()
@@ -487,7 +497,9 @@ struct DashboardBuilder {
         return "\(providerId)|\(accountId)|\(status.code)"
     }
 
-    private func isSupportedProvider(_ id: String) -> Bool { ProviderCatalog.supports(id) }
+    private func isSupportedProvider(_ id: String) -> Bool {
+        serverProviders.isEmpty ? ProviderCatalog.supports(id) : serverProviders[id] != nil
+    }
 
     private func isDefaultVisibleProvider(_ id: String) -> Bool {
         guard isEnabledProvider(id) else { return false }
@@ -526,7 +538,7 @@ struct DashboardBuilder {
 
         return WindowVM(
             id: "\(providerId)_rate_limit_resets",
-            label: "Codex resets",
+            label: "Rate-limit resets",
             value: "\(count) available",
             reset: reset,
             providerId: providerId,
@@ -539,10 +551,9 @@ struct DashboardBuilder {
     }
 
     private func resetCreditDetails(_ snapshot: UsageSnapshot) -> [ResetCreditVM] {
-        guard snapshot.providerId == "codex",
-              let credits = dashboardByAccount[
-                ProviderAccountKey(providerId: snapshot.providerId, accountId: snapshot.accountId)
-              ]?.resetCredits?.credits
+        guard let credits = dashboardByAccount[
+            ProviderAccountKey(providerId: snapshot.providerId, accountId: snapshot.accountId)
+        ]?.resetCredits?.credits
         else { return [] }
 
         return credits.map { credit in
@@ -743,7 +754,7 @@ struct DashboardBuilder {
     }
 
     private func pretty(_ id: String) -> String {
-        ProviderCatalog.name(for: id)
+        serverProviders[id]?.displayName ?? ProviderCatalog.name(for: id)
     }
 
     private func short(_ id: String) -> String {

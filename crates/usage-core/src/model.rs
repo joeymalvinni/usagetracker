@@ -58,10 +58,57 @@ fn diagnostics_are_empty(value: &serde_json::Value) -> bool {
 }
 
 impl UsageSnapshot {
+    fn dataset_provenance(&self) -> Vec<DatasetProvenance> {
+        self.metadata
+            .get("dataset_provenance")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
     /// Describes whether a quota-like window can safely drive forecasts and
     /// alerts. Provider collectors still own parsing; this compatibility
     /// adapter makes the normalized semantic explicit at the API boundary.
     pub fn window_provenance(&self, window: &UsageWindow) -> UsageWindowProvenance {
+        let datasets = self.dataset_provenance();
+        self.window_provenance_from(&datasets, window)
+    }
+
+    /// Resolves every window while parsing the persisted dataset mapping once.
+    pub fn windows_provenance(&self) -> Vec<UsageWindowProvenance> {
+        let datasets = self.dataset_provenance();
+        self.windows
+            .iter()
+            .map(|window| self.window_provenance_from(&datasets, window))
+            .collect()
+    }
+
+    fn window_provenance_from(
+        &self,
+        datasets: &[DatasetProvenance],
+        window: &UsageWindow,
+    ) -> UsageWindowProvenance {
+        if let Some(dataset) = datasets
+            .iter()
+            .find(|dataset| dataset.window_ids.iter().any(|id| id == &window.window_id))
+        {
+            let quota_like = (window.percent_used.is_some() || window.percent_remaining.is_some())
+                && !matches!(
+                    window.kind,
+                    UsageWindowKind::Credits | UsageWindowKind::Tokens
+                );
+            return UsageWindowProvenance {
+                provider_id: self.provider_id.clone(),
+                account_id: self.account_id.clone(),
+                window_id: window.window_id.clone(),
+                source: dataset.provenance.source,
+                scope: dataset.provenance.scope,
+                quality: dataset.provenance.quality,
+                completeness: dataset.provenance.completeness,
+                confidence: dataset.provenance.confidence,
+                authoritative: dataset.authoritative,
+                quota_like,
+            };
+        }
         let synthetic_local_window = self
             .metadata
             .get("web_authoritative")
@@ -111,6 +158,33 @@ impl UsageSnapshot {
         let provenance = self.window_provenance(window);
         provenance.quota_like && provenance.authoritative
     }
+
+    /// Resolves the typed origin of a persisted daily-usage source. This keeps
+    /// shared dashboard code independent of provider-specific source labels.
+    pub fn daily_provenance(&self, source: &str) -> Option<DataProvenance> {
+        self.dataset_provenance()
+            .into_iter()
+            .find(|dataset| {
+                dataset
+                    .daily_sources
+                    .iter()
+                    .any(|candidate| candidate == source)
+            })
+            .map(|dataset| dataset.provenance)
+    }
+}
+
+/// Persisted mapping from normalized data to its typed origin. It lives in the
+/// diagnostics object for wire compatibility, but consumers deserialize this
+/// type instead of inferring correctness from provider-specific strings.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct DatasetProvenance {
+    pub authoritative: bool,
+    pub provenance: DataProvenance,
+    #[serde(default)]
+    pub window_ids: Vec<String>,
+    #[serde(default)]
+    pub daily_sources: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]

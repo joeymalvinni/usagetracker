@@ -148,7 +148,6 @@ private final class FoundationDaemonProcessHandle: DaemonProcessHandle, @uncheck
         lock.unlock()
         if shouldTerminate {
             Darwin.kill(pid, SIGKILL)
-            process.waitUntilExit()
         }
     }
 

@@ -44,11 +44,14 @@ pub(crate) fn normalized_id(configured: Option<&str>, index: usize) -> String {
 pub(super) fn resolve(config: &ProviderConfig) -> anyhow::Result<Vec<GrokProfile>> {
     let default_home = default_home()?;
     let configured = if config.profiles.is_empty() {
-        vec![ProviderProfileConfig {
+        let mut profile = ProviderProfileConfig {
             id: Some(DEFAULT_PROFILE_ID.to_string()),
-            grok_home: Some(default_home.clone()),
             ..ProviderProfileConfig::default()
-        }]
+        };
+        super::settings::update_profile(&mut profile, |settings| {
+            settings.grok_home = Some(default_home.clone());
+        })?;
+        vec![profile]
     } else {
         config.profiles.clone()
     };
@@ -58,8 +61,9 @@ pub(super) fn resolve(config: &ProviderConfig) -> anyhow::Result<Vec<GrokProfile
         .enumerate()
         .filter(|(_, profile)| profile.enabled && !profile.deleted)
         .map(|(index, profile)| {
+            let settings = super::settings::profile(&profile)?;
             let id = normalized_id(profile.id.as_deref(), index);
-            let grok_home = match profile.grok_home {
+            let grok_home = match settings.grok_home {
                 Some(path) => expand_home_path(path),
                 None if id == DEFAULT_PROFILE_ID => default_home.clone(),
                 None => anyhow::bail!("Grok profile {id} is missing its home directory"),

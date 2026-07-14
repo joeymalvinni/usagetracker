@@ -16,18 +16,20 @@ use usage_core::ProviderId;
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
-        paths::expand_home_path, AccountDiscovery, DiscoveredAccount, ProviderCollectionResult,
-        ProviderCollector, ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
-        HTTP_REQUEST_TIMEOUT,
+        paths::expand_home_path, AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome,
+        DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
+        ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
+pub(crate) mod adapter;
 mod cli;
 mod client;
 mod cost;
 mod credentials;
 mod normalize;
 mod pricing;
+pub(crate) mod settings;
 
 use cli::collect_usage_from_cli;
 use client::{parse_cached_profile_identity, ClaudeAccountIdentity, ClaudeApiClient};
@@ -64,7 +66,7 @@ impl ClaudeCollector {
     pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("failed to resolve home directory for Claude data"))?;
-        let profiles = claude_profiles(config, &home);
+        let profiles = claude_profiles(config, &home)?;
         Ok(Self {
             profiles,
             api: ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?,
@@ -330,28 +332,32 @@ impl ClaudeCollector {
     }
 }
 
-fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile>> {
+fn claude_profiles(config: ProviderConfig, home: &Path) -> anyhow::Result<Vec<Arc<ClaudeProfile>>> {
     let default_keychain_account = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
     let has_explicit_profiles = !config.profiles.is_empty();
     let configured = if has_explicit_profiles {
         config.profiles
     } else {
-        vec![ProviderProfileConfig {
+        let mut profile = ProviderProfileConfig {
             id: Some("default".to_string()),
-            keychain_account: Some(default_keychain_account.clone()),
-            credentials_file: Some(home.join(CLAUDE_CREDENTIALS_FILE)),
-            cli_enabled: Some(true),
             ..ProviderProfileConfig::default()
-        }]
+        };
+        settings::update_profile(&mut profile, |settings| {
+            settings.keychain_account = Some(default_keychain_account.clone());
+            settings.credentials_file = Some(home.join(CLAUDE_CREDENTIALS_FILE));
+            settings.cli_enabled = Some(true);
+        })?;
+        vec![profile]
     };
 
     configured
         .into_iter()
         .enumerate()
         .filter(|(_, profile)| profile.enabled && !profile.deleted)
-        .map(|(index, profile)| {
+        .map(|(index, profile)| -> anyhow::Result<_> {
+            let settings = settings::profile(&profile)?;
             let id = profile_id(profile.id.as_deref(), index);
-            let keychain_account = profile
+            let keychain_account = settings
                 .keychain_account
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
@@ -362,40 +368,40 @@ fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile
                         default_keychain_account.clone()
                     }
                 });
-            let credentials_file_path = profile
+            let credentials_file_path = settings
                 .credentials_file
                 .map(expand_home_path)
                 .unwrap_or_else(|| home.join(CLAUDE_CREDENTIALS_FILE));
-            let config_dir = profile.claude_config_dir.map(expand_home_path);
+            let config_dir = settings.claude_config_dir.map(expand_home_path);
             let identity_file_path = config_dir
                 .as_ref()
                 .map(|root| root.join(".claude.json"))
                 .unwrap_or_else(|| home.join(".claude.json"));
-            let mut project_roots = if profile.project_roots.is_empty() {
+            let mut project_roots = if settings.project_roots.is_empty() {
                 config_dir
                     .as_ref()
                     .map(|root| vec![root.join("projects")])
                     .unwrap_or_default()
             } else {
-                profile
+                settings
                     .project_roots
                     .into_iter()
                     .map(expand_home_path)
                     .collect()
             };
-            if profile.owns_default_claude_activity {
+            if settings.owns_default_claude_activity {
                 project_roots.push(home.join(".config/claude/projects"));
                 project_roots.push(home.join(".claude/projects"));
             }
             project_roots.sort();
             project_roots.dedup();
-            let keychain_service = profile
+            let keychain_service = settings
                 .keychain_service
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .or_else(|| config_dir.as_deref().map(keychain_service_for_config_dir))
                 .unwrap_or_else(|| credentials::CLAUDE_KEYCHAIN_SERVICE.to_string());
-            Arc::new(ClaudeProfile {
+            Ok(Arc::new(ClaudeProfile {
                 id,
                 keychain_service,
                 keychain_account,
@@ -404,12 +410,12 @@ fn claude_profiles(config: ProviderConfig, home: &Path) -> Vec<Arc<ClaudeProfile
                 identity_file_path,
                 credentials_cache: Mutex::new(None),
                 display_name: profile.display_name,
-                cli_enabled: profile
+                cli_enabled: settings
                     .cli_enabled
                     .unwrap_or(!has_explicit_profiles || index == 0),
                 project_roots,
                 cost_cache: Arc::new(StdMutex::new(None)),
-            })
+            }))
         })
         .collect()
 }
@@ -439,8 +445,9 @@ fn should_use_cli_fallback(cli_enabled: bool, api_error: &ProviderError) -> bool
     cli_enabled && api_error.kind() != ProviderErrorKind::RateLimited
 }
 
-fn deduplicate_accounts(accounts: &mut Vec<DiscoveredAccount>) {
+fn deduplicate_accounts(accounts: &mut Vec<DiscoveredAccount>) -> Vec<AccountDiscoveryFailure> {
     let mut canonical_profiles: BTreeMap<String, String> = BTreeMap::new();
+    let mut failures = Vec::new();
     accounts.retain(|account| {
         let profile_id = account.profile_id.as_deref().unwrap_or("unknown");
         if let Some(canonical_profile_id) = canonical_profiles.get(&account.external_account_id) {
@@ -450,12 +457,23 @@ fn deduplicate_accounts(accounts: &mut Vec<DiscoveredAccount>) {
                 duplicate_profile_id = profile_id,
                 "duplicate Claude account ignored; each account can only be connected once"
             );
+            failures.push(AccountDiscoveryFailure {
+                profile_id: profile_id.to_string(),
+                error: ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    format!(
+                        "Claude account {} is already connected by profile {}; duplicate profile {} cannot be collected",
+                        account.external_account_id, canonical_profile_id, profile_id
+                    ),
+                ),
+            });
             false
         } else {
             canonical_profiles.insert(account.external_account_id.clone(), profile_id.to_string());
             true
         }
     });
+    failures
 }
 
 fn should_use_cached_identity(scopes: &[String]) -> bool {
@@ -469,6 +487,13 @@ fn should_use_cached_identity(scopes: &[String]) -> bool {
 impl ProviderCollector for ClaudeCollector {
     fn provider_id(&self) -> ProviderId {
         ProviderId::new(PROVIDER_ID)
+    }
+
+    fn configured_profile_ids(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect()
     }
 
     async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
@@ -489,28 +514,24 @@ impl ProviderCollector for ClaudeCollector {
                     email: identity.email,
                     profile_id: Some(profile.id.clone()),
                 }),
-                Err(err) => {
-                    failures.push(err);
-                }
+                Err(err) => failures.push(AccountDiscoveryFailure {
+                    profile_id: profile.id.clone(),
+                    error: err,
+                }),
             }
         }
 
         if !accounts.is_empty() {
-            deduplicate_accounts(&mut accounts);
-            return Ok(accounts.into());
+            failures.extend(deduplicate_accounts(&mut accounts));
+            return Ok(AccountDiscovery::from_parts(accounts, failures));
         }
-        Err(failures.into_iter().next().unwrap_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsMissing,
-                "no Claude accounts were discovered",
-            )
-        }))
+        Ok(AccountDiscovery::from_parts(accounts, failures))
     }
 
     async fn collect_usage(
         &self,
         account: &DiscoveredAccount,
-    ) -> Result<ProviderCollectionResult, ProviderError> {
+    ) -> Result<CollectionOutcome, ProviderError> {
         let profile = self.profile_for_account(account).await?;
 
         let mut warnings = Vec::new();
@@ -607,13 +628,13 @@ impl ProviderCollector for ClaudeCollector {
             }
         }
 
-        Ok(ProviderCollectionResult {
+        Ok(CollectionOutcome::collected(ProviderCollectionResult {
             usage,
             daily_usage: Vec::new(),
             collection_mode,
             account_email: account.email.clone(),
             warnings,
-        })
+        }))
     }
 }
 
@@ -622,6 +643,25 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::fs;
+
+    fn configured_profile(
+        id: &str,
+        config_dir: &str,
+        cli_enabled: Option<bool>,
+        owns_default_activity: bool,
+    ) -> ProviderProfileConfig {
+        let mut profile = ProviderProfileConfig {
+            id: Some(id.to_string()),
+            ..ProviderProfileConfig::default()
+        };
+        settings::update_profile(&mut profile, |settings| {
+            settings.claude_config_dir = Some(PathBuf::from(config_dir));
+            settings.cli_enabled = cli_enabled;
+            settings.owns_default_claude_activity = owns_default_activity;
+        })
+        .unwrap();
+        profile
+    }
 
     #[test]
     fn matches_claude_codes_custom_config_keychain_service() {
@@ -654,22 +694,14 @@ mod tests {
             ProviderConfig {
                 enabled: true,
                 profiles: vec![
-                    ProviderProfileConfig {
-                        id: Some("personal".to_string()),
-                        claude_config_dir: Some(PathBuf::from("/profiles/personal")),
-                        ..ProviderProfileConfig::default()
-                    },
-                    ProviderProfileConfig {
-                        id: Some("work".to_string()),
-                        claude_config_dir: Some(PathBuf::from("/profiles/work")),
-                        cli_enabled: Some(true),
-                        ..ProviderProfileConfig::default()
-                    },
+                    configured_profile("personal", "/profiles/personal", None, false),
+                    configured_profile("work", "/profiles/work", Some(true), false),
                 ],
                 ..ProviderConfig::default()
             },
             home,
-        );
+        )
+        .unwrap();
 
         assert_eq!(profiles.len(), 2);
         assert_eq!(
@@ -723,9 +755,15 @@ mod tests {
             },
         ];
 
-        deduplicate_accounts(&mut accounts);
+        let failures = deduplicate_accounts(&mut accounts);
 
         assert_eq!(accounts.len(), 2);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].profile_id, "second");
+        assert_eq!(
+            failures[0].error.kind(),
+            ProviderErrorKind::CredentialsInvalid
+        );
         assert_eq!(accounts[0].profile_id.as_deref(), Some("first"));
         assert_eq!(accounts[0].display_name.as_deref(), Some("First nickname"));
         assert_eq!(accounts[1].profile_id.as_deref(), Some("distinct"));
@@ -782,16 +820,17 @@ mod tests {
         let profiles = claude_profiles(
             ProviderConfig {
                 enabled: true,
-                profiles: vec![ProviderProfileConfig {
-                    id: Some("personal".to_string()),
-                    claude_config_dir: Some(PathBuf::from("/profiles/personal")),
-                    owns_default_claude_activity: true,
-                    ..ProviderProfileConfig::default()
-                }],
+                profiles: vec![configured_profile(
+                    "personal",
+                    "/profiles/personal",
+                    None,
+                    true,
+                )],
                 ..ProviderConfig::default()
             },
             home,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             profiles[0].project_roots,

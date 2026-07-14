@@ -64,8 +64,8 @@ struct DaemonClient: Sendable {
         guard case let .providerSetup(v) = try await send(.getProviderSetup(providerId: providerId)) else { throw DaemonError.badResponse }
         return v
     }
-    func updateProviderSetup(providerId: String, workspaceId: String?) async throws -> ProviderSetupResponse {
-        guard case let .providerSetup(v) = try await send(.updateProviderSetup(providerId: providerId, workspaceId: workspaceId)) else { throw DaemonError.badResponse }
+    func updateProviderSetup(providerId: String, settings: [String: String?]) async throws -> ProviderSetupResponse {
+        guard case let .providerSetup(v) = try await send(.updateProviderSetup(providerId: providerId, settings: settings)) else { throw DaemonError.badResponse }
         return v
     }
     func repairProvider(providerId: String, accountId: String?) async throws -> ProviderActionResponse {

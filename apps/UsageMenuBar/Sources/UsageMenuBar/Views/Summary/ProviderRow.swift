@@ -478,7 +478,6 @@ private struct ProviderRowContent: View {
     }
 
     private var resetWindow: WindowVM? {
-        guard provider.providerId == "codex" else { return nil }
         return provider.windows.first { $0.id == "\(provider.providerId)_rate_limit_resets" }
     }
 

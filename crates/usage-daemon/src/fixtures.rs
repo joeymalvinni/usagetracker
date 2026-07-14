@@ -124,7 +124,7 @@ async fn seed_account(
             &[]
         };
         storage
-            .record_success(&snapshot, buckets, &health, fixture.email)
+            .record_collection(&snapshot, buckets, &health, fixture.email, None, true)
             .await?;
         latest = Some(snapshot);
     }

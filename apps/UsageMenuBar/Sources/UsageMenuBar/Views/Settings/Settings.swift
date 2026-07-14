@@ -294,7 +294,9 @@ private struct ProviderAccountCard: View {
                 }
             }
 
-            if state.supportsWorkspaceSetup(provider.providerId) { workspaceControl }
+            if state.supportsSetup(provider.providerId), let setup {
+                ProviderSetupFields(providerId: provider.providerId, setup: setup, disabled: busy)
+            }
 
             if hasPrimaryAction {
                 HStack(spacing: Theme.Spacing.sm) {
@@ -308,20 +310,9 @@ private struct ProviderAccountCard: View {
         }
         .surfaceCard()
         .task {
-            if state.supportsWorkspaceSetup(provider.providerId), setup == nil {
+            if state.supportsSetup(provider.providerId), setup == nil {
                 await state.loadProviderSetup(provider.providerId)
             }
-        }
-    }
-
-    @ViewBuilder private var workspaceControl: some View {
-        if let setup, !setup.workspaceOptions.isEmpty {
-            Picker("Workspace", selection: workspaceBinding(setup)) {
-                ForEach(setup.workspaceOptions, id: \.self) { Text($0).tag($0) }
-            }
-            .pickerStyle(.menu)
-            .controlSize(.small)
-            .disabled(busy)
         }
     }
 
@@ -329,14 +320,6 @@ private struct ProviderAccountCard: View {
         Binding(
             get: { provider.visibleInMenu },
             set: { enabled in Task { await state.setProviderEnabled(provider.providerId, enabled) } }
-        )
-    }
-
-    private func workspaceBinding(_ setup: ProviderSetupResponse) -> Binding<String> {
-        let fallback = setup.selectedWorkspaceId ?? setup.workspaceOptions.first ?? ""
-        return Binding(
-            get: { state.providerSetups[provider.providerId]?.selectedWorkspaceId ?? fallback },
-            set: { workspace in Task { await state.selectWorkspace(providerId: provider.providerId, workspaceId: workspace) } }
         )
     }
 
