@@ -8,6 +8,7 @@ version.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+iana-time-zone.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 terminal_size.workspace = true

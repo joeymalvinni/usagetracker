@@ -22,6 +22,7 @@ chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 futures-util = "0.3"
+iana-time-zone = "0.1"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 libc = "0.2"
 notify = "8.0.0"
