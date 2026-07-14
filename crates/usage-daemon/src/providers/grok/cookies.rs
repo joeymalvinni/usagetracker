@@ -30,13 +30,16 @@ pub(super) fn manual_is_configured(config: &ProviderConfig) -> bool {
 }
 
 fn manual_raw(config: &ProviderConfig) -> Option<String> {
+    // This path serves only the default Grok profile: environment wins over
+    // the provider-level config and cookie file. Managed profiles never share
+    // the default profile's browser cookies and authenticate from GROK_HOME.
     std::env::var("USAGE_TRACKER_GROK_COOKIE")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
-            config
-                .cookie_header
-                .clone()
+            super::settings::provider(config)
+                .ok()
+                .and_then(|settings| settings.cookie_header)
                 .filter(|value| !value.trim().is_empty())
         })
         .or_else(|| {

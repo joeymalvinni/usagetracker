@@ -5,6 +5,8 @@ app_dir="$HOME/Applications"
 bin_dir="$HOME/.local/bin"
 purge_data=0
 force=0
+daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
+daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
 
 usage() {
   cat <<'EOF'
@@ -13,7 +15,7 @@ Usage: uninstall.sh [options]
 Options:
   --app-dir DIR   App directory used during installation
   --bin-dir DIR   CLI directory used during installation
-  --purge-data    Also remove ~/.usagetracker (irreversible)
+  --purge-data    Also remove USAGE_TRACKER_HOME (default: ~/.usagetracker; irreversible)
   --force         Remove destination files even if no matching install receipt exists
   -h, --help      Show this help
 EOF
@@ -63,6 +65,51 @@ signature_field() {
     awk -F= -v field="$field" '$1 == field { print $2; exit }'
 }
 
+wait_for_processes() {
+  local attempts="$1" attempt pid running
+  shift
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    running=0
+    for pid in "$@"; do
+      if kill -0 "$pid" 2>/dev/null; then running=1; fi
+    done
+    [[ "$running" == "0" ]] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+stop_daemons() {
+  local source pid executable command_line
+  local pids=()
+  while read -r source pid; do
+    [[ -n "$pid" ]] || continue
+    executable="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    executable="${executable#${executable%%[![:space:]]*}}"
+    [[ "${executable##*/}" == "usage-daemon" ]] || continue
+    if [[ "$source" == "lock" ]]; then
+      pids+=("$pid")
+      continue
+    fi
+    [[ "$executable" == "$app_path/Contents/MacOS/usage-daemon" ]] || continue
+    command_line="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+      *" --socket-path $daemon_socket"|*" --socket-path $daemon_socket "*) pids+=("$pid") ;;
+    esac
+  done < <({
+    /usr/sbin/lsof -t -- "$daemon_socket.lock" 2>/dev/null | awk '{ print "lock " $1 }' || true
+    pgrep -x usage-daemon 2>/dev/null | awk '{ print "scan " $1 }' || true
+  } | sort -u -k2,2)
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  kill -TERM "${pids[@]}" 2>/dev/null || true
+  if wait_for_processes 20 "${pids[@]}"; then return 0; fi
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+  done
+  wait_for_processes 20 "${pids[@]}"
+}
+
 if [[ -d "$app_path" ]]; then
   bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist" 2>/dev/null || true)"
   app_signature="$(signature_field "$app_path" Signature || true)"
@@ -105,6 +152,11 @@ if pgrep -x UsageMenuBar >/dev/null 2>&1; then
   fi
 fi
 
+if ! stop_daemons; then
+  echo "UsageTracker background service could not be stopped." >&2
+  exit 1
+fi
+
 if [[ -d "$app_path" ]]; then
   rm -rf "$app_path"
   rm -f "$app_receipt"
@@ -122,9 +174,9 @@ elif [[ -f "$cli_receipt" ]]; then
 fi
 
 if [[ "$purge_data" == "1" ]]; then
-  data_dir="$HOME/.usagetracker"
+  data_dir="$daemon_home"
   rm -rf "$data_dir"
   echo "Removed $data_dir"
 else
-  echo "Kept ~/.usagetracker data. Pass --purge-data to remove it."
+  echo "Kept $daemon_home data. Pass --purge-data to remove it."
 fi

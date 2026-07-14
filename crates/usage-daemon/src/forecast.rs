@@ -28,17 +28,19 @@ pub fn forecast_snapshot(
     history: &StoredForecastHistory,
     generated_at: DateTime<Utc>,
 ) -> Vec<UsageForecast> {
+    let provenance = current.windows_provenance();
     current
         .windows
         .iter()
-        .filter(|window| current.window_is_authoritative_quota(window))
-        .filter(|window| {
+        .zip(provenance)
+        .filter(|(_, provenance)| provenance.quota_like && provenance.authoritative)
+        .filter(|(window, _)| {
             !matches!(
                 window.kind,
                 UsageWindowKind::Credits | UsageWindowKind::Tokens
             )
         })
-        .filter_map(|window| forecast_window(current, window, history, generated_at))
+        .filter_map(|(window, _)| forecast_window(current, window, history, generated_at))
         .collect()
 }
 

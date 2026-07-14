@@ -135,9 +135,9 @@ impl ClaudeApiClient {
             ));
         }
 
+        let expected_contents = credentials.source_contents().to_string();
         let refreshed = credentials.with_refreshed_tokens(refresh)?;
-        save_credentials(refreshed.clone()).await?;
-        Ok(refreshed)
+        save_credentials(refreshed, expected_contents).await
     }
 
     pub(super) async fn fetch_usage(

@@ -4,15 +4,57 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
 use thiserror::Error;
-use usage_core::{ProviderFailureCode, ProviderId, UsageSnapshot, UsageWindow};
+use usage_core::{
+    DataProvenance, ProviderFailureCode, ProviderId, UsageDataCompleteness, UsageDataConfidence,
+    UsageDataQuality, UsageDataScope, UsageDataSource, UsageSnapshot, UsageWindow,
+};
+
+macro_rules! settings_accessors {
+    (provider: $settings:ty) => {
+        pub(crate) fn provider(
+            config: &crate::config::ProviderConfig,
+        ) -> anyhow::Result<$settings> {
+            config.settings()
+        }
+
+        pub(crate) fn update_provider(
+            config: &mut crate::config::ProviderConfig,
+            mutation: impl FnOnce(&mut $settings),
+        ) -> anyhow::Result<()> {
+            let mut settings = provider(config)?;
+            mutation(&mut settings);
+            config.patch_settings(&settings)
+        }
+    };
+    (profile: $settings:ty) => {
+        pub(crate) fn profile(
+            config: &crate::config::ProviderProfileConfig,
+        ) -> anyhow::Result<$settings> {
+            config.settings()
+        }
+
+        pub(crate) fn update_profile(
+            config: &mut crate::config::ProviderProfileConfig,
+            mutation: impl FnOnce(&mut $settings),
+        ) -> anyhow::Result<()> {
+            let mut settings = profile(config)?;
+            mutation(&mut settings);
+            config.patch_settings(&settings)
+        }
+    };
+}
+
+pub(crate) use settings_accessors;
 
 pub(crate) mod browser_cookies;
 pub mod claude;
 pub mod codex;
 pub mod grok;
+pub(crate) mod launchers;
 pub(crate) mod local_usage;
 pub mod opencode;
 pub(crate) mod paths;
+pub(crate) mod profile_service;
 
 pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -92,18 +134,68 @@ pub struct AccountDiscoveryFailure {
     pub error: ProviderError,
 }
 
+#[derive(Debug)]
+pub struct ProfileDiscovery {
+    pub profile_id: String,
+    pub result: Result<DiscoveredAccount, ProviderError>,
+}
+
 #[derive(Debug, Default)]
 pub struct AccountDiscovery {
-    pub accounts: Vec<DiscoveredAccount>,
-    pub failures: Vec<AccountDiscoveryFailure>,
+    pub profiles: Vec<ProfileDiscovery>,
 }
 
 impl From<Vec<DiscoveredAccount>> for AccountDiscovery {
     fn from(accounts: Vec<DiscoveredAccount>) -> Self {
+        Self::from_parts(accounts, Vec::new())
+    }
+}
+
+impl AccountDiscovery {
+    pub fn from_parts(
+        accounts: Vec<DiscoveredAccount>,
+        failures: Vec<AccountDiscoveryFailure>,
+    ) -> Self {
+        let successes = accounts.into_iter().enumerate().map(|(index, account)| {
+            let profile_id = account
+                .profile_id
+                .clone()
+                .unwrap_or_else(|| default_profile_id(index));
+            ProfileDiscovery {
+                profile_id,
+                result: Ok(account),
+            }
+        });
+        let failures = failures.into_iter().map(|failure| ProfileDiscovery {
+            profile_id: failure.profile_id,
+            result: Err(failure.error),
+        });
         Self {
-            accounts,
-            failures: Vec::new(),
+            profiles: successes.chain(failures).collect(),
         }
+    }
+
+    pub fn into_parts(self) -> (Vec<DiscoveredAccount>, Vec<AccountDiscoveryFailure>) {
+        let mut accounts = Vec::new();
+        let mut failures = Vec::new();
+        for profile in self.profiles {
+            match profile.result {
+                Ok(account) => accounts.push(account),
+                Err(error) => failures.push(AccountDiscoveryFailure {
+                    profile_id: profile.profile_id,
+                    error,
+                }),
+            }
+        }
+        (accounts, failures)
+    }
+}
+
+fn default_profile_id(index: usize) -> String {
+    if index == 0 {
+        "default".to_string()
+    } else {
+        format!("profile-{}", index + 1)
     }
 }
 
@@ -120,6 +212,79 @@ pub struct ProviderCollectionResult {
     pub collection_mode: String,
     pub account_email: Option<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UsageDataset {
+    pub collection: ProviderCollectionResult,
+    pub provenance: DataProvenance,
+    pub authoritative: bool,
+}
+
+impl UsageDataset {
+    pub fn authoritative(collection: ProviderCollectionResult) -> Self {
+        Self {
+            collection,
+            provenance: DataProvenance {
+                source: UsageDataSource::ProviderReported,
+                scope: UsageDataScope::AccountWide,
+                quality: UsageDataQuality::Authoritative,
+                completeness: UsageDataCompleteness::Complete,
+                confidence: UsageDataConfidence::High,
+            },
+            authoritative: true,
+        }
+    }
+
+    pub fn supplemental(
+        collection: ProviderCollectionResult,
+        source: UsageDataSource,
+        scope: UsageDataScope,
+        quality: UsageDataQuality,
+        completeness: UsageDataCompleteness,
+    ) -> Self {
+        Self {
+            collection,
+            provenance: DataProvenance {
+                source,
+                scope,
+                quality,
+                completeness,
+                confidence: UsageDataConfidence::Medium,
+            },
+            authoritative: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AuthoritativeOutcome {
+    Collected(UsageDataset),
+    #[allow(dead_code)] // Reserved for providers whose only meaningful data is supplemental.
+    NotApplicable,
+    Failed(ProviderError),
+}
+
+#[derive(Debug)]
+pub struct CollectionOutcome {
+    pub authoritative: AuthoritativeOutcome,
+    pub supplemental: Vec<UsageDataset>,
+}
+
+impl CollectionOutcome {
+    pub fn collected(collection: ProviderCollectionResult) -> Self {
+        Self {
+            authoritative: AuthoritativeOutcome::Collected(UsageDataset::authoritative(collection)),
+            supplemental: Vec::new(),
+        }
+    }
+
+    pub fn degraded(error: ProviderError, supplemental: Vec<UsageDataset>) -> Self {
+        Self {
+            authoritative: AuthoritativeOutcome::Failed(error),
+            supplemental,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,12 +319,19 @@ impl ProviderUsage {
 pub trait ProviderCollector: Send + Sync {
     fn provider_id(&self) -> ProviderId;
 
+    /// Explicit configured profile identities. The coordinator uses this to
+    /// enforce one discovery result per profile before touching storage.
+    /// Profileless providers return an empty vector; requiring the method
+    /// prevents a new multi-profile adapter from silently bypassing the
+    /// discovery contract.
+    fn configured_profile_ids(&self) -> Vec<String>;
+
     async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError>;
 
     async fn collect_usage(
         &self,
         account: &DiscoveredAccount,
-    ) -> Result<ProviderCollectionResult, ProviderError>;
+    ) -> Result<CollectionOutcome, ProviderError>;
 }
 
 pub type ProviderErrorKind = ProviderFailureCode;

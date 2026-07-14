@@ -69,7 +69,7 @@ struct Detail: View {
                                 }
                             }
                         }
-                        if activeProvider.providerId == "codex", !activeProvider.resetCredits.isEmpty {
+                        if !activeProvider.resetCredits.isEmpty {
                             ProviderSection(title: "Resets") {
                                 ResetCreditDisclosure(provider: activeProvider)
                             }
@@ -251,8 +251,7 @@ private struct AlertBanner: View {
     }
 }
 
-/// The "Resets" section on the Codex detail page. Codex hands out a pool of
-/// rate-limit *reset credits* that each expire; this collapses them to a
+/// A provider-independent view of expiring rate-limit reset credits. It collapses them to a
 /// one-line summary (count + soonest expiry, relative) and reveals the full
 /// per-credit list on tap. The whole header toggles — not just the caret —
 /// and the body is roomy enough to grow a pace estimate later.

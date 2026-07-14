@@ -2,11 +2,14 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
+    providers::profile_service::unique_profile_id,
     providers::{
-        grok::{default_grok_home, normalized_profile_id, DEFAULT_PROFILE_ID, PROVIDER_ID},
+        grok::{
+            default_grok_home, normalized_profile_id, settings, DEFAULT_PROFILE_ID, PROVIDER_ID,
+        },
         paths::expand_home_path,
     },
-    runtime::{managed_profiles, profile_service::unique_profile_id},
+    runtime::managed_profiles,
 };
 
 pub(crate) struct GrokLoginTarget {
@@ -84,8 +87,11 @@ pub(crate) fn ensure_login_profile(
             {
                 profile.enabled = true;
                 profile.deleted = false;
-                if profile.grok_home.is_none() {
-                    profile.grok_home = Some(default_grok_home()?);
+                if settings::profile(profile)?.grok_home.is_none() {
+                    let default_home = default_grok_home()?;
+                    settings::update_profile(profile, |settings| {
+                        settings.grok_home = Some(default_home);
+                    })?;
                 }
                 return login_target(profile, index);
             }
@@ -138,12 +144,15 @@ fn create_managed_profile(
     let profile_id = unique_profile_id(&provider.profiles, display_name.as_deref());
     let grok_home = managed_profiles::profile_home(PROVIDER_ID, &profile_id)?;
     std::fs::create_dir_all(&grok_home)?;
-    provider.profiles.push(ProviderProfileConfig {
+    let mut profile = ProviderProfileConfig {
         id: Some(profile_id.clone()),
         display_name: display_name.clone(),
-        grok_home: Some(grok_home.clone()),
         ..ProviderProfileConfig::default()
-    });
+    };
+    settings::update_profile(&mut profile, |settings| {
+        settings.grok_home = Some(grok_home.clone());
+    })?;
+    provider.profiles.push(profile);
     Ok(GrokLoginTarget {
         profile_id,
         display_name,
@@ -152,16 +161,20 @@ fn create_managed_profile(
 }
 
 fn default_profile() -> anyhow::Result<ProviderProfileConfig> {
-    Ok(ProviderProfileConfig {
+    let default_home = default_grok_home()?;
+    let mut profile = ProviderProfileConfig {
         id: Some(DEFAULT_PROFILE_ID.to_string()),
-        grok_home: Some(default_grok_home()?),
         ..ProviderProfileConfig::default()
-    })
+    };
+    settings::update_profile(&mut profile, |settings| {
+        settings.grok_home = Some(default_home);
+    })?;
+    Ok(profile)
 }
 
 fn login_target(profile: &ProviderProfileConfig, index: usize) -> anyhow::Result<GrokLoginTarget> {
     let profile_id = normalized_profile_id(profile.id.as_deref(), index);
-    let grok_home = match profile.grok_home.clone() {
+    let grok_home = match settings::profile(profile)?.grok_home {
         Some(path) => expand_home_path(path),
         None if profile_id == DEFAULT_PROFILE_ID => default_grok_home()?,
         None => anyhow::bail!("Grok profile {profile_id} is missing its home directory"),
@@ -178,11 +191,15 @@ mod tests {
     use super::*;
 
     fn profile(id: &str, home: impl Into<PathBuf>) -> ProviderProfileConfig {
-        ProviderProfileConfig {
+        let mut profile = ProviderProfileConfig {
             id: Some(id.to_string()),
-            grok_home: Some(home.into()),
             ..ProviderProfileConfig::default()
-        }
+        };
+        settings::update_profile(&mut profile, |settings| {
+            settings.grok_home = Some(home.into());
+        })
+        .unwrap();
+        profile
     }
 
     #[test]

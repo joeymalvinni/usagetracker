@@ -14,7 +14,7 @@ enum DaemonRequest: Encodable {
     case removeAccount(accountId: String)
     case deleteAccount(accountId: String)
     case getProviderSetup(providerId: String)
-    case updateProviderSetup(providerId: String, workspaceId: String?)
+    case updateProviderSetup(providerId: String, settings: [String: String?])
     case repairProvider(providerId: String, accountId: String?)
     case launchProviderAccount(accountId: String)
     func encode(to encoder: Encoder) throws {
@@ -59,10 +59,10 @@ enum DaemonRequest: Encodable {
         case .getProviderSetup(let providerId):
             try c.encode("get_provider_setup", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
-        case .updateProviderSetup(let providerId, let workspaceId):
+        case .updateProviderSetup(let providerId, let settings):
             try c.encode("update_provider_setup", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
-            try c.encodeIfPresent(workspaceId, forKey: .workspaceId)
+            try c.encode(settings, forKey: .settings)
         case .repairProvider(let providerId, let accountId):
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
@@ -74,7 +74,7 @@ enum DaemonRequest: Encodable {
     }
     enum K: String, CodingKey {
         case apiVersion = "api_version"
-        case method, providers, notifications, hidden, ids
+        case method, providers, notifications, hidden, ids, settings
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
@@ -159,7 +159,38 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
     let addAccount: Bool
     let repair: Bool
     let launchAccount: Bool
+    let setup: Bool
     let workspaceSetup: Bool
+
+    init(
+        multipleAccounts: Bool,
+        addAccount: Bool,
+        repair: Bool,
+        launchAccount: Bool,
+        workspaceSetup: Bool,
+        setup: Bool? = nil
+    ) {
+        self.multipleAccounts = multipleAccounts
+        self.addAccount = addAccount
+        self.repair = repair
+        self.launchAccount = launchAccount
+        self.workspaceSetup = workspaceSetup
+        self.setup = setup ?? workspaceSetup
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        multipleAccounts = try c.decode(Bool.self, forKey: .multipleAccounts)
+        addAccount = try c.decode(Bool.self, forKey: .addAccount)
+        repair = try c.decode(Bool.self, forKey: .repair)
+        launchAccount = try c.decode(Bool.self, forKey: .launchAccount)
+        workspaceSetup = try c.decode(Bool.self, forKey: .workspaceSetup)
+        setup = try c.decodeIfPresent(Bool.self, forKey: .setup) ?? workspaceSetup
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case multipleAccounts, addAccount, repair, launchAccount, setup, workspaceSetup
+    }
 }
 
 func providerSupports(

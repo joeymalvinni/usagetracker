@@ -19,7 +19,7 @@ Protocol versioning is exact-match. The daemon accepts `api_version: 3`, and eve
 | `refresh_coalescing` | Overlapping in-flight refresh work may be shared. |
 | `combined_state` | `get_state` returns the whole dashboard state in one response. |
 
-Separately, each provider descriptor advertises `multiple_accounts`, `add_account`, `repair`, `launch_account`, and `workspace_setup`.
+Separately, each provider descriptor advertises `multiple_accounts`, `add_account`, `repair`, `launch_account`, and generic `setup` capabilities. `workspace_setup` remains as a deprecated v3 compatibility alias.
 
 ## What can change, and what can't
 

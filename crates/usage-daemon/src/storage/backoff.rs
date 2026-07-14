@@ -1,4 +1,4 @@
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use usage_core::{AccountId, ProviderId};
 
 use super::{parse_time_sql, Storage, StoredProviderBackoff};
@@ -41,29 +41,8 @@ impl Storage {
         backoff: &StoredProviderBackoff,
     ) -> anyhow::Result<()> {
         let backoff = backoff.clone();
-        self.with_connection(move |conn| {
-            conn.execute(
-                "INSERT INTO provider_backoff
-                 (provider_id, account_id, consecutive_failures, retry_at,
-                  last_failure_at, error_message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(provider_id, account_id) DO UPDATE SET
-                   consecutive_failures = excluded.consecutive_failures,
-                   retry_at = excluded.retry_at,
-                   last_failure_at = excluded.last_failure_at,
-                   error_message = excluded.error_message",
-                params![
-                    backoff.provider_id.as_str(),
-                    backoff.account_id.as_str(),
-                    i64::try_from(backoff.consecutive_failures)?,
-                    backoff.retry_at.to_rfc3339(),
-                    backoff.last_failure_at.to_rfc3339(),
-                    backoff.error_message,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
+        self.with_connection(move |conn| upsert_provider_backoff_conn(conn, &backoff))
+            .await
     }
 
     pub async fn delete_provider_backoff(
@@ -74,12 +53,46 @@ impl Storage {
         let provider_id = provider_id.clone();
         let account_id = account_id.clone();
         self.with_connection(move |conn| {
-            conn.execute(
-                "DELETE FROM provider_backoff WHERE provider_id = ?1 AND account_id = ?2",
-                params![provider_id.as_str(), account_id.as_str()],
-            )?;
-            Ok(())
+            delete_provider_backoff_conn(conn, &provider_id, &account_id)
         })
         .await
     }
+}
+
+pub(super) fn upsert_provider_backoff_conn(
+    conn: &Connection,
+    backoff: &StoredProviderBackoff,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO provider_backoff
+         (provider_id, account_id, consecutive_failures, retry_at,
+          last_failure_at, error_message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(provider_id, account_id) DO UPDATE SET
+           consecutive_failures = excluded.consecutive_failures,
+           retry_at = excluded.retry_at,
+           last_failure_at = excluded.last_failure_at,
+           error_message = excluded.error_message",
+        params![
+            backoff.provider_id.as_str(),
+            backoff.account_id.as_str(),
+            i64::try_from(backoff.consecutive_failures)?,
+            backoff.retry_at.to_rfc3339(),
+            backoff.last_failure_at.to_rfc3339(),
+            backoff.error_message,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn delete_provider_backoff_conn(
+    conn: &Connection,
+    provider_id: &ProviderId,
+    account_id: &AccountId,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM provider_backoff WHERE provider_id = ?1 AND account_id = ?2",
+        params![provider_id.as_str(), account_id.as_str()],
+    )?;
+    Ok(())
 }

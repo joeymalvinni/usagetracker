@@ -12,29 +12,44 @@ use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, W
 use tracing::{debug, info, warn};
 use usage_core::ProviderId;
 
-use crate::{
-    config::{Config, ProviderConfig},
-    polling::RefreshCoordinator,
-    providers::paths::expand_home_path,
-};
+use crate::{config::Config, polling::RefreshCoordinator, runtime::provider_registry};
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_secs(30);
-const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
-const CLAUDE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const WATCH_EVENT_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Default)]
 pub struct LocalLogConfig {
-    codex: ProviderConfig,
-    claude: ProviderConfig,
+    targets: Vec<LocalLogTarget>,
 }
 
 impl LocalLogConfig {
     pub fn from_config(config: &Config) -> Self {
-        Self {
-            codex: config.providers.get("codex").cloned().unwrap_or_default(),
-            claude: config.providers.get("claude").cloned().unwrap_or_default(),
+        let mut targets = Vec::new();
+        for descriptor in provider_registry::descriptors() {
+            let Some(provider_config) = config.providers.get(descriptor.id.as_str()) else {
+                continue;
+            };
+            if !provider_config.enabled {
+                continue;
+            }
+            let Some(adapter) = provider_registry::find(descriptor.id.as_str()) else {
+                continue;
+            };
+            match adapter.local_usage_watch(provider_config) {
+                Ok(Some(watch)) => targets.push(LocalLogTarget {
+                    provider_id: descriptor.id.as_str().to_string(),
+                    roots: watch.roots,
+                    minimum_refresh_interval: watch.minimum_refresh_interval,
+                }),
+                Ok(None) => {}
+                Err(error) => warn!(
+                    provider_id = descriptor.id.as_str(),
+                    %error,
+                    "failed to derive provider-owned local usage watch roots"
+                ),
+            }
         }
+        Self { targets }
     }
 }
 
@@ -85,14 +100,15 @@ pub fn spawn_change_log_loop(
                     let newly_available = watch_state.sync(&mut watcher, &targets);
                     let active = targets
                         .iter()
-                        .map(|target| target.provider_id)
+                        .map(|target| target.provider_id.clone())
                         .collect::<BTreeSet<_>>();
-                    pending.retain(|provider| active.contains(provider.as_str()));
+                    pending.retain(|provider| active.contains(provider));
                     pending.extend(newly_available);
                     refresh_at = (!pending.is_empty()).then(|| local_refresh_deadline(
                         tokio::time::Instant::now(),
                         last_refresh,
                         &pending,
+                        &targets,
                     ));
                     info!(
                         watched_roots = watch_state.watched_roots.len(),
@@ -113,12 +129,13 @@ pub fn spawn_change_log_loop(
                             tokio::time::Instant::now(),
                             last_refresh,
                             &pending,
+                            &targets,
                         ));
                     }
                 }
                 _ = wait_for_deadline(deadline) => {
                     if overflowed.swap(false, Ordering::AcqRel) {
-                        pending.extend(targets.iter().map(|target| target.provider_id.to_string()));
+                        pending.extend(targets.iter().map(|target| target.provider_id.clone()));
                         warn!(
                             queue_capacity = WATCH_EVENT_QUEUE_CAPACITY,
                             "local message log watcher queue overflowed; refreshing all local providers"
@@ -180,23 +197,26 @@ fn local_refresh_deadline(
     now: tokio::time::Instant,
     last_refresh: Option<tokio::time::Instant>,
     pending: &BTreeSet<String>,
+    targets: &[LocalLogTarget],
 ) -> tokio::time::Instant {
     let debounced = now + CHANGE_DEBOUNCE;
-    let minimum_interval = if pending.contains("claude") {
-        CLAUDE_REFRESH_MIN_INTERVAL
-    } else {
-        LOCAL_REFRESH_MIN_INTERVAL
-    };
+    let minimum_interval = targets
+        .iter()
+        .filter(|target| pending.contains(&target.provider_id))
+        .map(|target| target.minimum_refresh_interval)
+        .max()
+        .unwrap_or_default();
     let rate_limited = last_refresh
         .map(|last| last + minimum_interval)
         .unwrap_or(now);
     debounced.max(rate_limited)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LocalLogTarget {
-    provider_id: &'static str,
+    provider_id: String,
     roots: Vec<PathBuf>,
+    minimum_refresh_interval: Duration,
 }
 
 #[derive(Default)]
@@ -215,9 +235,9 @@ impl LocalLogWatchState {
         for target in targets {
             for root in &target.roots {
                 if root.is_dir() {
-                    if self.watch_root(watcher, target.provider_id, root) {
+                    if self.watch_root(watcher, &target.provider_id, root) {
                         self.watched_roots.insert(root.clone());
-                        available_providers.insert(target.provider_id.to_string());
+                        available_providers.insert(target.provider_id.clone());
                     }
                     continue;
                 }
@@ -230,7 +250,7 @@ impl LocalLogWatchState {
                     Some(parent) => {
                         let _ = self.watch_path(
                             watcher,
-                            target.provider_id,
+                            &target.provider_id,
                             &parent,
                             RecursiveMode::NonRecursive,
                         );
@@ -340,97 +360,7 @@ async fn refresh_local_usage(refresh: &RefreshCoordinator, pending: BTreeSet<Str
 }
 
 fn local_log_targets(config: &LocalLogConfig) -> Vec<LocalLogTarget> {
-    let mut targets = Vec::new();
-    if config.codex.enabled {
-        targets.push(LocalLogTarget {
-            provider_id: "codex",
-            roots: codex_session_roots(&config.codex),
-        });
-    }
-    if config.claude.enabled {
-        targets.push(LocalLogTarget {
-            provider_id: "claude",
-            roots: claude_project_roots(&config.claude),
-        });
-    }
-    targets
-}
-
-fn codex_session_roots(config: &ProviderConfig) -> Vec<PathBuf> {
-    let codex_home = match std::env::var("CODEX_HOME") {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
-        _ => match dirs::home_dir() {
-            Some(home) => home.join(".codex"),
-            None => return Vec::new(),
-        },
-    };
-    let mut roots = vec![codex_home.join("sessions")];
-    roots.extend(
-        config
-            .profiles
-            .iter()
-            .filter(|profile| profile.enabled && !profile.deleted)
-            .filter_map(|profile| profile.codex_home.as_deref())
-            .map(expand_home_path)
-            .map(|home| home.join("sessions")),
-    );
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn claude_project_roots(config: &ProviderConfig) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(value) = std::env::var("CLAUDE_CONFIG_DIR") {
-        roots.extend(
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| PathBuf::from(value).join("projects")),
-        );
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        roots.push(home.join(".config/claude/projects"));
-        roots.push(home.join(".claude/projects"));
-    }
-
-    let managed_root =
-        usage_core::default_app_dir().map(|root| root.join("profiles").join("claude"));
-    if let Some(root) = managed_root.as_ref() {
-        // Watch the common parent so profiles created after daemon startup are picked up
-        // without rebuilding the filesystem watcher.
-        roots.push(root.clone());
-    }
-    for profile in config
-        .profiles
-        .iter()
-        .filter(|profile| profile.enabled && !profile.deleted)
-    {
-        let configured = if profile.project_roots.is_empty() {
-            profile
-                .claude_config_dir
-                .as_ref()
-                .map(|root| vec![expand_home_path(root.clone()).join("projects")])
-                .unwrap_or_default()
-        } else {
-            profile
-                .project_roots
-                .iter()
-                .cloned()
-                .map(expand_home_path)
-                .collect()
-        };
-        roots.extend(configured.into_iter().filter(|root| {
-            managed_root
-                .as_ref()
-                .is_none_or(|managed| !root.starts_with(managed))
-        }));
-    }
-    roots.sort();
-    roots.dedup();
-    roots
+    config.targets.clone()
 }
 
 fn jsonl_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -446,7 +376,7 @@ fn provider_id_for_paths<'a>(targets: &'a [LocalLogTarget], paths: &[PathBuf]) -
         paths
             .iter()
             .any(|path| target.roots.iter().any(|root| path.starts_with(root)))
-            .then_some(target.provider_id)
+            .then_some(target.provider_id.as_str())
     })
 }
 
@@ -484,12 +414,14 @@ mod tests {
     fn resolves_provider_from_watched_roots() {
         let targets = vec![
             LocalLogTarget {
-                provider_id: "codex",
+                provider_id: "alpha".to_string(),
                 roots: vec![PathBuf::from("/home/me/.codex/sessions")],
+                minimum_refresh_interval: Duration::from_secs(30),
             },
             LocalLogTarget {
-                provider_id: "claude",
+                provider_id: "beta".to_string(),
                 roots: vec![PathBuf::from("/home/me/.claude/projects")],
+                minimum_refresh_interval: Duration::from_secs(60),
             },
         ];
 
@@ -500,7 +432,7 @@ mod tests {
             )],
         );
 
-        assert_eq!(provider, Some("claude"));
+        assert_eq!(provider, Some("beta"));
     }
 
     #[test]
@@ -519,59 +451,33 @@ mod tests {
     #[test]
     fn refresh_deadline_debounces_and_rate_limits() {
         let now = tokio::time::Instant::now();
-        let codex = BTreeSet::from(["codex".to_string()]);
-        let claude = BTreeSet::from(["claude".to_string()]);
+        let fast = BTreeSet::from(["fast".to_string()]);
+        let slow = BTreeSet::from(["slow".to_string()]);
+        let targets = vec![
+            LocalLogTarget {
+                provider_id: "fast".to_string(),
+                roots: Vec::new(),
+                minimum_refresh_interval: Duration::from_secs(30),
+            },
+            LocalLogTarget {
+                provider_id: "slow".to_string(),
+                roots: Vec::new(),
+                minimum_refresh_interval: Duration::from_secs(60),
+            },
+        ];
         assert_eq!(
-            local_refresh_deadline(now, None, &codex),
+            local_refresh_deadline(now, None, &fast, &targets),
             now + CHANGE_DEBOUNCE
         );
 
         let recent = now - Duration::from_secs(5);
         assert_eq!(
-            local_refresh_deadline(now, Some(recent), &codex),
+            local_refresh_deadline(now, Some(recent), &fast, &targets),
             now + CHANGE_DEBOUNCE
         );
         assert_eq!(
-            local_refresh_deadline(now, Some(recent), &claude),
-            recent + CLAUDE_REFRESH_MIN_INTERVAL
+            local_refresh_deadline(now, Some(recent), &slow, &targets),
+            recent + Duration::from_secs(60)
         );
-    }
-
-    #[test]
-    fn watches_managed_and_manual_claude_profile_roots_separately() {
-        let config = ProviderConfig {
-            enabled: true,
-            profiles: vec![
-                crate::config::ProviderProfileConfig {
-                    id: Some("managed".to_string()),
-                    claude_config_dir: usage_core::default_app_dir()
-                        .map(|root| root.join("profiles/claude/managed")),
-                    ..crate::config::ProviderProfileConfig::default()
-                },
-                crate::config::ProviderProfileConfig {
-                    id: Some("manual".to_string()),
-                    project_roots: vec![PathBuf::from("/tmp/manual-claude/projects")],
-                    ..crate::config::ProviderProfileConfig::default()
-                },
-                crate::config::ProviderProfileConfig {
-                    id: Some("disabled".to_string()),
-                    enabled: false,
-                    project_roots: vec![PathBuf::from("/tmp/disabled-claude/projects")],
-                    ..crate::config::ProviderProfileConfig::default()
-                },
-            ],
-            ..ProviderConfig::default()
-        };
-
-        let roots = claude_project_roots(&config);
-
-        assert!(roots.contains(&PathBuf::from("/tmp/manual-claude/projects")));
-        assert!(!roots.contains(&PathBuf::from("/tmp/disabled-claude/projects")));
-        if let Some(managed) =
-            usage_core::default_app_dir().map(|root| root.join("profiles").join("claude"))
-        {
-            assert!(roots.contains(&managed));
-            assert!(!roots.contains(&managed.join("managed/projects")));
-        }
     }
 }

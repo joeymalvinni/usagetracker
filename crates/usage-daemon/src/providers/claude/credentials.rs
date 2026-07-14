@@ -39,14 +39,23 @@ pub(super) async fn load_credentials(
     })?
 }
 
-pub(super) async fn save_credentials(credentials: ClaudeCredentials) -> Result<(), ProviderError> {
+pub(super) async fn save_credentials(
+    mut credentials: ClaudeCredentials,
+    expected_contents: String,
+) -> Result<ClaudeCredentials, ProviderError> {
     match credentials.source.clone() {
         CredentialSource::Keychain => {
             let keychain_service = credentials.keychain_service.clone();
             let keychain_account = credentials.keychain_account.clone();
             let contents = credentials.raw.to_string();
+            let persisted_contents = contents.clone();
             tokio::task::spawn_blocking(move || {
-                save_keychain_credentials(&keychain_service, &keychain_account, &contents)
+                save_keychain_credentials(
+                    &keychain_service,
+                    &keychain_account,
+                    &expected_contents,
+                    &contents,
+                )
             })
             .await
             .map_err(|_| {
@@ -54,7 +63,8 @@ pub(super) async fn save_credentials(credentials: ClaudeCredentials) -> Result<(
                     ProviderErrorKind::CredentialsInvalid,
                     "Claude credential save task failed",
                 )
-            })?
+            })??;
+            credentials.source_contents = persisted_contents;
         }
         CredentialSource::File(path) => {
             let contents = serde_json::to_vec_pretty(&credentials.raw).map_err(|_| {
@@ -63,19 +73,32 @@ pub(super) async fn save_credentials(credentials: ClaudeCredentials) -> Result<(
                     "failed to serialize refreshed Claude credentials",
                 )
             })?;
-            tokio::task::spawn_blocking(move || save_file_credentials(&path, &contents))
-                .await
-                .map_err(|_| {
-                    ProviderError::new(
-                        ProviderErrorKind::CredentialsInvalid,
-                        "Claude credential file save task failed",
-                    )
-                })?
+            let persisted_contents = format!("{}\n", String::from_utf8_lossy(&contents));
+            tokio::task::spawn_blocking(move || {
+                save_file_credentials(&path, &expected_contents, &contents)
+            })
+            .await
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    "Claude credential file save task failed",
+                )
+            })??;
+            credentials.source_contents = persisted_contents;
         }
     }
+    Ok(credentials)
 }
 
-fn save_file_credentials(path: &Path, contents: &[u8]) -> Result<(), ProviderError> {
+fn save_file_credentials(
+    path: &Path,
+    expected_contents: &str,
+    contents: &[u8],
+) -> Result<(), ProviderError> {
+    match std::fs::read_to_string(path) {
+        Ok(current) if current == expected_contents => {}
+        _ => return Err(credential_conflict()),
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -151,14 +174,32 @@ fn load_keychain_credentials(
 fn save_keychain_credentials(
     keychain_service: &str,
     keychain_account: &str,
+    expected_contents: &str,
     contents: &str,
 ) -> Result<(), ProviderError> {
-    keychain::set_password(keychain_service, keychain_account, contents).map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::CredentialsInvalid,
-            "failed to save Claude Code credentials to macOS Keychain",
-        )
+    keychain::compare_and_set_password(
+        keychain_service,
+        keychain_account,
+        expected_contents,
+        contents,
+    )
+    .map_err(|error| {
+        if error == KeychainError::Conflict {
+            credential_conflict()
+        } else {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "failed to save Claude Code credentials to macOS Keychain",
+            )
+        }
     })
+}
+
+fn credential_conflict() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::CredentialsInvalid,
+        "Claude credentials changed during token refresh; reloading before retry",
+    )
 }
 
 fn load_file_credentials(
@@ -233,6 +274,7 @@ pub(super) fn parse_credentials(
         expires_at_ms: oauth.expires_at,
         scopes: oauth.scopes,
         raw,
+        source_contents: contents.to_string(),
     })
 }
 
@@ -288,9 +330,13 @@ pub(super) struct ClaudeCredentials {
     pub expires_at_ms: Option<i64>,
     pub scopes: Vec<String>,
     raw: Value,
+    source_contents: String,
 }
 
 impl ClaudeCredentials {
+    pub(super) fn source_contents(&self) -> &str {
+        &self.source_contents
+    }
     pub(super) fn source_label(&self) -> &'static str {
         match self.source {
             CredentialSource::Keychain => "keychain",
@@ -445,8 +491,9 @@ mod tests {
             std::env::temp_dir().join(format!("claude-credentials-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(".credentials.json");
+        std::fs::write(&path, "old").unwrap();
 
-        save_file_credentials(&path, br#"{"token":"secret"}"#).unwrap();
+        save_file_credentials(&path, "old", br#"{"token":"secret"}"#).unwrap();
 
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -456,6 +503,8 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "{\"token\":\"secret\"}\n"
         );
+        assert!(save_file_credentials(&path, "old", br#"{"token":"stale"}"#).is_err());
+        save_file_credentials(&path, "{\"token\":\"secret\"}\n", br#"{"token":"new"}"#).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -64,7 +64,8 @@ impl NotificationManager {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        for window in &snapshot.windows {
+        let provenance = snapshot.windows_provenance();
+        for (window, provenance) in snapshot.windows.iter().zip(provenance) {
             let policy = ResolvedNotificationPolicy::for_window(&config, account, window);
             let forecast = forecasts.iter().find(|forecast| {
                 forecast.provider_id == snapshot.provider_id
@@ -72,7 +73,14 @@ impl NotificationManager {
                     && forecast.window_id == window.window_id
             });
             if let Err(err) = self
-                .process_window(account, snapshot, window, forecast, &policy)
+                .process_window(
+                    account,
+                    snapshot,
+                    window,
+                    forecast,
+                    &policy,
+                    provenance.quota_like && provenance.authoritative,
+                )
                 .await
             {
                 warn!(
@@ -93,6 +101,7 @@ impl NotificationManager {
         window: &UsageWindow,
         forecast: Option<&UsageForecast>,
         policy: &ResolvedNotificationPolicy,
+        authoritative_quota: bool,
     ) -> anyhow::Result<()> {
         let now = Utc::now();
         if !policy.enabled
@@ -101,7 +110,7 @@ impl NotificationManager {
         {
             return Ok(());
         }
-        if !snapshot.window_is_authoritative_quota(window) {
+        if !authoritative_quota {
             debug!(
                 provider_id = snapshot.provider_id.as_str(),
                 account_id = account.id.as_str(),

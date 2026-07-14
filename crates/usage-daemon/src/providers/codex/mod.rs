@@ -17,9 +17,10 @@ use usage_core::ProviderId;
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
-        paths::expand_home_path, read_response_body, AccountDiscovery, DailyUsageBucket,
-        DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-        ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        paths::expand_home_path, read_response_body, AccountDiscovery, AccountDiscoveryFailure,
+        CollectionOutcome, DailyUsageBucket, DiscoveredAccount, ProviderCollectionResult,
+        ProviderCollector, ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -58,7 +59,7 @@ impl CodexCollector {
             .user_agent("codex-cli")
             .build()?;
         let local_codex_home = local_codex_home(&home);
-        let profiles = codex_profiles(config, &local_codex_home);
+        let profiles = codex_profiles(config, &local_codex_home)?;
         Ok(Self {
             profiles,
             local_codex_home,
@@ -243,21 +244,31 @@ fn local_codex_home(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".codex"))
 }
 
-fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexProfile> {
+fn codex_profiles(
+    config: ProviderConfig,
+    local_codex_home: &Path,
+) -> anyhow::Result<Vec<CodexProfile>> {
     let configured = if config.profiles.is_empty() {
-        vec![ProviderProfileConfig {
+        let mut profile = ProviderProfileConfig {
             id: Some("default".to_string()),
-            codex_home: Some(local_codex_home.to_path_buf()),
             ..ProviderProfileConfig::default()
-        }]
+        };
+        settings::update_profile(&mut profile, |settings| {
+            settings.codex_home = Some(local_codex_home.to_path_buf());
+        })?;
+        vec![profile]
     } else {
         config.profiles
     };
 
-    let has_direct_default_owner = configured.iter().any(|profile| {
+    let decoded = configured
+        .iter()
+        .map(settings::profile)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let has_direct_default_owner = configured.iter().zip(&decoded).any(|(profile, settings)| {
         profile.enabled
             && !profile.deleted
-            && profile
+            && settings
                 .codex_home
                 .as_ref()
                 .map(|path| expand_home_path(path.clone()))
@@ -266,23 +277,27 @@ fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexP
     });
     let default_activity_owner = (!has_direct_default_owner)
         .then(|| {
-            configured.iter().position(|profile| {
-                profile.enabled && !profile.deleted && profile.owns_default_codex_activity
-            })
+            configured
+                .iter()
+                .zip(&decoded)
+                .position(|(profile, settings)| {
+                    profile.enabled && !profile.deleted && settings.owns_default_codex_activity
+                })
         })
         .flatten();
 
-    configured
+    Ok(configured
         .into_iter()
+        .zip(decoded)
         .enumerate()
-        .filter(|(_, profile)| profile.enabled && !profile.deleted)
-        .map(|(index, profile)| {
+        .filter(|(_, (profile, _))| profile.enabled && !profile.deleted)
+        .map(|(index, (profile, settings))| {
             let id = profile_id(profile.id.as_deref(), index);
-            let codex_home = profile
+            let codex_home = settings
                 .codex_home
                 .map(expand_home_path)
                 .unwrap_or_else(|| local_codex_home.to_path_buf());
-            let auth_path = profile
+            let auth_path = settings
                 .auth_path
                 .map(expand_home_path)
                 .unwrap_or_else(|| codex_home.join("auth.json"));
@@ -295,7 +310,7 @@ fn codex_profiles(config: ProviderConfig, local_codex_home: &Path) -> Vec<CodexP
                 cost_cache: Arc::new(Mutex::new(None)),
             }
         })
-        .collect()
+        .collect())
 }
 
 fn profile_id(configured: Option<&str>, index: usize) -> String {
@@ -316,6 +331,13 @@ fn profile_id(configured: Option<&str>, index: usize) -> String {
 impl ProviderCollector for CodexCollector {
     fn provider_id(&self) -> ProviderId {
         ProviderId::new(PROVIDER_ID)
+    }
+
+    fn configured_profile_ids(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect()
     }
 
     async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
@@ -349,10 +371,16 @@ impl ProviderCollector for CodexCollector {
                         error = %err,
                         "failed to discover Codex profile"
                     );
-                    failures.push(err);
+                    failures.push(AccountDiscoveryFailure {
+                        profile_id: profile.id.clone(),
+                        error: err,
+                    });
                 }
                 Err(err) => {
-                    failures.push(err);
+                    failures.push(AccountDiscoveryFailure {
+                        profile_id: profile.id.clone(),
+                        error: err,
+                    });
                 }
             }
         }
@@ -370,6 +398,14 @@ impl ProviderCollector for CodexCollector {
                         duplicate_profile_id = profile_id,
                         "duplicate Codex account ignored; each account can only be connected once"
                     );
+                    failures.push(AccountDiscoveryFailure {
+                        profile_id: profile_id.to_string(),
+                        error: duplicate_profile_error(
+                            &account.external_account_id,
+                            canonical_profile_id,
+                            profile_id,
+                        ),
+                    });
                     false
                 } else {
                     canonical_profiles
@@ -377,20 +413,15 @@ impl ProviderCollector for CodexCollector {
                     true
                 }
             });
-            return Ok(accounts.into());
+            return Ok(AccountDiscovery::from_parts(accounts, failures));
         }
-        Err(failures.into_iter().next().unwrap_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsMissing,
-                "no Codex accounts were discovered",
-            )
-        }))
+        Ok(AccountDiscovery::from_parts(accounts, failures))
     }
 
     async fn collect_usage(
         &self,
         account: &DiscoveredAccount,
-    ) -> Result<ProviderCollectionResult, ProviderError> {
+    ) -> Result<CollectionOutcome, ProviderError> {
         let (profile, credentials) = self.profile_for_account(account).await?;
 
         let app_server_started = Instant::now();
@@ -488,13 +519,13 @@ impl ProviderCollector for CodexCollector {
                 .push(format!("Codex local cost scan task failed: {err}")),
         }
 
-        Ok(ProviderCollectionResult {
+        Ok(CollectionOutcome::collected(ProviderCollectionResult {
             usage: collected.usage,
             daily_usage: collected.daily_usage,
             collection_mode: collected.collection_mode,
             account_email: collected.account_display_name,
             warnings: collected.warnings,
-        })
+        }))
     }
 }
 
@@ -641,10 +672,12 @@ fn nonempty_string(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub(crate) mod adapter;
 mod app_server;
 mod cost;
 mod pricing;
 mod rate_limits;
+pub(crate) mod settings;
 
 use app_server::collect_usage_from_app_server;
 use cost::{codex_session_roots, scan_codex_local_costs_cached, CodexCostCache, CodexUsageCostExt};

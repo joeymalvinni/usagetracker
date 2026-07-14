@@ -267,22 +267,33 @@ pub fn render_provider_setup(
                 ))
             );
             output.push('\n');
-            push_kv(
-                &mut output,
-                theme,
-                "Workspace",
-                setup
-                    .selected_workspace_id
-                    .as_deref()
-                    .unwrap_or("automatic"),
-            );
-            if !setup.workspace_options.is_empty() {
+            if setup.fields.is_empty() {
                 push_kv(
                     &mut output,
                     theme,
-                    "Choices",
-                    &setup.workspace_options.join(", "),
+                    "Workspace",
+                    setup
+                        .selected_workspace_id
+                        .as_deref()
+                        .unwrap_or("automatic"),
                 );
+            } else {
+                for field in &setup.fields {
+                    push_kv(
+                        &mut output,
+                        theme,
+                        &field.label,
+                        field.value.as_deref().unwrap_or("automatic"),
+                    );
+                    if !field.options.is_empty() {
+                        push_kv(
+                            &mut output,
+                            theme,
+                            &format!("{} choices", field.label),
+                            &field.options.join(", "),
+                        );
+                    }
+                }
             }
             if let Some(error) = &setup.discovery_error {
                 push_kv(&mut output, theme, "Discovery", error);

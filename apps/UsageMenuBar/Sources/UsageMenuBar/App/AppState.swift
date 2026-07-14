@@ -47,6 +47,7 @@ private enum PendingAction {
     @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
+    @Published var serverProviderOrder = [String]()
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
     @Published private(set) var derived = DerivedState.empty
@@ -370,8 +371,8 @@ private enum PendingAction {
     }
 
     func loadProviderSetup(_ providerId: String) async {
-        guard supportsWorkspaceSetup(providerId) else {
-            actionError = "\(providerName(providerId)) does not support workspace setup."
+        guard supportsSetup(providerId) else {
+            actionError = "\(providerName(providerId)) does not expose setup options."
             return
         }
         await perform(.accountProvider(providerId)) {
@@ -379,17 +380,18 @@ private enum PendingAction {
         }
     }
 
-    func selectWorkspace(providerId: String, workspaceId: String) async {
-        guard supportsWorkspaceSetup(providerId) else {
-            actionError = "\(providerName(providerId)) does not support workspace setup."
+    func updateProviderSetup(providerId: String, key: String, value: String?) async {
+        guard supportsSetup(providerId) else {
+            actionError = "\(providerName(providerId)) does not expose setup options."
             return
         }
         await perform(.accountProvider(providerId)) {
+            let values: [String: String?] = [key: value]
             providerSetups[providerId] = try await client.updateProviderSetup(
                 providerId: providerId,
-                workspaceId: workspaceId
+                settings: values
             )
-            actionMessage = "OpenCode workspace selected."
+            actionMessage = "\(providerName(providerId)) setup updated."
             applyRefreshOutcome(try await client.refresh([providerId]))
             await load()
         }
@@ -601,6 +603,7 @@ private enum PendingAction {
     private func performLoad(allowDaemonStart: Bool) async {
         do {
             let state = try await client.state()
+            serverProviderOrder = state.server.providers.map(\.id)
             serverProviders = Dictionary(
                 uniqueKeysWithValues: state.server.providers.map { ($0.id, $0) }
             )
@@ -723,9 +726,7 @@ private enum PendingAction {
                 if discovered.contains(where: { $0.providerId == providerId && $0.profileId == profileId }) {
                     accounts = discovered
                     actionError = nil
-                    actionMessage = providerId == "claude"
-                        ? "Claude account connected. Use its terminal button in Settings for profile-scoped activity."
-                        : "\(providerName(providerId)) account connected."
+                    actionMessage = "\(providerName(providerId)) account connected."
                     await load()
                     return
                 }
@@ -819,7 +820,7 @@ private enum PendingAction {
     }
 
     private func providerName(_ id: String) -> String {
-        ProviderCatalog.name(for: id)
+        serverProviders[id]?.displayName ?? ProviderCatalog.name(for: id)
     }
 
     func supportsMultipleAccounts(_ providerId: String) -> Bool {
@@ -838,8 +839,8 @@ private enum PendingAction {
         providerSupports(providerId, capability: \.launchAccount, in: serverProviders)
     }
 
-    func supportsWorkspaceSetup(_ providerId: String) -> Bool {
-        providerSupports(providerId, capability: \.workspaceSetup, in: serverProviders)
+    func supportsSetup(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.setup, in: serverProviders)
     }
 
     private func refreshStatusText(_ status: ProviderRefreshStatus) -> String {
@@ -866,6 +867,8 @@ private enum PendingAction {
         let forecasts = forecasts
         let dashboardSummary = dashboardSummary
         let windowProvenance = windowProvenance
+        let serverProviders = serverProviders
+        let serverProviderOrder = serverProviderOrder
         let ui = ui
         let refreshingProviderIDs = Set(refreshingProviderCounts.keys)
         let daemon = daemon
@@ -888,6 +891,8 @@ private enum PendingAction {
                     forecasts: forecasts,
                     dashboard: dashboardSummary,
                     windowProvenance: windowProvenance,
+                    serverProviders: serverProviders,
+                    serverProviderOrder: serverProviderOrder,
                     ui: ui,
                     refreshingProviderIDs: refreshingProviderIDs,
                     visible: { config == nil || visibleProviderIds.contains($0) }

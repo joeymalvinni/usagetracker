@@ -148,6 +148,70 @@ final class DashboardBuilderTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(provider.credits.first).absolute, "4 / 10")
     }
 
+    func testServerRegisteredProviderNeedsNoCatalogEntry() throws {
+        let descriptor = ServerProviderDescriptor(
+            id: "future_provider",
+            displayName: "Future Provider",
+            minimumRefreshIntervalSeconds: 60,
+            capabilities: ProviderCapabilities(
+                multipleAccounts: false,
+                addAccount: false,
+                repair: false,
+                launchAccount: false,
+                workspaceSetup: false
+            )
+        )
+        let output = DashboardBuilder(
+            config: config(providers: ["future_provider": true]),
+            accounts: [],
+            health: [],
+            snapshots: [],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            serverProviders: [descriptor.id: descriptor],
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        let provider = try XCTUnwrap(output.settingsProviders.first)
+        XCTAssertEqual(provider.providerId, "future_provider")
+        XCTAssertEqual(provider.name, "Future Provider")
+        XCTAssertEqual(provider.symbol, "chart.bar")
+    }
+
+    func testServerRegistryOrderIsPreservedForUnknownProviders() {
+        let descriptors = ["provider_z", "provider_a"].map { id in
+            ServerProviderDescriptor(
+                id: id,
+                displayName: id,
+                minimumRefreshIntervalSeconds: 60,
+                capabilities: ProviderCapabilities(
+                    multipleAccounts: false,
+                    addAccount: false,
+                    repair: false,
+                    launchAccount: false,
+                    workspaceSetup: false
+                )
+            )
+        }
+        let output = DashboardBuilder(
+            config: config(providers: ["provider_z": true, "provider_a": true]),
+            accounts: [],
+            health: [],
+            snapshots: [],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            serverProviders: Dictionary(uniqueKeysWithValues: descriptors.map { ($0.id, $0) }),
+            serverProviderOrder: descriptors.map(\.id),
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        XCTAssertEqual(output.settingsProviders.map(\.providerId), ["provider_z", "provider_a"])
+    }
+
     private func config(providers: [String: Bool]) -> ConfigResponse {
         ConfigResponse(
             pollIntervalSeconds: 300,

@@ -145,7 +145,7 @@ impl SocketServer {
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
         match request {
             ApiRequest::GetServerInfo => ApiResponse::ServerInfo {
-                server: ServerInfo::current(),
+                server: ServerInfo::current(crate::runtime::provider_registry::descriptors()),
             },
             ApiRequest::GetState => self.state_response().await,
             ApiRequest::GetUsage => {
@@ -257,12 +257,12 @@ impl SocketServer {
             } => {
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
-                } else if !usage_core::provider_spec(provider_id.as_str())
-                    .is_some_and(|provider| provider.capabilities.add_account)
+                } else if crate::runtime::provider_registry::find(provider_id.as_str())
+                    .is_none_or(|provider| provider.add_account_handler().is_none())
                 {
                     ApiResponse::error(
                         ApiErrorCode::UnsupportedOperation,
-                        "adding accounts is not supported for OpenCode Go",
+                        format!("adding accounts is not supported for {provider_id}"),
                     )
                 } else {
                     match self
@@ -341,21 +341,34 @@ impl SocketServer {
             }
             ApiRequest::UpdateProviderSetup {
                 provider_id,
+                mut settings,
                 workspace_id,
             } => {
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
-                } else if !usage_core::provider_spec(provider_id.as_str())
-                    .is_some_and(|provider| provider.capabilities.workspace_setup)
+                } else if crate::runtime::provider_registry::find(provider_id.as_str())
+                    .is_none_or(|provider| provider.setup_handler().is_none())
                 {
                     ApiResponse::error(
                         ApiErrorCode::UnsupportedOperation,
-                        "workspace selection is only supported for OpenCode Go",
+                        format!("setup is not supported for {provider_id}"),
                     )
                 } else {
+                    let supports_legacy_workspace_setup = crate::runtime::provider_registry::find(
+                        provider_id.as_str(),
+                    )
+                    .is_some_and(|provider| provider.descriptor().capabilities.workspace_setup);
+                    if supports_legacy_workspace_setup && settings.is_empty() {
+                        settings.insert("workspace_id".to_string(), workspace_id);
+                    } else if workspace_id.is_some() {
+                        return ApiResponse::error(
+                            ApiErrorCode::InvalidArgument,
+                            "workspace_id is only supported by workspace-based provider setup; otherwise send provider setup values through settings",
+                        );
+                    }
                     match self
                         .runtime
-                        .update_provider_setup(provider_id, workspace_id)
+                        .update_provider_setup(provider_id, settings)
                         .await
                     {
                         Ok(setup) => ApiResponse::ProviderSetup { setup },
@@ -376,8 +389,8 @@ impl SocketServer {
                 };
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
-                } else if !usage_core::provider_spec(provider_id.as_str())
-                    .is_some_and(|provider| provider.capabilities.repair)
+                } else if crate::runtime::provider_registry::find(provider_id.as_str())
+                    .is_none_or(|provider| provider.repair_handler().is_none())
                 {
                     ApiResponse::error(
                         ApiErrorCode::UnsupportedOperation,
@@ -454,7 +467,7 @@ impl SocketServer {
         ApiResponse::State {
             state: StateSnapshot {
                 generated_at,
-                server: ServerInfo::current(),
+                server: ServerInfo::current(crate::runtime::provider_registry::descriptors()),
                 config,
                 accounts,
                 health,
@@ -503,12 +516,7 @@ fn build_usage_view(
         .collect();
     let window_provenance = snapshots
         .iter()
-        .flat_map(|snapshot| {
-            snapshot
-                .windows
-                .iter()
-                .map(|window| snapshot.window_provenance(window))
-        })
+        .flat_map(usage_core::UsageSnapshot::windows_provenance)
         .collect();
     let dashboard = dashboard::build_usage_dashboard(&snapshots, &stored.daily_usage);
     UsageView {
@@ -741,7 +749,7 @@ fn supported_accounts(accounts: Vec<Account>) -> Vec<Account> {
 }
 
 fn is_supported_provider(provider_id: &str) -> bool {
-    usage_core::provider_spec(provider_id).is_some()
+    crate::runtime::provider_registry::is_supported(provider_id)
 }
 
 fn provider_validation_error(provider_id: &usage_core::ProviderId) -> Option<ApiResponse> {
@@ -791,6 +799,7 @@ fn storage_error(err: anyhow::Error) -> ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderConfig;
     use crate::polling::RefreshCoordinator;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -910,7 +919,7 @@ mod tests {
     #[test]
     fn replaces_oversized_responses_with_a_bounded_error_and_closes() {
         let response = ResponseEnvelope::new(ApiResponse::ServerInfo {
-            server: ServerInfo::current(),
+            server: ServerInfo::current(crate::runtime::provider_registry::descriptors()),
         });
         let mut buffer = Vec::new();
 
@@ -1136,9 +1145,7 @@ mod tests {
             crate::config::ProviderConfig {
                 enabled: true,
                 profiles: Vec::new(),
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
+                ..ProviderConfig::default()
             },
         );
         let env = test_env(providers);
@@ -1185,9 +1192,7 @@ mod tests {
             crate::config::ProviderConfig {
                 enabled: false,
                 profiles: Vec::new(),
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
+                ..ProviderConfig::default()
             },
         );
         let env = test_env(providers);
@@ -1315,9 +1320,7 @@ mod tests {
                     display_name: Some("Work".to_string()),
                     ..Default::default()
                 }],
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
+                ..ProviderConfig::default()
             },
         );
         let env = test_env(providers);
@@ -1360,9 +1363,7 @@ mod tests {
                     display_name: Some("Old name".to_string()),
                     ..Default::default()
                 }],
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
+                ..ProviderConfig::default()
             },
         );
         let env = test_env(providers);
@@ -1428,9 +1429,7 @@ mod tests {
                     display_name: Some("Work".to_string()),
                     ..Default::default()
                 }],
-                cookie_header: None,
-                workspace_id: None,
-                source_mode: None,
+                ..ProviderConfig::default()
             },
         );
         let env = test_env(providers);

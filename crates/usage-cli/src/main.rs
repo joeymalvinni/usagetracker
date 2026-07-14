@@ -617,6 +617,7 @@ async fn run_providers(
                 socket,
                 ApiRequest::UpdateProviderSetup {
                     provider_id: ProviderId::new(provider),
+                    settings: BTreeMap::new(),
                     workspace_id: workspace,
                 },
             )

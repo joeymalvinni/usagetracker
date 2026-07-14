@@ -12,48 +12,8 @@ use crate::{
 pub const API_VERSION: u16 = 3;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProviderSpec {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub minimum_refresh_interval_seconds: u64,
-    pub default_visible: bool,
-    pub capabilities: ProviderCapabilities,
-}
-
-pub const PROVIDER_SPECS: &[ProviderSpec] = &[
-    ProviderSpec {
-        id: "codex",
-        display_name: "Codex",
-        minimum_refresh_interval_seconds: 60,
-        default_visible: true,
-        capabilities: ProviderCapabilities::managed_accounts(),
-    },
-    ProviderSpec {
-        id: "claude",
-        display_name: "Claude",
-        minimum_refresh_interval_seconds: 60,
-        default_visible: false,
-        capabilities: ProviderCapabilities::managed_accounts(),
-    },
-    ProviderSpec {
-        id: "opencode_go",
-        display_name: "OpenCode Go",
-        minimum_refresh_interval_seconds: 60,
-        default_visible: false,
-        capabilities: ProviderCapabilities::workspace(),
-    },
-    ProviderSpec {
-        id: "grok",
-        display_name: "Grok",
-        minimum_refresh_interval_seconds: 60,
-        default_visible: false,
-        capabilities: ProviderCapabilities::managed_accounts(),
-    },
-];
-
-pub fn provider_spec(id: &str) -> Option<&'static ProviderSpec> {
-    PROVIDER_SPECS.iter().find(|provider| provider.id == id)
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -144,6 +104,11 @@ pub enum ApiRequest {
     },
     UpdateProviderSetup {
         provider_id: ProviderId,
+        /// Generic provider-owned setup values. A null value clears a setting.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        settings: BTreeMap<String, Option<String>>,
+        /// Deprecated v3 compatibility field. New clients should send
+        /// `settings.workspace_id` instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_id: Option<String>,
     },
@@ -401,7 +366,7 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
-    pub fn current() -> Self {
+    pub fn current(providers: Vec<ProviderDescriptor>) -> Self {
         Self {
             api_version: API_VERSION,
             capabilities: vec![
@@ -411,10 +376,7 @@ impl ServerInfo {
                 ApiCapability::RefreshCoalescing,
                 ApiCapability::CombinedState,
             ],
-            providers: PROVIDER_SPECS
-                .iter()
-                .map(ProviderDescriptor::from)
-                .collect(),
+            providers,
         }
     }
 }
@@ -439,46 +401,16 @@ pub struct ProviderDescriptor {
     pub capabilities: ProviderCapabilities,
 }
 
-impl From<&ProviderSpec> for ProviderDescriptor {
-    fn from(spec: &ProviderSpec) -> Self {
-        Self {
-            id: ProviderId::new(spec.id),
-            display_name: spec.display_name.to_string(),
-            minimum_refresh_interval_seconds: spec.minimum_refresh_interval_seconds,
-            capabilities: spec.capabilities,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct ProviderCapabilities {
     pub multiple_accounts: bool,
     pub add_account: bool,
     pub repair: bool,
     pub launch_account: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup: bool,
+    /// Deprecated alias retained for v3 clients.
     pub workspace_setup: bool,
-}
-
-impl ProviderCapabilities {
-    const fn managed_accounts() -> Self {
-        Self {
-            multiple_accounts: true,
-            add_account: true,
-            repair: true,
-            launch_account: true,
-            workspace_setup: false,
-        }
-    }
-
-    const fn workspace() -> Self {
-        Self {
-            multiple_accounts: false,
-            add_account: false,
-            repair: true,
-            launch_account: false,
-            workspace_setup: true,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -550,9 +482,35 @@ pub struct AddProviderAccountResponse {
 pub struct ProviderSetupResponse {
     pub provider_id: ProviderId,
     pub profiles: Vec<ProviderProfileResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ProviderSetupField>,
+    /// Deprecated OpenCode-specific fields retained for v3 clients.
     pub selected_workspace_id: Option<String>,
     pub workspace_options: Vec<String>,
     pub discovery_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSetupFieldKind {
+    Select,
+    Text,
+    Secret,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct ProviderSetupField {
+    pub key: String,
+    pub label: String,
+    pub kind: ProviderSetupFieldKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -740,6 +698,26 @@ mod tests {
     }
 
     #[test]
+    fn generic_provider_setup_preserves_explicit_null_values() {
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"update_provider_setup","provider_id":"future","settings":{"region":null}}"#,
+        )
+        .unwrap();
+
+        let ApiRequest::UpdateProviderSetup {
+            provider_id,
+            settings,
+            workspace_id,
+        } = request.request
+        else {
+            panic!("unexpected request variant");
+        };
+        assert_eq!(provider_id.as_str(), "future");
+        assert_eq!(settings.get("region"), Some(&None));
+        assert_eq!(workspace_id, None);
+    }
+
+    #[test]
     fn decodes_usage_response_without_optional_collections() {
         let response: ResponseEnvelope = serde_json::from_str(
             r#"{"api_version":3,"type":"usage","snapshots":[],"dashboard":{"accounts":[],"days":[],"pricing":{"priced_tokens":0,"unpriced_tokens":0,"covered_percent":100.0},"provenance":{"scopes":[],"qualities":[],"partial":false,"estimated":false,"mixed_scope":false,"explanation":"No usage data."}}}"#,
@@ -770,7 +748,7 @@ mod tests {
         };
         assert_eq!(server.api_version, API_VERSION);
         assert!(server.capabilities.contains(&ApiCapability::RefreshJobs));
-        assert_eq!(server.providers.len(), PROVIDER_SPECS.len());
+        assert_eq!(server.providers.len(), 4);
         assert!(server
             .providers
             .iter()

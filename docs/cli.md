@@ -34,7 +34,7 @@ Run it with no command and you get `usage` — the dashboard.
 | `accounts launch ACCOUNT` | Open the provider using this account's managed profile. |
 | `providers [list]` | Show which providers are on. |
 | `providers enable\|disable PROVIDER` | Turn a provider on or off — takes effect right away and is saved. |
-| `providers setup PROVIDER` | Show profiles and OpenCode workspace discovery. |
+| `providers setup PROVIDER` | Show profiles and provider-owned setup fields/discovery. |
 | `providers workspace opencode_go WORKSPACE` | Pick a `wrk_…` workspace; add `--automatic` to go back to discovery. |
 | `providers repair PROVIDER [--account ACCOUNT]` | Open the provider's login or repair flow. |
 | `config [show]` | Show the effective paths, provider toggles, polling, and notifications. |

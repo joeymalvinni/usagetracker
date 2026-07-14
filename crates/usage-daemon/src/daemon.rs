@@ -11,30 +11,20 @@ use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{info, warn};
 use usage_core::{
     Account, AccountId, AddProviderAccountResponse, ConfigResponse, NotificationConfig,
-    ProviderActionResponse, ProviderId, ProviderProfileResponse, ProviderSetupResponse,
-    ProviderToggle,
+    ProviderActionResponse, ProviderId, ProviderSetupResponse, ProviderToggle,
 };
 
 #[cfg(test)]
 use usage_core::default_app_dir;
 
 use crate::{
-    config::{Config, ProviderConfig, ProviderProfileConfig},
+    config::Config,
     fixtures::{self, FixtureScenario},
     local_logs,
     notifications::NotificationManager,
     polling::RefreshCoordinator,
-    providers::{
-        claude::PROVIDER_ID as CLAUDE_PROVIDER_ID,
-        codex::PROVIDER_ID as CODEX_PROVIDER_ID,
-        grok::{self, PROVIDER_ID as GROK_PROVIDER_ID},
-        opencode::{clear_cached_cookie_cache, OpenCodeCollector, OPENCODE_GO_PROVIDER_ID},
-        paths::expand_home_path,
-        ProviderCollector,
-    },
-    runtime::{
-        grok_profile_service, launchers, managed_profiles, profile_service, provider_registry,
-    },
+    providers::ProviderCollector,
+    runtime::{managed_profiles, provider_registry},
     server::SocketServer,
     storage::Storage,
 };
@@ -59,43 +49,53 @@ const HIDDEN_PROVIDER_POLL_SECONDS: u64 = 30 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PollSchedule {
-    visible: Vec<ProviderId>,
-    hidden: Vec<ProviderId>,
-    visible_interval_seconds: u64,
+    initial: Vec<ProviderId>,
+    groups: Vec<PollGroup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PollGroup {
+    providers: Vec<ProviderId>,
+    interval_seconds: u64,
 }
 
 impl PollSchedule {
     fn from_config(config: &Config) -> Self {
-        let visible = config.enabled_provider_ids();
-        let visible_ids = visible
-            .iter()
-            .map(ProviderId::as_str)
-            .collect::<BTreeSet<_>>();
-        let hidden = config
-            .providers
-            .keys()
-            .filter(|id| provider_registry::is_supported(id))
-            .filter(|id| !visible_ids.contains(id.as_str()))
-            .map(|id| ProviderId::new(id.clone()))
-            .collect();
+        Self::from_descriptors(config, &provider_registry::descriptors())
+    }
+
+    fn from_descriptors(config: &Config, descriptors: &[usage_core::ProviderDescriptor]) -> Self {
+        let mut initial = Vec::new();
+        let mut by_interval = BTreeMap::<u64, Vec<ProviderId>>::new();
+        for descriptor in descriptors {
+            let visible = config.provider_enabled(descriptor.id.as_str());
+            if visible {
+                initial.push(descriptor.id.clone());
+            }
+            let requested_interval = if visible {
+                config.poll_interval_seconds
+            } else {
+                HIDDEN_PROVIDER_POLL_SECONDS
+            };
+            let effective_interval =
+                requested_interval.max(descriptor.minimum_refresh_interval_seconds);
+            by_interval
+                .entry(effective_interval)
+                .or_default()
+                .push(descriptor.id.clone());
+        }
         Self {
-            visible,
-            hidden,
-            visible_interval_seconds: config.poll_interval_seconds,
+            initial,
+            groups: by_interval
+                .into_iter()
+                .map(|(interval_seconds, providers)| PollGroup {
+                    providers,
+                    interval_seconds,
+                })
+                .collect(),
         }
     }
 }
-
-use grok_profile_service::{
-    ensure_login_profile as ensure_grok_login_profile,
-    select_browser_login_target as select_grok_browser_login_target,
-    select_login_target as select_grok_login_target, GrokLoginTarget,
-};
-use profile_service::{
-    codex_profile_home, create_managed_claude_profile, default_codex_profile,
-    ensure_claude_login_profile, pending_claude_profile, pending_codex_profile, unique_profile_id,
-    ClaudeLoginTarget,
-};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ConfigUpdateChanges {
@@ -113,7 +113,7 @@ impl ConfigUpdateChanges {
 impl Daemon {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let storage = Storage::open(&config.paths.db)?;
-        let providers = provider_registry::build_collectors(&config, &storage).await?;
+        let providers = provider_registry::build_collectors(&config)?;
         let notifications = NotificationManager::new(storage.clone(), config.notifications.clone());
         let refresh = Arc::new(RefreshCoordinator::with_notifications(
             storage.clone(),
@@ -262,6 +262,28 @@ impl DaemonRuntime {
             .0)
     }
 
+    pub(crate) async fn config_snapshot(&self) -> Config {
+        self.config.read().await.clone()
+    }
+
+    pub(crate) async fn mutate_config<T>(
+        &self,
+        mutation: impl FnOnce(&mut Config) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let guard = self.config_mutation.lock().await;
+        let mut updated = self.config.read().await.clone();
+        let result = mutation(&mut updated)?;
+        let collectors = self.collectors_for_config(&updated).await?;
+        updated.persist()?;
+        self.publish_local_log_config(&updated);
+        *self.config.write().await = updated.clone();
+        self.refresh.set_providers(collectors).await;
+        self.poll_schedule_tx
+            .send_replace(PollSchedule::from_config(&updated));
+        drop(guard);
+        Ok(result)
+    }
+
     pub async fn config_response_for_provider_data(
         &self,
         mut data_provider_ids: BTreeSet<String>,
@@ -295,7 +317,7 @@ impl DaemonRuntime {
         if self.fixture_mode {
             Ok(Vec::new())
         } else {
-            provider_registry::build_collectors(config, &self.storage).await
+            provider_registry::build_collectors(config)
         }
     }
 
@@ -392,199 +414,16 @@ impl DaemonRuntime {
         let display_name = display_name
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        match provider_id.as_str() {
-            CODEX_PROVIDER_ID => self.add_codex_account(provider_id, display_name).await,
-            CLAUDE_PROVIDER_ID => self.add_claude_account(provider_id, display_name).await,
-            GROK_PROVIDER_ID => self.add_grok_account(provider_id, display_name).await,
-            _ => anyhow::bail!("adding accounts is not supported for {provider_id}"),
-        }
-    }
-
-    async fn add_codex_account(
-        &self,
-        provider_id: ProviderId,
-        display_name: Option<String>,
-    ) -> anyhow::Result<AddProviderAccountResponse> {
-        let mutation = self.config_mutation.lock().await;
-        let mut updated_config = self.config.read().await.clone();
-        let provider = updated_config
-            .providers
-            .entry(CODEX_PROVIDER_ID.to_string())
-            .or_insert_with(ProviderConfig::default);
-        provider.enabled = true;
-        if provider.profiles.is_empty() {
-            provider.profiles.push(default_codex_profile()?);
-        }
-        let (profile_id, profile_path, profile_name) =
-            if let Some(pending) = pending_codex_profile(provider) {
-                pending
-            } else {
-                let profile_id = unique_profile_id(&provider.profiles, display_name.as_deref());
-                let profile_path = codex_profile_home(&profile_id)?;
-                std::fs::create_dir_all(&profile_path)?;
-                provider.profiles.push(ProviderProfileConfig {
-                    id: Some(profile_id.clone()),
-                    display_name: display_name.clone(),
-                    codex_home: Some(profile_path.clone()),
-                    ..ProviderProfileConfig::default()
-                });
-                (profile_id, profile_path, display_name)
-            };
-
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        self.publish_local_log_config(&updated_config);
-        *self.config.write().await = updated_config;
-        self.refresh.set_providers(collectors).await;
-        drop(mutation);
-
-        let child = launchers::launch_codex_login(&profile_path)?;
-        launchers::monitor_login(
-            child,
-            self.refresh.clone(),
-            CODEX_PROVIDER_ID,
-            Some(profile_id.clone()),
-        );
-
-        info!(
-            provider_id = provider_id.as_str(),
-            profile_id = profile_id.as_str(),
-            profile_path = %profile_path.display(),
-            "provider account login launched"
-        );
-
-        Ok(AddProviderAccountResponse {
-            provider_id,
-            profile_id,
-            display_name: profile_name,
-            profile_path: profile_path.display().to_string(),
-        })
-    }
-
-    async fn add_claude_account(
-        &self,
-        provider_id: ProviderId,
-        display_name: Option<String>,
-    ) -> anyhow::Result<AddProviderAccountResponse> {
-        let connected_profiles = self
-            .storage
-            .accounts()
-            .await?
-            .into_iter()
-            .filter(|account| account.provider_id.as_str() == CLAUDE_PROVIDER_ID)
-            .filter_map(|account| account.profile_id)
-            .collect::<BTreeSet<_>>();
-
-        let mutation = self.config_mutation.lock().await;
-        let mut updated_config = self.config.read().await.clone();
-        let provider = updated_config
-            .providers
-            .entry(CLAUDE_PROVIDER_ID.to_string())
-            .or_default();
-        provider.enabled = true;
-        let target = if let Some(target) = pending_claude_profile(provider, &connected_profiles) {
-            target
-        } else {
-            create_managed_claude_profile(provider, display_name.clone())?
-        };
-
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        self.publish_local_log_config(&updated_config);
-        *self.config.write().await = updated_config;
-        self.refresh.set_providers(collectors).await;
-        drop(mutation);
-
-        let profile_path = target
-            .config_dir
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("managed Claude profile is missing its config path"))?;
-        let child = launchers::launch_claude_login(Some(&profile_path))?;
-        launchers::monitor_login(
-            child,
-            self.refresh.clone(),
-            CLAUDE_PROVIDER_ID,
-            Some(target.profile_id.clone()),
-        );
-
-        info!(
-            provider_id = provider_id.as_str(),
-            profile_id = target.profile_id.as_str(),
-            profile_path = %profile_path.display(),
-            "provider account login launched"
-        );
-
-        Ok(AddProviderAccountResponse {
-            provider_id,
-            profile_id: target.profile_id,
-            display_name: target.display_name,
-            profile_path: profile_path.display().to_string(),
-        })
-    }
-
-    async fn add_grok_account(
-        &self,
-        provider_id: ProviderId,
-        display_name: Option<String>,
-    ) -> anyhow::Result<AddProviderAccountResponse> {
-        let connected_profiles = self
-            .storage
-            .accounts()
-            .await?
-            .into_iter()
-            .filter(|account| account.provider_id.as_str() == GROK_PROVIDER_ID)
-            .filter_map(|account| account.profile_id)
-            .collect::<BTreeSet<_>>();
-        let binary = grok::find_grok_binary();
-        if binary.is_none() && !connected_profiles.is_empty() {
-            anyhow::bail!("adding another Grok account requires the Grok Build CLI");
-        }
-
-        let mutation = self.config_mutation.lock().await;
-        let mut updated_config = self.config.read().await.clone();
-        let provider = updated_config
-            .providers
-            .entry(GROK_PROVIDER_ID.to_string())
-            .or_default();
-        provider.enabled = true;
-        let target = if binary.is_some() {
-            select_grok_login_target(provider, &connected_profiles, display_name.clone())?
-        } else {
-            select_grok_browser_login_target(provider)?
-        };
-
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        self.publish_local_log_config(&updated_config);
-        *self.config.write().await = updated_config;
-        self.refresh.set_providers(collectors).await;
-        drop(mutation);
-
-        if let Some(binary) = binary {
-            let child = launchers::launch_grok_login(&binary, &target.grok_home)?;
-            launchers::monitor_login(
-                child,
-                self.refresh.clone(),
-                GROK_PROVIDER_ID,
-                Some(target.profile_id.clone()),
-            );
-        } else {
-            launchers::open_url("https://grok.com/?_s=usage")?;
-        }
-
-        info!(
-            provider_id = provider_id.as_str(),
-            profile_id = target.profile_id.as_str(),
-            profile_path = %target.grok_home.display(),
-            "provider account login launched"
-        );
-
-        Ok(AddProviderAccountResponse {
-            provider_id,
-            profile_id: target.profile_id,
-            display_name: target.display_name,
-            profile_path: target.grok_home.display().to_string(),
-        })
+        let adapter = provider_registry::adapter(&provider_id)?;
+        let handler = adapter
+            .add_account_handler()
+            .ok_or_else(|| anyhow::anyhow!("adding accounts is not supported for {provider_id}"))?;
+        handler
+            .add_account(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                display_name,
+            )
+            .await
     }
 
     pub async fn update_account(
@@ -615,18 +454,19 @@ impl DaemonRuntime {
             .account(&account_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
-        if account.provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
-            clear_cached_cookie_cache().await?;
-        }
-        if account.provider_id.as_str() == GROK_PROVIDER_ID
-            && account.profile_id.as_deref() == Some("default")
-        {
-            grok::clear_cached_cookie_cache().await?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        if let Some(handler) = adapter.delete_handler() {
+            handler.cleanup_before_delete(&account).await?;
         }
 
         let mutation = self.config_mutation.lock().await;
         let previous_config = self.config.read().await.clone();
-        let plan = crate::runtime::account_service::plan_deletion(&previous_config, &account)?;
+        let plan = match adapter.delete_handler() {
+            Some(handler) => handler.plan_deletion(&previous_config, &account)?,
+            None => {
+                crate::runtime::provider_adapter::AccountDeletionPlan::unchanged(&previous_config)
+            }
+        };
         let previous_collectors = self.collectors_for_config(&previous_config).await?;
         let next_collectors = self.collectors_for_config(&plan.config).await?;
 
@@ -660,93 +500,37 @@ impl DaemonRuntime {
         &self,
         provider_id: ProviderId,
     ) -> anyhow::Result<ProviderSetupResponse> {
-        ensure_supported_provider(&provider_id)?;
-        let config = self.config.read().await.clone();
-        let provider = config
-            .providers
-            .get(provider_id.as_str())
-            .cloned()
-            .unwrap_or_default();
-        let profiles = provider
-            .profiles
-            .iter()
-            .filter(|profile| !profile.deleted)
-            .enumerate()
-            .map(|(index, profile)| ProviderProfileResponse {
-                id: profile
-                    .id
-                    .clone()
-                    .filter(|id| !id.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        if index == 0 {
-                            "default".to_string()
-                        } else {
-                            format!("profile-{}", index + 1)
-                        }
-                    }),
-                display_name: profile.display_name.clone(),
-                enabled: profile.enabled,
-            })
-            .collect();
-
-        let (mut workspace_options, discovery_error) =
-            if provider_id.as_str() == OPENCODE_GO_PROVIDER_ID {
-                let collector = OpenCodeCollector::new(provider.clone())?;
-                match collector.discover_workspace_options().await {
-                    Ok(options) => (options, None),
-                    Err(err) => (Vec::new(), Some(err.short_message().to_string())),
-                }
-            } else {
-                (Vec::new(), None)
-            };
-        if let Some(selected) = provider.workspace_id.as_deref() {
-            if !workspace_options.iter().any(|option| option == selected) {
-                workspace_options.insert(0, selected.to_string());
-            }
+        let adapter = provider_registry::adapter(&provider_id)?;
+        if let Some(handler) = adapter.setup_handler() {
+            handler
+                .get_setup(crate::runtime::provider_adapter::ProviderRuntime::new(self))
+                .await
+        } else {
+            let config = self.config.read().await;
+            let provider_config = config
+                .providers
+                .get(provider_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            Ok(adapter.setup_summary(&provider_config))
         }
-
-        Ok(ProviderSetupResponse {
-            provider_id,
-            profiles,
-            selected_workspace_id: provider.workspace_id,
-            workspace_options,
-            discovery_error,
-        })
     }
 
     pub async fn update_provider_setup(
         &self,
         provider_id: ProviderId,
-        workspace_id: Option<String>,
+        settings: BTreeMap<String, Option<String>>,
     ) -> anyhow::Result<ProviderSetupResponse> {
-        ensure_supported_provider(&provider_id)?;
-        if provider_id.as_str() != OPENCODE_GO_PROVIDER_ID {
-            anyhow::bail!("workspace selection is only supported for OpenCode Go");
-        }
-        let workspace_id = workspace_id
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        if workspace_id
-            .as_deref()
-            .is_some_and(|value| !value.starts_with("wrk_"))
-        {
-            anyhow::bail!("OpenCode workspace id must start with wrk_");
-        }
-
-        let mutation = self.config_mutation.lock().await;
-        let mut updated_config = self.config.read().await.clone();
-        updated_config
-            .providers
-            .entry(OPENCODE_GO_PROVIDER_ID.to_string())
-            .or_default()
-            .workspace_id = workspace_id;
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        self.publish_local_log_config(&updated_config);
-        *self.config.write().await = updated_config;
-        self.refresh.set_providers(collectors).await;
-        drop(mutation);
-        self.provider_setup(provider_id).await
+        let adapter = provider_registry::adapter(&provider_id)?;
+        let handler = adapter
+            .setup_handler()
+            .ok_or_else(|| anyhow::anyhow!("setup is not supported for {provider_id}"))?;
+        handler
+            .update_setup(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                settings,
+            )
+            .await
     }
 
     pub async fn repair_provider(
@@ -757,109 +541,16 @@ impl DaemonRuntime {
         if self.fixture_mode {
             anyhow::bail!("provider repair is unavailable in development fixture mode");
         }
-        ensure_supported_provider(&provider_id)?;
-        let message = match provider_id.as_str() {
-            CODEX_PROVIDER_ID => {
-                let config = self.config.read().await;
-                let account = match account_id.as_ref() {
-                    Some(id) => self.storage.account(id).await?,
-                    None => None,
-                };
-                let requested_profile = account
-                    .as_ref()
-                    .and_then(|account| account.profile_id.as_deref());
-                let profile = config
-                    .providers
-                    .get(CODEX_PROVIDER_ID)
-                    .and_then(|provider| {
-                        requested_profile
-                            .and_then(|id| {
-                                provider
-                                    .profiles
-                                    .iter()
-                                    .find(|profile| profile.id.as_deref() == Some(id))
-                            })
-                            .or_else(|| provider.profiles.first())
-                    });
-                let home = profile
-                    .and_then(|profile| profile.codex_home.clone())
-                    .map(expand_home_path)
-                    .unwrap_or(default_codex_profile()?.codex_home.unwrap_or_default());
-                let profile_id = profile
-                    .and_then(|profile| profile.id.clone())
-                    .unwrap_or_else(|| "default".to_string());
-                let child = launchers::launch_codex_login(&home)?;
-                launchers::monitor_login(
-                    child,
-                    self.refresh.clone(),
-                    CODEX_PROVIDER_ID,
-                    Some(profile_id),
-                );
-                "Finish signing in to Codex in your browser. UsageTracker will refresh automatically."
-                    .to_string()
-            }
-            CLAUDE_PROVIDER_ID => {
-                let target = self
-                    .prepare_claude_login_profile(account_id.as_ref())
-                    .await?;
-                let child = launchers::launch_claude_login(target.config_dir.as_deref())?;
-                launchers::monitor_login(
-                    child,
-                    self.refresh.clone(),
-                    CLAUDE_PROVIDER_ID,
-                    Some(target.profile_id),
-                );
-                "Finish signing in to Claude in your browser. UsageTracker will refresh automatically."
-                    .to_string()
-            }
-            OPENCODE_GO_PROVIDER_ID => {
-                clear_cached_cookie_cache().await?;
-                launchers::open_url("https://opencode.ai")?;
-                "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
-                    .to_string()
-            }
-            GROK_PROVIDER_ID => {
-                if let Some(binary) = grok::find_grok_binary() {
-                    let target = self.prepare_grok_login_profile(account_id.as_ref()).await?;
-                    if target.profile_id == "default" {
-                        grok::clear_cached_cookie_cache().await?;
-                    }
-                    let child = launchers::launch_grok_login(&binary, &target.grok_home)?;
-                    launchers::monitor_login(
-                        child,
-                        self.refresh.clone(),
-                        GROK_PROVIDER_ID,
-                        Some(target.profile_id),
-                    );
-                    "Finish signing in to Grok in your browser. UsageTracker will refresh automatically."
-                        .to_string()
-                } else {
-                    let requested_profile = match account_id.as_ref() {
-                        Some(id) => self
-                            .storage
-                            .account(id)
-                            .await?
-                            .and_then(|account| account.profile_id),
-                        None => None,
-                    };
-                    if requested_profile
-                        .as_deref()
-                        .is_some_and(|id| id != "default")
-                    {
-                        anyhow::bail!("reconnecting this Grok account requires the Grok Build CLI");
-                    }
-                    grok::clear_cached_cookie_cache().await?;
-                    launchers::open_url("https://grok.com/?_s=usage")?;
-                    "Grok opened in your browser. Sign in there, or install Grok Build for CLI billing."
-                        .to_string()
-                }
-            }
-            _ => unreachable!("supported provider validation should reject unknown ids"),
-        };
-        Ok(ProviderActionResponse {
-            provider_id,
-            message,
-        })
+        let adapter = provider_registry::adapter(&provider_id)?;
+        let handler = adapter
+            .repair_handler()
+            .ok_or_else(|| anyhow::anyhow!("repair is not supported for {provider_id}"))?;
+        handler
+            .repair(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                account_id,
+            )
+            .await
     }
 
     pub async fn launch_provider_account(
@@ -874,113 +565,19 @@ impl DaemonRuntime {
             .account(&account_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
-        if account.provider_id.as_str() != CLAUDE_PROVIDER_ID {
-            anyhow::bail!("profile sessions are currently supported for Claude only");
-        }
-        if !account.collection_enabled {
-            anyhow::bail!("enable Claude account tracking before opening a profile session");
-        }
-
-        let profile_id = account
-            .profile_id
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?;
-        let config = self.config.read().await;
-        let provider = config
-            .providers
-            .get(CLAUDE_PROVIDER_ID)
-            .ok_or_else(|| anyhow::anyhow!("Claude is not configured"))?;
-        let config_dir = if provider.profiles.is_empty() && profile_id == "default" {
-            None
-        } else {
-            let profile = provider
-                .profiles
-                .iter()
-                .find(|profile| {
-                    profile.enabled && !profile.deleted && profile.id.as_deref() == Some(profile_id)
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Claude profile {profile_id} is no longer configured")
-                })?;
-            profile.claude_config_dir.clone().map(expand_home_path)
-        };
-        drop(config);
-
-        let launcher =
-            launchers::write_claude_profile_launcher(&account_id, config_dir.as_deref())?;
-        launchers::open_terminal(&launcher)?;
-        Ok(ProviderActionResponse {
-            provider_id: account.provider_id,
-            message: format!(
-                "Opened a Claude session for {}. Activity from this terminal stays with this profile.",
-                account
-                    .display_name
-                    .as_deref()
-                    .unwrap_or(profile_id)
-            ),
-        })
-    }
-
-    async fn prepare_claude_login_profile(
-        &self,
-        account_id: Option<&AccountId>,
-    ) -> anyhow::Result<ClaudeLoginTarget> {
-        let requested_profile_id = match account_id {
-            Some(account_id) => self
-                .storage
-                .account(account_id)
-                .await?
-                .and_then(|account| account.profile_id),
-            None => None,
-        };
-
-        let mutation = self.config_mutation.lock().await;
-        let mut updated_config = self.config.read().await.clone();
-        let provider = updated_config
-            .providers
-            .entry(CLAUDE_PROVIDER_ID.to_string())
-            .or_default();
-        provider.enabled = true;
-        let target = ensure_claude_login_profile(provider, requested_profile_id.as_deref())?;
-
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        self.publish_local_log_config(&updated_config);
-        *self.config.write().await = updated_config;
-        self.refresh.set_providers(collectors).await;
-        drop(mutation);
-        Ok(target)
-    }
-
-    async fn prepare_grok_login_profile(
-        &self,
-        account_id: Option<&AccountId>,
-    ) -> anyhow::Result<GrokLoginTarget> {
-        let requested_profile_id = match account_id {
-            Some(account_id) => self
-                .storage
-                .account(account_id)
-                .await?
-                .and_then(|account| account.profile_id),
-            None => None,
-        };
-
-        let mutation = self.config_mutation.lock().await;
-        let mut updated_config = self.config.read().await.clone();
-        let provider = updated_config
-            .providers
-            .entry(GROK_PROVIDER_ID.to_string())
-            .or_default();
-        provider.enabled = true;
-        let target = ensure_grok_login_profile(provider, requested_profile_id.as_deref())?;
-
-        let collectors = self.collectors_for_config(&updated_config).await?;
-        updated_config.persist()?;
-        self.publish_local_log_config(&updated_config);
-        *self.config.write().await = updated_config;
-        self.refresh.set_providers(collectors).await;
-        drop(mutation);
-        Ok(target)
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.launch_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile sessions are not supported for {}",
+                account.provider_id
+            )
+        })?;
+        handler
+            .launch(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                account,
+            )
+            .await
     }
 
     fn publish_local_log_config(&self, config: &Config) {
@@ -1037,10 +634,6 @@ fn notification_threshold_policy_changed(
                 }))
 }
 
-fn ensure_supported_provider(provider_id: &ProviderId) -> anyhow::Result<()> {
-    provider_registry::ensure_supported(provider_id)
-}
-
 fn spawn_polling_loop(
     schedule_rx: watch::Receiver<PollSchedule>,
     refresh: Arc<RefreshCoordinator>,
@@ -1055,45 +648,70 @@ fn spawn_polling_loop_with_delay(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut schedule = schedule_rx.borrow_and_update().clone();
-        if !schedule.visible.is_empty() {
-            let report = refresh.refresh(Some(&schedule.visible)).await;
+        if !schedule.initial.is_empty() {
+            let report = refresh.refresh(Some(&schedule.initial)).await;
             info!(
                 results = report.provider_results.len(),
                 "initial visible refresh completed"
             );
         }
-        let mut visible_due =
-            tokio::time::Instant::now() + poll_delay(schedule.visible_interval_seconds);
-        let mut hidden_due = tokio::time::Instant::now() + poll_delay(HIDDEN_PROVIDER_POLL_SECONDS);
+        let mut due = poll_deadlines(&schedule, poll_delay);
 
         loop {
+            let next_due =
+                due.iter().map(|(_, due)| *due).min().unwrap_or_else(|| {
+                    tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60)
+                });
             tokio::select! {
-                _ = tokio::time::sleep_until(visible_due), if !schedule.visible.is_empty() => {
-                    let report = refresh.refresh(Some(&schedule.visible)).await;
-                    info!(results = report.provider_results.len(), "visible provider poll completed");
-                    visible_due = tokio::time::Instant::now()
-                        + poll_delay(schedule.visible_interval_seconds);
-                }
-                _ = tokio::time::sleep_until(hidden_due), if !schedule.hidden.is_empty() => {
-                    let report = refresh.refresh(Some(&schedule.hidden)).await;
-                    info!(results = report.provider_results.len(), "hidden provider poll completed");
-                    hidden_due = tokio::time::Instant::now()
-                        + poll_delay(HIDDEN_PROVIDER_POLL_SECONDS);
+                _ = tokio::time::sleep_until(next_due), if !due.is_empty() => {
+                    let now = tokio::time::Instant::now();
+                    let mut providers = Vec::new();
+                    let mut elapsed_groups = Vec::new();
+                    for (index, (group, group_due)) in due.iter().enumerate() {
+                        if *group_due <= now {
+                            providers.extend(group.providers.iter().cloned());
+                            elapsed_groups.push(index);
+                        }
+                    }
+                    let report = refresh.refresh(Some(&providers)).await;
+                    let completed_at = tokio::time::Instant::now();
+                    for index in elapsed_groups {
+                        let (group, group_due) = &mut due[index];
+                        *group_due = completed_at + poll_delay(group.interval_seconds);
+                    }
+                    info!(
+                        provider_count = providers.len(),
+                        results = report.provider_results.len(),
+                        "scheduled provider poll completed"
+                    );
                 }
                 changed = schedule_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }
                     schedule = schedule_rx.borrow_and_update().clone();
-                    visible_due = tokio::time::Instant::now()
-                        + poll_delay(schedule.visible_interval_seconds);
-                    hidden_due = tokio::time::Instant::now()
-                        + poll_delay(HIDDEN_PROVIDER_POLL_SECONDS);
+                    due = poll_deadlines(&schedule, poll_delay);
                     info!("provider poll schedule changed");
                 }
             }
         }
     })
+}
+
+fn poll_deadlines(
+    schedule: &PollSchedule,
+    poll_delay: fn(u64) -> Duration,
+) -> Vec<(PollGroup, tokio::time::Instant)> {
+    let now = tokio::time::Instant::now();
+    schedule
+        .groups
+        .iter()
+        .cloned()
+        .map(|group| {
+            let due = now + poll_delay(group.interval_seconds);
+            (group, due)
+        })
+        .collect()
 }
 
 fn prepare_socket_path(socket_path: &Path) -> anyhow::Result<()> {
@@ -1134,8 +752,21 @@ fn prepare_socket_path(socket_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::claude::keychain_service_for_config_dir;
-    use crate::runtime::profile_service::push_managed_claude_profile;
+    use crate::config::{ProviderConfig, ProviderProfileConfig};
+    use crate::providers::{
+        claude::{keychain_service_for_config_dir, PROVIDER_ID as CLAUDE_PROVIDER_ID},
+        codex::PROVIDER_ID as CODEX_PROVIDER_ID,
+        grok::profile_service::{
+            ensure_login_profile as ensure_grok_login_profile,
+            select_login_target as select_grok_login_target,
+        },
+        launchers,
+        opencode::OPENCODE_GO_PROVIDER_ID,
+        profile_service::{
+            ensure_claude_login_profile, pending_codex_profile, push_managed_claude_profile,
+            unique_profile_id,
+        },
+    };
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{sync::Notify, time::timeout};
@@ -1154,6 +785,10 @@ mod tests {
             ProviderId::new(CODEX_PROVIDER_ID)
         }
 
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
         async fn discover_accounts(
             &self,
         ) -> Result<crate::providers::AccountDiscovery, crate::providers::ProviderError> {
@@ -1168,8 +803,7 @@ mod tests {
         async fn collect_usage(
             &self,
             _account: &crate::providers::DiscoveredAccount,
-        ) -> Result<crate::providers::ProviderCollectionResult, crate::providers::ProviderError>
-        {
+        ) -> Result<crate::providers::CollectionOutcome, crate::providers::ProviderError> {
             unreachable!("the blocking test provider discovers no accounts")
         }
     }
@@ -1339,10 +973,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.poll_interval_seconds, 301);
         assert!(interval_rx.has_changed().unwrap());
-        assert_eq!(
-            interval_rx.borrow_and_update().visible_interval_seconds,
-            301
-        );
+        let updated_schedule = interval_rx.borrow_and_update();
+        assert!(updated_schedule.groups.iter().any(|group| {
+            group.interval_seconds == 301
+                && group
+                    .providers
+                    .contains(&ProviderId::new(CODEX_PROVIDER_ID))
+        }));
 
         drop(runtime);
         drop(refresh);
@@ -1409,9 +1046,11 @@ mod tests {
             vec![provider.clone()],
         ));
         let (_interval_tx, interval_rx) = watch::channel(PollSchedule {
-            visible: vec![ProviderId::new(CODEX_PROVIDER_ID)],
-            hidden: Vec::new(),
-            visible_interval_seconds: 30,
+            initial: vec![ProviderId::new(CODEX_PROVIDER_ID)],
+            groups: vec![PollGroup {
+                providers: vec![ProviderId::new(CODEX_PROVIDER_ID)],
+                interval_seconds: 30,
+            }],
         });
         let poll_task =
             spawn_polling_loop_with_delay(interval_rx, refresh.clone(), Duration::from_millis);
@@ -1450,17 +1089,50 @@ mod tests {
         let config = test_config(&root);
         let schedule = PollSchedule::from_config(&config);
 
-        assert_eq!(schedule.visible, vec![ProviderId::new(CODEX_PROVIDER_ID)]);
-        assert!(schedule
-            .hidden
+        assert_eq!(schedule.initial, vec![ProviderId::new(CODEX_PROVIDER_ID)]);
+        let visible = schedule
+            .groups
+            .iter()
+            .find(|group| group.interval_seconds == config.poll_interval_seconds)
+            .unwrap();
+        assert_eq!(visible.providers, [ProviderId::new(CODEX_PROVIDER_ID)]);
+        let hidden = schedule
+            .groups
+            .iter()
+            .find(|group| group.interval_seconds == HIDDEN_PROVIDER_POLL_SECONDS)
+            .unwrap();
+        assert!(hidden
+            .providers
             .contains(&ProviderId::new(CLAUDE_PROVIDER_ID)));
-        assert!(schedule
-            .hidden
+        assert!(hidden
+            .providers
             .contains(&ProviderId::new(OPENCODE_GO_PROVIDER_ID)));
-        assert_eq!(
-            schedule.visible_interval_seconds,
-            config.poll_interval_seconds
+    }
+
+    #[test]
+    fn poll_schedule_honors_a_new_providers_declared_minimum() {
+        let root =
+            std::env::temp_dir().join(format!("usage-poll-minimum-test-{}", uuid::Uuid::new_v4()));
+        let mut config = test_config(&root);
+        config.providers.insert(
+            "future_provider".to_string(),
+            ProviderConfig {
+                enabled: true,
+                ..ProviderConfig::default()
+            },
         );
+        config.poll_interval_seconds = 60;
+        let descriptors = vec![usage_core::ProviderDescriptor {
+            id: ProviderId::new("future_provider"),
+            display_name: "Future Provider".to_string(),
+            minimum_refresh_interval_seconds: 900,
+            capabilities: usage_core::ProviderCapabilities::default(),
+        }];
+
+        let schedule = PollSchedule::from_descriptors(&config, &descriptors);
+
+        assert_eq!(schedule.initial, [ProviderId::new("future_provider")]);
+        assert_eq!(schedule.groups[0].interval_seconds, 900);
     }
 
     #[test]
@@ -1497,14 +1169,18 @@ mod tests {
             .join("profiles")
             .join(CODEX_PROVIDER_ID)
             .join("pending-test");
+        let mut profile = ProviderProfileConfig {
+            id: Some("pending-test".to_string()),
+            display_name: Some("Pending".to_string()),
+            ..ProviderProfileConfig::default()
+        };
+        crate::providers::codex::settings::update_profile(&mut profile, |settings| {
+            settings.codex_home = Some(managed_path.clone());
+        })
+        .unwrap();
         let provider = ProviderConfig {
             enabled: true,
-            profiles: vec![ProviderProfileConfig {
-                id: Some("pending-test".to_string()),
-                display_name: Some("Pending".to_string()),
-                codex_home: Some(managed_path.clone()),
-                ..ProviderProfileConfig::default()
-            }],
+            profiles: vec![profile],
             ..ProviderConfig::default()
         };
 
@@ -1524,19 +1200,22 @@ mod tests {
     #[test]
     fn grok_pending_login_never_reuses_a_connected_profile() {
         let root = std::env::temp_dir().join(format!("grok-pending-{}", uuid::Uuid::new_v4()));
+        let grok_profile = |id: &str, home: std::path::PathBuf| {
+            let mut profile = ProviderProfileConfig {
+                id: Some(id.to_string()),
+                ..ProviderProfileConfig::default()
+            };
+            crate::providers::grok::settings::update_profile(&mut profile, |settings| {
+                settings.grok_home = Some(home);
+            })
+            .unwrap();
+            profile
+        };
         let mut provider = ProviderConfig {
             enabled: true,
             profiles: vec![
-                ProviderProfileConfig {
-                    id: Some("default".to_string()),
-                    grok_home: Some(root.join("default")),
-                    ..ProviderProfileConfig::default()
-                },
-                ProviderProfileConfig {
-                    id: Some("work".to_string()),
-                    grok_home: Some(root.join("work")),
-                    ..ProviderProfileConfig::default()
-                },
+                grok_profile("default", root.join("default")),
+                grok_profile("work", root.join("work")),
             ],
             ..ProviderConfig::default()
         };
@@ -1564,21 +1243,22 @@ mod tests {
         assert_eq!(target.profile_id, "work");
         assert_eq!(target.config_dir.as_deref(), Some(root.as_path()));
         let profile = provider.profiles.first().unwrap();
+        let settings = crate::providers::claude::settings::profile(profile).unwrap();
         assert!(profile.enabled);
         assert!(!profile.deleted);
         assert_eq!(profile.display_name.as_deref(), Some("Work"));
-        assert_eq!(profile.claude_config_dir.as_deref(), Some(root.as_path()));
+        assert_eq!(settings.claude_config_dir.as_deref(), Some(root.as_path()));
         assert_eq!(
-            profile.keychain_service.as_deref(),
+            settings.keychain_service.as_deref(),
             Some(keychain_service_for_config_dir(&root).as_str())
         );
         assert_eq!(
-            profile.credentials_file.as_deref(),
+            settings.credentials_file.as_deref(),
             Some(root.join(".credentials.json").as_path())
         );
-        assert_eq!(profile.project_roots, vec![root.join("projects")]);
-        assert!(profile.owns_default_claude_activity);
-        assert_eq!(profile.cli_enabled, Some(true));
+        assert_eq!(settings.project_roots, vec![root.join("projects")]);
+        assert!(settings.owns_default_claude_activity);
+        assert_eq!(settings.cli_enabled, Some(true));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1610,7 +1290,12 @@ mod tests {
         assert_eq!(target.profile_id, "default");
         assert!(provider.profiles[0].enabled);
         assert!(!provider.profiles[0].deleted);
-        assert!(provider.profiles[0].grok_home.is_some());
+        assert!(
+            crate::providers::grok::settings::profile(&provider.profiles[0])
+                .unwrap()
+                .grok_home
+                .is_some()
+        );
     }
 
     #[test]
@@ -1628,5 +1313,16 @@ mod tests {
 
         assert!(contents.contains("unset CLAUDE_CONFIG_DIR"));
         assert!(!contents.contains("export CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn launch_capabilities_match_the_daemon_handlers() {
+        let launchable = provider_registry::descriptors()
+            .into_iter()
+            .filter(|provider| provider.capabilities.launch_account)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(launchable, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
     }
 }

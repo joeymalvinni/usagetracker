@@ -1,5 +1,7 @@
 # UsageTracker documentation
 
+Developer guide: [Adding a provider](adding-a-provider.md)
+
 New here? Start with the [README](../README.md) — it walks you through building the app, running the daemon and CLI, and making your first request.
 
 When you need the details, these pages have them.

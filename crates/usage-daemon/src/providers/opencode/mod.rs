@@ -4,18 +4,24 @@ use async_trait::async_trait;
 use chrono::Local;
 use reqwest::{redirect::Policy, Url};
 use serde_json::json;
-use usage_core::ProviderId;
+use usage_core::{
+    ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
+};
 use uuid::Uuid;
 
 use crate::{
     config::ProviderConfig,
     providers::{
-        AccountDiscovery, DiscoveredAccount, ProviderCollectionResult, ProviderCollector,
-        ProviderError, ProviderErrorKind, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        AccountDiscovery, CollectionOutcome, DiscoveredAccount, ProviderCollectionResult,
+        ProviderCollector, ProviderError, ProviderErrorKind, UsageDataset, HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
     },
 };
 
 pub const OPENCODE_GO_PROVIDER_ID: &str = "opencode_go";
+
+pub(crate) mod adapter;
+pub(crate) mod settings;
 
 const OPENCODE_HOST: &str = "opencode.ai";
 const WORKSPACES_SERVER_ID: &str =
@@ -33,12 +39,13 @@ const COOKIE_NAMES: [&str; 2] = ["auth", "__Host-auth"];
 
 #[derive(Clone)]
 pub struct OpenCodeCollector {
-    config: ProviderConfig,
+    settings: settings::OpenCodeSettings,
     client: reqwest::Client,
 }
 
 impl OpenCodeCollector {
     pub fn new(config: ProviderConfig) -> anyhow::Result<Self> {
+        let settings = settings::provider(&config)?;
         let client = reqwest::Client::builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
@@ -59,7 +66,7 @@ impl OpenCodeCollector {
                 }
             }))
             .build()?;
-        Ok(Self { config, client })
+        Ok(Self { settings, client })
     }
 
     async fn collect_web_usage(
@@ -163,7 +170,7 @@ impl OpenCodeCollector {
 
     async fn resolve_workspace_id(&self, cookie_header: &str) -> Result<String, ProviderError> {
         if let Some(workspace_id) = self
-            .config
+            .settings
             .workspace_id
             .as_deref()
             .map(str::trim)
@@ -429,7 +436,7 @@ impl OpenCodeCollector {
         std::env::var(provider_cookie_env())
             .ok()
             .or_else(|| std::env::var("USAGE_TRACKER_OPENCODE_COOKIE").ok())
-            .or_else(|| self.config.cookie_header.clone())
+            .or_else(|| self.settings.cookie_header.clone())
     }
 
     async fn has_manual_cookie_header(&self) -> Result<bool, ProviderError> {
@@ -473,9 +480,13 @@ impl ProviderCollector for OpenCodeCollector {
         ProviderId::new(OPENCODE_GO_PROVIDER_ID)
     }
 
+    fn configured_profile_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
         if let Some(workspace_id) = self
-            .config
+            .settings
             .workspace_id
             .as_deref()
             .map(str::trim)
@@ -524,7 +535,7 @@ impl ProviderCollector for OpenCodeCollector {
     async fn collect_usage(
         &self,
         account: &DiscoveredAccount,
-    ) -> Result<ProviderCollectionResult, ProviderError> {
+    ) -> Result<CollectionOutcome, ProviderError> {
         let web_result = self
             .collect_web_usage(Some(&account.external_account_id), true)
             .await;
@@ -551,7 +562,7 @@ impl ProviderCollector for OpenCodeCollector {
         };
 
         match web_result {
-            Ok(result) => Ok(result),
+            Ok(result) => Ok(CollectionOutcome::collected(result)),
             Err(web_error) => {
                 let local_result = tokio::task::spawn_blocking(collect_go_local_usage)
                     .await
@@ -565,10 +576,19 @@ impl ProviderCollector for OpenCodeCollector {
                 match local_result {
                     Ok(mut result) => {
                         result.warnings.push(format!(
-                            "OpenCode Go web usage failed, used local estimate: {}",
+                            "OpenCode Go web usage failed; retained local observation: {}",
                             web_error.short_message()
                         ));
-                        Ok(result)
+                        Ok(CollectionOutcome::degraded(
+                            web_error,
+                            vec![UsageDataset::supplemental(
+                                result,
+                                UsageDataSource::LocalDatabase,
+                                UsageDataScope::ThisDevice,
+                                UsageDataQuality::Observed,
+                                UsageDataCompleteness::Partial,
+                            )],
+                        ))
                     }
                     Err(_) => Err(web_error),
                 }

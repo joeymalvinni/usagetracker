@@ -9,7 +9,7 @@
         "id": "codex",
         "display_name": "Codex",
         "minimum_refresh_interval_seconds": 60,
-        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "workspace_setup": false}
+        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": false, "workspace_setup": false}
       },
       {
         "id": "claude",
@@ -21,13 +21,13 @@
         "id": "opencode_go",
         "display_name": "OpenCode Go",
         "minimum_refresh_interval_seconds": 60,
-        "capabilities": {"multiple_accounts": false, "add_account": false, "repair": true, "launch_account": false, "workspace_setup": true}
+        "capabilities": {"multiple_accounts": false, "add_account": false, "repair": true, "launch_account": false, "setup": true, "workspace_setup": true}
       },
       {
         "id": "grok",
         "display_name": "Grok",
         "minimum_refresh_interval_seconds": 60,
-        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "workspace_setup": false}
+        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": false, "workspace_setup": false}
       }
     ]
   }

@@ -654,7 +654,11 @@
         "repair": {
           "type": "boolean"
         },
+        "setup": {
+          "type": "boolean"
+        },
         "workspace_setup": {
+          "description": "Deprecated alias retained for v3 clients.",
           "type": "boolean"
         }
       },
@@ -839,6 +843,54 @@
       ],
       "type": "string"
     },
+    "ProviderSetupField": {
+      "properties": {
+        "help_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ProviderSetupFieldKind"
+        },
+        "label": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ProviderSetupFieldKind": {
+      "enum": [
+        "select",
+        "text",
+        "secret"
+      ],
+      "type": "string"
+    },
     "ProviderSetupResponse": {
       "properties": {
         "discovery_error": {
@@ -846,6 +898,12 @@
             "string",
             "null"
           ]
+        },
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/ProviderSetupField"
+          },
+          "type": "array"
         },
         "profiles": {
           "items": {
@@ -857,6 +915,7 @@
           "type": "string"
         },
         "selected_workspace_id": {
+          "description": "Deprecated OpenCode-specific fields retained for v3 clients.",
           "type": [
             "string",
             "null"

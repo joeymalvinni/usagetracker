@@ -297,6 +297,22 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertFalse(providerSupports("fixture", capability: \.repair, in: providers))
         XCTAssertTrue(providerSupports("fixture", capability: \.launchAccount, in: providers))
         XCTAssertFalse(providerSupports("fixture", capability: \.workspaceSetup, in: providers))
+        XCTAssertFalse(providerSupports("fixture", capability: \.setup, in: providers))
+    }
+
+    func testGenericProviderSetupCanExplicitlyClearAValue() throws {
+        let request = DaemonRequest.updateProviderSetup(
+            providerId: "future_provider",
+            settings: ["region": nil]
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(request))
+                as? [String: Any]
+        )
+        let settings = try XCTUnwrap(object["settings"] as? [String: Any])
+
+        XCTAssertTrue(settings["region"] is NSNull)
+        XCTAssertNil(object["workspace_id"])
     }
 
     func testResponseLineBufferRejectsDataBeyondItsLimit() throws {
@@ -359,8 +375,11 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(codex.multipleAccounts)
         XCTAssertTrue(codex.addAccount)
         XCTAssertTrue(codex.repair)
-        XCTAssertTrue(codex.launchAccount)
+        XCTAssertFalse(codex.launchAccount)
         XCTAssertFalse(codex.workspaceSetup)
+
+        XCTAssertTrue(try XCTUnwrap(providers["claude"]?.capabilities).launchAccount)
+        XCTAssertFalse(try XCTUnwrap(providers["grok"]?.capabilities).launchAccount)
 
         let openCode = try XCTUnwrap(providers["opencode_go"]?.capabilities)
         XCTAssertFalse(openCode.multipleAccounts)
@@ -368,6 +387,7 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(openCode.repair)
         XCTAssertFalse(openCode.launchAccount)
         XCTAssertTrue(openCode.workspaceSetup)
+        XCTAssertTrue(openCode.setup)
 
         let stateURL = rustWireFixture("state_v3.json")
         let state = try JSONDecoder.usage.decode(
@@ -632,7 +652,7 @@ final class DaemonLogRotatorTests: XCTestCase {
 }
 
 final class ProviderCatalogTests: XCTestCase {
-    func testUsesAnExplicitProviderAllowlist() {
+    func testBuiltInCatalogProvidesOptionalPresentationDecorations() {
         XCTAssertEqual(ProviderCatalog.supportedIDs, ["codex", "claude", "opencode_go", "grok"])
         XCTAssertTrue(ProviderCatalog.supports("grok"))
         XCTAssertTrue(ProviderCatalog.supports("opencode_go"))
