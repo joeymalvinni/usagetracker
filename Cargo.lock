@@ -1999,6 +1999,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "iana-time-zone",
  "serde",
  "serde_json",
  "terminal_size",

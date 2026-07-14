@@ -1,10 +1,14 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 use std::hash::Hash;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
-use usage_core::{Account, ConfigResponse, ProviderHealth, ProviderHealthStatus, UsageSnapshot};
+#[cfg(test)]
+use usage_core::ProviderHealthStatus;
+use usage_core::{Account, ConfigResponse, ProviderHealth, UsageSnapshot};
 
 use crate::{
     render::{
@@ -126,6 +130,7 @@ fn insert_latest_snapshot<'a, K: Eq + Hash>(
 }
 
 impl StatusView {
+    #[cfg(test)]
     pub fn from_parts(
         socket_path: String,
         snapshots: &[UsageSnapshot],
@@ -133,12 +138,34 @@ impl StatusView {
         health: &[ProviderHealth],
         config: &ConfigResponse,
     ) -> Self {
-        let indexes = StatusIndexes::new(snapshots, accounts, health);
         let provider_ids = provider_ids(config, health, snapshots, accounts);
+        Self::from_selected_parts(
+            socket_path,
+            snapshots,
+            accounts,
+            health,
+            config,
+            &provider_ids,
+        )
+    }
+
+    pub fn from_selected_parts(
+        socket_path: String,
+        snapshots: &[UsageSnapshot],
+        accounts: &[Account],
+        health: &[ProviderHealth],
+        config: &ConfigResponse,
+        provider_ids: &[String],
+    ) -> Self {
+        let indexes = StatusIndexes::new(snapshots, accounts, health);
         let freshness_window = TimeDelta::seconds((config.poll_interval_seconds * 2) as i64);
 
         let mut providers = Vec::with_capacity(accounts.len().max(provider_ids.len()));
         for provider_id in provider_ids {
+            let provider_enabled = config
+                .providers
+                .get(provider_id)
+                .is_some_and(|provider| provider.enabled);
             let provider_accounts = indexes
                 .accounts_by_provider
                 .get(provider_id.as_str())
@@ -146,14 +173,21 @@ impl StatusView {
                 .unwrap_or_default();
             if provider_accounts.is_empty() {
                 providers.push(provider_status_row(
-                    &provider_id,
+                    provider_id,
                     None,
                     &indexes,
                     freshness_window,
+                    provider_enabled,
                 ));
             } else {
                 providers.extend(provider_accounts.iter().map(|account| {
-                    provider_status_row(&provider_id, Some(*account), &indexes, freshness_window)
+                    provider_status_row(
+                        provider_id,
+                        Some(*account),
+                        &indexes,
+                        freshness_window,
+                        provider_enabled,
+                    )
                 }));
             }
         }
@@ -166,7 +200,7 @@ impl StatusView {
 
         Self {
             response_type: "status",
-            daemon: "ok",
+            daemon: "connected",
             socket_path,
             poll_interval_seconds: config.poll_interval_seconds,
             enabled_provider_count: config
@@ -185,6 +219,7 @@ fn provider_status_row(
     account: Option<&Account>,
     indexes: &StatusIndexes<'_>,
     freshness_window: TimeDelta,
+    provider_enabled: bool,
 ) -> ProviderStatusRow {
     let account_id = account.map(|account| account.id.as_str());
     let latest = match account_id {
@@ -206,11 +241,15 @@ fn provider_status_row(
         account_id: account_id.map(str::to_string),
         identity: labels.identity,
         plan: labels.plan,
-        state: account
-            .filter(|account| !account.collection_enabled)
-            .map(|_| "disabled".to_string())
+        state: (!provider_enabled)
+            .then(|| "disabled".to_string())
+            .or_else(|| {
+                account
+                    .filter(|account| !account.collection_enabled)
+                    .map(|_| "disabled".to_string())
+            })
             .or_else(|| provider_health.map(|row| json_name(&row.status)))
-            .unwrap_or_else(|| "unknown".to_string()),
+            .unwrap_or_else(|| "ok".to_string()),
         usage: usage_freshness(last_update_at, freshness_window),
         last_success_at: provider_health.and_then(|row| row.last_success_at),
         last_update_at,
@@ -218,15 +257,25 @@ fn provider_status_row(
     }
 }
 
+#[cfg(test)]
 pub fn render_status(status: &StatusView, style: OutputStyle, color: bool) -> String {
+    render_status_with_width(status, style, color, usize::MAX)
+}
+
+pub fn render_status_with_width(
+    status: &StatusView,
+    style: OutputStyle,
+    color: bool,
+    width: usize,
+) -> String {
     let theme = Theme::new(color);
     match style {
-        OutputStyle::Dashboard => render_status_dashboard(status, theme),
+        OutputStyle::Dashboard => render_status_dashboard(status, theme, width),
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
 
-fn render_status_dashboard(status: &StatusView, theme: Theme) -> String {
+fn render_status_dashboard(status: &StatusView, theme: Theme, width: usize) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "{}", theme.title("Usage Tracker"));
     output.push('\n');
@@ -266,7 +315,7 @@ fn render_status_dashboard(status: &StatusView, theme: Theme) -> String {
             row.detail.clone().unwrap_or_else(|| "-".to_string()),
         ]);
     }
-    output.push_str(&table.render(theme));
+    output.push_str(&table.render_with_width(theme, width));
     output.trim_end().to_string()
 }
 
@@ -302,6 +351,7 @@ fn status_detail(provider_id: &str, health: Option<&ProviderHealth>) -> Option<S
     })
 }
 
+#[cfg(test)]
 fn provider_ids(
     config: &ConfigResponse,
     health: &[ProviderHealth],
@@ -348,6 +398,7 @@ fn provider_ids(
         .collect()
 }
 
+#[cfg(test)]
 fn is_enabled_provider(provider_id: &str, config: &ConfigResponse) -> bool {
     config
         .providers
@@ -499,6 +550,34 @@ mod tests {
         let rendered = serde_json::to_string(&status).unwrap();
 
         assert!(!rendered.contains(r#""provider_id":"codex""#));
+    }
+
+    #[test]
+    fn selected_status_includes_no_data_and_disabled_providers() {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("codex".to_string(), ProviderToggle { enabled: true });
+        providers.insert("grok".to_string(), ProviderToggle { enabled: false });
+        let config = ConfigResponse {
+            poll_interval_seconds: 60,
+            notifications: Default::default(),
+            config_path: "/tmp/config.json".to_string(),
+            socket_path: "/tmp/usage.sock".to_string(),
+            db_path: "/tmp/usage.sqlite3".to_string(),
+            providers,
+        };
+
+        let status = StatusView::from_selected_parts(
+            "/tmp/usage.sock".to_string(),
+            &[],
+            &[],
+            &[],
+            &config,
+            &["codex".to_string(), "grok".to_string()],
+        );
+        let rendered = serde_json::to_value(&status).unwrap();
+
+        assert_eq!(rendered["providers"][0]["state"], "ok");
+        assert_eq!(rendered["providers"][1]["state"], "disabled");
     }
 
     #[test]

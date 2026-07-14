@@ -4,8 +4,8 @@ use std::fmt::Write;
 use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
 use serde_json::Value;
 use usage_core::{
-    Account, ForecastStatus, UsageAmount, UsageForecast, UsageSnapshot, UsageUnit, UsageWindow,
-    UsageWindowKind,
+    Account, ForecastStatus, UsageAmount, UsageDashboardSummary, UsageForecast, UsageSnapshot,
+    UsageUnit, UsageWindow, UsageWindowKind,
 };
 
 use crate::{
@@ -33,6 +33,7 @@ pub struct UsageRenderOptions {
     pub color: bool,
     pub width: usize,
     pub details: bool,
+    pub provider_scoped: bool,
 }
 
 #[cfg(test)]
@@ -54,10 +55,12 @@ pub fn render_usage(
             color,
             width,
             details,
+            provider_scoped: false,
         },
     )
 }
 
+#[cfg(test)]
 pub fn render_usage_dashboard(
     snapshots: &[UsageSnapshot],
     forecasts: &[UsageForecast],
@@ -69,11 +72,38 @@ pub fn render_usage_dashboard(
         color,
         width,
         details,
+        provider_scoped,
     } = options;
     let dashboard = Dashboard::from_snapshots(snapshots, forecasts, accounts);
     let theme = Theme::new(color);
     match style {
-        OutputStyle::Dashboard => render_dashboard(&dashboard, theme, width, details),
+        OutputStyle::Dashboard => {
+            render_dashboard(&dashboard, theme, width, details, provider_scoped)
+        }
+        OutputStyle::Json => unreachable!("json style is handled before rendering"),
+    }
+}
+
+pub fn render_usage_dashboard_with_summary(
+    snapshots: &[UsageSnapshot],
+    forecasts: &[UsageForecast],
+    accounts: &[Account],
+    summary: &UsageDashboardSummary,
+    options: UsageRenderOptions,
+) -> String {
+    let UsageRenderOptions {
+        style,
+        color,
+        width,
+        details,
+        provider_scoped,
+    } = options;
+    let dashboard = Dashboard::from_summary(snapshots, forecasts, accounts, summary);
+    let theme = Theme::new(color);
+    match style {
+        OutputStyle::Dashboard => {
+            render_dashboard(&dashboard, theme, width, details, provider_scoped)
+        }
         OutputStyle::Json => unreachable!("json style is handled before rendering"),
     }
 }
@@ -83,6 +113,7 @@ struct Dashboard {
     overview: Overview,
     activity: Vec<ActivityDay>,
     providers: Vec<ProviderPanel>,
+    provenance_warning: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -176,7 +207,39 @@ impl Dashboard {
             overview,
             activity,
             providers,
+            provenance_warning: None,
         }
+    }
+
+    fn from_summary(
+        snapshots: &[UsageSnapshot],
+        forecasts: &[UsageForecast],
+        accounts: &[Account],
+        summary: &UsageDashboardSummary,
+    ) -> Self {
+        let mut dashboard = Self::from_snapshots(snapshots, forecasts, accounts);
+        let daily_tokens = summary
+            .days
+            .iter()
+            .map(|day| (day.date, day.tokens))
+            .collect::<BTreeMap<_, _>>();
+        dashboard.activity = last_seven_days(&daily_tokens);
+        let lifetime_tokens = summary
+            .accounts
+            .iter()
+            .filter_map(|account| account.activity.as_ref()?.lifetime_tokens)
+            .fold(0_u64, u64::saturating_add);
+        if lifetime_tokens > 0 {
+            dashboard.overview.lifetime_tokens = lifetime_tokens;
+        }
+        dashboard.overview.peak_tokens = daily_tokens.values().copied().max().unwrap_or_default();
+        dashboard.overview.current_streak_days = current_streak_days(&daily_tokens);
+        dashboard.overview.longest_streak_days = longest_streak_days(&daily_tokens);
+        dashboard.provenance_warning = summary
+            .provenance
+            .mixed_scope
+            .then(|| summary.provenance.explanation.clone());
+        dashboard
     }
 }
 
@@ -246,21 +309,42 @@ impl ProviderPanel {
     }
 }
 
-fn render_dashboard(dashboard: &Dashboard, theme: Theme, width: usize, details: bool) -> String {
+fn render_dashboard(
+    dashboard: &Dashboard,
+    theme: Theme,
+    width: usize,
+    details: bool,
+    provider_scoped: bool,
+) -> String {
     let mut output = String::new();
+    if !provider_scoped {
+        push_box(
+            &mut output,
+            width,
+            "Overview",
+            None,
+            &overview_lines(&dashboard.overview, theme),
+            theme,
+        );
+        if let Some(warning) = &dashboard.provenance_warning {
+            output.push('\n');
+            let _ = writeln!(output, "{}", theme.warn(warning));
+        }
+        output.push('\n');
+    }
+    let activity_title = if provider_scoped {
+        dashboard
+            .providers
+            .first()
+            .map(|provider| format!("{} Activity · last 7 days", provider.provider))
+            .unwrap_or_else(|| "Provider Activity · last 7 days".to_string())
+    } else {
+        "Activity · last 7 days".to_string()
+    };
     push_box(
         &mut output,
         width,
-        "Overview",
-        None,
-        &overview_lines(&dashboard.overview, theme),
-        theme,
-    );
-    output.push('\n');
-    push_box(
-        &mut output,
-        width,
-        "Activity · last 7 days",
+        &activity_title,
         None,
         &activity_lines(&dashboard.activity, theme, width),
         theme,
@@ -399,8 +483,8 @@ fn window_rows(windows: &[&WindowLine], theme: Theme, content_width: usize) -> V
         })
         .collect::<Vec<_>>();
     let reset_col = resets.iter().map(|reset| reset.len()).max().unwrap_or(0);
-    // label + "  " + bar + "  " + pct(4) + "  ·  " + reset
-    let fixed = LABEL_WIDTH + 2 + 2 + 4 + 5;
+    // label + "  " + bar + "  " + pct-and-direction(9) + "  ·  " + reset
+    let fixed = LABEL_WIDTH + 2 + 2 + 9 + 5;
     let bar_width = content_width
         .saturating_sub(fixed + reset_col)
         .clamp(BAR_MIN, BAR_MAX);
@@ -411,7 +495,7 @@ fn window_rows(windows: &[&WindowLine], theme: Theme, content_width: usize) -> V
         .map(|(window, reset)| {
             let percent = window
                 .percent_remaining
-                .map(format_percent)
+                .map(|value| format!("{} left", format_percent(value)))
                 .unwrap_or_else(|| "?".to_string());
             let percent = window
                 .percent_remaining
@@ -1066,6 +1150,7 @@ mod tests {
                 color: false,
                 width: TEST_WIDTH,
                 details: false,
+                provider_scoped: false,
             },
         );
 
@@ -1077,6 +1162,33 @@ mod tests {
         assert!(rendered.contains("Monthly"));
         assert!(rendered.contains("Updated"));
         assert!(!rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn provider_scoped_dashboard_omits_aggregate_context() {
+        let (snapshot, account) = sample_dashboard();
+        let mut summary = usage_core::aggregate_usage_dashboard(Vec::new());
+        summary.provenance.mixed_scope = true;
+        summary.provenance.explanation = "aggregate provenance warning".to_string();
+
+        let rendered = render_usage_dashboard_with_summary(
+            &[snapshot],
+            &[],
+            &[account],
+            &summary,
+            UsageRenderOptions {
+                style: OutputStyle::Dashboard,
+                color: false,
+                width: TEST_WIDTH,
+                details: false,
+                provider_scoped: true,
+            },
+        );
+
+        assert!(!rendered.contains("Overview"));
+        assert!(!rendered.contains("aggregate provenance warning"));
+        assert!(rendered.starts_with("╭─ Codex Activity · last 7 days"));
+        assert!(rendered.contains("Codex · openai-web · Pro Lite"));
     }
 
     #[test]

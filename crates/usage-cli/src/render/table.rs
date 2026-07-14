@@ -21,11 +21,16 @@ impl Table {
     }
 
     pub(crate) fn render(&self, theme: Theme) -> String {
+        self.render_with_width(theme, usize::MAX)
+    }
+
+    pub(crate) fn render_with_width(&self, theme: Theme, max_width: usize) -> String {
         if self.headers.is_empty() {
             return String::new();
         }
 
-        let widths = self.widths();
+        let mut widths = self.widths();
+        shrink_widths(&mut widths, &self.headers, max_width);
         let mut output = String::new();
         push_row(&mut output, &self.headers, &widths, |value| {
             theme.label(value)
@@ -58,6 +63,26 @@ impl Table {
         }
 
         widths
+    }
+}
+
+fn shrink_widths(widths: &mut [usize], headers: &[String], max_width: usize) {
+    let spacing = widths.len().saturating_sub(1) * 2;
+    while widths.iter().sum::<usize>().saturating_add(spacing) > max_width {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(index, width)| {
+                **width
+                    > headers
+                        .get(*index)
+                        .map_or(3, |header| visible_len(header).max(3))
+            })
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[index] -= 1;
     }
 }
 
