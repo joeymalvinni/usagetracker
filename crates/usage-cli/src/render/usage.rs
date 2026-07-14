@@ -113,7 +113,6 @@ struct Dashboard {
     overview: Overview,
     activity: Vec<ActivityDay>,
     providers: Vec<ProviderPanel>,
-    provenance_warning: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -207,7 +206,6 @@ impl Dashboard {
             overview,
             activity,
             providers,
-            provenance_warning: None,
         }
     }
 
@@ -235,10 +233,6 @@ impl Dashboard {
         dashboard.overview.peak_tokens = daily_tokens.values().copied().max().unwrap_or_default();
         dashboard.overview.current_streak_days = current_streak_days(&daily_tokens);
         dashboard.overview.longest_streak_days = longest_streak_days(&daily_tokens);
-        dashboard.provenance_warning = summary
-            .provenance
-            .mixed_scope
-            .then(|| summary.provenance.explanation.clone());
         dashboard
     }
 }
@@ -326,10 +320,6 @@ fn render_dashboard(
             &overview_lines(&dashboard.overview, theme),
             theme,
         );
-        if let Some(warning) = &dashboard.provenance_warning {
-            output.push('\n');
-            let _ = writeln!(output, "{}", theme.warn(warning));
-        }
         output.push('\n');
     }
     let activity_title = if provider_scoped {
@@ -1165,13 +1155,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_scoped_dashboard_omits_aggregate_context() {
+    fn dashboards_omit_aggregate_provenance_warning() {
         let (snapshot, account) = sample_dashboard();
         let mut summary = usage_core::aggregate_usage_dashboard(Vec::new());
         summary.provenance.mixed_scope = true;
         summary.provenance.explanation = "aggregate provenance warning".to_string();
 
-        let rendered = render_usage_dashboard_with_summary(
+        let aggregate = render_usage_dashboard_with_summary(
+            std::slice::from_ref(&snapshot),
+            &[],
+            std::slice::from_ref(&account),
+            &summary,
+            UsageRenderOptions {
+                style: OutputStyle::Dashboard,
+                color: false,
+                width: TEST_WIDTH,
+                details: false,
+                provider_scoped: false,
+            },
+        );
+        let provider = render_usage_dashboard_with_summary(
             &[snapshot],
             &[],
             &[account],
@@ -1185,10 +1188,12 @@ mod tests {
             },
         );
 
-        assert!(!rendered.contains("Overview"));
-        assert!(!rendered.contains("aggregate provenance warning"));
-        assert!(rendered.starts_with("╭─ Codex Activity · last 7 days"));
-        assert!(rendered.contains("Codex · openai-web · Pro Lite"));
+        assert!(aggregate.contains("Overview"));
+        assert!(!aggregate.contains("aggregate provenance warning"));
+        assert!(!provider.contains("Overview"));
+        assert!(!provider.contains("aggregate provenance warning"));
+        assert!(provider.starts_with("╭─ Codex Activity · last 7 days"));
+        assert!(provider.contains("Codex · openai-web · Pro Lite"));
     }
 
     #[test]

@@ -81,9 +81,6 @@ pub fn render_activity(view: &ActivityView, color: bool) -> String {
     if total_tokens == 0 {
         let _ = writeln!(output, "\nNo observed activity in this period.");
     }
-    if view.provenance.mixed_scope {
-        let _ = writeln!(output, "\n{}", view.provenance.explanation);
-    }
     output.trim_end().to_string()
 }
 

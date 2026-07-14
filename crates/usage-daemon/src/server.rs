@@ -456,13 +456,19 @@ impl SocketServer {
             .runtime
             .config_response_for_provider_data(data_provider_ids)
             .await;
+        let usage = build_usage_view_from_parts(
+            stored.snapshots,
+            &stored.accounts,
+            &stored.daily_usage,
+            &stored.forecast_histories,
+            generated_at,
+        );
         let health = visible_supported_provider_health(
-            stored.health.clone(),
+            stored.health,
             &stored.accounts,
             &visible_provider_ids,
         );
-        let accounts = supported_accounts(stored.accounts.clone());
-        let usage = build_usage_view(stored, generated_at);
+        let accounts = supported_accounts(stored.accounts);
 
         ApiResponse::State {
             state: StateSnapshot {
@@ -502,13 +508,31 @@ fn build_usage_view(
     stored: crate::storage::StoredUsageDashboard,
     generated_at: chrono::DateTime<chrono::Utc>,
 ) -> UsageView {
-    let snapshots = supported_visible_usage_snapshots(stored.snapshots, &stored.accounts);
+    build_usage_view_from_parts(
+        stored.snapshots,
+        &stored.accounts,
+        &stored.daily_usage,
+        &stored.forecast_histories,
+        generated_at,
+    )
+}
+
+fn build_usage_view_from_parts(
+    snapshots: Vec<UsageSnapshot>,
+    accounts: &[Account],
+    daily_usage: &[crate::storage::StoredDailyUsageHistory],
+    forecast_histories: &std::collections::HashMap<
+        (usage_core::ProviderId, AccountId),
+        crate::storage::StoredForecastHistory,
+    >,
+    generated_at: chrono::DateTime<chrono::Utc>,
+) -> UsageView {
+    let snapshots = supported_visible_usage_snapshots(snapshots, accounts);
     let empty_history = crate::storage::StoredForecastHistory::default();
     let forecasts = snapshots
         .iter()
         .flat_map(|snapshot| {
-            let history = stored
-                .forecast_histories
+            let history = forecast_histories
                 .get(&(snapshot.provider_id.clone(), snapshot.account_id.clone()))
                 .unwrap_or(&empty_history);
             forecast::forecast_snapshot(snapshot, history, generated_at)
@@ -518,7 +542,7 @@ fn build_usage_view(
         .iter()
         .flat_map(usage_core::UsageSnapshot::windows_provenance)
         .collect();
-    let dashboard = dashboard::build_usage_dashboard(&snapshots, &stored.daily_usage);
+    let dashboard = dashboard::build_usage_dashboard(&snapshots, daily_usage);
     UsageView {
         snapshots,
         dashboard,
@@ -612,6 +636,26 @@ impl io::Write for BoundedResponseWriter<'_> {
 }
 
 fn decode_request(line: &[u8]) -> Result<ApiRequest, ApiResponse> {
+    match serde_json::from_slice::<RequestEnvelope>(line) {
+        Ok(envelope) if envelope.api_version == API_VERSION => return Ok(envelope.request),
+        Ok(envelope) => {
+            return Err(ApiResponse::error(
+                ApiErrorCode::IncompatibleProtocol,
+                format!(
+                    "unsupported api_version {}; server requires {API_VERSION}",
+                    envelope.api_version
+                ),
+            ));
+        }
+        Err(_) => {}
+    }
+
+    classify_invalid_request(line)
+}
+
+/// Retains the protocol's precise error categories on the uncommon invalid
+/// request path without making valid requests allocate an intermediate JSON DOM.
+fn classify_invalid_request(line: &[u8]) -> Result<ApiRequest, ApiResponse> {
     let value: serde_json::Value = serde_json::from_slice(line).map_err(|err| {
         ApiResponse::error(
             ApiErrorCode::InvalidJson,
@@ -806,6 +850,70 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use usage_core::ProviderId;
     use uuid::Uuid;
+
+    fn benchmark(name: &str, iterations: u32, mut operation: impl FnMut() -> usize) {
+        for _ in 0..iterations.min(100) {
+            std::hint::black_box(operation());
+        }
+        let started = std::time::Instant::now();
+        let mut checksum = 0;
+        for _ in 0..iterations {
+            checksum ^= std::hint::black_box(operation());
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "BENCH {name}: {:.2} us/iter ({iterations} iterations, checksum={checksum})",
+            elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode performance benchmark"]
+    fn benchmark_daemon_response_pipeline() {
+        let request = serde_json::to_vec(&RequestEnvelope::new(
+            ApiRequest::AcknowledgeNotifications {
+                ids: (0..2_048).collect(),
+            },
+        ))
+        .unwrap();
+        benchmark(
+            "daemon.decode_request.2048_ids",
+            10_000,
+            || match decode_request(std::hint::black_box(&request)).unwrap() {
+                ApiRequest::AcknowledgeNotifications { ids } => ids.len(),
+                _ => unreachable!(),
+            },
+        );
+
+        let now = chrono::Utc::now();
+        let accounts = (0..256)
+            .map(|index| Account {
+                id: AccountId::new(format!("account-{index}")),
+                provider_id: usage_core::ProviderId::new("codex"),
+                external_account_id: format!("external-{index}"),
+                profile_id: Some(format!("profile-{index}")),
+                display_name: Some(format!("Benchmark account {index}")),
+                display_name_source: Default::default(),
+                email: Some(format!("account-{index}@example.com")),
+                hidden: false,
+                collection_enabled: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect();
+        let response = ResponseEnvelope::new(ApiResponse::Accounts { accounts });
+        let mut buffer = Vec::with_capacity(64 * 1024);
+        benchmark("daemon.encode_response.256_accounts", 5_000, || {
+            let close = encode_response(
+                std::hint::black_box(&response),
+                &mut buffer,
+                MAX_RESPONSE_BYTES,
+            )
+            .unwrap();
+            assert!(!close);
+            buffer.len()
+        });
+    }
 
     struct TestEnv {
         root: std::path::PathBuf,

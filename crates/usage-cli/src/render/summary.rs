@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 
 use crate::render::style::{relative_time, truncate, visible_len, Theme};
@@ -137,13 +138,21 @@ fn push_row(output: &mut String, cells: &[String], widths: &[usize], theme: Them
         if index > 0 {
             output.push_str("  ");
         }
-        let cell = truncate(
-            cells.get(index).map(String::as_str).unwrap_or_default(),
-            *width,
-        );
-        let padding = width.saturating_sub(visible_len(&cell));
-        let cell = if header { theme.label(&cell) } else { cell };
-        let _ = write!(output, "{cell}{}", " ".repeat(padding));
+        let cell = cells.get(index).map(String::as_str).unwrap_or_default();
+        let cell_len = visible_len(cell);
+        let (cell, cell_len) = if cell_len <= *width {
+            (Cow::Borrowed(cell), cell_len)
+        } else {
+            let cell = truncate(cell, *width);
+            let cell_len = visible_len(&cell);
+            (Cow::Owned(cell), cell_len)
+        };
+        let padding = width.saturating_sub(cell_len);
+        if header {
+            let _ = write!(output, "{}{}", theme.label(&cell), " ".repeat(padding));
+        } else {
+            let _ = write!(output, "{cell}{}", " ".repeat(padding));
+        }
     }
     output.push('\n');
 }
