@@ -21,7 +21,7 @@ A manual `cookie_header` is a secret, stored as plaintext in the owner-only conf
 
 ### Keychain isolation
 
-Every Keychain read, write, and delete — including provider credentials, cached cookie headers, and browser Safe Storage keys — goes through a one-operation helper process. A cross-process lock at `~/.usagetracker/keychain.lock` lets only one UsageTracker helper enter Keychain at a time, even if multiple daemons or providers refresh concurrently. OpenCode Go's cache update reads and conditionally writes under that same lock, so concurrent refreshes don't issue duplicate writes.
+Every uncached Keychain read, write, and delete — including provider credentials, cached cookie headers, and browser Safe Storage keys — goes through a one-operation helper process. A cross-process lock at `~/.usagetracker/keychain.lock` lets only one UsageTracker helper enter Keychain at a time, even if multiple daemons or providers refresh concurrently. Successful reads are cached in daemon memory for 60 seconds so account discovery and collection don't trigger duplicate authorization prompts; writes and deletes update or invalidate that cache immediately. OpenCode Go's cache update reads and conditionally writes under the same lock, so concurrent refreshes don't issue duplicate writes.
 
 Requests and responses travel through private pipes; secrets are never placed in process arguments. The daemon gives each helper 20 seconds, then kills and reaps it if macOS Keychain hangs. A helper also exits if its owning daemon disappears, and the lock is released automatically when the helper exits.
 
