@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 
 use super::style::{truncate, visible_len, Theme};
@@ -92,8 +93,15 @@ fn push_row(output: &mut String, row: &[String], widths: &[usize], paint: impl F
             output.push_str("  ");
         }
         let value = row.get(index).map(String::as_str).unwrap_or_default();
-        let value = truncate(value, *width);
-        let padding = width.saturating_sub(visible_len(&value));
+        let value_len = visible_len(value);
+        let (value, value_len) = if value_len <= *width {
+            (Cow::Borrowed(value), value_len)
+        } else {
+            let value = truncate(value, *width);
+            let value_len = visible_len(&value);
+            (Cow::Owned(value), value_len)
+        };
+        let padding = width.saturating_sub(value_len);
         let _ = write!(output, "{}{}", paint(&value), " ".repeat(padding));
     }
     output.push('\n');

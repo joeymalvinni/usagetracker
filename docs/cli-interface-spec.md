@@ -173,7 +173,7 @@ The default view retains the existing dashboard structure:
 2. Seven-day activity chart.
 3. One panel per visible provider account.
 
-The overview contains lifetime tokens when available, tracked spend, peak daily tokens, and current and longest streaks. Values with mixed account-wide and local scope must retain the existing provenance warning; they must not be presented as a provider bill.
+The overview contains lifetime tokens when available, tracked spend, peak daily tokens, and current and longest streaks. The underlying JSON retains aggregate provenance metadata; values must not be presented as a provider bill.
 
 Provider panels contain, when available:
 
@@ -414,7 +414,7 @@ Rules:
 - Every date in the selected range is printed. A missing date has zero observed tokens.
 - Cost is `—` when cost data is unavailable. It is `$0.00` only when the data explicitly represents a known zero.
 - Coverage is priced tokens divided by priced plus unpriced tokens. It is not the share of quota remaining.
-- Mixed-scope selections show the existing mixed-scope explanation below the table.
+- Mixed-scope selections remain identified in the `Scope` row and in JSON provenance metadata.
 - Selecting a provider explicitly includes its retained activity even when the provider is disabled.
 - Filters rebuild daily totals, pricing coverage, and provenance from the selected accounts.
 

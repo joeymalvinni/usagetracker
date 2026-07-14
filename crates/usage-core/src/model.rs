@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use schemars::JsonSchema;
@@ -61,7 +61,7 @@ impl UsageSnapshot {
     fn dataset_provenance(&self) -> Vec<DatasetProvenance> {
         self.metadata
             .get("dataset_provenance")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .and_then(|value| Vec::<DatasetProvenance>::deserialize(value).ok())
             .unwrap_or_default()
     }
 
@@ -76,9 +76,36 @@ impl UsageSnapshot {
     /// Resolves every window while parsing the persisted dataset mapping once.
     pub fn windows_provenance(&self) -> Vec<UsageWindowProvenance> {
         let datasets = self.dataset_provenance();
+        if datasets.len() <= 4 {
+            return self
+                .windows
+                .iter()
+                .map(|window| self.window_provenance_from(&datasets, window))
+                .collect();
+        }
+
+        let indexed_window_count = datasets
+            .iter()
+            .map(|dataset| dataset.window_ids.len())
+            .sum();
+        let mut datasets_by_window = HashMap::with_capacity(indexed_window_count);
+        for dataset in &datasets {
+            for window_id in &dataset.window_ids {
+                // Preserve the former linear search's first-match behavior for
+                // malformed metadata that assigns a window to two datasets.
+                datasets_by_window
+                    .entry(window_id.as_str())
+                    .or_insert(dataset);
+            }
+        }
         self.windows
             .iter()
-            .map(|window| self.window_provenance_from(&datasets, window))
+            .map(|window| {
+                self.window_provenance_for(
+                    datasets_by_window.get(window.window_id.as_str()).copied(),
+                    window,
+                )
+            })
             .collect()
     }
 
@@ -87,10 +114,18 @@ impl UsageSnapshot {
         datasets: &[DatasetProvenance],
         window: &UsageWindow,
     ) -> UsageWindowProvenance {
-        if let Some(dataset) = datasets
+        let dataset = datasets
             .iter()
-            .find(|dataset| dataset.window_ids.iter().any(|id| id == &window.window_id))
-        {
+            .find(|dataset| dataset.window_ids.iter().any(|id| id == &window.window_id));
+        self.window_provenance_for(dataset, window)
+    }
+
+    fn window_provenance_for(
+        &self,
+        dataset: Option<&DatasetProvenance>,
+        window: &UsageWindow,
+    ) -> UsageWindowProvenance {
+        if let Some(dataset) = dataset {
             let quota_like = (window.percent_used.is_some() || window.percent_remaining.is_some())
                 && !matches!(
                     window.kind,
@@ -591,6 +626,69 @@ pub struct ProviderHealth {
 mod tests {
     use super::*;
 
+    fn benchmark(name: &str, iterations: u32, mut operation: impl FnMut() -> usize) {
+        for _ in 0..iterations.min(100) {
+            std::hint::black_box(operation());
+        }
+        let started = std::time::Instant::now();
+        let mut checksum = 0;
+        for _ in 0..iterations {
+            checksum ^= std::hint::black_box(operation());
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "BENCH {name}: {:.2} us/iter ({iterations} iterations, checksum={checksum})",
+            elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode performance benchmark"]
+    fn benchmark_core_response_pipeline() {
+        let window_count = 256;
+        let datasets = (0..64)
+            .map(|dataset| {
+                serde_json::json!({
+                    "authoritative": dataset % 2 == 0,
+                    "provenance": {
+                        "source": "provider_reported",
+                        "scope": "account_wide",
+                        "quality": "authoritative",
+                        "completeness": "complete",
+                        "confidence": "high"
+                    },
+                    "window_ids": (0..4)
+                        .map(|offset| format!("window-{}", dataset * 4 + offset))
+                        .collect::<Vec<_>>(),
+                    "daily_sources": [format!("source-{dataset}")]
+                })
+            })
+            .collect::<Vec<_>>();
+        let snapshot = UsageSnapshot {
+            provider_id: ProviderId::new("codex"),
+            account_id: AccountId::new("benchmark"),
+            collected_at: Utc::now(),
+            windows: (0..window_count)
+                .map(|index| UsageWindow {
+                    window_id: format!("window-{index}"),
+                    label: format!("Window {index}"),
+                    kind: UsageWindowKind::Weekly,
+                    used: None,
+                    limit: None,
+                    remaining: None,
+                    percent_used: Some(50.0),
+                    percent_remaining: Some(50.0),
+                    reset_at: None,
+                })
+                .collect(),
+            metadata: serde_json::json!({"dataset_provenance": datasets}),
+        };
+
+        benchmark("core.windows_provenance.256", 2_000, || {
+            snapshot.windows_provenance().len()
+        });
+    }
+
     fn snapshot(metadata: serde_json::Value, kind: UsageWindowKind) -> UsageSnapshot {
         UsageSnapshot {
             provider_id: ProviderId::new("opencode_go"),
@@ -629,6 +727,36 @@ mod tests {
         let snapshot = snapshot(serde_json::json!({}), UsageWindowKind::Credits);
 
         assert!(!snapshot.window_is_authoritative_quota(&snapshot.windows[0]));
+    }
+
+    #[test]
+    fn indexed_provenance_preserves_first_dataset_match() {
+        let mut datasets = (0..5)
+            .map(|_| {
+                serde_json::json!({
+                    "authoritative": true,
+                    "provenance": {
+                        "source": "provider_reported",
+                        "scope": "account_wide",
+                        "quality": "authoritative",
+                        "completeness": "complete",
+                        "confidence": "high"
+                    },
+                    "window_ids": ["window"]
+                })
+            })
+            .collect::<Vec<_>>();
+        datasets[0]["authoritative"] = serde_json::json!(false);
+        datasets[0]["provenance"]["source"] = serde_json::json!("local_logs");
+        let snapshot = snapshot(
+            serde_json::json!({"dataset_provenance": datasets}),
+            UsageWindowKind::Weekly,
+        );
+
+        let provenance = snapshot.windows_provenance();
+
+        assert_eq!(provenance[0].source, UsageDataSource::LocalLogs);
+        assert!(!provenance[0].authoritative);
     }
 
     #[test]

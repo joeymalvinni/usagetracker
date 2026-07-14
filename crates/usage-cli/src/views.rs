@@ -556,6 +556,20 @@ mod tests {
     }
 
     #[test]
+    fn activity_dashboard_omits_aggregate_provenance_explanation() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let state = fixture_state();
+        let mut selected = SelectedState::from_state(state, SelectionRequest::default()).unwrap();
+        selected.dashboard.provenance.mixed_scope = true;
+        selected.dashboard.provenance.explanation = "aggregate provenance warning".to_string();
+        let view = ActivityView::build(&selected, 3, today);
+
+        let rendered = crate::render::render_activity(&view, false);
+
+        assert!(!rendered.contains("aggregate provenance warning"));
+    }
+
+    #[test]
     fn summary_uses_ranges_instead_of_averaging_account_limits() {
         let now = Utc::now();
         let mut state = fixture_state();

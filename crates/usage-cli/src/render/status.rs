@@ -159,6 +159,7 @@ impl StatusView {
     ) -> Self {
         let indexes = StatusIndexes::new(snapshots, accounts, health);
         let freshness_window = TimeDelta::seconds((config.poll_interval_seconds * 2) as i64);
+        let now = Utc::now();
 
         let mut providers = Vec::with_capacity(accounts.len().max(provider_ids.len()));
         for provider_id in provider_ids {
@@ -177,6 +178,7 @@ impl StatusView {
                     None,
                     &indexes,
                     freshness_window,
+                    now,
                     provider_enabled,
                 ));
             } else {
@@ -186,6 +188,7 @@ impl StatusView {
                         Some(*account),
                         &indexes,
                         freshness_window,
+                        now,
                         provider_enabled,
                     )
                 }));
@@ -219,6 +222,7 @@ fn provider_status_row(
     account: Option<&Account>,
     indexes: &StatusIndexes<'_>,
     freshness_window: TimeDelta,
+    now: DateTime<Utc>,
     provider_enabled: bool,
 ) -> ProviderStatusRow {
     let account_id = account.map(|account| account.id.as_str());
@@ -250,7 +254,7 @@ fn provider_status_row(
             })
             .or_else(|| provider_health.map(|row| json_name(&row.status)))
             .unwrap_or_else(|| "ok".to_string()),
-        usage: usage_freshness(last_update_at, freshness_window),
+        usage: usage_freshness(last_update_at, freshness_window, now),
         last_success_at: provider_health.and_then(|row| row.last_success_at),
         last_update_at,
         detail: status_detail(provider_id, provider_health),
@@ -330,11 +334,12 @@ fn freshness_text(freshness: UsageFreshness, theme: Theme) -> String {
 fn usage_freshness(
     last_update_at: Option<DateTime<Utc>>,
     freshness_window: TimeDelta,
+    now: DateTime<Utc>,
 ) -> UsageFreshness {
     let Some(last_update_at) = last_update_at else {
         return UsageFreshness::Missing;
     };
-    if Utc::now() - last_update_at <= freshness_window {
+    if now - last_update_at <= freshness_window {
         UsageFreshness::Fresh
     } else {
         UsageFreshness::Stale
@@ -411,6 +416,115 @@ mod tests {
     use super::*;
     use serde_json::json;
     use usage_core::{AccountId, ProviderHealthStatus, ProviderId, ProviderToggle, UsageWindow};
+
+    fn benchmark(name: &str, iterations: u32, mut operation: impl FnMut() -> usize) {
+        for _ in 0..iterations.min(100) {
+            std::hint::black_box(operation());
+        }
+        let started = std::time::Instant::now();
+        let mut checksum = 0;
+        for _ in 0..iterations {
+            checksum ^= std::hint::black_box(operation());
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "BENCH {name}: {:.2} us/iter ({iterations} iterations, checksum={checksum})",
+            elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode performance benchmark"]
+    fn benchmark_cli_response_pipeline_status() {
+        let now = Utc::now();
+        let provider_ids = ["codex", "claude", "opencode_go", "grok"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let accounts = (0..256)
+            .map(|index| Account {
+                id: AccountId::new(format!("account-{index}")),
+                provider_id: ProviderId::new(provider_ids[index % provider_ids.len()].as_str()),
+                external_account_id: format!("external-{index}"),
+                profile_id: None,
+                display_name: Some(format!("Benchmark account {index}")),
+                display_name_source: Default::default(),
+                email: Some(format!("account-{index}@example.com")),
+                hidden: false,
+                collection_enabled: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect::<Vec<_>>();
+        let snapshots = accounts
+            .iter()
+            .flat_map(|account| {
+                (0..4).map(|history_index| UsageSnapshot {
+                    provider_id: account.provider_id.clone(),
+                    account_id: account.id.clone(),
+                    collected_at: now - TimeDelta::seconds(history_index),
+                    windows: Vec::new(),
+                    metadata: json!({"subscription_type": "team"}),
+                })
+            })
+            .collect::<Vec<_>>();
+        let health = accounts
+            .iter()
+            .map(|account| ProviderHealth {
+                provider_id: account.provider_id.clone(),
+                account_id: Some(account.id.clone()),
+                status: ProviderHealthStatus::Ok,
+                collection_mode: Some("benchmark".to_string()),
+                last_success_at: Some(now),
+                last_failure_at: None,
+                last_error_code: None,
+                last_error_message: None,
+                updated_at: now,
+            })
+            .collect::<Vec<_>>();
+        let config = ConfigResponse {
+            poll_interval_seconds: 300,
+            notifications: Default::default(),
+            config_path: "/tmp/config.json".to_string(),
+            socket_path: "/tmp/usage.sock".to_string(),
+            db_path: "/tmp/usage.sqlite3".to_string(),
+            providers: provider_ids
+                .iter()
+                .map(|provider_id| (provider_id.clone(), ProviderToggle { enabled: true }))
+                .collect(),
+        };
+
+        benchmark("cli.build_status.256_accounts", 2_000, || {
+            let status = StatusView::from_selected_parts(
+                "/tmp/usage.sock".to_string(),
+                &snapshots,
+                &accounts,
+                &health,
+                &config,
+                &provider_ids,
+            );
+            std::hint::black_box(&status);
+            std::mem::size_of_val(&status)
+        });
+
+        let status = StatusView::from_selected_parts(
+            "/tmp/usage.sock".to_string(),
+            &snapshots,
+            &accounts,
+            &health,
+            &config,
+            &provider_ids,
+        );
+        benchmark("cli.render_status.256_accounts", 1_000, || {
+            render_status_with_width(
+                std::hint::black_box(&status),
+                OutputStyle::Dashboard,
+                false,
+                120,
+            )
+            .len()
+        });
+    }
 
     #[test]
     fn renders_status_dashboard_with_fresh_provider() {

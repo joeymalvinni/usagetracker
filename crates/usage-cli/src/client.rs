@@ -5,8 +5,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{sleep, timeout, Duration, Instant};
 use usage_core::{
-    ApiRequest, ApiResponse, RefreshJob, RefreshJobStatus, RequestEnvelope, ResponseEnvelope,
-    API_VERSION, MAX_RESPONSE_BYTES,
+    ApiRequest, ApiResponse, RefreshJob, RefreshJobStatus, ResponseEnvelope, API_VERSION,
+    MAX_RESPONSE_BYTES,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -98,10 +98,7 @@ impl<'a> Client<'a> {
             })?;
         let (reader, mut writer) = stream.into_split();
         let mut payload = Vec::with_capacity(requests.len().saturating_mul(64));
-        for request in &requests {
-            serde_json::to_writer(&mut payload, &RequestEnvelope::new(request.clone()))?;
-            payload.push(b'\n');
-        }
+        encode_requests(&requests, &mut payload)?;
         timeout(WRITE_TIMEOUT, writer.write_all(&payload))
             .await
             .context("timed out writing daemon request")??;
@@ -129,6 +126,28 @@ impl<'a> Client<'a> {
         }
         Ok(responses)
     }
+}
+
+fn encode_requests(requests: &[ApiRequest], payload: &mut Vec<u8>) -> serde_json::Result<()> {
+    #[derive(serde::Serialize)]
+    struct BorrowedRequestEnvelope<'a> {
+        api_version: u16,
+        #[serde(flatten)]
+        request: &'a ApiRequest,
+    }
+
+    payload.clear();
+    for request in requests {
+        serde_json::to_writer(
+            &mut *payload,
+            &BorrowedRequestEnvelope {
+                api_version: API_VERSION,
+                request,
+            },
+        )?;
+        payload.push(b'\n');
+    }
+    Ok(())
 }
 
 async fn read_bounded_response(
@@ -191,6 +210,64 @@ mod tests {
     use super::*;
 
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn benchmark(name: &str, iterations: u32, mut operation: impl FnMut() -> usize) {
+        for _ in 0..iterations.min(100) {
+            std::hint::black_box(operation());
+        }
+        let started = std::time::Instant::now();
+        let mut checksum = 0;
+        for _ in 0..iterations {
+            checksum ^= std::hint::black_box(operation());
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "BENCH {name}: {:.2} us/iter ({iterations} iterations, checksum={checksum})",
+            elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-mode performance benchmark"]
+    fn benchmark_cli_response_pipeline() {
+        let requests = (0..64)
+            .map(|batch| ApiRequest::AcknowledgeNotifications {
+                ids: ((batch * 128)..((batch + 1) * 128)).collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut payload = Vec::with_capacity(64 * 1024);
+        benchmark("cli.encode_requests.64x128_ids", 5_000, || {
+            encode_requests(std::hint::black_box(&requests), &mut payload).unwrap();
+            payload.len()
+        });
+
+        let now = chrono::Utc::now();
+        let accounts = (0..256)
+            .map(|index| usage_core::Account {
+                id: usage_core::AccountId::new(format!("account-{index}")),
+                provider_id: usage_core::ProviderId::new("codex"),
+                external_account_id: format!("external-{index}"),
+                profile_id: Some(format!("profile-{index}")),
+                display_name: Some(format!("Benchmark account {index}")),
+                display_name_source: Default::default(),
+                email: Some(format!("account-{index}@example.com")),
+                hidden: false,
+                collection_enabled: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect();
+        let response =
+            serde_json::to_vec(&ResponseEnvelope::new(ApiResponse::Accounts { accounts })).unwrap();
+        benchmark(
+            "cli.decode_response.256_accounts",
+            5_000,
+            || match decode_response(std::hint::black_box(&response)).unwrap() {
+                ApiResponse::Accounts { accounts } => accounts.len(),
+                _ => unreachable!(),
+            },
+        );
+    }
 
     struct TestSocketPath(PathBuf);
 
