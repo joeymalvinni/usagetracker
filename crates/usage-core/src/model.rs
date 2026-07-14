@@ -390,8 +390,9 @@ pub fn aggregate_usage_dashboard(accounts: Vec<AccountUsageSummary>) -> UsageDas
                 let aggregate = days
                     .entry(point.date)
                     .or_insert_with(|| empty_dashboard_day(point.date));
-                aggregate.cost_usd =
-                    Some(aggregate.cost_usd.unwrap_or(0.0) + point.cost_usd.unwrap_or(0.0));
+                if let Some(cost_usd) = point.cost_usd {
+                    aggregate.cost_usd = Some(aggregate.cost_usd.unwrap_or(0.0) + cost_usd);
+                }
                 aggregate.priced_tokens =
                     aggregate.priced_tokens.saturating_add(point.priced_tokens);
                 aggregate.unpriced_tokens = aggregate
@@ -628,5 +629,46 @@ mod tests {
         let snapshot = snapshot(serde_json::json!({}), UsageWindowKind::Credits);
 
         assert!(!snapshot.window_is_authoritative_quota(&snapshot.windows[0]));
+    }
+
+    #[test]
+    fn aggregate_preserves_unavailable_daily_cost() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let provenance = DataProvenance {
+            source: UsageDataSource::LocalLogs,
+            scope: UsageDataScope::ThisDevice,
+            quality: UsageDataQuality::Estimated,
+            completeness: UsageDataCompleteness::Partial,
+            confidence: UsageDataConfidence::Medium,
+        };
+        let dashboard = aggregate_usage_dashboard(vec![AccountUsageSummary {
+            provider_id: ProviderId::new("codex"),
+            account_id: AccountId::new("default"),
+            activity: None,
+            cost: Some(CostSummary {
+                provenance,
+                days: vec![DailyUsagePoint {
+                    date,
+                    tokens: 10,
+                    cost_usd: None,
+                    priced_tokens: 0,
+                    unpriced_tokens: 10,
+                }],
+                today_cost_usd: 0.0,
+                lookback_cost_usd: 0.0,
+                pricing: PricingCoverage {
+                    priced_tokens: 0,
+                    unpriced_tokens: 10,
+                    covered_percent: 0.0,
+                    unpriced_models: vec!["unknown".to_string()],
+                    catalog_version: None,
+                    catalog_source: None,
+                    catalog_effective_from: None,
+                },
+            }),
+            reset_credits: None,
+        }]);
+
+        assert_eq!(dashboard.days[0].cost_usd, None);
     }
 }
