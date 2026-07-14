@@ -186,6 +186,12 @@ actor DaemonSupervisor {
 
     private func beginStartup(socketPath: String) async -> Bool {
         if case .starting(_, let task) = state { return await task.value }
+        // Another reentrant ensureRunning call can finish startup while this
+        // caller is suspended discovering or stopping orphan processes. Treat
+        // that running daemon as the shared result instead of launching again.
+        if case .running(let daemon) = state, daemon.socketPath == socketPath {
+            return true
+        }
         cancelRecovery()
         generation += 1
         let startupGeneration = generation
