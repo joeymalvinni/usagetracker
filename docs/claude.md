@@ -42,14 +42,16 @@ Diagnostics can note things like the collection mode, profile ID, Keychain servi
 ## What failures mean
 
 - Keychain item or file missing → `credentials_missing`.
-- Bad JSON or tokens, or a Keychain read/write failure → `credentials_invalid`.
+- A rejected Keychain password is prompted again immediately, up to three attempts during the same refresh. Cancel stops without another prompt.
+- Exhausted Keychain authentication or another Keychain read/write failure → `keychain_access_failed`.
+- Bad credential JSON, shape, or token fields → `credentials_invalid`.
 - OAuth 401/403 or `invalid_grant` → `unauthorized`; a 429 → `rate_limited`.
 - HTTP or CLI transport trouble → `network` or `provider_unavailable`; usage output it can't read → `parse`.
 - When both OAuth and the CLI fail, the final message safely mentions both.
 
 ## A few security notes
 
-Reading the Keychain can prompt macOS for permission. Managed login and launch commands only ever see their own profile directory — use the app's per-profile launch action so activity gets attributed correctly. Your local history may contain project paths and model names, but UsageTracker doesn't copy whole records into its own storage.
+Reading or refreshing credentials in the Keychain can prompt macOS for permission. UsageTracker distinguishes a rejected Keychain password from Claude rejecting an OAuth token, and successful reads are cached briefly so discovery and collection do not repeat an accepted prompt. Managed login and launch commands only ever see their own profile directory — use the app's per-profile launch action so activity gets attributed correctly. Your local history may contain project paths and model names, but UsageTracker doesn't copy whole records into its own storage.
 
 ## Tests and fixtures
 

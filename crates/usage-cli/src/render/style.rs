@@ -100,9 +100,11 @@ impl Theme {
         match status {
             "ok" => self.good(status),
             "disabled" => self.muted(status),
-            "credentials_missing" | "auth_failed" | "rate_limited" | "backing_off" => {
-                self.warn(status)
-            }
+            "credentials_missing"
+            | "auth_failed"
+            | "keychain_access_failed"
+            | "rate_limited"
+            | "backing_off" => self.warn(status),
             _ => self.danger(status),
         }
     }

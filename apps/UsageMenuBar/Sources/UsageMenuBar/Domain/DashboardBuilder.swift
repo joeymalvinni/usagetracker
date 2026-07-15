@@ -600,7 +600,7 @@ struct DashboardBuilder {
         case .rateLimited: 2
         case .providerError: 3
         case .parseError: 4
-        case .authFailed: 5
+        case .authFailed, .keychainAccessFailed: 5
         case .credentialsMissing: 6
         case .disabled: 7
         case .other: 8

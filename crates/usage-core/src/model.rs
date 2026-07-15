@@ -602,6 +602,7 @@ pub enum ProviderHealthStatus {
     Ok,
     CredentialsMissing,
     AuthFailed,
+    KeychainAccessFailed,
     RateLimited,
     ProviderError,
     ParseError,

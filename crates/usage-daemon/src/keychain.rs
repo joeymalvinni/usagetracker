@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
 const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
+const AUTHENTICATION_ATTEMPTS: usize = 3;
 // Discovery and collection commonly read the same credential back-to-back. Keep
 // successful reads briefly so that macOS only has to authorize that item once,
 // while still noticing credentials changed by another process promptly.
@@ -35,6 +36,7 @@ static BROKER: LazyLock<Broker> =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     Missing,
+    AuthenticationFailed,
     QueueFull,
     QueueTimeout,
     HelperTimeout,
@@ -45,7 +47,7 @@ pub(crate) enum Error {
 }
 
 pub(crate) fn get_password(service: &str, account: &str) -> Result<String, Error> {
-    let result = match invoke(Request::Get {
+    let result = match invoke_with_auth_retry(Request::Get {
         service: service.to_string(),
         account: account.to_string(),
     }) {
@@ -53,6 +55,7 @@ pub(crate) fn get_password(service: &str, account: &str) -> Result<String, Error
         Ok(Response::Missing) => Err(Error::Missing),
         Ok(Response::Ok) => Err(Error::InvalidResponse),
         Ok(Response::Failed) => Err(Error::BackendRejected),
+        Ok(Response::AuthenticationFailed) => Err(Error::InvalidResponse),
         Ok(Response::Conflict) => Err(Error::InvalidResponse),
         Err(error) => Err(error),
     };
@@ -65,7 +68,7 @@ pub(crate) fn set_password_if_changed(
     account: &str,
     password: &str,
 ) -> Result<(), Error> {
-    let result = invoke(Request::SetIfChanged {
+    let result = invoke_with_auth_retry(Request::SetIfChanged {
         service: service.to_string(),
         account: account.to_string(),
         password: password.to_string(),
@@ -81,7 +84,7 @@ pub(crate) fn compare_and_set_password(
     expected: &str,
     password: &str,
 ) -> Result<(), Error> {
-    let result = match invoke(Request::CompareAndSet {
+    let result = match invoke_with_auth_retry(Request::CompareAndSet {
         service: service.to_string(),
         account: account.to_string(),
         expected: expected.to_string(),
@@ -91,6 +94,7 @@ pub(crate) fn compare_and_set_password(
         Ok(Response::Conflict) => Err(Error::Conflict),
         Ok(Response::Missing) => Err(Error::Missing),
         Ok(Response::Failed) => Err(Error::BackendRejected),
+        Ok(Response::AuthenticationFailed) => Err(Error::InvalidResponse),
         Ok(Response::Value { .. }) => Err(Error::InvalidResponse),
         Err(error) => Err(error),
     };
@@ -99,7 +103,7 @@ pub(crate) fn compare_and_set_password(
 }
 
 pub(crate) fn delete_password(service: &str, account: &str) -> Result<(), Error> {
-    let result = invoke(Request::Delete {
+    let result = invoke_with_auth_retry(Request::Delete {
         service: service.to_string(),
         account: account.to_string(),
     })
@@ -121,12 +125,37 @@ fn expect_ok(response: Response) -> Result<(), Error> {
         Response::Ok | Response::Missing => Ok(()),
         Response::Value { .. } => Err(Error::InvalidResponse),
         Response::Failed => Err(Error::BackendRejected),
+        Response::AuthenticationFailed => Err(Error::InvalidResponse),
         Response::Conflict => Err(Error::Conflict),
     }
 }
 
 fn invoke(request: Request) -> Result<Response, Error> {
     BROKER.invoke(request, HELPER_TIMEOUT)
+}
+
+fn invoke_with_auth_retry(request: Request) -> Result<Response, Error> {
+    invoke_with_auth_retry_using(request, invoke)
+}
+
+fn invoke_with_auth_retry_using(
+    request: Request,
+    mut operation: impl FnMut(Request) -> Result<Response, Error>,
+) -> Result<Response, Error> {
+    for attempt in 1..=AUTHENTICATION_ATTEMPTS {
+        match operation(request.clone())? {
+            Response::AuthenticationFailed if attempt < AUTHENTICATION_ATTEMPTS => {
+                tracing::debug!(
+                    attempt,
+                    max_attempts = AUTHENTICATION_ATTEMPTS,
+                    "Keychain authentication failed; prompting again"
+                );
+            }
+            Response::AuthenticationFailed => return Err(Error::AuthenticationFailed),
+            response => return Ok(response),
+        }
+    }
+    unreachable!("Keychain authentication retry loop always returns")
 }
 
 type Executor = Arc<dyn Fn(Request, Instant) -> Result<Response, Error> + Send + Sync>;
@@ -417,7 +446,7 @@ fn perform(request: Request) -> Response {
             match entry(&service, &account).and_then(|entry| entry.get_password()) {
                 Ok(value) => Response::Value { value },
                 Err(KeyringError::NoEntry) => Response::Missing,
-                Err(_) => Response::Failed,
+                Err(error) => keyring_failure_response(&error),
             }
         }
         Request::SetIfChanged {
@@ -433,22 +462,22 @@ fn perform(request: Request) -> Response {
         } => {
             let entry = match entry(&service, &account) {
                 Ok(entry) => entry,
-                Err(_) => return Response::Failed,
+                Err(error) => return keyring_failure_response(&error),
             };
             match entry.get_password() {
                 Ok(current) if current == expected => match entry.set_password(&password) {
                     Ok(()) => Response::Ok,
-                    Err(_) => Response::Failed,
+                    Err(error) => keyring_failure_response(&error),
                 },
                 Ok(_) => Response::Conflict,
                 Err(KeyringError::NoEntry) => Response::Missing,
-                Err(_) => Response::Failed,
+                Err(error) => keyring_failure_response(&error),
             }
         }
         Request::Delete { service, account } => {
             match entry(&service, &account).and_then(|entry| entry.delete_credential()) {
                 Ok(()) | Err(KeyringError::NoEntry) => Response::Ok,
-                Err(_) => Response::Failed,
+                Err(error) => keyring_failure_response(&error),
             }
         }
     }
@@ -457,19 +486,37 @@ fn perform(request: Request) -> Response {
 fn write_password(service: &str, account: &str, password: &str, only_if_changed: bool) -> Response {
     let entry = match entry(service, account) {
         Ok(entry) => entry,
-        Err(_) => return Response::Failed,
+        Err(error) => return keyring_failure_response(&error),
     };
     if only_if_changed {
         match entry.get_password() {
             Ok(current) if current == password => return Response::Ok,
             Ok(_) | Err(KeyringError::NoEntry) => {}
-            Err(_) => return Response::Failed,
+            Err(error) => return keyring_failure_response(&error),
         }
     }
     match entry.set_password(password) {
         Ok(()) => Response::Ok,
-        Err(_) => Response::Failed,
+        Err(error) => keyring_failure_response(&error),
     }
+}
+
+fn keyring_failure_response(error: &KeyringError) -> Response {
+    if is_authentication_failure(error) {
+        Response::AuthenticationFailed
+    } else {
+        Response::Failed
+    }
+}
+
+fn is_authentication_failure(error: &KeyringError) -> bool {
+    let platform_error = match error {
+        KeyringError::PlatformFailure(error) | KeyringError::NoStorageAccess(error) => error,
+        _ => return false,
+    };
+    platform_error
+        .downcast_ref::<security_framework::base::Error>()
+        .is_some_and(|error| error.code() == security_framework_sys::base::errSecAuthFailed)
 }
 
 fn entry(service: &str, account: &str) -> Result<Entry, KeyringError> {
@@ -573,6 +620,7 @@ enum Response {
     Ok,
     Value { value: String },
     Missing,
+    AuthenticationFailed,
     Failed,
     Conflict,
 }
@@ -624,6 +672,73 @@ mod tests {
                 password
             } if service == "cache" && account == "provider" && password == "secret"
         ));
+    }
+
+    #[test]
+    fn classifies_macos_authentication_failure_without_conflating_cancel() {
+        let authentication =
+            KeyringError::PlatformFailure(Box::new(security_framework::base::Error::from_code(
+                security_framework_sys::base::errSecAuthFailed,
+            )));
+        let canceled = KeyringError::PlatformFailure(Box::new(
+            security_framework::base::Error::from_code(-128),
+        ));
+
+        assert!(is_authentication_failure(&authentication));
+        assert!(!is_authentication_failure(&canceled));
+        assert!(matches!(
+            keyring_failure_response(&authentication),
+            Response::AuthenticationFailed
+        ));
+        assert!(matches!(
+            keyring_failure_response(&canceled),
+            Response::Failed
+        ));
+    }
+
+    #[test]
+    fn authentication_failure_reprompts_until_success() {
+        let calls = AtomicUsize::new(0);
+        let response = invoke_with_auth_retry_using(request(), |_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                Ok(Response::AuthenticationFailed)
+            } else {
+                Ok(Response::Value {
+                    value: "secret".to_string(),
+                })
+            }
+        })
+        .unwrap();
+
+        assert!(matches!(response, Response::Value { value } if value == "secret"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn authentication_failure_stops_after_three_attempts() {
+        let calls = AtomicUsize::new(0);
+        let error = invoke_with_auth_retry_using(request(), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::AuthenticationFailed)
+        })
+        .unwrap_err();
+
+        assert_eq!(error, Error::AuthenticationFailed);
+        assert_eq!(calls.load(Ordering::SeqCst), AUTHENTICATION_ATTEMPTS);
+    }
+
+    #[test]
+    fn non_authentication_failure_does_not_retry() {
+        let calls = AtomicUsize::new(0);
+        let response = invoke_with_auth_retry_using(request(), |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::Failed)
+        })
+        .unwrap();
+
+        assert!(matches!(response, Response::Failed));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -542,6 +542,7 @@ pub enum ProviderRefreshStatus {
     Ok,
     CredentialsMissing,
     CredentialsInvalid,
+    KeychainAccessFailed,
     Unauthorized,
     RateLimited,
     Network,
@@ -556,6 +557,7 @@ pub enum ProviderRefreshStatus {
 pub enum ProviderFailureCode {
     CredentialsMissing,
     CredentialsInvalid,
+    KeychainAccessFailed,
     Unauthorized,
     RateLimited,
     Network,
@@ -568,6 +570,7 @@ impl ProviderFailureCode {
         match self {
             Self::CredentialsMissing => "credentials_missing",
             Self::CredentialsInvalid => "credentials_invalid",
+            Self::KeychainAccessFailed => "keychain_access_failed",
             Self::Unauthorized => "unauthorized",
             Self::RateLimited => "rate_limited",
             Self::Network => "network",
@@ -582,6 +585,7 @@ impl From<ProviderFailureCode> for ProviderRefreshStatus {
         match value {
             ProviderFailureCode::CredentialsMissing => Self::CredentialsMissing,
             ProviderFailureCode::CredentialsInvalid => Self::CredentialsInvalid,
+            ProviderFailureCode::KeychainAccessFailed => Self::KeychainAccessFailed,
             ProviderFailureCode::Unauthorized => Self::Unauthorized,
             ProviderFailureCode::RateLimited => Self::RateLimited,
             ProviderFailureCode::Network => Self::Network,

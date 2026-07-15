@@ -73,6 +73,7 @@ extension ProviderHealthStatus {
         case .ok: "all good"
         case .credentialsMissing: "needs login"
         case .authFailed: "auth failed"
+        case .keychainAccessFailed: "keychain access failed"
         case .rateLimited: "rate limited"
         case .providerError: "provider error"
         case .parseError: "parse error"

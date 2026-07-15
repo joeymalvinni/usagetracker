@@ -80,10 +80,35 @@ fn status_for_kind(kind: ProviderErrorKind) -> ProviderHealthStatus {
         ProviderErrorKind::CredentialsInvalid | ProviderErrorKind::Unauthorized => {
             ProviderHealthStatus::AuthFailed
         }
+        ProviderErrorKind::KeychainAccessFailed => ProviderHealthStatus::KeychainAccessFailed,
         ProviderErrorKind::RateLimited => ProviderHealthStatus::RateLimited,
         ProviderErrorKind::Parse => ProviderHealthStatus::ParseError,
         ProviderErrorKind::Network | ProviderErrorKind::ProviderUnavailable => {
             ProviderHealthStatus::ProviderError
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_access_is_not_reported_as_provider_authentication() {
+        let error = ProviderError::new(
+            ProviderErrorKind::KeychainAccessFailed,
+            "macOS Keychain authentication failed after 3 attempts",
+        );
+
+        let health = from_provider_error(ProviderId::new("claude"), None, &error);
+
+        assert!(matches!(
+            health.status,
+            ProviderHealthStatus::KeychainAccessFailed
+        ));
+        assert_eq!(
+            health.last_error_code.as_deref(),
+            Some("keychain_access_failed")
+        );
     }
 }

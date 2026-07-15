@@ -69,12 +69,13 @@ struct ProviderRefreshResult: Decodable, Equatable, Sendable {
 }
 
 enum ProviderRefreshStatus: Equatable, Decodable, Sendable {
-    case ok, credentialsMissing, credentialsInvalid, unauthorized, rateLimited, network, parse, providerUnavailable, storageError, disabled, other(String)
+    case ok, credentialsMissing, credentialsInvalid, keychainAccessFailed, unauthorized, rateLimited, network, parse, providerUnavailable, storageError, disabled, other(String)
     init(from decoder: Decoder) throws {
         switch try decoder.singleValueContainer().decode(String.self) {
         case "ok": self = .ok
         case "credentials_missing": self = .credentialsMissing
         case "credentials_invalid": self = .credentialsInvalid
+        case "keychain_access_failed": self = .keychainAccessFailed
         case "unauthorized": self = .unauthorized
         case "rate_limited": self = .rateLimited
         case "network": self = .network

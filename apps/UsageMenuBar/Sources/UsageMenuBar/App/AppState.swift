@@ -848,6 +848,7 @@ private enum PendingAction {
         case .ok: "refreshed"
         case .credentialsMissing: "sign-in required"
         case .credentialsInvalid, .unauthorized: "credentials need repair"
+        case .keychainAccessFailed: "keychain access failed"
         case .rateLimited: "temporarily rate limited"
         case .network: "network request failed"
         case .parse: "provider response changed"

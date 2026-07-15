@@ -149,19 +149,8 @@ fn load_keychain_credentials(
     keychain_service: &str,
     keychain_account: &str,
 ) -> Result<ClaudeCredentials, ProviderError> {
-    let password = keychain::get_password(keychain_service, keychain_account).map_err(|err| {
-        if err == KeychainError::Missing {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsMissing,
-                "Claude Code credentials are missing from macOS Keychain",
-            )
-        } else {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "failed to read Claude Code credentials from macOS Keychain",
-            )
-        }
-    })?;
+    let password =
+        keychain::get_password(keychain_service, keychain_account).map_err(keychain_load_error)?;
 
     parse_credentials(
         &password,
@@ -169,6 +158,23 @@ fn load_keychain_credentials(
         keychain_account,
         CredentialSource::Keychain,
     )
+}
+
+fn keychain_load_error(error: KeychainError) -> ProviderError {
+    match error {
+        KeychainError::Missing => ProviderError::new(
+            ProviderErrorKind::CredentialsMissing,
+            "Claude Code credentials are missing from macOS Keychain",
+        ),
+        KeychainError::AuthenticationFailed => ProviderError::new(
+            ProviderErrorKind::KeychainAccessFailed,
+            "macOS Keychain authentication failed after 3 attempts",
+        ),
+        _ => ProviderError::new(
+            ProviderErrorKind::KeychainAccessFailed,
+            "failed to access Claude Code credentials in macOS Keychain",
+        ),
+    }
 }
 
 fn save_keychain_credentials(
@@ -187,12 +193,20 @@ fn save_keychain_credentials(
         if error == KeychainError::Conflict {
             credential_conflict()
         } else {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "failed to save Claude Code credentials to macOS Keychain",
-            )
+            keychain_save_error(error)
         }
     })
+}
+
+fn keychain_save_error(error: KeychainError) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::KeychainAccessFailed,
+        if error == KeychainError::AuthenticationFailed {
+            "macOS Keychain authentication failed after 3 attempts"
+        } else {
+            "failed to save Claude Code credentials in macOS Keychain"
+        },
+    )
 }
 
 fn credential_conflict() -> ProviderError {
@@ -445,6 +459,20 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), ProviderErrorKind::CredentialsInvalid);
+    }
+
+    #[test]
+    fn distinguishes_keychain_access_from_invalid_claude_credentials() {
+        let authentication = keychain_load_error(KeychainError::AuthenticationFailed);
+        let backend = keychain_load_error(KeychainError::BackendRejected);
+        let missing = keychain_load_error(KeychainError::Missing);
+
+        assert_eq!(
+            authentication.kind(),
+            ProviderErrorKind::KeychainAccessFailed
+        );
+        assert_eq!(backend.kind(), ProviderErrorKind::KeychainAccessFailed);
+        assert_eq!(missing.kind(), ProviderErrorKind::CredentialsMissing);
     }
 
     #[test]

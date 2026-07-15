@@ -278,6 +278,21 @@ final class AppUpdaterTests: XCTestCase {
 }
 
 final class DaemonClientTests: XCTestCase {
+    func testDecodesKeychainAccessFailureSeparatelyFromProviderAuthentication() throws {
+        let healthStatus = try JSONDecoder().decode(
+            ProviderHealthStatus.self,
+            from: Data(#""keychain_access_failed""#.utf8)
+        )
+        let refreshStatus = try JSONDecoder().decode(
+            ProviderRefreshStatus.self,
+            from: Data(#""keychain_access_failed""#.utf8)
+        )
+
+        XCTAssertEqual(healthStatus, .keychainAccessFailed)
+        XCTAssertEqual(healthStatus.friendly, "keychain access failed")
+        XCTAssertEqual(refreshStatus, .keychainAccessFailed)
+    }
+
     func testProviderCapabilitiesRemainIndependent() {
         let providers = ["fixture": ServerProviderDescriptor(
             id: "fixture",

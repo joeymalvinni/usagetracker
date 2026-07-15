@@ -100,6 +100,7 @@ pub(super) fn health_status_to_sql(status: &ProviderHealthStatus) -> &'static st
         ProviderHealthStatus::Ok => "ok",
         ProviderHealthStatus::CredentialsMissing => "credentials_missing",
         ProviderHealthStatus::AuthFailed => "auth_failed",
+        ProviderHealthStatus::KeychainAccessFailed => "keychain_access_failed",
         ProviderHealthStatus::RateLimited => "rate_limited",
         ProviderHealthStatus::ProviderError => "provider_error",
         ProviderHealthStatus::ParseError => "parse_error",
@@ -113,10 +114,28 @@ fn health_status_from_sql(value: &str) -> ProviderHealthStatus {
         "ok" => ProviderHealthStatus::Ok,
         "credentials_missing" => ProviderHealthStatus::CredentialsMissing,
         "auth_failed" => ProviderHealthStatus::AuthFailed,
+        "keychain_access_failed" => ProviderHealthStatus::KeychainAccessFailed,
         "rate_limited" => ProviderHealthStatus::RateLimited,
         "parse_error" => ProviderHealthStatus::ParseError,
         "backing_off" => ProviderHealthStatus::BackingOff,
         "disabled" => ProviderHealthStatus::Disabled,
         _ => ProviderHealthStatus::ProviderError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_access_status_round_trips_through_sql_text() {
+        let status = ProviderHealthStatus::KeychainAccessFailed;
+        let encoded = health_status_to_sql(&status);
+
+        assert_eq!(encoded, "keychain_access_failed");
+        assert!(matches!(
+            health_status_from_sql(encoded),
+            ProviderHealthStatus::KeychainAccessFailed
+        ));
     }
 }

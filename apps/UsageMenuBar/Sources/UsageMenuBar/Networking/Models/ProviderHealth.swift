@@ -11,12 +11,13 @@ struct ProviderHealth: Decodable, Identifiable, Equatable {
 }
 
 enum ProviderHealthStatus: Equatable, Decodable {
-    case ok, credentialsMissing, authFailed, rateLimited, providerError, parseError, backingOff, disabled, other(String)
+    case ok, credentialsMissing, authFailed, keychainAccessFailed, rateLimited, providerError, parseError, backingOff, disabled, other(String)
     init(from decoder: Decoder) throws {
         switch try decoder.singleValueContainer().decode(String.self) {
         case "ok": self = .ok
         case "credentials_missing": self = .credentialsMissing
         case "auth_failed": self = .authFailed
+        case "keychain_access_failed": self = .keychainAccessFailed
         case "rate_limited": self = .rateLimited
         case "provider_error": self = .providerError
         case "parse_error": self = .parseError
