@@ -3,9 +3,8 @@ import SwiftUI
 struct WindowRow: View {
     let window: WindowVM
     /// Compact mode: used by `ProviderRow` summary tiles. Drops the percent
-    /// number (the progress bar communicates it) and the reset time string
-    /// (surfaced via `.help`). Renders as a plain `HStack` inside the parent
-    /// card rather than a nested inset, so surfaces never stack.
+    /// number (the progress bar communicates it). Renders without a nested
+    /// inset inside the parent card, so surfaces never stack.
     var compact: Bool = false
     /// When false, the inline "Resets …" line is dropped and the reset time is
     /// only surfaced via `.help`.
@@ -25,11 +24,8 @@ struct WindowRow: View {
             HStack(alignment: .firstTextBaseline) {
                 Text(window.label).lineLimit(1)
                 Spacer()
-                if let absolute = window.absolute, compact {
-                    // "12M / 50M"-style: show the absolute used count as the
-                    // primary figure in compact mode. Percent number is
-                    // redundant next to the progress bar.
-                    Text(absolute)
+                if compact, !window.reset.isEmpty {
+                    Text(relativeReset)
                         .font(Theme.Typography.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }

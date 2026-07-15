@@ -456,15 +456,18 @@ private struct ProviderRowContent: View {
             if let primaryWindow = limitWindows.first {
                 VStack(spacing: 0) {
                     WindowRow(window: primaryWindow, compact: true)
-                    if countSummaryText != nil || resetExpiryText != nil {
+                    if showsUsageResetSummary {
                         HStack(spacing: Theme.Spacing.xs) {
-                            if let resetExpiryText {
-                                Text(resetExpiryText)
-                                    .fontWeight(.medium)
+                            if let usageResetCountText {
+                                Text(usageResetCountText)
+                                    .monospacedDigit()
+                                    .fixedSize(horizontal: true, vertical: false)
                             }
                             Spacer(minLength: Theme.Spacing.sm)
-                            if let countSummaryText {
-                                Text(countSummaryText)
+                            if let nextUsageResetExpiryText {
+                                Text(nextUsageResetExpiryText)
+                                    .monospacedDigit()
+                                    .minimumScaleFactor(0.8)
                             }
                         }
                         .font(Theme.Typography.micro)
@@ -477,42 +480,27 @@ private struct ProviderRowContent: View {
         }
     }
 
-    private var resetWindow: WindowVM? {
-        return provider.windows.first { $0.id == "\(provider.providerId)_rate_limit_resets" }
-    }
-
     private var limitWindows: [WindowVM] {
-        provider.windows.filter { $0.id != "\(provider.providerId)_rate_limit_resets" }
+        provider.windows
     }
 
-    /// Trailing count cluster — reset credits sit immediately to the left of the
-    /// limits count, e.g. "3 resets · 2 limits". Either part is dropped when it
-    /// has nothing to report.
-    private var countSummaryText: String? {
-        var parts: [String] = []
-        if let resetCountText { parts.append(resetCountText) }
-        if limitWindows.count > 1 { parts.append(limitCountText) }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    private var showsUsageResetSummary: Bool {
+        provider.providerId == "codex"
+            && (usageResetCountText != nil || nextUsageResetExpiryText != nil)
     }
 
-    private var resetCountText: String? {
-        guard let resetWindow else { return nil }
-        let value = resetWindow.value.replacingOccurrences(of: " available", with: "")
-        let noun = value == "1" ? "reset" : "resets"
-        return "\(value) \(noun)"
+    private var usageResetCountText: String? {
+        guard let summary = provider.resetCreditSummary,
+              summary.availableCount > 0 || !summary.credits.isEmpty else { return nil }
+        let noun = summary.availableCount == 1 ? "usage reset" : "usage resets"
+        return "\(summary.availableCount) \(noun)"
     }
 
-    /// The soonest reset credit's relative deadline ("expires in 2 days"), shown
-    /// on the leading side; the count itself lives in `countSummaryText`.
-    private var resetExpiryText: String? {
-        guard resetWindow != nil, let expiresAt = provider.resetCredits.first?.expiresAt else { return nil }
+    private var nextUsageResetExpiryText: String? {
+        guard let expiresAt = provider.resetCreditSummary?.nextExpiresAt else { return nil }
         let relative = DateFormats.resetRelativeString(for: expiresAt)
         let verb = expiresAt <= Date() ? "expired" : "expires"
-        return "\(verb) \(relative)"
-    }
-
-    private var limitCountText: String {
-        "\(limitWindows.count) limits"
+        return "next \(verb) \(relative)"
     }
 }
 

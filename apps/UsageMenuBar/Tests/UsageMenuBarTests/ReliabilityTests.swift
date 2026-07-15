@@ -792,7 +792,7 @@ final class MenuBarPresentationTests: XCTestCase {
             spend: [],
             windows: [],
             credits: [],
-            resetCredits: [],
+            resetCreditSummary: nil,
             account: nil,
             healthText: "all good",
             visibleInMenu: true,

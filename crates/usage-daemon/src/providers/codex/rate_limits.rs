@@ -34,6 +34,7 @@ pub(super) fn normalize_usage(
     ));
     windows.extend(collect_credits_window(object.get("credits")));
 
+    let reset_credits = object.get("rate_limit_reset_credits");
     let top_level_keys = object.keys().cloned().collect::<Vec<_>>();
     Ok(ProviderUsage {
         provider_id: ProviderId::new(PROVIDER_ID),
@@ -48,13 +49,31 @@ pub(super) fn normalize_usage(
             "credits_unlimited": object.get("credits").and_then(|value| value.get("unlimited")).and_then(Value::as_bool),
             "plan_type": object.get("plan_type").and_then(Value::as_str),
             "rate_limit_reached_type": object.get("rate_limit_reached_type").and_then(Value::as_str),
-            "rate_limit_reset_credits_available_count": object
-                .get("rate_limit_reset_credits")
+            "rate_limit_reset_credits_available_count": reset_credits
                 .and_then(|value| value.get("available_count"))
                 .and_then(number_from_json_value),
+            "rate_limit_reset_credits": wham_reset_credits_metadata(reset_credits),
             "spend_control_reached": object.get("spend_control").and_then(|value| value.get("reached")).and_then(Value::as_bool),
             "top_level_keys": top_level_keys,
         }),
+    })
+}
+
+fn wham_reset_credits_metadata(reset_credits: Option<&Value>) -> Value {
+    let Some(reset_credits) = reset_credits.and_then(Value::as_object) else {
+        return Value::Null;
+    };
+
+    // WHAM currently exposes only the available count. Keep the normalized
+    // shape aligned with app-server output so downstream consumers can render
+    // the useful partial result without needing access to raw diagnostics.
+    json!({
+        "available_count": reset_credits
+            .get("available_count")
+            .and_then(number_from_json_value),
+        "credits": [],
+        "next_expires_at": Value::Null,
+        "next_expires_at_iso": Value::Null,
     })
 }
 

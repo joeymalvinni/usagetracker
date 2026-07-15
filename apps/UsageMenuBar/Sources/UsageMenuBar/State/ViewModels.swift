@@ -91,7 +91,7 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     let percent: Double?
     let status: DisplayStatus
     let spend, windows, credits: [WindowVM]
-    let resetCredits: [ResetCreditVM]
+    let resetCreditSummary: ResetCreditSummaryVM?
     let account: String?
     let healthText: String
     let visibleInMenu: Bool
@@ -143,6 +143,12 @@ struct ResetCreditVM: Identifiable, Equatable, Sendable {
     let status: String
     let expiresAt: Date?
     let expiresText: String
+}
+
+struct ResetCreditSummaryVM: Equatable, Sendable {
+    let availableCount: Int
+    let nextExpiresAt: Date?
+    let credits: [ResetCreditVM]
 }
 
 struct CostDashboardVM: Equatable, Sendable {

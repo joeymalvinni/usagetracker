@@ -27,7 +27,7 @@ struct Detail: View {
             name: providerId, short: "", symbol: "chart.bar",
             primary: "No data", detail: "waiting for data",
             percent: nil, status: .stale,
-            spend: [], windows: [], credits: [], resetCredits: [],
+            spend: [], windows: [], credits: [], resetCreditSummary: nil,
             account: nil, healthText: "unknown",
             visibleInMenu: false, enabled: false,
             secondary: "no activity", sparkline: [],
@@ -69,9 +69,10 @@ struct Detail: View {
                                 }
                             }
                         }
-                        if !activeProvider.resetCredits.isEmpty {
+                        if let resetCreditSummary = activeProvider.resetCreditSummary,
+                           resetCreditSummary.availableCount > 0 || !resetCreditSummary.credits.isEmpty {
                             ProviderSection(title: "Resets") {
-                                ResetCreditDisclosure(provider: activeProvider)
+                                ResetCreditDisclosure(summary: resetCreditSummary)
                             }
                         }
                         if !activeProvider.spend.isEmpty {
@@ -256,21 +257,16 @@ private struct AlertBanner: View {
 /// per-credit list on tap. The whole header toggles — not just the caret —
 /// and the body is roomy enough to grow a pace estimate later.
 private struct ResetCreditDisclosure: View {
-    let provider: ProviderVM
+    let summary: ResetCreditSummaryVM
     @State private var expanded = false
 
     var body: some View {
         VStack(spacing: 0) {
-            Button {
-                withAnimation(.spring(duration: 0.28)) { expanded.toggle() }
-            } label: {
-                header
-            }
-            .buttonStyle(.plain)
+            disclosureHeader
 
             if expanded {
                 VStack(spacing: Theme.Spacing.xs) {
-                    ForEach(provider.resetCredits) { credit in
+                    ForEach(summary.credits) { credit in
                         Divider().opacity(0.35)
                         creditRow(credit)
                     }
@@ -281,6 +277,20 @@ private struct ResetCreditDisclosure: View {
         }
         .surfaceInset()
         .help(headerHelp)
+    }
+
+    @ViewBuilder
+    private var disclosureHeader: some View {
+        if summary.credits.isEmpty {
+            header
+        } else {
+            Button {
+                withAnimation(.spring(duration: 0.28)) { expanded.toggle() }
+            } label: {
+                header
+            }
+            .buttonStyle(.plain)
+        }
     }
 
     private var header: some View {
@@ -296,10 +306,12 @@ private struct ResetCreditDisclosure: View {
                     .monospacedDigit()
             }
             Spacer(minLength: Theme.Spacing.sm)
-            Image(systemName: "chevron.down")
-                .font(Theme.Typography.micro.weight(.semibold))
-                .foregroundStyle(.tertiary)
-                .rotationEffect(.degrees(expanded ? 0 : -90))
+            if !summary.credits.isEmpty {
+                Image(systemName: "chevron.down")
+                    .font(Theme.Typography.micro.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(expanded ? 0 : -90))
+            }
         }
         .font(Theme.Typography.caption)
         .lineLimit(1)
@@ -330,15 +342,13 @@ private struct ResetCreditDisclosure: View {
     }
 
     private var countText: String {
-        let count = provider.resetCredits.count
-        return "\(count) credit\(count == 1 ? "" : "s")"
+        let count = summary.availableCount
+        return "\(count) reset credit\(count == 1 ? "" : "s") available"
     }
 
-    /// Soonest-expiring credit, rendered relative ("expires in 2 days") with a
-    /// tint that escalates as the deadline nears. `resetCredits` is sorted
-    /// earliest-first upstream, so `.first` is the soonest boundary.
+    /// Soonest-expiring credit, rendered relative ("expires in 2 days").
     private var nextExpiry: (text: String, tint: Color)? {
-        guard let date = provider.resetCredits.first?.expiresAt else { return nil }
+        guard let date = summary.nextExpiresAt else { return nil }
         let expired = date <= Date()
         let text = expired ? "expired \(relative(date))" : "expires \(relative(date))"
         return (text, expiryTint(date))
@@ -360,8 +370,8 @@ private struct ResetCreditDisclosure: View {
     }
 
     private var headerHelp: String {
-        guard let next = provider.resetCredits.first else { return countText }
-        return "\(countText) · next \(next.expiresText)"
+        guard let next = summary.nextExpiresAt else { return countText }
+        return "\(countText) · next \(DateFormats.expiry.string(from: next))"
     }
 }
 

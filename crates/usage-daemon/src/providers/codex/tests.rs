@@ -438,6 +438,14 @@ fn normalizes_codex_rate_limits() {
         snapshot.metadata["rate_limit_reset_credits_available_count"],
         1.0
     );
+    assert_eq!(
+        snapshot.metadata["rate_limit_reset_credits"]["available_count"],
+        1.0
+    );
+    assert_eq!(
+        snapshot.metadata["rate_limit_reset_credits"]["credits"],
+        json!([])
+    );
 }
 
 #[test]

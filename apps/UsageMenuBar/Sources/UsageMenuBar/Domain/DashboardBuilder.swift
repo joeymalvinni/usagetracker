@@ -143,7 +143,7 @@ struct DashboardBuilder {
                 detail: "waiting for data",
                 percent: nil,
                 status: status,
-                spend: [], windows: [], credits: [], resetCredits: [],
+                spend: [], windows: [], credits: [], resetCreditSummary: nil,
                 account: nil,
                 healthText: h.map { $0.status.friendly } ?? "unknown",
                 visibleInMenu: visible(providerId),
@@ -178,7 +178,7 @@ struct DashboardBuilder {
             detail: "waiting for a successful refresh",
             percent: nil,
             status: status,
-            spend: [], windows: [], credits: [], resetCredits: [],
+            spend: [], windows: [], credits: [], resetCreditSummary: nil,
             account: nil,
             healthText: h.map { $0.status.friendly } ?? "setup required",
             visibleInMenu: visible(providerId),
@@ -213,7 +213,9 @@ struct DashboardBuilder {
         let allWindows = accountVMs.flatMap(\.windows)
         let allCredits = accountVMs.flatMap(\.credits)
         let allSpend = accountVMs.flatMap(\.spend)
-        let allResetCredits = accountVMs.flatMap(\.resetCredits)
+        let resetCreditSummary = combinedResetCreditSummary(
+            accountVMs.compactMap(\.resetCreditSummary)
+        )
         let allSparklines = accountVMs.map(\.sparkline)
         let aggregatedSparkline = mergeSparklines(allSparklines)
         let worstPercent = accountVMs.compactMap(\.percent).min()
@@ -244,7 +246,7 @@ struct DashboardBuilder {
             spend: allSpend,
             windows: allWindows,
             credits: allCredits,
-            resetCredits: allResetCredits,
+            resetCreditSummary: resetCreditSummary,
             account: singleAccount?.account,
             healthText: healthText,
             visibleInMenu: visible(providerId),
@@ -276,16 +278,13 @@ struct DashboardBuilder {
         } ?? []
         let spend = snapshotWindows.filter(isSpendWindow).map { window($0, providerId: providerId, accountId: accountId) }
         var windows = snapshotWindows.filter { !isSpendWindow($0) && $0.kind != .credits }.map { window($0, providerId: providerId, accountId: accountId) }
-        if let latest, let resetCredits = resetCreditWindow(latest, providerId: providerId) {
-            windows.append(resetCredits)
-        }
         var credits = snapshotWindows.filter { !isSpendWindow($0) && $0.kind == .credits }.map { window($0, providerId: providerId, accountId: accountId) }
         // Drop user-hidden progress bars before they reach any view model, so the
         // provider's headline percent, status, and menu-bar number recompute
         // without them.
         windows.removeAll { ui.hiddenWindows[AppState.windowKey(providerId, $0.id)] != nil }
         credits.removeAll { ui.hiddenWindows[AppState.windowKey(providerId, $0.id)] != nil }
-        let resetCredits = latest.map(resetCreditDetails) ?? []
+        let resetCreditSummary = latest.flatMap(self.resetCreditSummary)
         let primary = windows.compactMap(\.percent).min()
         let enabled = isEnabledProvider(providerId) && (account?.collectionEnabled ?? true)
         let status = statusValue(id: providerId, percent: primary, latest: latest, health: h, enabled: enabled)
@@ -308,7 +307,7 @@ struct DashboardBuilder {
             spend: spend,
             windows: windows,
             credits: credits,
-            resetCredits: resetCredits,
+            resetCreditSummary: resetCreditSummary,
             account: displayName,
             healthText: h.map { $0.status.friendly } ?? "unknown",
             visibleInMenu: visible(providerId),
@@ -519,44 +518,12 @@ struct DashboardBuilder {
         health.contains { $0.providerId == id && $0.lastErrorCode == "provider_unavailable" }
     }
 
-    private func resetCreditWindow(_ snapshot: UsageSnapshot, providerId: String) -> WindowVM? {
+    private func resetCreditSummary(_ snapshot: UsageSnapshot) -> ResetCreditSummaryVM? {
         guard let summary = dashboardByAccount[
             ProviderAccountKey(providerId: snapshot.providerId, accountId: snapshot.accountId)
-        ]?.resetCredits, summary.availableCount > 0 else { return nil }
+        ]?.resetCredits else { return nil }
 
-        let count = Int(summary.availableCount)
-        let expiresAt = summary.nextExpiresAt
-        let reset = expiresAt.map { "expires \(expiryTime($0))" } ?? "expiry unknown"
-        let status: DisplayStatus
-        if let expiresAt, expiresAt <= Date() {
-            status = .critical
-        } else if let expiresAt, expiresAt.timeIntervalSinceNow < 24 * 60 * 60 {
-            status = .warning
-        } else {
-            status = .normal
-        }
-
-        return WindowVM(
-            id: "\(providerId)_rate_limit_resets",
-            label: "Rate-limit resets",
-            value: "\(count) available",
-            reset: reset,
-            providerId: providerId,
-            providerName: pretty(providerId),
-            absolute: nil,
-            percent: nil,
-            status: status,
-            resetAt: expiresAt
-        )
-    }
-
-    private func resetCreditDetails(_ snapshot: UsageSnapshot) -> [ResetCreditVM] {
-        guard let credits = dashboardByAccount[
-            ProviderAccountKey(providerId: snapshot.providerId, accountId: snapshot.accountId)
-        ]?.resetCredits?.credits
-        else { return [] }
-
-        return credits.map { credit in
+        let credits = summary.credits.map { credit in
             return ResetCreditVM(
                 id: credit.id,
                 title: credit.title,
@@ -573,6 +540,30 @@ struct DashboardBuilder {
             case (nil, nil): return $0.title < $1.title
             }
         }
+        return ResetCreditSummaryVM(
+            availableCount: Int(clamping: summary.availableCount),
+            nextExpiresAt: summary.nextExpiresAt ?? credits.compactMap(\.expiresAt).min(),
+            credits: credits
+        )
+    }
+
+    private func combinedResetCreditSummary(
+        _ summaries: [ResetCreditSummaryVM]
+    ) -> ResetCreditSummaryVM? {
+        guard !summaries.isEmpty else { return nil }
+        let credits = summaries.flatMap(\.credits).sorted {
+            switch ($0.expiresAt, $1.expiresAt) {
+            case let (left?, right?): return left < right
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return $0.title < $1.title
+            }
+        }
+        return ResetCreditSummaryVM(
+            availableCount: summaries.reduce(0) { $0 + $1.availableCount },
+            nextExpiresAt: summaries.compactMap(\.nextExpiresAt).min(),
+            credits: credits
+        )
     }
 
     private func selectedHealth(providerId: String, accountId: String?) -> ProviderHealth? {

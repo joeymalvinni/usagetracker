@@ -53,7 +53,12 @@ fn account_summary(
         .metadata
         .get(format!("{provider_id}_activity"))
         .and_then(Value::as_object);
-    if cost.is_none() && activity.is_none() && retained_activity.is_none() {
+    let reset_credits = reset_credit_summary(snapshot);
+    if cost.is_none()
+        && activity.is_none()
+        && retained_activity.is_none()
+        && reset_credits.is_none()
+    {
         return None;
     }
 
@@ -157,14 +162,17 @@ fn account_summary(
         account_id: snapshot.account_id.clone(),
         activity: activity_summary,
         cost: cost_summary,
-        reset_credits: reset_credit_summary(snapshot),
+        reset_credits,
     })
 }
 
 fn reset_credit_summary(snapshot: &UsageSnapshot) -> Option<ResetCreditSummary> {
-    let root = snapshot.metadata.get("rate_limit_reset_credits")?;
+    let root = snapshot
+        .metadata
+        .get("rate_limit_reset_credits")
+        .and_then(Value::as_object);
     let available_count = root
-        .get("available_count")
+        .and_then(|value| value.get("available_count"))
         .and_then(nonnegative_integer)
         .or_else(|| {
             snapshot
@@ -174,7 +182,7 @@ fn reset_credit_summary(snapshot: &UsageSnapshot) -> Option<ResetCreditSummary> 
         })
         .unwrap_or(0);
     let credits = root
-        .get("credits")
+        .and_then(|value| value.get("credits"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -202,9 +210,8 @@ fn reset_credit_summary(snapshot: &UsageSnapshot) -> Option<ResetCreditSummary> 
             })
         })
         .collect::<Vec<_>>();
-    let next_expires_at = root
-        .as_object()
-        .and_then(|value| timestamp(value, "next_expires_at", "next_expires_at_iso"));
+    let next_expires_at =
+        root.and_then(|value| timestamp(value, "next_expires_at", "next_expires_at_iso"));
     (available_count > 0 || !credits.is_empty()).then_some(ResetCreditSummary {
         available_count,
         next_expires_at,
@@ -558,6 +565,35 @@ mod tests {
 
         assert_eq!(summary.available_count, 3);
         assert_eq!(summary.credits.len(), 1);
+    }
+
+    #[test]
+    fn reset_credit_summary_accepts_legacy_scalar_without_details() {
+        let snapshot = UsageSnapshot {
+            provider_id: ProviderId::new("codex"),
+            account_id: AccountId::new("codex-account"),
+            collected_at: Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap(),
+            windows: Vec::new(),
+            metadata: json!({
+                "rate_limit_reset_credits_available_count": 4.0
+            }),
+        };
+
+        let summary = reset_credit_summary(&snapshot).expect("reset credit summary");
+
+        assert_eq!(summary.available_count, 4);
+        assert!(summary.next_expires_at.is_none());
+        assert!(summary.credits.is_empty());
+
+        let dashboard = build_usage_dashboard(&[snapshot], &[]);
+        assert_eq!(dashboard.accounts.len(), 1);
+        assert_eq!(
+            dashboard.accounts[0]
+                .reset_credits
+                .as_ref()
+                .map(|summary| summary.available_count),
+            Some(4)
+        );
     }
 
     #[test]

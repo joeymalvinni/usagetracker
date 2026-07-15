@@ -148,6 +148,51 @@ final class DashboardBuilderTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(provider.credits.first).absolute, "4 / 10")
     }
 
+    func testCountOnlyResetSummaryReachesProviderViewModel() throws {
+        let snapshot = UsageSnapshot(
+            providerId: "codex",
+            accountId: "codex-account",
+            collectedAt: Date(),
+            windows: []
+        )
+        let dashboard = UsageDashboardSummary(
+            accounts: [
+                AccountUsageSummary(
+                    providerId: "codex",
+                    accountId: "codex-account",
+                    activity: nil,
+                    cost: nil,
+                    resetCredits: ResetCreditSummary(
+                        availableCount: 4,
+                        nextExpiresAt: nil,
+                        credits: []
+                    )
+                )
+            ],
+            days: [],
+            pricing: .empty,
+            provenance: .empty
+        )
+
+        let output = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [],
+            health: [],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: dashboard,
+            windowProvenance: [],
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        let summary = try XCTUnwrap(output.providers.first?.resetCreditSummary)
+        XCTAssertEqual(summary.availableCount, 4)
+        XCTAssertNil(summary.nextExpiresAt)
+        XCTAssertTrue(summary.credits.isEmpty)
+        XCTAssertTrue(try XCTUnwrap(output.providers.first).windows.isEmpty)
+    }
+
     func testServerRegisteredProviderNeedsNoCatalogEntry() throws {
         let descriptor = ServerProviderDescriptor(
             id: "future_provider",
