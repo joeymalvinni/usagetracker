@@ -156,9 +156,13 @@ impl NotificationManager {
             );
         }
 
-        if window.reset_at.is_some() && state.reset_at != window.reset_at {
-            state.notified_mask = 0;
-            state.last_attempt_at = None;
+        if reset_completed {
+            // A provider may revise a future reset timestamp on every poll. That
+            // is not proof that usage recovered, so keep threshold alerts armed
+            // until the observed percentage actually rises above them. The
+            // predictive alert is cycle-specific and can safely rearm once the
+            // previous reset time has passed.
+            state.notified_mask &= !PREDICTIVE_NOTIFICATION_BIT;
         }
         let levels = notification_levels(&policy.thresholds);
         for (threshold, bit) in &levels {
@@ -570,7 +574,13 @@ mod tests {
     async fn reset_rearms_thresholds() {
         let storage = test_storage();
         let account = insert_account(&storage, &test_account()).await;
-        let manager = NotificationManager::new(storage.clone(), true);
+        let manager = NotificationManager::new(
+            storage.clone(),
+            NotificationConfig {
+                cooldown_minutes: 0,
+                ..NotificationConfig::default()
+            },
+        );
         let first_reset = Utc::now() + TimeDelta::hours(2);
         manager
             .process_snapshot(&account, &test_snapshot(24.0, first_reset))
@@ -635,6 +645,43 @@ mod tests {
             .await;
 
         assert!(storage.pending_notifications().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_usage_with_shifted_reset_time_alerts_once() {
+        let storage = test_storage();
+        let account = insert_account(&storage, &test_account()).await;
+        let manager = NotificationManager::new(
+            storage.clone(),
+            NotificationConfig {
+                cooldown_minutes: 0,
+                ..NotificationConfig::default()
+            },
+        );
+
+        manager
+            .process_snapshot(
+                &account,
+                &test_snapshot(0.0, Utc::now() + TimeDelta::hours(2)),
+            )
+            .await;
+        manager
+            .process_snapshot(
+                &account,
+                &test_snapshot(0.0, Utc::now() + TimeDelta::hours(3)),
+            )
+            .await;
+        let restarted = NotificationManager::new(storage.clone(), true);
+        restarted
+            .process_snapshot(
+                &account,
+                &test_snapshot(0.0, Utc::now() + TimeDelta::hours(4)),
+            )
+            .await;
+
+        let notifications = storage.pending_notifications().await.unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].title.contains("usage exhausted"));
     }
 
     #[tokio::test]
