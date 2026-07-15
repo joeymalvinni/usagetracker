@@ -103,15 +103,7 @@ pub(super) fn collect_usage_from_app_server(
 fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> {
     let started = Instant::now();
     debug!("codex app-server process starting");
-    let mut child = ChildGuard(
-        Command::new("codex")
-            .arg("app-server")
-            .env("CODEX_HOME", codex_home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+    let mut child = ChildGuard(spawn_codex_app_server(codex_home)?);
 
     let mut stdin = child
         .0
@@ -311,6 +303,63 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
     }))
 }
 
+fn spawn_codex_app_server(codex_home: &Path) -> std::io::Result<Child> {
+    let configure = |command: &mut Command| {
+        command
+            .env("CODEX_HOME", codex_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    };
+
+    let mut direct = Command::new("codex");
+    direct.arg("app-server");
+    configure(&mut direct);
+    match direct.spawn() {
+        Ok(child) => Ok(child),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // GUI applications normally inherit LaunchServices' minimal PATH,
+            // which omits common npm and managed-tool locations. Resolve with a
+            // login shell, then launch the absolute binary directly so shell
+            // startup output can never corrupt the JSON-RPC stream.
+            let executable = resolve_codex_executable_with_login_shell()?;
+            let mut fallback = Command::new(executable);
+            fallback.arg("app-server");
+            configure(&mut fallback);
+            fallback.spawn()
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn resolve_codex_executable_with_login_shell() -> std::io::Result<std::path::PathBuf> {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let output = Command::new(shell)
+        .args(["-lic", "command -v codex"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if output.status.success() {
+        if let Some(path) = executable_path_from_shell_output(&output.stdout) {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "codex was not found in the login-shell PATH",
+    ))
+}
+
+fn executable_path_from_shell_output(output: &[u8]) -> Option<std::path::PathBuf> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(std::path::PathBuf::from)
+        .find(|path| path.is_absolute() && path.is_file())
+}
+
 fn write_json_rpc(stdin: &mut impl Write, message: &Value) -> anyhow::Result<()> {
     serde_json::to_writer(&mut *stdin, message)?;
     stdin.write_all(b"\n")?;
@@ -498,5 +547,19 @@ impl CodexAccountActivityExt for ProviderUsage {
             "longest_streak_days": activity.longest_streak_days,
             "by_day": by_day,
         });
+    }
+}
+
+#[cfg(test)]
+mod executable_resolution_tests {
+    use super::executable_path_from_shell_output;
+
+    #[test]
+    fn extracts_an_existing_absolute_executable_after_shell_startup_output() {
+        let output = b"startup message\n/bin/sh\n";
+        assert_eq!(
+            executable_path_from_shell_output(output).as_deref(),
+            Some(std::path::Path::new("/bin/sh"))
+        );
     }
 }
