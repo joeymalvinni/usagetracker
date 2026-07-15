@@ -4,6 +4,32 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.4 — 2026-07-15
+
+### CLI
+
+- Redesigned the CLI around provider-focused views, including provider shortcuts such as `usage codex` and dedicated `summary`, `activity`, and scoped `status` commands.
+- Improved response processing and preserved unavailable cost data instead of presenting unknown totals as zero.
+
+### App
+
+- Displayed Codex rate-limit reset credits consistently across account, provider, summary, and detail views.
+- Unified the menu bar popover under one native glass shell.
+
+### Usage tracking
+
+- Added event-driven local usage overlays that refresh supported providers promptly as their local activity changes.
+
+### Reliability
+
+- Distinguished and retried Keychain authentication failures so temporary credential-access errors can recover automatically.
+- Resolved the Codex executable through the login shell when UsageTracker starts outside a terminal.
+- Prevented duplicate threshold alerts when providers revise future reset timestamps.
+
+### Installation
+
+- Added clearer installer progress, verification, completion, and troubleshooting feedback while preserving existing checksum and code-signature checks.
+
 ## 0.1.3 — 2026-07-13
 
 ### App

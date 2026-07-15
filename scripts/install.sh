@@ -14,6 +14,34 @@ update_status_file="${USAGETRACKER_UPDATE_STATUS_FILE:-}"
 daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
 daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
 
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  style_bold=$'\033[1m'
+  style_dim=$'\033[2m'
+  style_cyan=$'\033[36m'
+  style_green=$'\033[32m'
+  style_yellow=$'\033[33m'
+  style_reset=$'\033[0m'
+else
+  style_bold=""
+  style_dim=""
+  style_cyan=""
+  style_green=""
+  style_yellow=""
+  style_reset=""
+fi
+
+status() {
+  printf '  %s→%s %s\n' "$style_cyan" "$style_reset" "$1"
+}
+
+success() {
+  printf '  %s✓%s %s\n' "$style_green" "$style_reset" "$1"
+}
+
+notice() {
+  printf '  %s!%s %s\n' "$style_yellow" "$style_reset" "$1"
+}
+
 usage() {
   cat <<'EOF'
 Install UsageTracker from a checksum-verified GitHub release.
@@ -126,9 +154,11 @@ fi
 case "$machine" in
   arm64)
     release_arch="arm64"
+    architecture_name="Apple silicon"
     ;;
   x86_64)
     release_arch="x86_64"
+    architecture_name="Intel"
     ;;
   *)
     echo "Unsupported Mac architecture: $machine" >&2
@@ -170,18 +200,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+printf '\n%sUsageTracker%s\n' "$style_bold" "$style_reset"
+printf '%sInstaller · macOS %s · %s%s\n\n' \
+  "$style_dim" "$macos_version" "$architecture_name" "$style_reset"
+
 download() {
   local name="$1"
-  echo "Downloading $name..."
+  local label="$2"
+  status "Downloading $label..."
   curl --proto '=https' --tlsv1.2 \
     --fail --location --silent --show-error --retry 3 \
     --output "$work_dir/$name" "$download_base/$name"
 }
 
-download SHA256SUMS
+download SHA256SUMS "release checksums"
 
 verify_download() {
   local name="$1"
+  local label="$2"
   local expected actual
   expected="$(awk -v name="$name" '$2 == name { print $1; exit }' "$work_dir/SHA256SUMS")"
   if [[ -z "$expected" ]]; then
@@ -193,7 +229,20 @@ verify_download() {
     echo "Checksum verification failed for $name" >&2
     exit 1
   fi
-  echo "Verified $name"
+  success "Verified $label"
+}
+
+verify_code_signature() {
+  local path="$1"
+  local label="$2"
+  local log="$work_dir/codesign-$label.log"
+  shift 2
+  if ! codesign --verify "$@" "$path" >"$log" 2>&1; then
+    echo "Code signature verification failed for $label" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  success "Verified $label code signature"
 }
 
 signature_field() {
@@ -280,8 +329,8 @@ expected_cli_identifier="$expected_app_identifier.cli"
 
 if [[ "$install_app" == "1" ]]; then
   app_asset="UsageTracker-macos-$release_arch.zip"
-  download "$app_asset"
-  verify_download "$app_asset"
+  download "$app_asset" "app"
+  verify_download "$app_asset" "app archive"
   if ! unzip -Z1 "$work_dir/$app_asset" | awk '
     BEGIN { valid = 1; found_app = 0 }
     /^UsageTracker\.app\// { found_app = 1; next }
@@ -298,7 +347,7 @@ if [[ "$install_app" == "1" ]]; then
     echo "$app_asset does not contain UsageTracker.app" >&2
     exit 1
   fi
-  codesign --verify --deep --strict --verbose=2 "$source_app"
+  verify_code_signature "$source_app" "app" --deep --strict --verbose=2
   app_bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
     "$source_app/Contents/Info.plist")"
   app_identifier="$(signature_field "$source_app" Identifier)"
@@ -316,8 +365,8 @@ fi
 
 if [[ "$install_cli" == "1" ]]; then
   cli_asset="usage-macos-$release_arch.tar.gz"
-  download "$cli_asset"
-  verify_download "$cli_asset"
+  download "$cli_asset" "command-line tool"
+  verify_download "$cli_asset" "command-line archive"
   if [[ "$(tar -tzf "$work_dir/$cli_asset")" != "usage" ]]; then
     echo "$cli_asset does not contain exactly one usage executable" >&2
     exit 1
@@ -329,7 +378,7 @@ if [[ "$install_cli" == "1" ]]; then
     echo "$cli_asset does not contain an executable usage command" >&2
     exit 1
   fi
-  codesign --verify --strict --verbose=2 "$source_cli"
+  verify_code_signature "$source_cli" "command-line tool" --strict --verbose=2
   cli_identifier="$(signature_field "$source_cli" Identifier)"
   cli_signature="$(signature_field "$source_cli" Signature)"
   if [[ "$cli_identifier" != "$expected_cli_identifier" ]]; then
@@ -368,9 +417,10 @@ if [[ "$install_cli" == "1" ]]; then
 fi
 
 if [[ "$install_app" == "1" ]]; then
+  status "Installing app..."
   if app_is_running; then
     app_was_running=1
-    echo "Asking UsageTracker to quit before updating..."
+    status "Closing the running app..."
     osascript -e "tell application id \"$app_identifier\" to quit" >/dev/null 2>&1 || true
     for _ in {1..20}; do
       if ! app_is_running; then break; fi
@@ -411,10 +461,11 @@ if [[ "$install_app" == "1" ]]; then
   printf '%s\n%s\n' "$app_identifier" "$app_signature" \
     > "$app_dir/.UsageTracker.app.install-receipt"
   chmod 0600 "$app_dir/.UsageTracker.app.install-receipt"
-  echo "Installed $app_path"
+  success "Installed app"
 fi
 
 if [[ "$install_cli" == "1" ]]; then
+  status "Installing command-line tool..."
   mkdir -p "$bin_dir"
   cli_temp="$bin_dir/.usage.install.$$"
   install -m 0755 "$source_cli" "$cli_temp"
@@ -422,16 +473,28 @@ if [[ "$install_cli" == "1" ]]; then
   printf '%s\n%s\n' "$cli_identifier" "$cli_signature" \
     > "$bin_dir/.usage.install-receipt"
   chmod 0600 "$bin_dir/.usage.install-receipt"
-  echo "Installed $cli_path"
+  success "Installed command-line tool"
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
-    *) echo "Add $bin_dir to PATH to run 'usage' from your shell." ;;
+    *) notice "Add $bin_dir to PATH to run 'usage' from your shell." ;;
   esac
 fi
 
 if [[ "$install_app" == "1" && "$launch_app" == "1" ]]; then
   open "$app_dir/UsageTracker.app" || true
-  echo "If macOS blocks the app, open System Settings → Privacy & Security and click Open Anyway."
 fi
 
-echo "UsageTracker installation complete. Existing $daemon_home data was left untouched."
+printf '\n'
+success "Installation complete"
+printf '\n'
+if [[ "$install_app" == "1" ]]; then
+  printf '  %-5s %s\n' "App" "$app_path"
+fi
+if [[ "$install_cli" == "1" ]]; then
+  printf '  %-5s %s\n' "CLI" "$cli_path"
+fi
+printf '  %-5s %s (preserved)\n' "Data" "$daemon_home"
+if [[ "$install_app" == "1" && "$launch_app" == "1" ]]; then
+  printf '\n'
+  notice "If macOS blocks the app, open System Settings → Privacy & Security and click Open Anyway."
+fi
