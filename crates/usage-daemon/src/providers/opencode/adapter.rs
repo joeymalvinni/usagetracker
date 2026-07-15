@@ -10,8 +10,9 @@ use crate::{
     config::ProviderConfig,
     providers::{launchers, ProviderCollector},
     runtime::provider_adapter::{
-        AccountDeletionPlan, DeleteHandler, ExecutionPolicy, ProviderAdapter, ProviderManifest,
-        ProviderRuntime, RepairHandler, SetupHandler,
+        AccountDeletionPlan, DeleteHandler, ExecutionPolicy, LocalUsagePathMatcher,
+        LocalUsageWatch, ProviderAdapter, ProviderManifest, ProviderRuntime, RepairHandler,
+        SetupHandler,
     },
 };
 
@@ -41,6 +42,23 @@ impl ProviderAdapter for OpenCodeAdapter {
 
     fn validate_config(&self, config: &ProviderConfig) -> anyhow::Result<()> {
         settings::validate(config)
+    }
+
+    fn local_usage_watch(
+        &self,
+        _config: &ProviderConfig,
+    ) -> anyhow::Result<Option<LocalUsageWatch>> {
+        let Some(home) = dirs::home_dir() else {
+            return Ok(None);
+        };
+        Ok(Some(LocalUsageWatch::new(
+            vec![home.join(".local/share/opencode")],
+            [
+                LocalUsagePathMatcher::file_name("opencode.db"),
+                LocalUsagePathMatcher::suffix(".db-wal"),
+            ],
+            Duration::from_secs(60),
+        )))
     }
 
     fn build_collector(

@@ -13,6 +13,41 @@ Create `crates/usage-daemon/src/providers/<provider>/` with:
 
 The provider module must expose `pub const PROVIDER_ID: &str`; use that constant in its manifest, collector, handlers, profile paths, and tests so those identities cannot drift.
 
+## Local usage sources
+
+Providers with reproducible local activity should implement both halves of the
+local update contract:
+
+1. Return a `LocalUsageWatch` from the adapter. Construct it with the resolved
+   roots, declarative `LocalUsagePathMatcher`s (`extension`, `file_name`, or
+   `suffix`), and the source's real minimum scan interval. Use `with_timing`
+   only when the default 30-second debounce and 60-second maximum latency are
+   inappropriate. Shared watcher code must not contain provider file names or
+   extensions.
+2. Override `ProviderCollector::collect_local_usage`. It receives a stored
+   account and the current composed snapshot, performs no remote requests, and
+   returns only supplemental `UsageDataset`s with typed provenance. Use
+   `UsageDataset::supplemental_named` with a stable provider-owned source ID so
+   multiple local sources of the same kind remain independently replaceable. The shared
+   coordinator validates and persists those datasets as source-scoped overlays;
+   local refreshes never mutate remote health or rate-limit backoff. A successful
+   result is the provider's complete local source set for that account: omitting a
+   previously returned source removes its overlay, while an error preserves the
+   last successful observation.
+
+Filesystem events are dirty hints rather than usage records. Collectors must
+reconcile their source from disk so coalesced, missing, rename, delete, and
+overflow events remain correct. The shared watcher batches independently per
+provider, bounds continuous-write latency, and refreshes every matching target
+when roots overlap. Local overlays currently support snapshot windows and
+diagnostics; providers that need local daily-usage buckets must extend the
+source-scoped daily storage model first.
+
+Full collection should return the same local observation as a supplemental
+dataset via `CollectionOutcome::collected_with_supplemental`. Do not merge local
+windows into the authoritative `ProviderCollectionResult`, because doing so
+marks device-local estimates as account-wide provider reports.
+
 Every typed settings struct must use `#[serde(deny_unknown_fields)]`. This is a required correctness boundary: it makes misspelled supported settings and incomplete migrations fail visibly. Declare the corresponding flattened keys through the adapter's `provider_setting_keys` and `profile_setting_keys` methods. The loader warns, removes, and persists keys the adapter does not own so stale settings from an older release cannot brick startup; supported keys with invalid values still fail validation. Use the shared `settings_accessors!` helper for the standard typed provider/profile readers and mutation functions instead of copying them into each module.
 
 The adapter's required `validate_config` method decodes all provider and profile settings before any runtime component is built. The collector must implement `configured_profile_ids` (profileless providers explicitly return an empty list) and return one `ProfileDiscovery` outcome for every configured profile, including when every profile fails. Collection returns a `CollectionOutcome`: authoritative data or an authoritative failure, plus any supplemental datasets. Every dataset declares typed source, scope, quality, completeness, and confidence. A supplemental success must never turn an authoritative rate limit or authentication failure into healthy state.

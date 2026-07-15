@@ -47,7 +47,99 @@ pub(crate) struct ProviderManifest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LocalUsageWatch {
     pub(crate) roots: Vec<PathBuf>,
+    pub(crate) matchers: Vec<LocalUsagePathMatcher>,
+    pub(crate) debounce: Duration,
+    pub(crate) maximum_latency: Duration,
     pub(crate) minimum_refresh_interval: Duration,
+}
+
+impl LocalUsageWatch {
+    pub(crate) fn new(
+        roots: Vec<PathBuf>,
+        matchers: impl IntoIterator<Item = LocalUsagePathMatcher>,
+        minimum_refresh_interval: Duration,
+    ) -> Self {
+        Self {
+            roots,
+            matchers: matchers.into_iter().collect(),
+            debounce: Duration::from_secs(30),
+            maximum_latency: Duration::from_secs(60),
+            minimum_refresh_interval,
+        }
+    }
+
+    pub(crate) fn with_timing(mut self, debounce: Duration, maximum_latency: Duration) -> Self {
+        self.debounce = debounce;
+        self.maximum_latency = maximum_latency;
+        self
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.roots.is_empty(), "local usage watch has no roots");
+        anyhow::ensure!(
+            !self.matchers.is_empty(),
+            "local usage watch has no path matchers"
+        );
+        anyhow::ensure!(!self.debounce.is_zero(), "local usage debounce is zero");
+        anyhow::ensure!(
+            self.maximum_latency >= self.debounce,
+            "local usage maximum latency is shorter than its debounce"
+        );
+        anyhow::ensure!(
+            !self.minimum_refresh_interval.is_zero(),
+            "local usage minimum refresh interval is zero"
+        );
+        for matcher in &self.matchers {
+            anyhow::ensure!(!matcher.value().is_empty(), "local usage matcher is empty");
+        }
+        Ok(())
+    }
+}
+
+/// Declarative path matching keeps provider-specific file layouts out of the
+/// shared watcher while preserving an inspectable, comparable watch config.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalUsagePathMatcher {
+    Extension(String),
+    FileName(String),
+    Suffix(String),
+}
+
+impl LocalUsagePathMatcher {
+    pub(crate) fn extension(value: impl Into<String>) -> Self {
+        Self::Extension(value.into())
+    }
+
+    pub(crate) fn file_name(value: impl Into<String>) -> Self {
+        Self::FileName(value.into())
+    }
+
+    pub(crate) fn suffix(value: impl Into<String>) -> Self {
+        Self::Suffix(value.into())
+    }
+
+    pub(crate) fn matches(&self, path: &std::path::Path) -> bool {
+        match self {
+            Self::Extension(expected) => path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(expected)),
+            Self::FileName(expected) => path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == expected),
+            Self::Suffix(expected) => path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.ends_with(expected)),
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::Extension(value) | Self::FileName(value) | Self::Suffix(value) => value,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

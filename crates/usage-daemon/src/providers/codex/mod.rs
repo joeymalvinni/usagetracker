@@ -12,15 +12,18 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
-use usage_core::ProviderId;
+use usage_core::{
+    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
+    UsageSnapshot,
+};
 
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
         paths::expand_home_path, read_response_body, AccountDiscovery, AccountDiscoveryFailure,
         CollectionOutcome, DailyUsageBucket, DiscoveredAccount, ProviderCollectionResult,
-        ProviderCollector, ProviderError, ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT,
-        HTTP_REQUEST_TIMEOUT,
+        ProviderCollector, ProviderError, ProviderErrorKind, ProviderUsage, UsageDataset,
+        HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -143,6 +146,73 @@ impl CodexCollector {
         Err(ProviderError::new(
             ProviderErrorKind::CredentialsInvalid,
             "Codex account changed since discovery",
+        ))
+    }
+
+    async fn collect_local_usage_dataset(
+        &self,
+        profile: &CodexProfile,
+        include_token_activity: bool,
+    ) -> Result<UsageDataset, ProviderError> {
+        let pricing = CodexPricingCatalog::bundled();
+        let cost_cache = profile.cost_cache.clone();
+        let local_codex_home = self.local_codex_home.clone();
+        let profile_codex_home = profile.codex_home.clone();
+        let owns_default_activity = profile.owns_default_activity;
+        let cost_started = Instant::now();
+        debug!("codex local cost scan started");
+        let scan = tokio::task::spawn_blocking(move || {
+            let cost_roots = codex_session_roots(
+                &profile_codex_home,
+                &local_codex_home,
+                owns_default_activity,
+            );
+            scan_codex_local_costs_cached(cost_cache, cost_roots, pricing)
+        })
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("Codex local cost scan task failed: {err}"),
+            )
+        })?
+        .map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                format!("Codex local cost scan failed: {err}"),
+            )
+        })?;
+
+        info!(
+            elapsed_ms = cost_started.elapsed().as_millis(),
+            cache_status = scan.cache_status.as_str(),
+            files_scanned = scan.report.files_scanned,
+            token_count_events = scan.report.token_count_events,
+            today_tokens = scan.report.today_tokens,
+            lookback_tokens = scan.report.lookback_tokens,
+            unpriced_tokens = scan.report.unpriced_tokens,
+            "codex local cost scan completed"
+        );
+        let mut usage = ProviderUsage {
+            provider_id: ProviderId::new(PROVIDER_ID),
+            collected_at: chrono::Utc::now(),
+            windows: Vec::new(),
+            metadata: json!({}),
+        };
+        usage.merge_cost_report(scan.report, include_token_activity);
+        Ok(UsageDataset::supplemental_named(
+            "codex_local_logs",
+            ProviderCollectionResult {
+                usage,
+                daily_usage: Vec::new(),
+                collection_mode: "codex_local_logs".to_string(),
+                account_email: None,
+                warnings: Vec::new(),
+            },
+            UsageDataSource::LocalLogs,
+            UsageDataScope::SelectedLocalRoots,
+            UsageDataQuality::Estimated,
+            UsageDataCompleteness::Partial,
         ))
     }
 
@@ -478,54 +548,55 @@ impl ProviderCollector for CodexCollector {
             collected.usage.metadata["profile_display_name"] = json!(display_name);
         }
 
-        let pricing = CodexPricingCatalog::bundled();
-
-        let cost_cache = profile.cost_cache.clone();
-        let local_codex_home = self.local_codex_home.clone();
-        let profile_codex_home = profile.codex_home.clone();
-        let owns_default_activity = profile.owns_default_activity;
-        let cost_started = Instant::now();
-        debug!("codex local cost scan started");
-        match tokio::task::spawn_blocking(move || {
-            let cost_roots = codex_session_roots(
-                &profile_codex_home,
-                &local_codex_home,
-                owns_default_activity,
-            );
-            scan_codex_local_costs_cached(cost_cache, cost_roots, pricing)
-        })
-        .await
+        let mut supplemental = Vec::new();
+        match self
+            .collect_local_usage_dataset(&profile, !collected.account_activity_available)
+            .await
         {
-            Ok(Ok(scan)) => {
-                info!(
-                    elapsed_ms = cost_started.elapsed().as_millis(),
-                    cache_status = scan.cache_status.as_str(),
-                    files_scanned = scan.report.files_scanned,
-                    token_count_events = scan.report.token_count_events,
-                    today_tokens = scan.report.today_tokens,
-                    lookback_tokens = scan.report.lookback_tokens,
-                    unpriced_tokens = scan.report.unpriced_tokens,
-                    "codex local cost scan completed"
-                );
-                collected
-                    .usage
-                    .merge_cost_report(scan.report, !collected.account_activity_available)
-            }
-            Ok(Err(err)) => collected
-                .warnings
-                .push(format!("Codex local cost scan failed: {err}")),
-            Err(err) => collected
-                .warnings
-                .push(format!("Codex local cost scan task failed: {err}")),
+            Ok(dataset) => supplemental.push(dataset),
+            Err(error) => collected.warnings.push(error.short_message().to_string()),
         }
 
-        Ok(CollectionOutcome::collected(ProviderCollectionResult {
-            usage: collected.usage,
-            daily_usage: collected.daily_usage,
-            collection_mode: collected.collection_mode,
-            account_email: collected.account_display_name,
-            warnings: collected.warnings,
-        }))
+        Ok(CollectionOutcome::collected_with_supplemental(
+            ProviderCollectionResult {
+                usage: collected.usage,
+                daily_usage: collected.daily_usage,
+                collection_mode: collected.collection_mode,
+                account_email: collected.account_display_name,
+                warnings: collected.warnings,
+            },
+            supplemental,
+        ))
+    }
+
+    async fn collect_local_usage(
+        &self,
+        account: &Account,
+        current: Option<&UsageSnapshot>,
+    ) -> Result<Vec<UsageDataset>, ProviderError> {
+        let profile_id = account.profile_id.as_deref().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Codex account has no profile identity",
+            )
+        })?;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    format!("Codex profile {profile_id} no longer exists"),
+                )
+            })?;
+        let include_token_activity = current
+            .and_then(|snapshot| snapshot.metadata.get("codex_activity"))
+            .is_none();
+        Ok(vec![
+            self.collect_local_usage_dataset(profile, include_token_activity)
+                .await?,
+        ])
     }
 }
 

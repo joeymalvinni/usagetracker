@@ -5,7 +5,8 @@ use chrono::Local;
 use reqwest::{redirect::Policy, Url};
 use serde_json::json;
 use usage_core::{
-    ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
+    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
+    UsageSnapshot,
 };
 use uuid::Uuid;
 
@@ -67,6 +68,27 @@ impl OpenCodeCollector {
             }))
             .build()?;
         Ok(Self { settings, client })
+    }
+
+    async fn collect_local_usage_dataset(&self) -> Result<Option<UsageDataset>, ProviderError> {
+        let result = tokio::task::spawn_blocking(collect_go_local_usage)
+            .await
+            .map_err(|err| {
+                ProviderError::new(
+                    ProviderErrorKind::ProviderUnavailable,
+                    format!("OpenCode Go local usage task failed: {err}"),
+                )
+            })??;
+        Ok(result.map(|result| {
+            UsageDataset::supplemental_named(
+                "opencode_local_database",
+                result,
+                UsageDataSource::LocalDatabase,
+                UsageDataScope::ThisDevice,
+                UsageDataQuality::Observed,
+                UsageDataCompleteness::Partial,
+            )
+        }))
     }
 
     async fn collect_web_usage(
@@ -561,39 +583,34 @@ impl ProviderCollector for OpenCodeCollector {
             result => result,
         };
 
-        match web_result {
-            Ok(result) => Ok(CollectionOutcome::collected(result)),
-            Err(web_error) => {
-                let local_result = tokio::task::spawn_blocking(collect_go_local_usage)
-                    .await
-                    .map_err(|err| {
-                        ProviderError::new(
-                            ProviderErrorKind::ProviderUnavailable,
-                            format!("OpenCode Go local usage task failed: {err}"),
-                        )
-                    })
-                    .and_then(|result| result);
-                match local_result {
-                    Ok(mut result) => {
-                        result.warnings.push(format!(
-                            "OpenCode Go web usage failed; retained local observation: {}",
-                            web_error.short_message()
-                        ));
-                        Ok(CollectionOutcome::degraded(
-                            web_error,
-                            vec![UsageDataset::supplemental(
-                                result,
-                                UsageDataSource::LocalDatabase,
-                                UsageDataScope::ThisDevice,
-                                UsageDataQuality::Observed,
-                                UsageDataCompleteness::Partial,
-                            )],
-                        ))
-                    }
-                    Err(_) => Err(web_error),
-                }
+        let local_result = self.collect_local_usage_dataset().await;
+        match (web_result, local_result) {
+            (Ok(result), Ok(Some(local))) => Ok(CollectionOutcome::collected_with_supplemental(
+                result,
+                vec![local],
+            )),
+            (Ok(result), Ok(None) | Err(_)) => Ok(CollectionOutcome::collected(result)),
+            (Err(web_error), Ok(Some(mut local))) => {
+                local.collection.warnings.push(format!(
+                    "OpenCode Go web usage failed; retained local observation: {}",
+                    web_error.short_message()
+                ));
+                Ok(CollectionOutcome::degraded(web_error, vec![local]))
             }
+            (Err(web_error), Ok(None) | Err(_)) => Err(web_error),
         }
+    }
+
+    async fn collect_local_usage(
+        &self,
+        _account: &Account,
+        _current: Option<&UsageSnapshot>,
+    ) -> Result<Vec<UsageDataset>, ProviderError> {
+        Ok(self
+            .collect_local_usage_dataset()
+            .await?
+            .into_iter()
+            .collect())
     }
 }
 

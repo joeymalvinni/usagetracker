@@ -19,14 +19,17 @@ use std::{
 use async_trait::async_trait;
 use reqwest::redirect::Policy;
 use serde_json::json;
-use usage_core::ProviderId;
+use usage_core::{
+    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
+    UsageSnapshot,
+};
 
 use crate::{
     config::ProviderConfig,
     providers::{
         AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome, DiscoveredAccount,
         ProviderCollectionResult, ProviderCollector, ProviderError, ProviderErrorKind,
-        HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        ProviderUsage, UsageDataset, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -265,7 +268,7 @@ impl GrokCollector {
         }))
     }
 
-    async fn collection_result(
+    fn collection_result(
         &self,
         data: BillingData,
         source: BillingSource,
@@ -286,18 +289,62 @@ impl GrokCollector {
         if let Some(display_name) = profile.display_name.as_deref() {
             usage.metadata["profile_display_name"] = json!(display_name);
         }
-        let grok_home = profile.grok_home.clone();
-        if let Ok(Ok(summary)) =
-            tokio::task::spawn_blocking(move || local_sessions::scan_home(&grok_home)).await
-        {
-            usage.metadata["local_sessions"] = summary.metadata();
-        }
         ProviderCollectionResult {
             usage,
             daily_usage: Vec::new(),
             collection_mode: collection_mode.to_string(),
             account_email: credentials.and_then(|value| value.email.clone()),
             warnings,
+        }
+    }
+
+    async fn collect_local_usage_dataset(
+        &self,
+        profile: &GrokProfile,
+    ) -> Result<UsageDataset, ProviderError> {
+        let grok_home = profile.grok_home.clone();
+        let summary = tokio::task::spawn_blocking(move || local_sessions::scan_home(&grok_home))
+            .await
+            .map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorKind::ProviderUnavailable,
+                    format!("Grok local session scan task failed: {error}"),
+                )
+            })??;
+        Ok(UsageDataset::supplemental_named(
+            "grok_local_sessions",
+            ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id: ProviderId::new(PROVIDER_ID),
+                    collected_at: chrono::Utc::now(),
+                    windows: Vec::new(),
+                    metadata: json!({"local_sessions": summary.metadata()}),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "grok_local_sessions".to_string(),
+                account_email: None,
+                warnings: Vec::new(),
+            },
+            UsageDataSource::LocalLogs,
+            UsageDataScope::ThisDevice,
+            UsageDataQuality::Observed,
+            UsageDataCompleteness::Partial,
+        ))
+    }
+
+    async fn collected_with_local_usage(
+        &self,
+        mut collection: ProviderCollectionResult,
+        profile: &GrokProfile,
+    ) -> CollectionOutcome {
+        match self.collect_local_usage_dataset(profile).await {
+            Ok(dataset) => {
+                CollectionOutcome::collected_with_supplemental(collection, vec![dataset])
+            }
+            Err(error) => {
+                collection.warnings.push(error.short_message().to_string());
+                CollectionOutcome::collected(collection)
+            }
         }
     }
 }
@@ -413,17 +460,15 @@ impl ProviderCollector for GrokCollector {
         if self.source_mode.uses_cli() {
             match self.cli_billing(profile).await {
                 Ok(data) => {
-                    return Ok(CollectionOutcome::collected(
-                        self.collection_result(
-                            data,
-                            BillingSource::CliRpc,
-                            None,
-                            credentials.as_ref(),
-                            profile,
-                            Vec::new(),
-                        )
-                        .await,
-                    ))
+                    let collection = self.collection_result(
+                        data,
+                        BillingSource::CliRpc,
+                        None,
+                        credentials.as_ref(),
+                        profile,
+                        Vec::new(),
+                    );
+                    return Ok(self.collected_with_local_usage(collection, profile).await);
                 }
                 Err(error)
                     if self.source_mode.permits_fallback() && should_fallback_after_cli(&error) =>
@@ -453,17 +498,15 @@ impl ProviderCollector for GrokCollector {
                         )]
                     })
                     .unwrap_or_default();
-                Ok(CollectionOutcome::collected(
-                    self.collection_result(
-                        data,
-                        BillingSource::GrokWeb,
-                        Some(cookie_source),
-                        credentials.as_ref(),
-                        profile,
-                        warnings,
-                    )
-                    .await,
-                ))
+                let collection = self.collection_result(
+                    data,
+                    BillingSource::GrokWeb,
+                    Some(cookie_source),
+                    credentials.as_ref(),
+                    profile,
+                    warnings,
+                );
+                Ok(self.collected_with_local_usage(collection, profile).await)
             }
             Err(web_error) if web_error.kind() == ProviderErrorKind::RateLimited => Err(web_error),
             Err(web_error) => match cli_error {
@@ -478,6 +521,30 @@ impl ProviderCollector for GrokCollector {
                 None => Err(web_error),
             },
         }
+    }
+
+    async fn collect_local_usage(
+        &self,
+        account: &Account,
+        _current: Option<&UsageSnapshot>,
+    ) -> Result<Vec<UsageDataset>, ProviderError> {
+        let profile_id = account.profile_id.as_deref().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Grok account is missing its profile identity",
+            )
+        })?;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    format!("Grok profile {profile_id} no longer exists"),
+                )
+            })?;
+        Ok(vec![self.collect_local_usage_dataset(profile).await?])
     }
 }
 
@@ -529,6 +596,7 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use crate::config::ProviderProfileConfig;
+    use crate::providers::AuthoritativeOutcome;
 
     #[test]
     fn duplicate_profile_failures_keep_the_more_specific_error() {
@@ -607,6 +675,49 @@ mod tests {
             vec![Some("token"), None]
         );
         assert_eq!(web_auth_attempts(None).collect::<Vec<_>>(), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn full_collection_keeps_local_sessions_in_a_supplemental_dataset() {
+        let root = std::env::temp_dir().join(format!("grok-local-{}", uuid::Uuid::new_v4()));
+        let collector =
+            GrokCollector::new(cli_config(vec![profile("default", root.clone())])).unwrap();
+        let profile = collector.profiles[0].clone();
+        let outcome = collector
+            .collected_with_local_usage(
+                ProviderCollectionResult {
+                    usage: ProviderUsage {
+                        provider_id: ProviderId::new(PROVIDER_ID),
+                        collected_at: chrono::Utc::now(),
+                        windows: Vec::new(),
+                        metadata: json!({"remote": true}),
+                    },
+                    daily_usage: Vec::new(),
+                    collection_mode: "grok_cli_billing_rpc".to_string(),
+                    account_email: None,
+                    warnings: Vec::new(),
+                },
+                &profile,
+            )
+            .await;
+
+        let AuthoritativeOutcome::Collected(authoritative) = outcome.authoritative else {
+            panic!("full collection should remain authoritative");
+        };
+        assert_eq!(authoritative.collection.usage.metadata["remote"], true);
+        assert!(authoritative
+            .collection
+            .usage
+            .metadata
+            .get("local_sessions")
+            .is_none());
+        assert_eq!(outcome.supplemental.len(), 1);
+        assert_eq!(outcome.supplemental[0].source_id, "grok_local_sessions");
+        assert!(!outcome.supplemental[0].authoritative);
+        assert_eq!(
+            outcome.supplemental[0].provenance.source,
+            UsageDataSource::LocalLogs
+        );
     }
 
     #[tokio::test]

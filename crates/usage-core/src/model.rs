@@ -214,12 +214,21 @@ impl UsageSnapshot {
 /// type instead of inferring correctness from provider-specific strings.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct DatasetProvenance {
+    /// Stable provider-owned identity for replacing one independently
+    /// refreshable dataset without conflating sources with the same kind.
+    #[serde(default)]
+    pub source_id: String,
     pub authoritative: bool,
     pub provenance: DataProvenance,
     #[serde(default)]
     pub window_ids: Vec<String>,
     #[serde(default)]
     pub daily_sources: Vec<String>,
+    /// Top-level diagnostic keys contributed by this dataset. This permits a
+    /// newer source-scoped observation to replace its own metadata without
+    /// knowing provider-specific key names.
+    #[serde(default)]
+    pub metadata_keys: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]

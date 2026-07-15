@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Row};
-use usage_core::{AccountId, ProviderHealth, ProviderId, UsageSnapshot, UsageWindowKind};
+use serde::Deserialize;
+use usage_core::{
+    AccountId, DatasetProvenance, ProviderHealth, ProviderId, UsageSnapshot, UsageWindowKind,
+};
 use uuid::Uuid;
 
-use crate::providers::DailyUsageBucket;
+use crate::providers::{DailyUsageBucket, UsageDataset};
 
 use super::{
     accounts::{accounts_from_conn, looks_like_email},
@@ -18,6 +21,98 @@ use super::{
 };
 
 impl Storage {
+    #[cfg(test)]
+    pub async fn upsert_local_usage_overlay(
+        &self,
+        account_id: &AccountId,
+        dataset: &UsageDataset,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !dataset.authoritative,
+            "local usage overlays must be supplemental"
+        );
+        anyhow::ensure!(
+            !dataset.source_id.trim().is_empty(),
+            "local usage overlays require a stable source id"
+        );
+        anyhow::ensure!(
+            dataset.collection.daily_usage.is_empty(),
+            "local usage overlays do not yet support daily usage buckets"
+        );
+        let account_id = account_id.clone();
+        let dataset = dataset.clone();
+        self.with_connection(move |conn| {
+            let provider_id = &dataset.collection.usage.provider_id;
+            ensure_overlay_account(conn, &account_id, provider_id)?;
+            upsert_local_usage_overlay_conn(
+                conn,
+                &account_id,
+                &dataset,
+                dataset.collection.usage.collected_at,
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn reconcile_local_usage_overlays(
+        &self,
+        account_id: &AccountId,
+        provider_id: &ProviderId,
+        datasets: &[UsageDataset],
+        reconciliation_started_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let account_id = account_id.clone();
+        let provider_id = provider_id.clone();
+        let datasets = datasets.to_vec();
+        self.with_connection(move |conn| {
+            let transaction = conn.unchecked_transaction()?;
+            ensure_overlay_account(&transaction, &account_id, &provider_id)?;
+
+            let mut sources = BTreeSet::new();
+            for dataset in &datasets {
+                validate_local_usage_overlay(dataset, &provider_id)?;
+                anyhow::ensure!(
+                    sources.insert(dataset.source_key().to_string()),
+                    "local usage overlays contain a duplicate source id"
+                );
+                upsert_local_usage_overlay_conn(
+                    &transaction,
+                    &account_id,
+                    dataset,
+                    reconciliation_started_at,
+                )?;
+            }
+
+            let version =
+                reconciliation_started_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let stale_sources = {
+                let mut stmt = transaction.prepare(
+                    "SELECT source FROM local_usage_overlays
+                     WHERE provider_id = ?1 AND account_id = ?2 AND collected_at <= ?3",
+                )?;
+                let rows = stmt.query_map(
+                    params![provider_id.as_str(), account_id.as_str(), version],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for source in stale_sources {
+                if !sources.contains(&source) {
+                    transaction.execute(
+                        "DELETE FROM local_usage_overlays
+                         WHERE provider_id = ?1 AND account_id = ?2 AND source = ?3
+                           AND collected_at <= ?4",
+                        params![provider_id.as_str(), account_id.as_str(), source, version],
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     #[cfg(test)]
     pub async fn insert_snapshot(&self, snapshot: &UsageSnapshot) -> anyhow::Result<()> {
         let snapshot = snapshot.clone();
@@ -290,7 +385,6 @@ impl Storage {
         .await
     }
 
-    #[cfg(test)]
     pub async fn latest_usage(&self) -> anyhow::Result<Vec<UsageSnapshot>> {
         self.with_connection(latest_usage_from_conn).await
     }
@@ -328,6 +422,74 @@ impl Storage {
         })
         .await
     }
+}
+
+fn validate_local_usage_overlay(
+    dataset: &UsageDataset,
+    provider_id: &ProviderId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !dataset.authoritative,
+        "local usage overlays must be supplemental"
+    );
+    anyhow::ensure!(
+        dataset.collection.usage.provider_id == *provider_id,
+        "local usage overlay belongs to a different provider"
+    );
+    anyhow::ensure!(
+        !dataset.source_id.trim().is_empty(),
+        "local usage overlays require a stable source id"
+    );
+    anyhow::ensure!(
+        dataset.collection.daily_usage.is_empty(),
+        "local usage overlays do not yet support daily usage buckets"
+    );
+    Ok(())
+}
+
+fn ensure_overlay_account(
+    conn: &Connection,
+    account_id: &AccountId,
+    provider_id: &ProviderId,
+) -> anyhow::Result<()> {
+    let belongs_to_account: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM accounts WHERE id = ?1 AND provider_id = ?2
+         )",
+        params![account_id.as_str(), provider_id.as_str()],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        belongs_to_account,
+        "local usage overlay account does not belong to its provider"
+    );
+    Ok(())
+}
+
+fn upsert_local_usage_overlay_conn(
+    conn: &Connection,
+    account_id: &AccountId,
+    dataset: &UsageDataset,
+    version: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let provider_id = &dataset.collection.usage.provider_id;
+    conn.execute(
+        "INSERT INTO local_usage_overlays
+         (provider_id, account_id, source, collected_at, dataset_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(provider_id, account_id, source) DO UPDATE SET
+           collected_at = excluded.collected_at,
+           dataset_json = excluded.dataset_json
+         WHERE excluded.collected_at >= local_usage_overlays.collected_at",
+        params![
+            provider_id.as_str(),
+            account_id.as_str(),
+            dataset.source_key(),
+            version.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            serde_json::to_string(dataset)?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn upsert_daily_usage_buckets(
@@ -370,10 +532,149 @@ fn latest_usage_from_conn(conn: &Connection) -> anyhow::Result<Vec<UsageSnapshot
          )
          ORDER BY account.provider_id, account.id",
     )?;
-    let snapshots = stmt
+    let mut snapshots = stmt
         .query_map([], usage_snapshot_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
+    let overlays = local_usage_overlays_from_conn(conn)?;
+    for snapshot in &mut snapshots {
+        if let Some(datasets) = overlays.get(&(
+            snapshot.provider_id.as_str().to_string(),
+            snapshot.account_id.as_str().to_string(),
+        )) {
+            apply_local_usage_overlays(snapshot, datasets);
+        }
+    }
     Ok(snapshots)
+}
+
+fn local_usage_overlays_from_conn(
+    conn: &Connection,
+) -> anyhow::Result<HashMap<(String, String), Vec<UsageDataset>>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_id, account_id, dataset_json
+         FROM local_usage_overlays
+         ORDER BY provider_id, account_id, source",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut overlays = HashMap::<(String, String), Vec<UsageDataset>>::new();
+    for (provider_id, account_id, json) in rows {
+        overlays
+            .entry((provider_id, account_id))
+            .or_default()
+            .push(serde_json::from_str(&json)?);
+    }
+    Ok(overlays)
+}
+
+fn apply_local_usage_overlays(snapshot: &mut UsageSnapshot, overlays: &[UsageDataset]) {
+    let mut provenance = snapshot
+        .metadata
+        .get("dataset_provenance")
+        .and_then(|value| Vec::<DatasetProvenance>::deserialize(value).ok())
+        .unwrap_or_default();
+
+    for overlay in overlays {
+        let existing_for_source = provenance
+            .iter()
+            .any(|dataset| local_provenance_matches(dataset, overlay));
+        if existing_for_source && snapshot.collected_at >= overlay.collection.usage.collected_at {
+            continue;
+        }
+
+        let mut replaced_window_ids = std::collections::BTreeSet::new();
+        let mut replaced_metadata_keys = std::collections::BTreeSet::new();
+        provenance.retain(|dataset| {
+            let replaced = local_provenance_matches(dataset, overlay);
+            if replaced {
+                replaced_window_ids.extend(dataset.window_ids.iter().cloned());
+                replaced_metadata_keys.extend(dataset.metadata_keys.iter().cloned());
+            }
+            !replaced
+        });
+        snapshot
+            .windows
+            .retain(|window| !replaced_window_ids.contains(&window.window_id));
+        let mut window_ids = snapshot
+            .windows
+            .iter()
+            .map(|window| window.window_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        if !snapshot.metadata.is_object() {
+            snapshot.metadata = serde_json::json!({});
+        }
+        let metadata = snapshot
+            .metadata
+            .as_object_mut()
+            .expect("metadata was normalized to an object");
+        for key in replaced_metadata_keys {
+            metadata.remove(&key);
+        }
+        let claimed_metadata_keys = provenance
+            .iter()
+            .flat_map(|dataset| dataset.metadata_keys.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if !existing_for_source
+            && overlay.provenance.source == usage_core::UsageDataSource::LocalLogs
+        {
+            if let Some(incoming) = overlay.collection.usage.metadata.as_object() {
+                for key in incoming.keys() {
+                    if !claimed_metadata_keys.contains(key) {
+                        metadata.remove(key);
+                    }
+                }
+            }
+        }
+        let mut contributed_metadata_keys = Vec::new();
+        if let Some(incoming) = overlay.collection.usage.metadata.as_object() {
+            for (key, value) in incoming {
+                if let serde_json::map::Entry::Vacant(entry) = metadata.entry(key.clone()) {
+                    contributed_metadata_keys.push(key.clone());
+                    entry.insert(value.clone());
+                }
+            }
+        }
+        let mut contributed_window_ids = Vec::new();
+        for window in &overlay.collection.usage.windows {
+            if window_ids.insert(window.window_id.clone()) {
+                contributed_window_ids.push(window.window_id.clone());
+                snapshot.windows.push(window.clone());
+            }
+        }
+        snapshot.collected_at = snapshot
+            .collected_at
+            .max(overlay.collection.usage.collected_at);
+        let mut provenance_record = overlay.provenance_record();
+        provenance_record.window_ids = contributed_window_ids;
+        provenance_record.metadata_keys = contributed_metadata_keys;
+        provenance.push(provenance_record);
+    }
+
+    if let Some(metadata) = snapshot.metadata.as_object_mut() {
+        metadata.insert(
+            "dataset_provenance".to_string(),
+            serde_json::to_value(provenance).expect("dataset provenance is serializable"),
+        );
+    }
+}
+
+fn local_provenance_matches(dataset: &DatasetProvenance, overlay: &UsageDataset) -> bool {
+    if dataset.authoritative {
+        return false;
+    }
+    if !dataset.source_id.is_empty() && !overlay.source_id.is_empty() {
+        dataset.source_id == overlay.source_id
+    } else {
+        dataset.provenance.source == overlay.provenance.source
+    }
 }
 
 fn daily_usage_dashboard_from_conn(
