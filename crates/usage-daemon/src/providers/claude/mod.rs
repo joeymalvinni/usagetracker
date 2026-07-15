@@ -11,14 +11,17 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
-use usage_core::ProviderId;
+use usage_core::{
+    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
+    UsageSnapshot,
+};
 
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
     providers::{
         paths::expand_home_path, AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome,
         DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
-        ProviderErrorKind, ProviderUsage, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        ProviderErrorKind, ProviderUsage, UsageDataset, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
 };
 
@@ -161,6 +164,57 @@ impl ClaudeCollector {
         } else {
             Ok(credentials)
         }
+    }
+
+    async fn collect_local_usage_dataset(
+        &self,
+        profile: &ClaudeProfile,
+    ) -> Result<Option<UsageDataset>, ProviderError> {
+        if !profile.cli_enabled {
+            return Ok(None);
+        }
+        let project_roots = profile.project_roots.clone();
+        let cost_cache = profile.cost_cache.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            scan_claude_local_costs_cached(cost_cache, project_roots)
+        })
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("Claude local cost scan task failed: {err}"),
+            )
+        })?
+        .map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::Parse,
+                format!("Claude local cost scan failed: {err}"),
+            )
+        })?;
+
+        let cache_status = scan.cache_status.as_str();
+        let mut usage = ProviderUsage {
+            provider_id: ProviderId::new(PROVIDER_ID),
+            collected_at: chrono::Utc::now(),
+            windows: Vec::new(),
+            metadata: json!({}),
+        };
+        merge_local_cost_report(&mut usage, scan.report);
+        usage.metadata["claude_cost"]["scan_cache"] = json!(cache_status);
+        Ok(Some(UsageDataset::supplemental_named(
+            "claude_local_logs",
+            ProviderCollectionResult {
+                usage,
+                daily_usage: Vec::new(),
+                collection_mode: "claude_local_logs".to_string(),
+                account_email: None,
+                warnings: Vec::new(),
+            },
+            UsageDataSource::LocalLogs,
+            UsageDataScope::SelectedLocalRoots,
+            UsageDataQuality::Estimated,
+            UsageDataCompleteness::Partial,
+        )))
     }
 
     async fn fetch_profile_identity(
@@ -593,24 +647,6 @@ impl ProviderCollector for ClaudeCollector {
             Err(api_err) => return Err(api_err),
         };
 
-        if profile.cli_enabled {
-            let project_roots = profile.project_roots.clone();
-            let cost_cache = profile.cost_cache.clone();
-            match tokio::task::spawn_blocking(move || {
-                scan_claude_local_costs_cached(cost_cache, project_roots)
-            })
-            .await
-            {
-                Ok(Ok(scan)) => {
-                    let cache_status = scan.cache_status.as_str();
-                    merge_local_cost_report(&mut usage, scan.report);
-                    usage.metadata["claude_cost"]["scan_cache"] = json!(cache_status);
-                }
-                Ok(Err(err)) => warnings.push(format!("Claude local cost scan failed: {err}")),
-                Err(err) => warnings.push(format!("Claude local cost scan task failed: {err}")),
-            }
-        }
-
         usage.metadata["credential_profile"] = json!(account.external_account_id);
         usage.metadata["profile_id"] = json!(profile.id.as_str());
         if let Some(display_name) = profile.display_name.as_deref() {
@@ -628,13 +664,51 @@ impl ProviderCollector for ClaudeCollector {
             }
         }
 
-        Ok(CollectionOutcome::collected(ProviderCollectionResult {
-            usage,
-            daily_usage: Vec::new(),
-            collection_mode,
-            account_email: account.email.clone(),
-            warnings,
-        }))
+        let mut supplemental = Vec::new();
+        match self.collect_local_usage_dataset(&profile).await {
+            Ok(Some(dataset)) => supplemental.push(dataset),
+            Ok(None) => {}
+            Err(error) => warnings.push(error.short_message().to_string()),
+        }
+
+        Ok(CollectionOutcome::collected_with_supplemental(
+            ProviderCollectionResult {
+                usage,
+                daily_usage: Vec::new(),
+                collection_mode,
+                account_email: account.email.clone(),
+                warnings,
+            },
+            supplemental,
+        ))
+    }
+
+    async fn collect_local_usage(
+        &self,
+        account: &Account,
+        _current: Option<&UsageSnapshot>,
+    ) -> Result<Vec<UsageDataset>, ProviderError> {
+        let profile_id = account.profile_id.as_deref().ok_or_else(|| {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Claude account has no profile identity",
+            )
+        })?;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    format!("Claude profile {profile_id} no longer exists"),
+                )
+            })?;
+        Ok(self
+            .collect_local_usage_dataset(profile)
+            .await?
+            .into_iter()
+            .collect())
     }
 }
 

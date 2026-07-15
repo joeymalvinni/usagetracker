@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,12 +9,16 @@ use std::{
 };
 
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 use usage_core::ProviderId;
 
-use crate::{config::Config, polling::RefreshCoordinator, runtime::provider_registry};
+use crate::{
+    config::Config,
+    polling::RefreshCoordinator,
+    runtime::{provider_adapter::LocalUsagePathMatcher, provider_registry},
+};
 
-const CHANGE_DEBOUNCE: Duration = Duration::from_secs(30);
 const WATCH_EVENT_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Default)]
@@ -36,11 +40,21 @@ impl LocalLogConfig {
                 continue;
             };
             match adapter.local_usage_watch(provider_config) {
-                Ok(Some(watch)) => targets.push(LocalLogTarget {
-                    provider_id: descriptor.id.as_str().to_string(),
-                    roots: watch.roots,
-                    minimum_refresh_interval: watch.minimum_refresh_interval,
-                }),
+                Ok(Some(watch)) => match watch.validate() {
+                    Ok(()) => targets.push(LocalLogTarget {
+                        provider_id: descriptor.id.as_str().to_string(),
+                        roots: watch.roots,
+                        matchers: watch.matchers,
+                        debounce: watch.debounce,
+                        maximum_latency: watch.maximum_latency,
+                        minimum_refresh_interval: watch.minimum_refresh_interval,
+                    }),
+                    Err(error) => warn!(
+                        provider_id = descriptor.id.as_str(),
+                        %error,
+                        "ignoring invalid provider-owned local usage watch"
+                    ),
+                },
                 Ok(None) => {}
                 Err(error) => warn!(
                     provider_id = descriptor.id.as_str(),
@@ -62,10 +76,12 @@ pub fn spawn_change_log_loop(
         let (tx, mut rx) = tokio::sync::mpsc::channel(WATCH_EVENT_QUEUE_CAPACITY);
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflowed = overflowed.clone();
+        let overflow_wakeup = Arc::new(Notify::new());
+        let callback_overflow_wakeup = overflow_wakeup.clone();
         let mut watcher = match RecommendedWatcher::new(
             move |event| {
                 if tx.try_send(event).is_err() {
-                    callback_overflowed.store(true, Ordering::Release);
+                    signal_queue_overflow(&callback_overflowed, &callback_overflow_wakeup);
                 }
             },
             NotifyConfig::default(),
@@ -85,11 +101,10 @@ pub fn spawn_change_log_loop(
             "local message log watcher started"
         );
 
-        let mut pending = BTreeSet::<String>::new();
-        let mut refresh_at = None;
-        let mut last_refresh = None;
+        let mut pending = BTreeMap::<String, PendingRefresh>::new();
+        let mut last_refresh = BTreeMap::<String, tokio::time::Instant>::new();
         loop {
-            let deadline = refresh_at;
+            let deadline = pending.values().map(|pending| pending.deadline).min();
             tokio::select! {
                 changed = configs.changed() => {
                     if changed.is_err() {
@@ -102,14 +117,15 @@ pub fn spawn_change_log_loop(
                         .iter()
                         .map(|target| target.provider_id.clone())
                         .collect::<BTreeSet<_>>();
-                    pending.retain(|provider| active.contains(provider));
-                    pending.extend(newly_available);
-                    refresh_at = (!pending.is_empty()).then(|| local_refresh_deadline(
+                    pending.retain(|provider, _| active.contains(provider));
+                    last_refresh.retain(|provider, _| active.contains(provider));
+                    schedule_providers(
                         tokio::time::Instant::now(),
-                        last_refresh,
-                        &pending,
+                        newly_available,
                         &targets,
-                    ));
+                        &last_refresh,
+                        &mut pending,
+                    );
                     info!(
                         watched_roots = watch_state.watched_roots.len(),
                         targets = ?target_roots(&targets),
@@ -118,36 +134,61 @@ pub fn spawn_change_log_loop(
                 }
                 event = rx.recv() => {
                     let Some(event) = event else { return };
-                    if handle_watch_event(
+                    let changed = handle_watch_event(
                         event,
                         &mut watch_state,
                         &mut watcher,
                         &targets,
+                    );
+                    schedule_providers(
+                        tokio::time::Instant::now(),
+                        changed,
+                        &targets,
+                        &last_refresh,
                         &mut pending,
-                    ) {
-                        refresh_at = Some(local_refresh_deadline(
+                    );
+                }
+                _ = overflow_wakeup.notified() => {
+                    if overflowed.swap(false, Ordering::AcqRel) {
+                        schedule_providers(
                             tokio::time::Instant::now(),
-                            last_refresh,
-                            &pending,
+                            targets.iter().map(|target| target.provider_id.clone()).collect(),
                             &targets,
-                        ));
+                            &last_refresh,
+                            &mut pending,
+                        );
+                        warn!(
+                            queue_capacity = WATCH_EVENT_QUEUE_CAPACITY,
+                            "local message log watcher queue overflowed; reconciling all local providers"
+                        );
                     }
                 }
                 _ = wait_for_deadline(deadline) => {
-                    if overflowed.swap(false, Ordering::AcqRel) {
-                        pending.extend(targets.iter().map(|target| target.provider_id.clone()));
-                        warn!(
-                            queue_capacity = WATCH_EVENT_QUEUE_CAPACITY,
-                            "local message log watcher queue overflowed; refreshing all local providers"
-                        );
+                    let now = tokio::time::Instant::now();
+                    let due = pending
+                        .iter()
+                        .filter(|(_, pending)| pending.deadline <= now)
+                        .map(|(provider, _)| provider.clone())
+                        .collect::<BTreeSet<_>>();
+                    for provider in &due {
+                        pending.remove(provider);
+                        last_refresh.insert(provider.clone(), now);
                     }
-                    refresh_local_usage(&refresh, std::mem::take(&mut pending)).await;
-                    last_refresh = Some(tokio::time::Instant::now());
-                    refresh_at = None;
+                    if !due.is_empty() {
+                        let refresh = refresh.clone();
+                        tokio::spawn(async move {
+                            refresh_local_usage(&refresh, due).await;
+                        });
+                    }
                 }
             }
         }
     })
+}
+
+fn signal_queue_overflow(overflowed: &AtomicBool, wakeup: &Notify) {
+    overflowed.store(true, Ordering::Release);
+    wakeup.notify_one();
 }
 
 async fn wait_for_deadline(deadline: Option<tokio::time::Instant>) {
@@ -173,50 +214,65 @@ fn handle_watch_event(
     watch_state: &mut LocalLogWatchState,
     watcher: &mut RecommendedWatcher,
     targets: &[LocalLogTarget],
-    pending: &mut BTreeSet<String>,
-) -> bool {
+) -> BTreeSet<String> {
     match event {
         Ok(event) => {
-            let newly_available = watch_state.sync(watcher, targets);
-            let should_refresh = !newly_available.is_empty();
-            pending.extend(newly_available);
-            let provider_id = provider_id_for_event(targets, &event);
-            if let Some(provider_id) = provider_id {
-                pending.insert(provider_id.to_string());
-            }
-            should_refresh || provider_id.is_some()
+            let mut changed = watch_state.sync(watcher, targets);
+            changed.extend(provider_ids_for_event(targets, &event));
+            changed
         }
         Err(err) => {
             warn!(error = %err, "local message log watcher error");
-            false
+            BTreeSet::new()
         }
     }
 }
 
-fn local_refresh_deadline(
+fn schedule_providers(
     now: tokio::time::Instant,
-    last_refresh: Option<tokio::time::Instant>,
-    pending: &BTreeSet<String>,
+    providers: BTreeSet<String>,
     targets: &[LocalLogTarget],
-) -> tokio::time::Instant {
-    let debounced = now + CHANGE_DEBOUNCE;
-    let minimum_interval = targets
-        .iter()
-        .filter(|target| pending.contains(&target.provider_id))
-        .map(|target| target.minimum_refresh_interval)
-        .max()
-        .unwrap_or_default();
-    let rate_limited = last_refresh
-        .map(|last| last + minimum_interval)
-        .unwrap_or(now);
-    debounced.max(rate_limited)
+    last_refresh: &BTreeMap<String, tokio::time::Instant>,
+    pending: &mut BTreeMap<String, PendingRefresh>,
+) {
+    for provider in providers {
+        let Some(target) = targets.iter().find(|target| target.provider_id == provider) else {
+            continue;
+        };
+        let first_change = pending
+            .get(&provider)
+            .map(|pending| pending.first_change)
+            .unwrap_or(now);
+        let debounced = now + target.debounce;
+        let bounded = first_change + target.maximum_latency;
+        let rate_limited = last_refresh
+            .get(&provider)
+            .map(|last| *last + target.minimum_refresh_interval)
+            .unwrap_or(now);
+        pending.insert(
+            provider,
+            PendingRefresh {
+                first_change,
+                deadline: debounced.min(bounded).max(rate_limited),
+            },
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
 struct LocalLogTarget {
     provider_id: String,
     roots: Vec<PathBuf>,
+    matchers: Vec<LocalUsagePathMatcher>,
+    debounce: Duration,
+    maximum_latency: Duration,
     minimum_refresh_interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRefresh {
+    first_change: tokio::time::Instant,
+    deadline: tokio::time::Instant,
 }
 
 #[derive(Default)]
@@ -329,20 +385,15 @@ fn nearest_existing_parent(root: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn provider_id_for_event<'a>(targets: &'a [LocalLogTarget], event: &Event) -> Option<&'a str> {
-    let paths = jsonl_paths(&event.paths);
-    if paths.is_empty() {
-        return None;
-    }
-
-    let provider_id = provider_id_for_paths(targets, &paths);
+fn provider_ids_for_event(targets: &[LocalLogTarget], event: &Event) -> BTreeSet<String> {
+    let provider_ids = provider_ids_for_paths(targets, &event.paths);
     debug!(
-        provider_id = provider_id.unwrap_or("unknown"),
+        provider_ids = ?provider_ids,
         kind = ?event.kind,
-        paths = ?display_paths(&paths),
+        paths = ?display_paths(&event.paths),
         "local message logs changed; scheduling usage refresh"
     );
-    provider_id
+    provider_ids
 }
 
 async fn refresh_local_usage(refresh: &RefreshCoordinator, pending: BTreeSet<String>) {
@@ -351,10 +402,10 @@ async fn refresh_local_usage(refresh: &RefreshCoordinator, pending: BTreeSet<Str
     }
 
     let providers = pending.into_iter().map(ProviderId::new).collect::<Vec<_>>();
-    let report = refresh.refresh(Some(&providers)).await;
+    let datasets = refresh.refresh_local(&providers).await;
     info!(
         provider_filter = ?providers.iter().map(ProviderId::as_str).collect::<Vec<_>>(),
-        results = report.provider_results.len(),
+        datasets,
         "local message log refresh completed"
     );
 }
@@ -363,21 +414,17 @@ fn local_log_targets(config: &LocalLogConfig) -> Vec<LocalLogTarget> {
     config.targets.clone()
 }
 
-fn jsonl_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
-    paths
+fn provider_ids_for_paths(targets: &[LocalLogTarget], paths: &[PathBuf]) -> BTreeSet<String> {
+    targets
         .iter()
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
-        .cloned()
+        .filter(|target| {
+            paths.iter().any(|path| {
+                target.roots.iter().any(|root| path.starts_with(root))
+                    && target.matchers.iter().any(|matcher| matcher.matches(path))
+            })
+        })
+        .map(|target| target.provider_id.clone())
         .collect()
-}
-
-fn provider_id_for_paths<'a>(targets: &'a [LocalLogTarget], paths: &[PathBuf]) -> Option<&'a str> {
-    targets.iter().find_map(|target| {
-        paths
-            .iter()
-            .any(|path| target.roots.iter().any(|root| path.starts_with(root)))
-            .then_some(target.provider_id.as_str())
-    })
 }
 
 fn target_roots(targets: &[LocalLogTarget]) -> Vec<String> {
@@ -399,40 +446,70 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn keeps_only_jsonl_paths() {
-        let paths = jsonl_paths(&[
-            PathBuf::from("/tmp/session.jsonl"),
-            PathBuf::from("/tmp/session.json"),
-            PathBuf::from("/tmp/nested"),
-        ]);
-
-        assert_eq!(paths, vec![PathBuf::from("/tmp/session.jsonl")]);
+    fn target(
+        provider_id: &str,
+        root: &str,
+        matcher: LocalUsagePathMatcher,
+        minimum_refresh_interval: Duration,
+    ) -> LocalLogTarget {
+        LocalLogTarget {
+            provider_id: provider_id.to_string(),
+            roots: vec![PathBuf::from(root)],
+            matchers: vec![matcher],
+            debounce: Duration::from_secs(30),
+            maximum_latency: Duration::from_secs(60),
+            minimum_refresh_interval,
+        }
     }
 
     #[test]
-    fn resolves_provider_from_watched_roots() {
+    fn resolves_every_provider_with_a_matching_root_and_file_pattern() {
         let targets = vec![
-            LocalLogTarget {
-                provider_id: "alpha".to_string(),
-                roots: vec![PathBuf::from("/home/me/.codex/sessions")],
-                minimum_refresh_interval: Duration::from_secs(30),
-            },
-            LocalLogTarget {
-                provider_id: "beta".to_string(),
-                roots: vec![PathBuf::from("/home/me/.claude/projects")],
-                minimum_refresh_interval: Duration::from_secs(60),
-            },
+            target(
+                "alpha",
+                "/home/me/.shared/sessions",
+                LocalUsagePathMatcher::extension("jsonl"),
+                Duration::from_secs(30),
+            ),
+            target(
+                "beta",
+                "/home/me/.shared",
+                LocalUsagePathMatcher::file_name("session.jsonl"),
+                Duration::from_secs(60),
+            ),
+            target(
+                "database",
+                "/home/me/.local/share/opencode",
+                LocalUsagePathMatcher::suffix(".db-wal"),
+                Duration::from_secs(60),
+            ),
         ];
 
-        let provider = provider_id_for_paths(
+        let providers = provider_ids_for_paths(
             &targets,
             &[PathBuf::from(
-                "/home/me/.claude/projects/project/session.jsonl",
+                "/home/me/.shared/sessions/project/session.jsonl",
             )],
         );
 
-        assert_eq!(provider, Some("beta"));
+        assert_eq!(
+            providers,
+            BTreeSet::from(["alpha".to_string(), "beta".to_string()])
+        );
+        assert!(provider_ids_for_paths(
+            &targets,
+            &[PathBuf::from(
+                "/home/me/.local/share/opencode/opencode.db-wal"
+            )]
+        )
+        .contains("database"));
+        assert!(provider_ids_for_paths(
+            &targets,
+            &[PathBuf::from(
+                "/home/me/.shared/sessions/project/session.json"
+            )]
+        )
+        .is_empty());
     }
 
     #[test]
@@ -449,35 +526,57 @@ mod tests {
     }
 
     #[test]
-    fn refresh_deadline_debounces_and_rate_limits() {
+    fn scheduling_is_independent_and_has_bounded_trailing_debounce() {
         let now = tokio::time::Instant::now();
-        let fast = BTreeSet::from(["fast".to_string()]);
-        let slow = BTreeSet::from(["slow".to_string()]);
         let targets = vec![
-            LocalLogTarget {
-                provider_id: "fast".to_string(),
-                roots: Vec::new(),
-                minimum_refresh_interval: Duration::from_secs(30),
-            },
-            LocalLogTarget {
-                provider_id: "slow".to_string(),
-                roots: Vec::new(),
-                minimum_refresh_interval: Duration::from_secs(60),
-            },
+            target(
+                "fast",
+                "/fast",
+                LocalUsagePathMatcher::extension("jsonl"),
+                Duration::from_secs(30),
+            ),
+            target(
+                "slow",
+                "/slow",
+                LocalUsagePathMatcher::extension("jsonl"),
+                Duration::from_secs(90),
+            ),
         ];
-        assert_eq!(
-            local_refresh_deadline(now, None, &fast, &targets),
-            now + CHANGE_DEBOUNCE
-        );
+        let mut pending = BTreeMap::new();
+        let last_refresh = BTreeMap::from([("slow".to_string(), now - Duration::from_secs(5))]);
 
-        let recent = now - Duration::from_secs(5);
-        assert_eq!(
-            local_refresh_deadline(now, Some(recent), &fast, &targets),
-            now + CHANGE_DEBOUNCE
+        schedule_providers(
+            now,
+            BTreeSet::from(["fast".to_string(), "slow".to_string()]),
+            &targets,
+            &last_refresh,
+            &mut pending,
         );
-        assert_eq!(
-            local_refresh_deadline(now, Some(recent), &slow, &targets),
-            recent + Duration::from_secs(60)
+        assert_eq!(pending["fast"].deadline, now + Duration::from_secs(30));
+        assert_eq!(pending["slow"].deadline, now + Duration::from_secs(85));
+
+        schedule_providers(
+            now + Duration::from_secs(50),
+            BTreeSet::from(["fast".to_string()]),
+            &targets,
+            &last_refresh,
+            &mut pending,
         );
+        assert_eq!(pending["fast"].deadline, now + Duration::from_secs(60));
+        assert_eq!(pending["slow"].deadline, now + Duration::from_secs(85));
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_wakes_reconciliation_without_a_refresh_deadline() {
+        let overflowed = AtomicBool::new(false);
+        let wakeup = Notify::new();
+        let notified = wakeup.notified();
+
+        signal_queue_overflow(&overflowed, &wakeup);
+
+        tokio::time::timeout(Duration::from_millis(10), notified)
+            .await
+            .expect("overflow should wake the watcher loop");
+        assert!(overflowed.swap(false, Ordering::AcqRel));
     }
 }

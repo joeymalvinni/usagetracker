@@ -35,6 +35,16 @@ CREATE TABLE usage_snapshots (
 CREATE INDEX usage_snapshots_provider_account_time
 ON usage_snapshots(provider_id, account_id, collected_at DESC, sequence DESC);
 
+CREATE TABLE local_usage_overlays (
+  provider_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  collected_at TEXT NOT NULL,
+  dataset_json TEXT NOT NULL,
+  PRIMARY KEY(provider_id, account_id, source),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
 CREATE TABLE usage_window_observations (
   snapshot_id TEXT NOT NULL,
   snapshot_sequence INTEGER NOT NULL,

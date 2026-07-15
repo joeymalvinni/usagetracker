@@ -4,12 +4,13 @@ use rusqlite::params;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use usage_core::{
-    AccountDisplayNameSource, ProviderHealth, ProviderHealthStatus, UsageAmount, UsageUnit,
-    UsageWindow, UsageWindowKind,
+    AccountDisplayNameSource, DataProvenance, DatasetProvenance, ProviderHealth,
+    ProviderHealthStatus, UsageAmount, UsageDataCompleteness, UsageDataConfidence,
+    UsageDataQuality, UsageDataScope, UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
 };
 use uuid::Uuid;
 
-use crate::providers::DailyUsageBucket;
+use crate::providers::{DailyUsageBucket, ProviderCollectionResult, ProviderUsage, UsageDataset};
 
 #[tokio::test]
 async fn stores_and_reads_accounts_snapshots_and_health() {
@@ -77,6 +78,309 @@ async fn stores_and_reads_accounts_snapshots_and_health() {
     assert_eq!(health.len(), 1);
     assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
     assert_eq!(health[0].collection_mode.as_deref(), Some("test"));
+}
+
+#[tokio::test]
+async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
+    let storage = test_storage();
+    let provider_id = ProviderId::new("codex");
+    let account = storage
+        .upsert_account(&provider_id, "external-account", None, None, None)
+        .await
+        .unwrap();
+    let remote_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let old_local = DatasetProvenance {
+        source_id: "codex_local_logs".to_string(),
+        authoritative: false,
+        provenance: DataProvenance {
+            source: UsageDataSource::LocalLogs,
+            scope: UsageDataScope::ThisDevice,
+            quality: UsageDataQuality::Estimated,
+            completeness: UsageDataCompleteness::Partial,
+            confidence: UsageDataConfidence::Medium,
+        },
+        window_ids: vec!["local_tokens".to_string()],
+        daily_sources: Vec::new(),
+        metadata_keys: vec!["codex_cost".to_string()],
+    };
+    storage
+        .insert_snapshot(&UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id.clone(),
+            collected_at: remote_at,
+            windows: vec![
+                percentage_window("remote_quota", UsageWindowKind::Session, 25.0, None),
+                token_test_window("local_tokens", 10.0),
+            ],
+            metadata: json!({
+                "remote": true,
+                "codex_cost": {"tokens": 10},
+                "dataset_provenance": [old_local],
+            }),
+        })
+        .await
+        .unwrap();
+    let health = ProviderHealth {
+        provider_id: provider_id.clone(),
+        account_id: Some(account.id.clone()),
+        status: ProviderHealthStatus::RateLimited,
+        collection_mode: Some("remote".to_string()),
+        last_success_at: None,
+        last_failure_at: Some(remote_at),
+        last_error_code: Some("rate_limited".to_string()),
+        last_error_message: Some("wait".to_string()),
+        updated_at: remote_at,
+    };
+    storage.upsert_health(&health).await.unwrap();
+
+    let local_at = remote_at + chrono::TimeDelta::minutes(1);
+    let overlay = UsageDataset::supplemental_named(
+        "codex_local_logs",
+        ProviderCollectionResult {
+            usage: ProviderUsage {
+                provider_id: provider_id.clone(),
+                collected_at: local_at,
+                windows: vec![token_test_window("local_tokens", 25.0)],
+                metadata: json!({"codex_cost": {"tokens": 25}}),
+            },
+            daily_usage: Vec::new(),
+            collection_mode: "codex_local_logs".to_string(),
+            account_email: None,
+            warnings: Vec::new(),
+        },
+        UsageDataSource::LocalLogs,
+        UsageDataScope::ThisDevice,
+        UsageDataQuality::Estimated,
+        UsageDataCompleteness::Partial,
+    );
+    storage
+        .upsert_local_usage_overlay(&account.id, &overlay)
+        .await
+        .unwrap();
+
+    let snapshot = storage.latest_usage().await.unwrap().remove(0);
+    assert_eq!(snapshot.collected_at, local_at);
+    assert!(snapshot
+        .windows
+        .iter()
+        .any(|window| window.window_id == "remote_quota"));
+    let local = snapshot
+        .windows
+        .iter()
+        .find(|window| window.window_id == "local_tokens")
+        .unwrap();
+    assert_eq!(local.used.as_ref().unwrap().value, 25.0);
+    assert_eq!(snapshot.metadata["codex_cost"]["tokens"], 25);
+    assert!(matches!(
+        storage.provider_health().await.unwrap()[0].status,
+        ProviderHealthStatus::RateLimited
+    ));
+}
+
+#[tokio::test]
+async fn local_overlay_preserves_colliding_values_owned_by_the_remote_dataset() {
+    let storage = test_storage();
+    let provider_id = ProviderId::new("opencode_go");
+    let account = storage
+        .upsert_account(&provider_id, "workspace", None, None, None)
+        .await
+        .unwrap();
+    let remote_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    let provenance = vec![
+        DatasetProvenance {
+            source_id: "provider_reported".to_string(),
+            authoritative: true,
+            provenance: DataProvenance {
+                source: UsageDataSource::ProviderReported,
+                scope: UsageDataScope::AccountWide,
+                quality: UsageDataQuality::Authoritative,
+                completeness: UsageDataCompleteness::Complete,
+                confidence: UsageDataConfidence::High,
+            },
+            window_ids: vec!["shared_history".to_string()],
+            daily_sources: Vec::new(),
+            metadata_keys: vec![
+                "collection_mode".to_string(),
+                "web_authoritative".to_string(),
+            ],
+        },
+        DatasetProvenance {
+            source_id: "opencode_local_database".to_string(),
+            authoritative: false,
+            provenance: DataProvenance {
+                source: UsageDataSource::LocalDatabase,
+                scope: UsageDataScope::ThisDevice,
+                quality: UsageDataQuality::Observed,
+                completeness: UsageDataCompleteness::Partial,
+                confidence: UsageDataConfidence::Medium,
+            },
+            window_ids: vec!["local_history".to_string()],
+            daily_sources: Vec::new(),
+            metadata_keys: vec!["database".to_string()],
+        },
+    ];
+    storage
+        .insert_snapshot(&UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id.clone(),
+            collected_at: remote_at,
+            windows: vec![
+                token_test_window("shared_history", 10.0),
+                token_test_window("local_history", 10.0),
+            ],
+            metadata: json!({
+                "collection_mode": "opencode_go_web_console",
+                "web_authoritative": true,
+                "database": "old.db",
+                "dataset_provenance": provenance,
+            }),
+        })
+        .await
+        .unwrap();
+
+    let local_at = remote_at + chrono::TimeDelta::minutes(1);
+    let overlay = UsageDataset::supplemental_named(
+        "opencode_local_database",
+        ProviderCollectionResult {
+            usage: ProviderUsage {
+                provider_id: provider_id.clone(),
+                collected_at: local_at,
+                windows: vec![
+                    token_test_window("shared_history", 99.0),
+                    token_test_window("local_history", 25.0),
+                ],
+                metadata: json!({
+                    "collection_mode": "opencode_go_local_sqlite",
+                    "web_authoritative": false,
+                    "database": "new.db",
+                }),
+            },
+            daily_usage: Vec::new(),
+            collection_mode: "opencode_go_local_sqlite".to_string(),
+            account_email: None,
+            warnings: Vec::new(),
+        },
+        UsageDataSource::LocalDatabase,
+        UsageDataScope::ThisDevice,
+        UsageDataQuality::Observed,
+        UsageDataCompleteness::Partial,
+    );
+    storage
+        .upsert_local_usage_overlay(&account.id, &overlay)
+        .await
+        .unwrap();
+
+    let snapshot = storage.latest_usage().await.unwrap().remove(0);
+    assert_eq!(
+        snapshot.metadata["collection_mode"],
+        "opencode_go_web_console"
+    );
+    assert_eq!(snapshot.metadata["web_authoritative"], true);
+    assert_eq!(snapshot.metadata["database"], "new.db");
+    assert_eq!(
+        snapshot
+            .windows
+            .iter()
+            .filter(|window| window.window_id == "shared_history")
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.window_id == "shared_history")
+            .unwrap()
+            .used
+            .as_ref()
+            .unwrap()
+            .value,
+        10.0
+    );
+    assert_eq!(
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.window_id == "local_history")
+            .unwrap()
+            .used
+            .as_ref()
+            .unwrap()
+            .value,
+        25.0
+    );
+    let provenance = serde_json::from_value::<Vec<DatasetProvenance>>(
+        snapshot.metadata["dataset_provenance"].clone(),
+    )
+    .unwrap();
+    let local = provenance
+        .iter()
+        .find(|dataset| dataset.source_id == "opencode_local_database")
+        .unwrap();
+    assert_eq!(local.window_ids, ["local_history"]);
+    assert_eq!(local.metadata_keys, ["database"]);
+}
+
+#[tokio::test]
+async fn successful_empty_local_reconciliation_removes_stale_overlays() {
+    let storage = test_storage();
+    let provider_id = ProviderId::new("claude");
+    let account = storage
+        .upsert_account(&provider_id, "account", Some("default"), None, None)
+        .await
+        .unwrap();
+    let remote_at = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+    storage
+        .insert_snapshot(&UsageSnapshot {
+            provider_id: provider_id.clone(),
+            account_id: account.id.clone(),
+            collected_at: remote_at,
+            windows: Vec::new(),
+            metadata: json!({"remote": true}),
+        })
+        .await
+        .unwrap();
+    let overlay = UsageDataset::supplemental_named(
+        "claude_local_logs",
+        ProviderCollectionResult {
+            usage: ProviderUsage {
+                provider_id: provider_id.clone(),
+                collected_at: remote_at + chrono::TimeDelta::minutes(1),
+                windows: Vec::new(),
+                metadata: json!({"claude_cost": {"tokens": 42}}),
+            },
+            daily_usage: Vec::new(),
+            collection_mode: "claude_local_logs".to_string(),
+            account_email: None,
+            warnings: Vec::new(),
+        },
+        UsageDataSource::LocalLogs,
+        UsageDataScope::ThisDevice,
+        UsageDataQuality::Estimated,
+        UsageDataCompleteness::Partial,
+    );
+    storage
+        .upsert_local_usage_overlay(&account.id, &overlay)
+        .await
+        .unwrap();
+    assert!(storage.latest_usage().await.unwrap()[0]
+        .metadata
+        .get("claude_cost")
+        .is_some());
+
+    storage
+        .reconcile_local_usage_overlays(
+            &account.id,
+            &provider_id,
+            &[],
+            remote_at + chrono::TimeDelta::minutes(2),
+        )
+        .await
+        .unwrap();
+
+    let snapshot = storage.latest_usage().await.unwrap().remove(0);
+    assert_eq!(snapshot.metadata["remote"], true);
+    assert!(snapshot.metadata.get("claude_cost").is_none());
 }
 
 #[tokio::test]
@@ -969,5 +1273,22 @@ fn percentage_window(
         percent_used: Some(percent_used),
         percent_remaining: Some(100.0 - percent_used),
         reset_at,
+    }
+}
+
+fn token_test_window(window_id: &str, tokens: f64) -> UsageWindow {
+    UsageWindow {
+        window_id: window_id.to_string(),
+        label: window_id.to_string(),
+        kind: UsageWindowKind::Tokens,
+        used: Some(UsageAmount {
+            value: tokens,
+            unit: UsageUnit::Tokens,
+        }),
+        limit: None,
+        remaining: None,
+        percent_used: None,
+        percent_remaining: None,
+        reset_at: None,
     }
 }

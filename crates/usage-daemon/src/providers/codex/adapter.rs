@@ -22,8 +22,8 @@ use crate::{
     },
     runtime::provider_adapter::{
         plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-        ExecutionPolicy, LocalUsageWatch, ProviderAdapter, ProviderManifest, ProviderRuntime,
-        RepairHandler,
+        ExecutionPolicy, LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter, ProviderManifest,
+        ProviderRuntime, RepairHandler,
     },
 };
 
@@ -73,10 +73,14 @@ impl ProviderAdapter for CodexAdapter {
         }
         roots.sort();
         roots.dedup();
-        Ok(Some(LocalUsageWatch {
-            roots,
-            minimum_refresh_interval: Duration::from_secs(30),
-        }))
+        Ok(Some(
+            LocalUsageWatch::new(
+                roots,
+                [LocalUsagePathMatcher::extension("jsonl")],
+                Duration::from_secs(60),
+            )
+            .with_timing(Duration::from_secs(30), Duration::from_secs(60)),
+        ))
     }
 
     fn build_collector(

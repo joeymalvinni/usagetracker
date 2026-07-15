@@ -19,8 +19,8 @@ use crate::{
     },
     runtime::provider_adapter::{
         plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-        ExecutionPolicy, LaunchHandler, LocalUsageWatch, ProviderAdapter, ProviderManifest,
-        ProviderRuntime, RepairHandler,
+        ExecutionPolicy, LaunchHandler, LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter,
+        ProviderManifest, ProviderRuntime, RepairHandler,
     },
 };
 
@@ -111,10 +111,11 @@ impl ProviderAdapter for ClaudeAdapter {
         }
         roots.sort();
         roots.dedup();
-        Ok(Some(LocalUsageWatch {
+        Ok(Some(LocalUsageWatch::new(
             roots,
-            minimum_refresh_interval: Duration::from_secs(60),
-        }))
+            [LocalUsagePathMatcher::extension("jsonl")],
+            Duration::from_secs(60),
+        )))
     }
 
     fn build_collector(

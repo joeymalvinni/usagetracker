@@ -213,6 +213,14 @@ mod tests {
             let collector = provider
                 .build_collector(&ProviderConfig::default())
                 .unwrap_or_else(|error| panic!("{} default config: {error}", manifest.id));
+            if let Some(watch) = provider
+                .local_usage_watch(&ProviderConfig::default())
+                .unwrap_or_else(|error| panic!("{} default local watch: {error}", manifest.id))
+            {
+                watch
+                    .validate()
+                    .unwrap_or_else(|error| panic!("{} invalid local watch: {error}", manifest.id));
+            }
             assert_eq!(collector.provider_id().as_str(), manifest.id);
             assert_eq!(provider.descriptor().id.as_str(), manifest.id);
             let policy = provider.execution_policy();

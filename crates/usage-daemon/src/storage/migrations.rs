@@ -6,11 +6,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial",
-    sql: include_str!("../../migrations/0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial",
+        sql: include_str!("../../migrations/0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "local_usage_overlays",
+        sql: include_str!("../../migrations/0002_local_usage_overlays.sql"),
+    },
+];
 
 // "USG2". This schema identity cleanly separates the disposable v2 database
 // from every pre-registry schema without accumulating repair probes.
@@ -26,6 +33,7 @@ DROP TABLE IF EXISTS usage_window_observations;
 DROP TABLE IF EXISTS provider_daily_usage_summary;
 DROP TABLE IF EXISTS provider_daily_usage;
 DROP TABLE IF EXISTS raw_payloads;
+DROP TABLE IF EXISTS local_usage_overlays;
 DROP TABLE IF EXISTS usage_snapshots;
 DROP TABLE IF EXISTS provider_health;
 DROP TABLE IF EXISTS provider_backoff;
@@ -161,18 +169,20 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         migrate(&mut conn).unwrap();
 
-        assert_eq!(schema_version(&conn).unwrap(), 1);
+        assert_eq!(schema_version(&conn).unwrap(), 2);
         assert_eq!(
             conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             APPLICATION_ID
         );
         let applied: (i64, String) = conn
-            .query_row("SELECT version, name FROM schema_migrations", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(
+                "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(applied, (1, "initial".to_string()));
+        assert_eq!(applied, (2, "local_usage_overlays".to_string()));
         assert!(conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'accounts')",
@@ -208,7 +218,7 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(schema_version(&conn).unwrap(), 1);
+        assert_eq!(schema_version(&conn).unwrap(), 2);
         let columns = conn
             .prepare("PRAGMA table_info(accounts)")
             .unwrap()

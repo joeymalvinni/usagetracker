@@ -3,10 +3,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use usage_core::{
-    DataProvenance, ProviderFailureCode, ProviderId, UsageDataCompleteness, UsageDataConfidence,
-    UsageDataQuality, UsageDataScope, UsageDataSource, UsageSnapshot, UsageWindow,
+    Account, DataProvenance, DatasetProvenance, ProviderFailureCode, ProviderId,
+    UsageDataCompleteness, UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource,
+    UsageSnapshot, UsageWindow,
 };
 
 macro_rules! settings_accessors {
@@ -205,7 +207,7 @@ impl FromIterator<DiscoveredAccount> for AccountDiscovery {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
     pub daily_usage: Vec<DailyUsageBucket>,
@@ -214,8 +216,10 @@ pub struct ProviderCollectionResult {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UsageDataset {
+    #[serde(default)]
+    pub source_id: String,
     pub collection: ProviderCollectionResult,
     pub provenance: DataProvenance,
     pub authoritative: bool,
@@ -224,6 +228,7 @@ pub struct UsageDataset {
 impl UsageDataset {
     pub fn authoritative(collection: ProviderCollectionResult) -> Self {
         Self {
+            source_id: "provider_reported".to_string(),
             collection,
             provenance: DataProvenance {
                 source: UsageDataSource::ProviderReported,
@@ -236,7 +241,8 @@ impl UsageDataset {
         }
     }
 
-    pub fn supplemental(
+    pub fn supplemental_named(
+        source_id: impl Into<String>,
         collection: ProviderCollectionResult,
         source: UsageDataSource,
         scope: UsageDataScope,
@@ -244,6 +250,7 @@ impl UsageDataset {
         completeness: UsageDataCompleteness,
     ) -> Self {
         Self {
+            source_id: source_id.into(),
             collection,
             provenance: DataProvenance {
                 source,
@@ -254,6 +261,40 @@ impl UsageDataset {
             },
             authoritative: false,
         }
+    }
+
+    pub(crate) fn provenance_record(&self) -> DatasetProvenance {
+        DatasetProvenance {
+            source_id: self.source_id.clone(),
+            authoritative: self.authoritative,
+            provenance: self.provenance.clone(),
+            window_ids: self
+                .collection
+                .usage
+                .windows
+                .iter()
+                .map(|window| window.window_id.clone())
+                .collect(),
+            daily_sources: self
+                .collection
+                .daily_usage
+                .iter()
+                .map(|bucket| bucket.source.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            metadata_keys: self
+                .collection
+                .usage
+                .metadata
+                .as_object()
+                .map(|metadata| metadata.keys().cloned().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn source_key(&self) -> &str {
+        &self.source_id
     }
 }
 
@@ -273,9 +314,16 @@ pub struct CollectionOutcome {
 
 impl CollectionOutcome {
     pub fn collected(collection: ProviderCollectionResult) -> Self {
+        Self::collected_with_supplemental(collection, Vec::new())
+    }
+
+    pub fn collected_with_supplemental(
+        collection: ProviderCollectionResult,
+        supplemental: Vec<UsageDataset>,
+    ) -> Self {
         Self {
             authoritative: AuthoritativeOutcome::Collected(UsageDataset::authoritative(collection)),
-            supplemental: Vec::new(),
+            supplemental,
         }
     }
 
@@ -287,7 +335,7 @@ impl CollectionOutcome {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct DailyUsageBucket {
     pub date: NaiveDate,
     pub tokens: u64,
@@ -295,7 +343,7 @@ pub struct DailyUsageBucket {
     pub source: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
     pub provider_id: ProviderId,
     pub collected_at: DateTime<Utc>,
@@ -332,6 +380,16 @@ pub trait ProviderCollector: Send + Sync {
         &self,
         account: &DiscoveredAccount,
     ) -> Result<CollectionOutcome, ProviderError>;
+
+    /// Reconciles reproducible local sources without performing account
+    /// discovery, remote requests, or changing authoritative provider health.
+    async fn collect_local_usage(
+        &self,
+        _account: &Account,
+        _current: Option<&UsageSnapshot>,
+    ) -> Result<Vec<UsageDataset>, ProviderError> {
+        Ok(Vec::new())
+    }
 }
 
 pub type ProviderErrorKind = ProviderFailureCode;

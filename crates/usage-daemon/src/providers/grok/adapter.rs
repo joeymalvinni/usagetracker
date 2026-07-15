@@ -11,7 +11,8 @@ use crate::{
     providers::{launchers, ProviderCollector},
     runtime::provider_adapter::{
         plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-        ExecutionPolicy, ProviderAdapter, ProviderManifest, ProviderRuntime, RepairHandler,
+        ExecutionPolicy, LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter, ProviderManifest,
+        ProviderRuntime, RepairHandler,
     },
 };
 
@@ -51,6 +52,21 @@ impl ProviderAdapter for GrokAdapter {
 
     fn validate_config(&self, config: &ProviderConfig) -> anyhow::Result<()> {
         settings::validate(config)
+    }
+
+    fn local_usage_watch(
+        &self,
+        config: &ProviderConfig,
+    ) -> anyhow::Result<Option<LocalUsageWatch>> {
+        let roots = super::profile::resolve(config)?
+            .into_iter()
+            .map(|profile| profile.grok_home.join("sessions"))
+            .collect::<Vec<_>>();
+        Ok(Some(LocalUsageWatch::new(
+            roots,
+            [LocalUsagePathMatcher::file_name("signals.json")],
+            Duration::from_secs(60),
+        )))
     }
 
     fn build_collector(

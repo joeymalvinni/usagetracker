@@ -14,8 +14,8 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use usage_core::{
-    AccountId, DatasetProvenance, ProviderId, ProviderRefreshResult, ProviderRefreshStatus,
-    RefreshJob, RefreshJobId, RefreshJobStatus, RefreshScope, RefreshTrigger,
+    AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus, RefreshJob, RefreshJobId,
+    RefreshJobStatus, RefreshScope, RefreshTrigger,
 };
 
 use crate::{
@@ -55,6 +55,7 @@ pub struct RefreshCoordinator {
     providers: Arc<RwLock<Vec<Arc<dyn ProviderCollector>>>>,
     jobs: Arc<Mutex<RefreshJobs>>,
     provider_flights: Arc<Mutex<HashMap<ProviderId, Arc<ProviderRefreshFlight>>>>,
+    local_provider_locks: Arc<Mutex<HashMap<ProviderId, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -112,6 +113,7 @@ impl RefreshCoordinator {
             providers: Arc::new(RwLock::new(providers)),
             jobs: Arc::new(Mutex::new(RefreshJobs::default())),
             provider_flights: Arc::new(Mutex::new(HashMap::new())),
+            local_provider_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -155,6 +157,149 @@ impl RefreshCoordinator {
         }
         let job = wait_for_job(entry).await;
         RefreshReport::from_job(job)
+    }
+
+    /// Reconciles provider-owned local sources against already known accounts.
+    /// This deliberately bypasses discovery, remote backoff, health updates,
+    /// forecasts, and notifications; supplemental datasets are composed by
+    /// storage when the latest usage snapshot is read.
+    pub async fn refresh_local(&self, filter: &[ProviderId]) -> usize {
+        let providers = self.providers.read().await.clone();
+        let accounts = match self.storage.accounts().await {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                warn!(%error, "failed to load accounts for local usage refresh");
+                return 0;
+            }
+        };
+        let snapshots = match self.storage.latest_usage().await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                warn!(%error, "failed to load current snapshots for local usage refresh");
+                Vec::new()
+            }
+        };
+        let current = snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.account_id.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+
+        let refreshes = providers.into_iter().filter_map(|provider| {
+            let provider_id = provider.provider_id();
+            should_refresh_provider(&provider_id, Some(filter)).then(|| {
+                let accounts = accounts
+                    .iter()
+                    .filter(|account| {
+                        account.provider_id == provider_id && account.collection_enabled
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.refresh_local_provider(provider, provider_id, accounts, &current)
+            })
+        });
+        join_all(refreshes).await.into_iter().sum()
+    }
+
+    async fn refresh_local_provider(
+        &self,
+        provider: Arc<dyn ProviderCollector>,
+        provider_id: ProviderId,
+        accounts: Vec<usage_core::Account>,
+        current: &HashMap<AccountId, usage_core::UsageSnapshot>,
+    ) -> usize {
+        let provider_lock = {
+            let mut locks = self.local_provider_locks.lock().await;
+            locks
+                .entry(provider_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _provider_guard = provider_lock.lock().await;
+        let policy = match provider_registry::execution_policy(&provider_id) {
+            Ok(policy) => policy,
+            Err(error) => {
+                warn!(provider_id = provider_id.as_str(), %error, "local usage policy unavailable");
+                return 0;
+            }
+        };
+        stream::iter(accounts)
+            .map(|account| {
+                let provider = provider.clone();
+                let provider_id = provider_id.clone();
+                let current = current.get(&account.id).cloned();
+                async move {
+                    let reconciliation_started_at = Utc::now();
+                    let datasets = match timeout(
+                        policy.collection_timeout,
+                        provider.collect_local_usage(&account, current.as_ref()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(datasets)) => datasets,
+                        Ok(Err(error)) => {
+                            warn!(
+                                provider_id = provider_id.as_str(),
+                                account_id = account.id.as_str(),
+                                error_code = error.kind().as_str(),
+                                error = %error,
+                                "local usage collection failed"
+                            );
+                            return 0;
+                        }
+                        Err(_) => {
+                            warn!(
+                                provider_id = provider_id.as_str(),
+                                account_id = account.id.as_str(),
+                                "local usage collection timed out"
+                            );
+                            return 0;
+                        }
+                    };
+
+                    let mut source_ids = BTreeSet::new();
+                    for dataset in &datasets {
+                        if dataset.collection.usage.provider_id != provider_id
+                            || dataset.authoritative
+                            || dataset.source_id.trim().is_empty()
+                            || !source_ids.insert(dataset.source_id.as_str())
+                        {
+                            warn!(
+                                provider_id = provider_id.as_str(),
+                                account_id = account.id.as_str(),
+                                "provider returned an invalid local usage dataset"
+                            );
+                            return 0;
+                        }
+                    }
+                    let stored = datasets.len();
+                    match self
+                        .storage
+                        .reconcile_local_usage_overlays(
+                            &account.id,
+                            &provider_id,
+                            &datasets,
+                            reconciliation_started_at,
+                        )
+                        .await
+                    {
+                        Ok(()) => stored,
+                        Err(error) => {
+                            warn!(
+                                provider_id = provider_id.as_str(),
+                                account_id = account.id.as_str(),
+                                %error,
+                                "failed to reconcile local usage overlays"
+                            );
+                            0
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(policy.max_parallel_accounts)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .sum()
     }
 
     async fn claim_job(
@@ -1077,20 +1222,41 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
     let mut provenance = vec![dataset_provenance(&first)];
     let mut result = first.collection;
     let mut modes = BTreeSet::from([result.collection_mode.clone()]);
+    let mut window_ids = result
+        .usage
+        .windows
+        .iter()
+        .map(|window| window.window_id.clone())
+        .collect::<BTreeSet<_>>();
 
     for dataset in datasets {
-        provenance.push(dataset_provenance(&dataset));
+        let mut contributed_window_ids = Vec::new();
+        let mut contributed_metadata_keys = Vec::new();
+        let mut provenance_record = dataset.provenance_record();
         let incoming = dataset.collection;
         result.usage.collected_at = result.usage.collected_at.max(incoming.usage.collected_at);
-        result.usage.windows.extend(incoming.usage.windows);
+        for window in incoming.usage.windows {
+            if window_ids.insert(window.window_id.clone()) {
+                contributed_window_ids.push(window.window_id.clone());
+                result.usage.windows.push(window);
+            }
+        }
         if let (Some(target), Some(source)) = (
             result.usage.metadata.as_object_mut(),
             incoming.usage.metadata.as_object(),
         ) {
             for (key, value) in source {
-                target.entry(key.clone()).or_insert_with(|| value.clone());
+                if let serde_json::map::Entry::Vacant(entry) = target.entry(key.clone()) {
+                    contributed_metadata_keys.push(key.clone());
+                    entry.insert(value.clone());
+                }
             }
         }
+        provenance_record.window_ids = contributed_window_ids;
+        provenance_record.metadata_keys = contributed_metadata_keys;
+        provenance.push(
+            serde_json::to_value(provenance_record).expect("dataset provenance is serializable"),
+        );
         result.daily_usage.extend(incoming.daily_usage);
         result.warnings.extend(incoming.warnings);
         if result.account_email.is_none() {
@@ -1110,26 +1276,7 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
 }
 
 fn dataset_provenance(dataset: &UsageDataset) -> serde_json::Value {
-    serde_json::to_value(DatasetProvenance {
-        authoritative: dataset.authoritative,
-        provenance: dataset.provenance.clone(),
-        window_ids: dataset
-            .collection
-            .usage
-            .windows
-            .iter()
-            .map(|window| window.window_id.clone())
-            .collect(),
-        daily_sources: dataset
-            .collection
-            .daily_usage
-            .iter()
-            .map(|bucket| bucket.source.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
-    })
-    .expect("dataset provenance is serializable")
+    serde_json::to_value(dataset.provenance_record()).expect("dataset provenance is serializable")
 }
 
 fn jittered_backoff_seconds(
@@ -1243,8 +1390,9 @@ mod tests {
         time::timeout,
     };
     use usage_core::{
-        ProviderHealth, ProviderHealthStatus, UsageAmount, UsageDataCompleteness, UsageDataQuality,
-        UsageDataScope, UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
+        DatasetProvenance, ProviderHealth, ProviderHealthStatus, UsageAmount,
+        UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource, UsageUnit,
+        UsageWindow, UsageWindowKind,
     };
     use uuid::Uuid;
 
@@ -1260,6 +1408,66 @@ mod tests {
     struct FakeProvider;
 
     struct MismatchedProvider;
+
+    struct LocalOnlyProvider {
+        remote_attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProviderCollector for LocalOnlyProvider {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("claude")
+        }
+
+        fn configured_profile_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn discover_accounts(&self) -> Result<AccountDiscovery, ProviderError> {
+            self.remote_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                "remote discovery must not run",
+            ))
+        }
+
+        async fn collect_usage(
+            &self,
+            _account: &DiscoveredAccount,
+        ) -> Result<CollectionOutcome, ProviderError> {
+            self.remote_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                "remote collection must not run",
+            ))
+        }
+
+        async fn collect_local_usage(
+            &self,
+            _account: &usage_core::Account,
+            _current: Option<&usage_core::UsageSnapshot>,
+        ) -> Result<Vec<UsageDataset>, ProviderError> {
+            Ok(vec![UsageDataset::supplemental_named(
+                "claude_local_logs",
+                ProviderCollectionResult {
+                    usage: ProviderUsage {
+                        provider_id: ProviderId::new("claude"),
+                        collected_at: Utc::now(),
+                        windows: Vec::new(),
+                        metadata: json!({"claude_cost": {"tokens": 42}}),
+                    },
+                    daily_usage: Vec::new(),
+                    collection_mode: "claude_local_logs".to_string(),
+                    account_email: None,
+                    warnings: Vec::new(),
+                },
+                UsageDataSource::LocalLogs,
+                UsageDataScope::ThisDevice,
+                UsageDataQuality::Estimated,
+                UsageDataCompleteness::Partial,
+            )])
+        }
+    }
 
     #[async_trait]
     impl ProviderCollector for FakeProvider {
@@ -1623,7 +1831,8 @@ mod tests {
             _account: &DiscoveredAccount,
         ) -> Result<CollectionOutcome, ProviderError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            let supplemental = UsageDataset::supplemental(
+            let supplemental = UsageDataset::supplemental_named(
+                "opencode_local_database",
                 ProviderCollectionResult {
                     usage: ProviderUsage {
                         provider_id: ProviderId::new("opencode_go"),
@@ -1696,6 +1905,156 @@ mod tests {
                 warnings: Vec::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn local_refresh_bypasses_remote_collection_and_preserves_the_full_snapshot() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account = storage
+            .upsert_account(&provider_id, "claude-account", Some("default"), None, None)
+            .await
+            .unwrap();
+        storage
+            .insert_snapshot(&usage_core::UsageSnapshot {
+                provider_id: provider_id.clone(),
+                account_id: account.id.clone(),
+                collected_at: Utc::now() - chrono::TimeDelta::minutes(1),
+                windows: vec![UsageWindow {
+                    window_id: "remote_quota".to_string(),
+                    label: "Remote quota".to_string(),
+                    kind: UsageWindowKind::Session,
+                    used: None,
+                    limit: None,
+                    remaining: None,
+                    percent_used: Some(10.0),
+                    percent_remaining: Some(90.0),
+                    reset_at: None,
+                }],
+                metadata: json!({"remote": true}),
+            })
+            .await
+            .unwrap();
+        let remote_attempts = Arc::new(AtomicUsize::new(0));
+        let coordinator = RefreshCoordinator::new(
+            storage.clone(),
+            vec![Arc::new(LocalOnlyProvider {
+                remote_attempts: remote_attempts.clone(),
+            })],
+        );
+
+        let stored = coordinator.refresh_local(&[provider_id]).await;
+
+        assert_eq!(stored, 1);
+        assert_eq!(remote_attempts.load(Ordering::SeqCst), 0);
+        let snapshot = storage.latest_usage().await.unwrap().remove(0);
+        assert!(snapshot
+            .windows
+            .iter()
+            .any(|window| window.window_id == "remote_quota"));
+        assert_eq!(snapshot.metadata["remote"], true);
+        assert_eq!(snapshot.metadata["claude_cost"]["tokens"], 42);
+    }
+
+    #[test]
+    fn dataset_merge_records_only_values_contributed_by_each_source() {
+        let window = |id: &str, tokens: f64| UsageWindow {
+            window_id: id.to_string(),
+            label: id.to_string(),
+            kind: UsageWindowKind::Tokens,
+            used: Some(UsageAmount {
+                value: tokens,
+                unit: UsageUnit::Tokens,
+            }),
+            limit: None,
+            remaining: None,
+            percent_used: None,
+            percent_remaining: None,
+            reset_at: None,
+        };
+        let provider_id = ProviderId::new("opencode_go");
+        let authoritative = UsageDataset::authoritative(ProviderCollectionResult {
+            usage: ProviderUsage {
+                provider_id: provider_id.clone(),
+                collected_at: Utc::now(),
+                windows: vec![window("shared_history", 10.0)],
+                metadata: json!({
+                    "collection_mode": "opencode_go_web_console",
+                    "web_authoritative": true,
+                }),
+            },
+            daily_usage: Vec::new(),
+            collection_mode: "web".to_string(),
+            account_email: None,
+            warnings: Vec::new(),
+        });
+        let local = UsageDataset::supplemental_named(
+            "opencode_local_database",
+            ProviderCollectionResult {
+                usage: ProviderUsage {
+                    provider_id,
+                    collected_at: Utc::now(),
+                    windows: vec![
+                        window("shared_history", 99.0),
+                        window("local_history", 25.0),
+                    ],
+                    metadata: json!({
+                        "collection_mode": "opencode_go_local_sqlite",
+                        "web_authoritative": false,
+                        "database": "opencode.db",
+                    }),
+                },
+                daily_usage: Vec::new(),
+                collection_mode: "local".to_string(),
+                account_email: None,
+                warnings: Vec::new(),
+            },
+            UsageDataSource::LocalDatabase,
+            UsageDataScope::ThisDevice,
+            UsageDataQuality::Observed,
+            UsageDataCompleteness::Partial,
+        );
+
+        let merged = merge_datasets(vec![authoritative, local]).unwrap();
+
+        assert_eq!(
+            merged.usage.metadata["collection_mode"],
+            "opencode_go_web_console"
+        );
+        assert_eq!(merged.usage.metadata["web_authoritative"], true);
+        assert_eq!(merged.usage.metadata["database"], "opencode.db");
+        assert_eq!(
+            merged
+                .usage
+                .windows
+                .iter()
+                .filter(|window| window.window_id == "shared_history")
+                .count(),
+            1
+        );
+        assert_eq!(
+            merged
+                .usage
+                .windows
+                .iter()
+                .find(|window| window.window_id == "shared_history")
+                .unwrap()
+                .used
+                .as_ref()
+                .unwrap()
+                .value,
+            10.0
+        );
+        let provenance = serde_json::from_value::<Vec<DatasetProvenance>>(
+            merged.usage.metadata["dataset_provenance"].clone(),
+        )
+        .unwrap();
+        let local = provenance
+            .iter()
+            .find(|dataset| dataset.source_id == "opencode_local_database")
+            .unwrap();
+        assert_eq!(local.window_ids, vec!["local_history".to_string()]);
+        assert_eq!(local.metadata_keys, vec!["database".to_string()]);
     }
 
     #[tokio::test]

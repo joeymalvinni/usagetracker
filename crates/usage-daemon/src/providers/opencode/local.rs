@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use usage_core::ProviderId;
 
@@ -15,26 +15,24 @@ use super::{
     OPENCODE_GO_PROVIDER_ID,
 };
 
-pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, ProviderError> {
+pub(super) fn collect_go_local_usage() -> Result<Option<ProviderCollectionResult>, ProviderError> {
     if !local_go_auth_exists() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::CredentialsMissing,
-            "OpenCode Go local auth key was not found",
-        ));
+        return Ok(None);
     }
     let db_path = opencode_data_dir()?.join("opencode.db");
-    let conn = Connection::open(&db_path).map_err(|err| {
-        ProviderError::new(
-            ProviderErrorKind::ProviderUnavailable,
-            format!("failed to open OpenCode local database: {err}"),
-        )
-    })?;
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let conn =
+        Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|err| {
+            ProviderError::new(
+                ProviderErrorKind::ProviderUnavailable,
+                format!("failed to open OpenCode local database: {err}"),
+            )
+        })?;
     let rows = read_local_usage_rows(&conn)?;
     if rows.is_empty() {
-        return Err(ProviderError::new(
-            ProviderErrorKind::Parse,
-            "OpenCode Go local database had no usage rows",
-        ));
+        return Ok(None);
     }
 
     let now = Utc::now();
@@ -57,7 +55,7 @@ pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, Provi
             object.insert("opencode_go_cost".to_string(), report.metadata_value());
         }
     }
-    Ok(ProviderCollectionResult {
+    Ok(Some(ProviderCollectionResult {
         usage: ProviderUsage {
             provider_id: ProviderId::new(OPENCODE_GO_PROVIDER_ID),
             collected_at: now,
@@ -68,7 +66,7 @@ pub(super) fn collect_go_local_usage() -> Result<ProviderCollectionResult, Provi
         collection_mode: "opencode_go_local_sqlite".to_string(),
         account_email: None,
         warnings: Vec::new(),
-    })
+    }))
 }
 
 #[derive(Clone, Debug)]
