@@ -142,7 +142,7 @@ import UserNotifications
     }
 
     private func makePopoverController() -> NSViewController {
-        GlassPopoverHostingController(rootView: Popover(navigation: navigation).environmentObject(state))
+        NSHostingController(rootView: Popover(navigation: navigation).environmentObject(state))
     }
 
     private func configurePopoverWindow() {
@@ -509,10 +509,9 @@ enum StatusMenuProviderSelection {
     }
 }
 
-/// Hosts the SwiftUI popover content on the app's single translucent shell:
-/// Liquid Glass (`NSGlassEffectView`) on macOS 26, vibrancy
-/// (`NSVisualEffectView`) on 14/15. All interior surfaces are flat fills, so
-/// the two renderings read as the same app.
+/// Gives the standalone debug window its own translucent shell. The live
+/// `NSPopover` deliberately does not use this controller because AppKit owns
+/// that popover's body, arrow, material, and corner geometry.
 private final class GlassPopoverHostingController<Content: View>: NSViewController {
     private let rootView: Content
 
