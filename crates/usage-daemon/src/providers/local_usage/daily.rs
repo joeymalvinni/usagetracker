@@ -5,7 +5,10 @@ use chrono::{Days, NaiveDate};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct DailyCostSummary {
     pub(crate) cost_usd: f64,
+    /// Total processed tokens, including cached input.
     pub(crate) tokens: u64,
+    /// Cached input included in `tokens`. Providers without this detail leave it at zero.
+    pub(crate) cached_input_tokens: u64,
     pub(crate) priced_tokens: u64,
     pub(crate) unpriced_tokens: u64,
     pub(crate) unpriced_models: BTreeMap<String, u64>,
@@ -16,6 +19,9 @@ impl DailyCostSummary {
     pub(crate) fn add(&mut self, source: &Self) {
         self.cost_usd += source.cost_usd;
         self.tokens = self.tokens.saturating_add(source.tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(source.cached_input_tokens);
         self.priced_tokens = self.priced_tokens.saturating_add(source.priced_tokens);
         self.unpriced_tokens = self.unpriced_tokens.saturating_add(source.unpriced_tokens);
         self.rows = self.rows.saturating_add(source.rows);
@@ -79,6 +85,8 @@ pub(crate) struct DailyCostRow {
     date: String,
     cost_usd: f64,
     tokens: u64,
+    activity_tokens: u64,
+    cached_input_tokens: u64,
     priced_tokens: u64,
     unpriced_tokens: u64,
     unpriced_models: Vec<UnpricedModelRow>,
@@ -98,6 +106,8 @@ pub(crate) fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) ->
             date: date.to_string(),
             cost_usd: summary.cost_usd,
             tokens: summary.tokens,
+            activity_tokens: summary.tokens.saturating_sub(summary.cached_input_tokens),
+            cached_input_tokens: summary.cached_input_tokens,
             priced_tokens: summary.priced_tokens,
             unpriced_tokens: summary.unpriced_tokens,
             unpriced_models: summary
@@ -116,6 +126,24 @@ pub(crate) fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_rows_publish_activity_without_cached_input() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 11).unwrap();
+        let rows = daily_cost_rows(&BTreeMap::from([(
+            date,
+            DailyCostSummary {
+                tokens: 1_100,
+                cached_input_tokens: 800,
+                ..Default::default()
+            },
+        )]));
+        let value = serde_json::to_value(rows).unwrap();
+
+        assert_eq!(value[0]["tokens"], 1_100);
+        assert_eq!(value[0]["cached_input_tokens"], 800);
+        assert_eq!(value[0]["activity_tokens"], 300);
+    }
 
     #[test]
     fn rollup_includes_today_and_exact_lookback() {
