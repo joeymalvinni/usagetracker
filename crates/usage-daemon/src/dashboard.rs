@@ -14,7 +14,6 @@ pub(crate) fn build_usage_dashboard(
     snapshots: &[UsageSnapshot],
     daily_usage: &[StoredDailyUsageHistory],
 ) -> UsageDashboardSummary {
-    let codex_reference_rate = codex_reference_cost_per_token(snapshots);
     let history = daily_usage
         .iter()
         .map(|history| {
@@ -32,7 +31,6 @@ pub(crate) fn build_usage_dashboard(
                 history
                     .get(&(snapshot.provider_id.as_str(), snapshot.account_id.as_str()))
                     .copied(),
-                codex_reference_rate,
             )
         })
         .collect::<Vec<_>>();
@@ -42,7 +40,6 @@ pub(crate) fn build_usage_dashboard(
 fn account_summary(
     snapshot: &UsageSnapshot,
     retained_activity: Option<&StoredDailyUsageHistory>,
-    codex_reference_rate: Option<f64>,
 ) -> Option<AccountUsageSummary> {
     let provider_id = snapshot.provider_id.as_str();
     let cost = snapshot
@@ -65,50 +62,76 @@ fn account_summary(
     let cost_source = cost
         .and_then(|value| value.get("source"))
         .and_then(Value::as_str);
-    let activity_source = retained_activity
-        .and_then(|history| history.recent.last())
-        .map(|row| row.source.as_str())
-        .or_else(|| {
-            activity
-                .and_then(|value| value.get("source"))
-                .and_then(Value::as_str)
-        })
-        .or(cost_source);
-    let mut cost_days = cost
+    let cost_rows = cost
         .and_then(|value| value.get("by_day"))
-        .and_then(Value::as_array)
+        .and_then(Value::as_array);
+    let cost_days = cost_rows
         .map(|rows| daily_points(rows))
         .unwrap_or_else(|| synthesized_today_point(cost));
-    let activity_days = retained_activity
-        .map(|history| {
-            history
-                .recent
-                .iter()
-                .map(|row| DailyUsagePoint {
-                    date: row.date,
-                    tokens: row.tokens,
-                    cost_usd: row.cost_usd,
-                    priced_tokens: 0,
-                    unpriced_tokens: 0,
+    let (activity_source, activity_metadata, activity_days, activity_lifetime_tokens) =
+        if provider_id == "codex" {
+            // Codex's account endpoint reports an opaque processed-token total with
+            // no cached-input split. Use local logs for the activity graph so cached
+            // context can be excluded and keep account-wide data for quota only.
+            (
+                cost_source,
+                cost,
+                cost_rows
+                    .map(|rows| activity_daily_points(rows))
+                    .unwrap_or_default(),
+                cost.and_then(|value| value.get("total_activity_tokens"))
+                    .and_then(Value::as_u64),
+            )
+        } else {
+            let source = retained_activity
+                .and_then(|history| history.recent.last())
+                .map(|row| row.source.as_str())
+                .or_else(|| {
+                    activity
+                        .and_then(|value| value.get("source"))
+                        .and_then(Value::as_str)
                 })
-                .collect()
-        })
-        .or_else(|| {
-            activity
-                .and_then(|value| value.get("by_day"))
-                .and_then(Value::as_array)
-                .map(|rows| daily_points(rows))
-        })
-        .unwrap_or_else(|| cost_days.clone());
-
-    if provider_id == "codex" && !activity_days.is_empty() {
-        cost_days = extrapolate_codex_costs(&activity_days, &cost_days, codex_reference_rate);
-    }
+                .or(cost_source);
+            let days = retained_activity
+                .map(|history| {
+                    history
+                        .recent
+                        .iter()
+                        .map(|row| DailyUsagePoint {
+                            date: row.date,
+                            tokens: row.tokens,
+                            cost_usd: row.cost_usd,
+                            priced_tokens: 0,
+                            unpriced_tokens: 0,
+                        })
+                        .collect()
+                })
+                .or_else(|| {
+                    activity
+                        .and_then(|value| value.get("by_day"))
+                        .and_then(Value::as_array)
+                        .map(|rows| daily_points(rows))
+                })
+                .unwrap_or_else(|| cost_days.clone());
+            let lifetime_tokens = retained_activity
+                .map(|history| history.total_tokens)
+                .or_else(|| {
+                    activity
+                        .and_then(|value| value.get("lifetime_tokens"))
+                        .and_then(Value::as_u64)
+                });
+            (source, activity, days, lifetime_tokens)
+        };
 
     let activity_summary = (!activity_days.is_empty()).then(|| {
         let today = Local::now().date_naive();
         ActivitySummary {
-            provenance: typed_or_legacy_provenance(snapshot, activity_source, false, activity),
+            provenance: typed_or_legacy_provenance(
+                snapshot,
+                activity_source,
+                false,
+                activity_metadata,
+            ),
             today_tokens: activity_days
                 .iter()
                 .find(|point| point.date == today)
@@ -116,13 +139,7 @@ fn account_summary(
             lookback_tokens: activity_days
                 .iter()
                 .fold(0_u64, |total, point| total.saturating_add(point.tokens)),
-            lifetime_tokens: retained_activity
-                .map(|history| history.total_tokens)
-                .or_else(|| {
-                    activity
-                        .and_then(|value| value.get("lifetime_tokens"))
-                        .and_then(Value::as_u64)
-                }),
+            lifetime_tokens: activity_lifetime_tokens,
             days: activity_days,
         }
     });
@@ -245,66 +262,38 @@ fn timestamp(
         })
 }
 
-fn extrapolate_codex_costs(
-    activity: &[DailyUsagePoint],
-    local_cost: &[DailyUsagePoint],
-    reference_rate: Option<f64>,
-) -> Vec<DailyUsagePoint> {
-    let local = local_cost
-        .iter()
-        .map(|point| (point.date, point))
-        .collect::<BTreeMap<_, _>>();
-    activity
-        .iter()
-        .map(|activity| {
-            let local = local.get(&activity.date).copied();
-            let estimated_cost = local
-                .filter(|point| point.cost_usd.unwrap_or(0.0) > 0.0 && point.tokens > 0)
-                .map(|point| {
-                    let local_cost = point.cost_usd.unwrap_or(0.0);
-                    if activity.tokens <= point.tokens {
-                        local_cost * activity.tokens as f64 / point.tokens as f64
-                    } else if point.priced_tokens > 0 {
-                        local_cost
-                            + activity.tokens.saturating_sub(point.tokens) as f64 * local_cost
-                                / point.priced_tokens as f64
-                    } else {
-                        local_cost
-                    }
-                })
-                .or_else(|| reference_rate.map(|rate| activity.tokens as f64 * rate));
-            let priced_tokens = local.map_or(0, |point| point.priced_tokens.min(activity.tokens));
-            DailyUsagePoint {
-                date: activity.date,
-                tokens: activity.tokens,
-                cost_usd: estimated_cost,
-                priced_tokens,
-                unpriced_tokens: activity.tokens.saturating_sub(priced_tokens),
-            }
-        })
-        .collect()
-}
-
-fn codex_reference_cost_per_token(snapshots: &[UsageSnapshot]) -> Option<f64> {
-    let mut total_cost = 0.0;
-    let mut priced_tokens = 0_u64;
-    for snapshot in snapshots
-        .iter()
-        .filter(|snapshot| snapshot.provider_id.as_str() == "codex")
-    {
-        let Some(cost) = snapshot.metadata.get("codex_cost") else {
+fn activity_daily_points(rows: &[Value]) -> Vec<DailyUsagePoint> {
+    let mut by_date = BTreeMap::new();
+    for row in rows.iter().filter_map(Value::as_object) {
+        let Some(date) = row
+            .get("date")
+            .and_then(Value::as_str)
+            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        else {
             continue;
         };
-        let cost_usd = number(cost, "total_cost_usd").unwrap_or(0.0);
-        let tokens = integer(cost, "priced_tokens")
-            .or_else(|| integer(cost, "total_tokens"))
-            .unwrap_or(0);
-        if cost_usd > 0.0 && tokens > 0 {
-            total_cost += cost_usd;
-            priced_tokens = priced_tokens.saturating_add(tokens);
-        }
+        let processed_tokens = row.get("tokens").and_then(Value::as_u64).unwrap_or(0);
+        let cached_input_tokens = row
+            .get("cached_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(processed_tokens);
+        let tokens = row
+            .get("activity_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| processed_tokens.saturating_sub(cached_input_tokens));
+        by_date.insert(
+            date,
+            DailyUsagePoint {
+                date,
+                tokens,
+                cost_usd: None,
+                priced_tokens: 0,
+                unpriced_tokens: 0,
+            },
+        );
     }
-    (total_cost > 0.0 && priced_tokens > 0).then(|| total_cost / priced_tokens as f64)
+    by_date.into_values().collect()
 }
 
 fn daily_points(rows: &[Value]) -> Vec<DailyUsagePoint> {
@@ -474,14 +463,6 @@ fn unpriced_models(metadata: &serde_json::Map<String, Value>) -> Vec<String> {
     models.into_iter().collect()
 }
 
-fn number(value: &Value, key: &str) -> Option<f64> {
-    value.get(key).and_then(Value::as_f64)
-}
-
-fn integer(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(Value::as_u64)
-}
-
 fn string(metadata: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     metadata
         .get(key)
@@ -499,7 +480,7 @@ mod tests {
     use crate::storage::StoredDailyUsage;
 
     #[test]
-    fn builds_typed_mixed_scope_dashboard_and_honest_pricing_coverage() {
+    fn codex_dashboard_uses_local_uncached_activity_without_scaling_cost() {
         let collected_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
         let snapshots = vec![
             UsageSnapshot {
@@ -508,8 +489,22 @@ mod tests {
                 collected_at,
                 windows: Vec::new(),
                 metadata: json!({
-                    "codex_activity": {"source":"codex_account_usage","by_day":[{"date":"2026-07-11","tokens":1000}]},
-                    "codex_cost": {"source":"local_session_logs","estimate":true,"partial":true,"by_day":[{"date":"2026-07-11","tokens":400,"priced_tokens":300,"unpriced_tokens":100,"cost_usd":1.5}]}
+                    "codex_activity": {"source":"codex_account_usage","by_day":[{"date":"2026-07-11","tokens":1_500_000_000}]},
+                    "codex_cost": {
+                        "source":"local_session_logs",
+                        "estimate":true,
+                        "partial":true,
+                        "total_activity_tokens":100,
+                        "by_day":[{
+                            "date":"2026-07-11",
+                            "tokens":1_400_000_100_u64,
+                            "activity_tokens":100,
+                            "cached_input_tokens":1_400_000_000_u64,
+                            "priced_tokens":1_400_000_000_u64,
+                            "unpriced_tokens":100,
+                            "cost_usd":1.5
+                        }]
+                    }
                 }),
             },
             UsageSnapshot {
@@ -529,13 +524,43 @@ mod tests {
         assert!(dashboard.provenance.mixed_scope);
         assert!(dashboard.provenance.partial);
         assert!(dashboard.provenance.estimated);
-        assert_eq!(dashboard.days[0].tokens, 1_200);
-        assert_eq!(dashboard.pricing.priced_tokens, 500);
-        assert_eq!(dashboard.pricing.unpriced_tokens, 700);
+        assert_eq!(dashboard.days[0].tokens, 300);
+        assert_eq!(dashboard.days[0].cost_usd, Some(2.0));
+        assert_eq!(dashboard.pricing.priced_tokens, 1_400_000_200);
+        assert_eq!(dashboard.pricing.unpriced_tokens, 100);
+        let codex = dashboard
+            .accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "codex")
+            .unwrap();
+        assert_eq!(codex.activity.as_ref().unwrap().lookback_tokens, 100);
+        assert_eq!(codex.activity.as_ref().unwrap().lifetime_tokens, Some(100));
+        assert_eq!(codex.cost.as_ref().unwrap().lookback_cost_usd, 1.5);
         assert!(dashboard
             .provenance
             .explanation
             .contains("not directly comparable"));
+    }
+
+    #[test]
+    fn codex_account_processed_tokens_are_not_used_without_local_logs() {
+        let snapshot = UsageSnapshot {
+            provider_id: ProviderId::new("codex"),
+            account_id: AccountId::new("codex-account"),
+            collected_at: Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap(),
+            windows: Vec::new(),
+            metadata: json!({
+                "codex_activity": {
+                    "source": "codex_account_usage",
+                    "by_day": [{"date": "2026-07-11", "tokens": 1_500_000_000_u64}]
+                }
+            }),
+        };
+
+        let dashboard = build_usage_dashboard(&[snapshot], &[]);
+
+        assert!(dashboard.accounts[0].activity.is_none());
+        assert!(dashboard.days.is_empty());
     }
 
     #[test]

@@ -46,7 +46,7 @@ fn does_not_duplicate_standard_codex_session_root() {
 }
 
 #[test]
-fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() {
+fn account_activity_is_diagnostic_while_local_logs_drive_visible_tokens() {
     let today = Local::now().date_naive();
     let yesterday = today.checked_sub_days(Days::new(1)).unwrap();
     let activity = normalize_account_token_usage(&json!({
@@ -96,20 +96,18 @@ fn account_activity_is_authoritative_and_local_cost_does_not_duplicate_tokens() 
             by_day,
             ..Default::default()
         },
-        false,
+        true,
     );
 
     assert_eq!(usage.metadata["codex_activity"]["lifetime_tokens"], 300);
     assert_eq!(usage.metadata["codex_activity"]["by_day"][1]["tokens"], 100);
     assert_eq!(usage.metadata["codex_cost"]["partial"], true);
-    assert_eq!(
-        usage
-            .windows
-            .iter()
-            .filter(|window| window.window_id == "codex_tokens_today")
-            .count(),
-        1
-    );
+    let token_window = usage
+        .windows
+        .iter()
+        .find(|window| window.window_id == "codex_tokens_today")
+        .unwrap();
+    assert_eq!(token_window.used.as_ref().unwrap().value, 100.0);
     assert!(usage
         .windows
         .iter()
@@ -742,7 +740,9 @@ fn keeps_undated_codex_usage_out_of_today_and_lookback() {
     .unwrap();
 
     assert_eq!(report.total_tokens, 110);
+    assert_eq!(report.total_cached_input_tokens, 50);
     assert_eq!(report.undated_tokens, 110);
+    assert_eq!(report.undated_cached_input_tokens, 50);
     assert_eq!(report.today_tokens, 0);
     assert_eq!(report.lookback_tokens, 0);
     assert!(report.by_day.is_empty());
@@ -856,6 +856,7 @@ fn records_unknown_model_tokens_as_unpriced_daily_usage() {
     assert_eq!(report.priced_tokens, 0);
     assert_eq!(report.unpriced_tokens, 110);
     assert_eq!(report.unpriced_models["gpt-future"], 110);
+    assert_eq!(report.by_day[&today].cached_input_tokens, 50);
     assert_eq!(report.by_day[&today].unpriced_tokens, 110);
     assert_eq!(report.by_day[&today].unpriced_models["gpt-future"], 110);
     let _ = std::fs::remove_file(path);

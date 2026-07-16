@@ -209,21 +209,14 @@ fn fixture_windows(
                 "codex_tokens_today",
                 "Codex tokens today",
                 UsageWindowKind::Daily,
-                125_177_016.0,
+                7_384_811.0,
                 UsageUnit::Tokens,
             ),
             metric_window(
                 "codex_tokens_30d",
                 "Codex tokens 30 days",
                 UsageWindowKind::Monthly,
-                1_092_768_692.0,
-                UsageUnit::Tokens,
-            ),
-            metric_window(
-                "codex_tokens_lifetime",
-                "Codex lifetime tokens",
-                UsageWindowKind::Other("lifetime".to_string()),
-                2_373_310_905.0,
+                58_794_373.0,
                 UsageUnit::Tokens,
             ),
             metric_window(
@@ -492,9 +485,16 @@ fn fixture_metadata(
     let rows = daily_usage
         .iter()
         .map(|bucket| {
+            let cached_input_tokens = if provider_id == "codex" {
+                bucket.tokens.saturating_mul(19) / 20
+            } else {
+                0
+            };
             serde_json::json!({
                 "date": bucket.date.to_string(),
                 "tokens": bucket.tokens,
+                "activity_tokens": bucket.tokens.saturating_sub(cached_input_tokens),
+                "cached_input_tokens": cached_input_tokens,
                 "priced_tokens": bucket.tokens,
                 "cost_usd": bucket.cost_usd,
             })

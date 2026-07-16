@@ -41,7 +41,10 @@ impl CodexUsageCostExt for ProviderUsage {
                 "token_count_events": report.token_count_events,
                 "baseline_seeded_events": report.baseline_seeded_events,
                 "undated_tokens": report.undated_tokens,
+                "undated_cached_input_tokens": report.undated_cached_input_tokens,
                 "undated_cost_usd": report.undated_cost_usd,
+                "total_cached_input_tokens": report.total_cached_input_tokens,
+                "total_activity_tokens": report.total_tokens.saturating_sub(report.total_cached_input_tokens),
                 "priced_tokens": report.priced_tokens,
                 "unpriced_tokens": report.unpriced_tokens,
                 "unpriced_models": unpriced_model_rows(&report.unpriced_models),
@@ -52,6 +55,13 @@ impl CodexUsageCostExt for ProviderUsage {
             return;
         }
 
+        let today_activity_tokens = report
+            .today_tokens
+            .saturating_sub(report.today_cached_input_tokens);
+        let lookback_activity_tokens = report
+            .lookback_tokens
+            .saturating_sub(report.lookback_cached_input_tokens);
+
         if report.today_cost_usd > 0.0 {
             self.windows.push(cost_window(
                 "codex_estimated_spend_today",
@@ -59,11 +69,11 @@ impl CodexUsageCostExt for ProviderUsage {
                 report.today_cost_usd,
             ));
         }
-        if include_token_activity && report.today_tokens > 0 {
+        if include_token_activity && today_activity_tokens > 0 {
             self.windows.push(token_window(
                 "codex_tokens_today",
                 "Codex tokens today",
-                report.today_tokens,
+                today_activity_tokens,
                 UsageWindowKind::Daily,
             ));
         }
@@ -75,11 +85,11 @@ impl CodexUsageCostExt for ProviderUsage {
                 report.lookback_cost_usd,
             ));
         }
-        if include_token_activity && report.lookback_tokens > 0 {
+        if include_token_activity && lookback_activity_tokens > 0 {
             self.windows.push(token_window(
                 "codex_tokens_30d",
                 "Codex tokens 30 days",
-                report.lookback_tokens,
+                lookback_activity_tokens,
                 UsageWindowKind::Monthly,
             ));
         }
@@ -96,13 +106,20 @@ impl CodexUsageCostExt for ProviderUsage {
             "baseline_seeded_events": report.baseline_seeded_events,
             "today_cost_usd": report.today_cost_usd,
             "today_tokens": report.today_tokens,
+            "today_cached_input_tokens": report.today_cached_input_tokens,
+            "today_activity_tokens": today_activity_tokens,
             "lookback_days": COST_LOOKBACK_DAYS,
             "lookback_cost_usd": report.lookback_cost_usd,
             "lookback_tokens": report.lookback_tokens,
+            "lookback_cached_input_tokens": report.lookback_cached_input_tokens,
+            "lookback_activity_tokens": lookback_activity_tokens,
             "total_cost_usd": report.total_cost_usd,
             "total_tokens": report.total_tokens,
+            "total_cached_input_tokens": report.total_cached_input_tokens,
+            "total_activity_tokens": report.total_tokens.saturating_sub(report.total_cached_input_tokens),
             "undated_cost_usd": report.undated_cost_usd,
             "undated_tokens": report.undated_tokens,
+            "undated_cached_input_tokens": report.undated_cached_input_tokens,
             "priced_tokens": report.priced_tokens,
             "unpriced_tokens": report.unpriced_tokens,
             "unpriced_models": unpriced_model_rows(&report.unpriced_models),
@@ -135,12 +152,16 @@ pub(super) struct CodexCostReport {
     pub(super) baseline_seeded_events: usize,
     pub(super) today_cost_usd: f64,
     pub(super) today_tokens: u64,
+    pub(super) today_cached_input_tokens: u64,
     pub(super) lookback_cost_usd: f64,
     pub(super) lookback_tokens: u64,
+    pub(super) lookback_cached_input_tokens: u64,
     pub(super) total_cost_usd: f64,
     pub(super) total_tokens: u64,
+    pub(super) total_cached_input_tokens: u64,
     pub(super) undated_cost_usd: f64,
     pub(super) undated_tokens: u64,
+    pub(super) undated_cached_input_tokens: u64,
     pub(super) priced_tokens: u64,
     pub(super) unpriced_tokens: u64,
     pub(super) unpriced_models: BTreeMap<String, u64>,
@@ -161,8 +182,10 @@ pub(super) struct CodexFileCostReport {
     baseline_seeded_events: usize,
     total_cost_usd: f64,
     total_tokens: u64,
+    total_cached_input_tokens: u64,
     undated_cost_usd: f64,
     undated_tokens: u64,
+    undated_cached_input_tokens: u64,
     priced_tokens: u64,
     unpriced_tokens: u64,
     unpriced_models: BTreeMap<String, u64>,
@@ -346,6 +369,9 @@ fn scan_codex_session_file_all_days(
         let date = codex_event_date_in_timezone(&event, &Local);
 
         report.total_tokens = report.total_tokens.saturating_add(tokens);
+        report.total_cached_input_tokens = report
+            .total_cached_input_tokens
+            .saturating_add(delta.cached);
         if let Some(cost) = cost {
             report.total_cost_usd += cost;
             report.priced_tokens = report.priced_tokens.saturating_add(tokens);
@@ -357,6 +383,7 @@ fn scan_codex_session_file_all_days(
         if let Some(date) = date {
             let day = report.by_day.entry(date).or_default();
             day.tokens = day.tokens.saturating_add(tokens);
+            day.cached_input_tokens = day.cached_input_tokens.saturating_add(delta.cached);
             day.rows = day.rows.saturating_add(1);
             if let Some(cost) = cost {
                 day.cost_usd += cost;
@@ -367,6 +394,9 @@ fn scan_codex_session_file_all_days(
             }
         } else {
             report.undated_tokens = report.undated_tokens.saturating_add(tokens);
+            report.undated_cached_input_tokens = report
+                .undated_cached_input_tokens
+                .saturating_add(delta.cached);
             if let Some(cost) = cost {
                 report.undated_cost_usd += cost;
             }
@@ -401,8 +431,14 @@ fn merge_codex_file_report(
         .saturating_add(file.baseline_seeded_events);
     report.total_cost_usd += file.total_cost_usd;
     report.total_tokens = report.total_tokens.saturating_add(file.total_tokens);
+    report.total_cached_input_tokens = report
+        .total_cached_input_tokens
+        .saturating_add(file.total_cached_input_tokens);
     report.undated_cost_usd += file.undated_cost_usd;
     report.undated_tokens = report.undated_tokens.saturating_add(file.undated_tokens);
+    report.undated_cached_input_tokens = report
+        .undated_cached_input_tokens
+        .saturating_add(file.undated_cached_input_tokens);
     report.priced_tokens = report.priced_tokens.saturating_add(file.priced_tokens);
     report.unpriced_tokens = report.unpriced_tokens.saturating_add(file.unpriced_tokens);
     for (model, tokens) in &file.unpriced_models {
@@ -411,8 +447,14 @@ fn merge_codex_file_report(
 
     let daily = DailyRollup::from_range(&file.by_day, today, lookback_start);
     report.today_tokens = report.today_tokens.saturating_add(daily.today.tokens);
+    report.today_cached_input_tokens = report
+        .today_cached_input_tokens
+        .saturating_add(daily.today.cached_input_tokens);
     report.today_cost_usd += daily.today.cost_usd;
     report.lookback_tokens = report.lookback_tokens.saturating_add(daily.lookback.tokens);
+    report.lookback_cached_input_tokens = report
+        .lookback_cached_input_tokens
+        .saturating_add(daily.lookback.cached_input_tokens);
     report.lookback_cost_usd += daily.lookback.cost_usd;
     merge_daily_summary(&mut report.by_day, &daily.by_day);
 

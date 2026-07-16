@@ -152,7 +152,6 @@ impl CodexCollector {
     async fn collect_local_usage_dataset(
         &self,
         profile: &CodexProfile,
-        include_token_activity: bool,
     ) -> Result<UsageDataset, ProviderError> {
         let pricing = CodexPricingCatalog::bundled();
         let cost_cache = profile.cost_cache.clone();
@@ -199,7 +198,7 @@ impl CodexCollector {
             windows: Vec::new(),
             metadata: json!({}),
         };
-        usage.merge_cost_report(scan.report, include_token_activity);
+        usage.merge_cost_report(scan.report, true);
         Ok(UsageDataset::supplemental_named(
             "codex_local_logs",
             ProviderCollectionResult {
@@ -298,7 +297,6 @@ impl CodexCollector {
         Ok(CodexCollectedUsage {
             usage,
             daily_usage: Vec::new(),
-            account_activity_available: false,
             collection_mode: "wham_usage_api".to_string(),
             account_display_name,
             warnings: Vec::new(),
@@ -549,10 +547,7 @@ impl ProviderCollector for CodexCollector {
         }
 
         let mut supplemental = Vec::new();
-        match self
-            .collect_local_usage_dataset(&profile, !collected.account_activity_available)
-            .await
-        {
+        match self.collect_local_usage_dataset(&profile).await {
             Ok(dataset) => supplemental.push(dataset),
             Err(error) => collected.warnings.push(error.short_message().to_string()),
         }
@@ -572,7 +567,7 @@ impl ProviderCollector for CodexCollector {
     async fn collect_local_usage(
         &self,
         account: &Account,
-        current: Option<&UsageSnapshot>,
+        _current: Option<&UsageSnapshot>,
     ) -> Result<Vec<UsageDataset>, ProviderError> {
         let profile_id = account.profile_id.as_deref().ok_or_else(|| {
             ProviderError::new(
@@ -590,13 +585,7 @@ impl ProviderCollector for CodexCollector {
                     format!("Codex profile {profile_id} no longer exists"),
                 )
             })?;
-        let include_token_activity = current
-            .and_then(|snapshot| snapshot.metadata.get("codex_activity"))
-            .is_none();
-        Ok(vec![
-            self.collect_local_usage_dataset(profile, include_token_activity)
-                .await?,
-        ])
+        Ok(vec![self.collect_local_usage_dataset(profile).await?])
     }
 }
 
@@ -604,7 +593,6 @@ impl ProviderCollector for CodexCollector {
 struct CodexCollectedUsage {
     usage: ProviderUsage,
     daily_usage: Vec<DailyUsageBucket>,
-    account_activity_available: bool,
     collection_mode: String,
     account_display_name: Option<String>,
     warnings: Vec<String>,

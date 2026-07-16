@@ -13,12 +13,9 @@ use std::{
 use chrono::{Days, Local, NaiveDate};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
-use usage_core::UsageWindowKind;
 use wait_timeout::ChildExt;
 
-use crate::providers::{
-    local_usage::token_window, DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsage,
-};
+use crate::providers::{DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsage};
 
 use super::{
     cost::u64_from_json_value, rate_limits::normalize_app_server_usage, CodexCollectedUsage,
@@ -60,7 +57,7 @@ pub(super) fn collect_usage_from_app_server(
         .map(str::to_string);
     let mut usage = normalize_app_server_usage(&payload, account_display_name.as_deref())?;
     let mut warnings = Vec::new();
-    let (daily_usage, account_activity_available) = match payload
+    let daily_usage = match payload
         .get("account_usage_read")
         .filter(|value| !value.is_null())
     {
@@ -68,14 +65,14 @@ pub(super) fn collect_usage_from_app_server(
             Ok(activity) => {
                 let daily_usage = activity.daily_usage.clone();
                 usage.merge_account_activity(activity);
-                (daily_usage, true)
+                daily_usage
             }
             Err(err) => {
                 warnings.push(format!(
                     "Codex account activity could not be parsed; using local activity fallback: {}",
                     err.short_message()
                 ));
-                (Vec::new(), false)
+                Vec::new()
             }
         },
         None => {
@@ -86,14 +83,13 @@ pub(super) fn collect_usage_from_app_server(
             warnings.push(format!(
                 "Codex account activity was unavailable; using local activity fallback: {detail}"
             ));
-            (Vec::new(), false)
+            Vec::new()
         }
     };
 
     Ok(CodexCollectedUsage {
         usage,
         daily_usage,
-        account_activity_available,
         collection_mode: "codex_app_server_rate_limits".to_string(),
         account_display_name,
         warnings,
@@ -497,31 +493,6 @@ impl CodexAccountActivityExt for ProviderUsage {
             .iter()
             .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
         let lifetime_tokens = activity.lifetime_tokens.unwrap_or(bucket_sum);
-
-        if today_tokens > 0 {
-            self.windows.push(token_window(
-                "codex_tokens_today",
-                "Codex tokens today",
-                today_tokens,
-                UsageWindowKind::Daily,
-            ));
-        }
-        if lookback_tokens > 0 {
-            self.windows.push(token_window(
-                "codex_tokens_30d",
-                "Codex tokens 30 days",
-                lookback_tokens,
-                UsageWindowKind::Monthly,
-            ));
-        }
-        if lifetime_tokens > 0 {
-            self.windows.push(token_window(
-                "codex_tokens_lifetime",
-                "Codex lifetime tokens",
-                lifetime_tokens,
-                UsageWindowKind::Other("lifetime".to_string()),
-            ));
-        }
 
         let by_day = activity
             .daily_usage
