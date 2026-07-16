@@ -519,6 +519,58 @@ final class DaemonClientTests: XCTestCase {
     }
 }
 
+final class DaemonLaunchAgentPlistTests: XCTestCase {
+    func testLaunchAgentIsPerUserPersistentAndRunsTheManagedDaemon() throws {
+        let plistURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // UsageMenuBarTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // UsageMenuBar
+            .appending(path: "LaunchAgents")
+            .appending(path: daemonLaunchAgentPlistName)
+        let object = try PropertyListSerialization.propertyList(
+            from: Data(contentsOf: plistURL),
+            format: nil
+        )
+        let plist = try XCTUnwrap(object as? [String: Any])
+        XCTAssertEqual(plist["Label"] as? String, daemonLaunchAgentLabel)
+        XCTAssertEqual(plist["BundleProgram"] as? String, "Contents/MacOS/usage-daemon")
+        XCTAssertEqual(plist["KeepAlive"] as? Bool, true)
+        XCTAssertEqual(plist["RunAtLoad"] as? Bool, true)
+        XCTAssertEqual(plist["LimitLoadToSessionType"] as? String, "Aqua")
+        XCTAssertEqual(
+            plist["ProgramArguments"] as? [String],
+            ["usage-daemon", "--foreground", "--managed"]
+        )
+    }
+}
+
+final class DaemonLaunchAgentControllerTests: XCTestCase {
+    func testEnvironmentOverridesUseTheInheritedChildProcessLauncher() {
+        XCTAssertTrue(SystemDaemonLaunchAgentController.supportsLaunchAgentEnvironment([:]))
+        for name in [
+            "USAGE_TRACKER_LOG_LEVEL",
+            "USAGE_TRACKER_OPENCODE_GO_COOKIE",
+            "USAGE_TRACKER_OPENCODE_COOKIE",
+            "USAGE_TRACKER_OPENCODE_GO_WORKSPACE_ID",
+            "USAGE_TRACKER_GROK_COOKIE",
+            "USAGE_TRACKER_ALLOW_BROWSER_COOKIE_IMPORT",
+            "RUST_LOG",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "GROK_HOME",
+            "GROK_CLI_PATH",
+            "XAI_API_KEY",
+        ] {
+            XCTAssertFalse(
+                SystemDaemonLaunchAgentController.supportsLaunchAgentEnvironment([
+                    name: "override"
+                ]),
+                name
+            )
+        }
+    }
+}
+
 final class DaemonSupervisorTests: XCTestCase {
     func testConcurrentEnsureRunningCallsShareOneLaunch() async throws {
         let transport = LockedTransport()
@@ -574,6 +626,32 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertEqual(status, .running)
     }
 
+    func testLaunchAgentOwnsProductionLifecycleAndRestartsWithoutChildProcesses() async throws {
+        let transport = LockedTransport()
+        let launcher = FakeProcessLauncher { XCTFail("launchd should own the daemon") }
+        let launchAgent = FakeLaunchAgent {
+            transport.setConnected(true)
+        } onUnregister: {
+            transport.setConnected(false)
+        }
+        let supervisor = makeSupervisor(
+            transport: transport,
+            launcher: launcher,
+            launchAgent: launchAgent
+        )
+
+        let initiallyRunning = await supervisor.ensureRunning(socketPath: "/tmp/usage-test.sock")
+        XCTAssertTrue(initiallyRunning)
+        XCTAssertEqual(launchAgent.registerCount, 1)
+        XCTAssertEqual(launcher.launchCount, 0)
+
+        let restarted = await supervisor.restart(socketPath: "/tmp/usage-test.sock")
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(launchAgent.unregisterCount, 1)
+        XCTAssertEqual(launchAgent.registerCount, 2)
+        XCTAssertEqual(launcher.launchCount, 0)
+    }
+
     func testAutomaticCrashRecoveryIsBoundedUntilTheDaemonIsStable() async throws {
         let transport = LockedTransport()
         let launcher = FakeProcessLauncher { transport.setConnected(true) }
@@ -604,6 +682,7 @@ final class DaemonSupervisorTests: XCTestCase {
     private func makeSupervisor(
         transport: LockedTransport,
         launcher: FakeProcessLauncher,
+        launchAgent: (any DaemonLaunchAgentControlling)? = nil,
         maximumAutomaticRestarts: Int = 2,
         stabilityResetInterval: TimeInterval = 0
     ) -> DaemonSupervisor {
@@ -626,6 +705,7 @@ final class DaemonSupervisorTests: XCTestCase {
             transport: transport,
             executableLocator: FakeExecutableLocator(),
             processLauncher: launcher,
+            launchAgent: launchAgent,
             environment: [:],
             rootURL: FileManager.default.temporaryDirectory,
             policy: policy,
@@ -845,6 +925,49 @@ private final class LockedTransport: DaemonTransport, @unchecked Sendable {
 
     func setConnected(_ connected: Bool) {
         lock.withLock { self.connected = connected }
+    }
+}
+
+private final class FakeLaunchAgent: DaemonLaunchAgentControlling, @unchecked Sendable {
+    let isAvailable = true
+    private let lock = NSLock()
+    private var status: DaemonLaunchAgentRegistrationStatus = .notRegistered
+    private var registrations = 0
+    private var unregistrations = 0
+    private let onRegister: @Sendable () -> Void
+    private let onUnregister: @Sendable () -> Void
+
+    init(
+        onRegister: @escaping @Sendable () -> Void,
+        onUnregister: @escaping @Sendable () -> Void
+    ) {
+        self.onRegister = onRegister
+        self.onUnregister = onUnregister
+    }
+
+    var registerCount: Int { lock.withLock { registrations } }
+    var unregisterCount: Int { lock.withLock { unregistrations } }
+
+    func registrationStatus() -> DaemonLaunchAgentRegistrationStatus {
+        lock.withLock { status }
+    }
+
+    func register() throws {
+        lock.withLock {
+            status = .enabled
+            registrations += 1
+        }
+        onRegister()
+    }
+
+    func unregisterIfNeeded() async throws {
+        let wasEnabled = lock.withLock {
+            guard status == .enabled else { return false }
+            status = .notRegistered
+            unregistrations += 1
+            return true
+        }
+        if wasEnabled { onUnregister() }
     }
 }
 

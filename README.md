@@ -68,7 +68,7 @@ Each provider exposes different data, so UsageTracker reports the best available
 
 ## Local by design
 
-UsageTracker has no hosted backend. A local daemon talks directly to the providers you enable, stores normalized history in SQLite, and serves the menu bar app and CLI over a Unix socket.
+UsageTracker has no hosted backend. A local daemon talks directly to the providers you enable, stores normalized history in SQLite, and serves the menu bar app and CLI over a Unix socket. After onboarding, macOS runs it as a per-user LaunchAgent so collection and the CLI continue working when the menu app is closed.
 
 It uses credentials already available in Keychain, provider config files, or supported browser sessions. Raw provider responses are parsed in memory and are not stored. See [Security](docs/security.md) and [Data and privacy](docs/data-and-privacy.md) for the full trust model.
 

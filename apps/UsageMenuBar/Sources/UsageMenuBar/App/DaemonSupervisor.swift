@@ -31,6 +31,7 @@ actor DaemonSupervisor {
     private let transport: any DaemonTransport
     private let executableLocator: any DaemonExecutableLocating
     private let processLauncher: any DaemonProcessLaunching
+    private let launchAgent: any DaemonLaunchAgentControlling
     private let environment: [String: String]
     private let rootURL: URL
     private let policy: DaemonSupervisorPolicy
@@ -50,6 +51,7 @@ actor DaemonSupervisor {
         transport: any DaemonTransport = POSIXDaemonTransport(),
         executableLocator: any DaemonExecutableLocating = SystemDaemonExecutableLocator(),
         processLauncher: any DaemonProcessLaunching = FoundationDaemonProcessLauncher(),
+        launchAgent: (any DaemonLaunchAgentControlling)? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         rootURL: URL = UIPaths.root,
         policy: DaemonSupervisorPolicy = DaemonSupervisorPolicy(),
@@ -62,6 +64,7 @@ actor DaemonSupervisor {
         self.transport = transport
         self.executableLocator = executableLocator
         self.processLauncher = processLauncher
+        self.launchAgent = launchAgent ?? SystemDaemonLaunchAgentController(environment: environment)
         self.environment = environment
         self.rootURL = rootURL
         self.policy = policy
@@ -79,6 +82,10 @@ actor DaemonSupervisor {
         }
     }
 
+    func launchAgentRequiresApproval() -> Bool {
+        launchAgent.isAvailable && launchAgent.registrationStatus() == .requiresApproval
+    }
+
     func ensureRunning(socketPath: String) async -> Bool {
         lastSocketPath = socketPath
 
@@ -87,6 +94,27 @@ actor DaemonSupervisor {
         }
 
         if await transport.canConnect(path: socketPath, timeout: 1) {
+            if launchAgent.isAvailable {
+                switch launchAgent.registrationStatus() {
+                case .enabled:
+                    break
+                case .requiresApproval:
+                    // Disabling the background item is an explicit stop. Do not
+                    // silently re-register it or leave an older process alive.
+                    let pids = await Task.detached(priority: .utility) {
+                        Self.daemonPIDs(associatedWith: socketPath)
+                    }.value
+                    _ = await stopDaemons(
+                        ownedProcess: nil,
+                        pids: pids,
+                        socketPath: socketPath
+                    )
+                    state = .stopped
+                    return false
+                case .notRegistered, .notFound:
+                    return await restart(socketPath: socketPath)
+                }
+            }
             if await shouldReplaceBundledDaemon(listeningOn: socketPath) {
                 return await restart(socketPath: socketPath)
             }
@@ -124,18 +152,20 @@ actor DaemonSupervisor {
             if case .starting(_, let task) = state { return await task.value }
         }
 
-        let orphanPIDs = await Task.detached(priority: .utility) {
-            Self.daemonPIDs(associatedWith: socketPath)
-        }.value
-        if !orphanPIDs.isEmpty {
-            let stopped = await stopDaemons(
-                ownedProcess: nil,
-                pids: orphanPIDs,
-                socketPath: socketPath
-            )
-            if !stopped {
-                enterBackoff()
-                return false
+        if !launchAgent.isAvailable {
+            let orphanPIDs = await Task.detached(priority: .utility) {
+                Self.daemonPIDs(associatedWith: socketPath)
+            }.value
+            if !orphanPIDs.isEmpty {
+                let stopped = await stopDaemons(
+                    ownedProcess: nil,
+                    pids: orphanPIDs,
+                    socketPath: socketPath
+                )
+                if !stopped {
+                    enterBackoff()
+                    return false
+                }
             }
         }
 
@@ -162,6 +192,15 @@ actor DaemonSupervisor {
         if let startupTask { _ = await startupTask.value }
 
         let runningOwnedProcess = ownedProcess?.isRunning == true ? ownedProcess : nil
+        if launchAgent.isAvailable {
+            do {
+                try await launchAgent.unregisterIfNeeded()
+            } catch {
+                enterBackoff()
+                return false
+            }
+        }
+
         let pids: [pid_t]
         if runningOwnedProcess != nil {
             // The owned process is authoritative and can be stopped directly;
@@ -208,6 +247,12 @@ actor DaemonSupervisor {
 
     private func performStartup(socketPath: String, generation startupGeneration: Int) async -> Bool {
         guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
+        if launchAgent.isAvailable {
+            return await performLaunchAgentStartup(
+                socketPath: socketPath,
+                generation: startupGeneration
+            )
+        }
         guard let executable = executableLocator.executableURL() else {
             enterBackoff()
             return false
@@ -286,6 +331,81 @@ actor DaemonSupervisor {
 
         guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
         enterBackoff()
+        return false
+    }
+
+    private func performLaunchAgentStartup(
+        socketPath: String,
+        generation startupGeneration: Int
+    ) async -> Bool {
+        for attempt in 0..<policy.launchAttempts {
+            guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
+            do {
+                // Unregistering first is required after an app update and also
+                // prevents KeepAlive from racing the cleanup of a stale process.
+                try await launchAgent.unregisterIfNeeded()
+                let pids = await Task.detached(priority: .utility) {
+                    Self.daemonPIDs(associatedWith: socketPath)
+                }.value
+                guard await stopDaemons(
+                    ownedProcess: nil,
+                    pids: pids,
+                    socketPath: socketPath
+                ) else {
+                    throw DaemonError.transport(EBUSY)
+                }
+                try launchAgent.register()
+
+                if await waitUntilLaunchAgentReady(
+                    socketPath: socketPath,
+                    generation: startupGeneration
+                ) {
+                    guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
+                    state = .running(RunningDaemon(
+                        generation: startupGeneration,
+                        process: nil,
+                        socketPath: socketPath
+                    ))
+                    consecutiveFailures = 0
+                    return true
+                }
+            } catch {
+                // A later bounded attempt may recover after launchd has reaped
+                // an older helper or macOS has refreshed its registration.
+            }
+
+            guard attempt + 1 < policy.launchAttempts else { break }
+            do {
+                try await sleep(backoffDelay(for: attempt + 1))
+            } catch {
+                return false
+            }
+        }
+
+        guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
+        enterBackoff()
+        return false
+    }
+
+    private func waitUntilLaunchAgentReady(
+        socketPath: String,
+        generation startupGeneration: Int
+    ) async -> Bool {
+        for check in 0..<policy.readinessChecks {
+            guard isCurrent(startupGeneration), !Task.isCancelled else { return false }
+            if await transport.canConnect(
+                path: socketPath,
+                timeout: policy.readinessProbeTimeout
+            ) {
+                return true
+            }
+            guard check + 1 < policy.readinessChecks else { return false }
+            do {
+                try await sleep(policy.readinessPollInterval)
+            } catch {
+                return false
+            }
+        }
         return false
     }
 

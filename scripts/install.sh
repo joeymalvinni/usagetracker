@@ -10,9 +10,12 @@ install_cli=1
 launch_app=1
 force=0
 app_was_running=0
+launch_agent_was_disabled=0
+launch_agent_was_registered=0
 update_status_file="${USAGETRACKER_UPDATE_STATUS_FILE:-}"
 daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
 daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
+launch_agent_label="engineering.super.usagetracker.daemon"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
   style_bold=$'\033[1m'
@@ -193,6 +196,9 @@ cleanup() {
   if [[ -n "$backup_app" && -e "$backup_app" ]]; then
     echo "A previous app was preserved at $backup_app" >&2
   fi
+  if [[ "$status" != "0" && "$launch_agent_was_registered" == "1" && -d "${app_path:-}" ]]; then
+    "$app_path/Contents/MacOS/UsageMenuBar" --reconcile-daemon-agent >/dev/null 2>&1 || true
+  fi
   if [[ "$status" != "0" && "$app_was_running" == "1" && -d "${app_path:-}" ]]; then
     open "$app_path" >/dev/null 2>&1 || true
   fi
@@ -287,6 +293,34 @@ daemon_pids() {
     fi
     printf '%s\n' "$pid"
   done
+}
+
+unregister_launch_agent() {
+  local executable="$app_path/Contents/MacOS/UsageMenuBar"
+  local plist="$app_path/Contents/Library/LaunchAgents/$launch_agent_label.plist"
+  if [[ -x "$executable" && -f "$plist" ]]; then
+    local command_status
+    if "$executable" --prepare-daemon-agent-update >/dev/null 2>&1; then
+      command_status=0
+    else
+      command_status=$?
+    fi
+    case "$command_status" in
+      0) ;;
+      3) launch_agent_was_disabled=1 ;;
+      4) launch_agent_was_registered=1 ;;
+      *) return 1 ;;
+    esac
+  fi
+  # Defensive cleanup for an interrupted older update. Once booted out,
+  # KeepAlive cannot race stop_daemons or app-bundle replacement.
+  launchctl bootout "gui/$(id -u)/$launch_agent_label" >/dev/null 2>&1 || true
+}
+
+reconcile_launch_agent() {
+  local executable="$app_path/Contents/MacOS/UsageMenuBar"
+  [[ -x "$executable" ]] || return 1
+  "$executable" --reconcile-daemon-agent >/dev/null 2>&1
 }
 
 stop_daemons() {
@@ -432,6 +466,10 @@ if [[ "$install_app" == "1" ]]; then
     fi
   fi
 
+  if ! unregister_launch_agent; then
+    echo "UsageTracker background service could not be unregistered." >&2
+    exit 1
+  fi
   if ! stop_daemons; then
     exit 1
   fi
@@ -461,7 +499,13 @@ if [[ "$install_app" == "1" ]]; then
   printf '%s\n%s\n' "$app_identifier" "$app_signature" \
     > "$app_dir/.UsageTracker.app.install-receipt"
   chmod 0600 "$app_dir/.UsageTracker.app.install-receipt"
-  success "Installed app"
+  if [[ "$launch_agent_was_disabled" == "1" ]]; then
+    success "Installed app and preserved the disabled background service"
+  elif reconcile_launch_agent; then
+    success "Installed app and reconciled background service"
+  else
+    notice "Installed app, but its background service needs attention in Login Items."
+  fi
 fi
 
 if [[ "$install_cli" == "1" ]]; then

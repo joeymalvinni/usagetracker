@@ -2,7 +2,7 @@
 
 ## The trust boundary
 
-UsageTracker is local software. The daemon makes outbound HTTPS and provider-CLI requests, and it exposes a Unix socket to local clients. The default app directory is `0700`; config and socket are `0600`.
+UsageTracker is local software. After onboarding, macOS runs the daemon as a per-user LaunchAgent in the logged-in Aqua session; it is never installed as a privileged system daemon. The daemon makes outbound HTTPS and provider-CLI requests, and it exposes a Unix socket to local clients. The default app directory is `0700`; config, logs, and socket are `0600`.
 
 There's no extra authentication on the socket. Any process running as the same macOS user can read your usage and diagnostics, change your configuration, manage accounts, acknowledge notifications, and trigger provider login and launch actions. In other words, UsageTracker doesn't try to defend against a malicious process that's *already* running as you.
 
@@ -21,7 +21,7 @@ A manual `cookie_header` is a secret, stored as plaintext in the owner-only conf
 
 ### Keychain isolation
 
-Every uncached Keychain read, write, and delete — including provider credentials, cached cookie headers, and browser Safe Storage keys — goes through a one-operation helper process. A cross-process lock at `~/.usagetracker/keychain.lock` lets only one UsageTracker helper enter Keychain at a time, even if multiple daemons or providers refresh concurrently. Successful reads are cached in daemon memory for 60 seconds so account discovery and collection don't trigger duplicate authorization prompts; writes and deletes update or invalidate that cache immediately. OpenCode Go's cache update reads and conditionally writes under the same lock, so concurrent refreshes don't issue duplicate writes.
+Every uncached Keychain read, write, and delete — including provider credentials, cached cookie headers, and browser Safe Storage keys — goes through a one-operation helper process. A cross-process lock at `~/.usagetracker/keychain.lock` lets only one UsageTracker helper enter Keychain at a time, even if multiple daemons or providers refresh concurrently. Successful reads are cached in daemon memory for the daemon's lifetime so account discovery and collection don't trigger duplicate authorization prompts; writes and deletes update or invalidate that cache immediately. OpenCode Go's cache update reads and conditionally writes under the same lock, so concurrent refreshes don't issue duplicate writes.
 
 Requests and responses travel through private pipes; secrets are never placed in process arguments. The daemon gives each helper 20 seconds, then kills and reaps it if macOS Keychain hangs. A helper also exits if its owning daemon disappears, and the lock is released automatically when the helper exits.
 

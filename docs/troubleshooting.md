@@ -6,7 +6,15 @@ When something looks off, start here:
 cargo run -p usage-cli -- status
 ```
 
-When the menu app launches the daemon, logs land in `~/.usagetracker/usage-daemon.log` (with numbered rotated archives). A daemon you run in the foreground logs straight to the terminal — add `RUST_LOG=debug` for more detail.
+The installed app registers the daemon as a per-user macOS LaunchAgent after onboarding. Logs land in `~/.usagetracker/usage-daemon.log` with three bounded, numbered archives. A daemon you run in the foreground logs straight to the terminal — add `RUST_LOG=debug` for more detail.
+
+Inspect the installed background service with:
+
+```sh
+launchctl print gui/$(id -u)/engineering.super.usagetracker.daemon
+```
+
+The service intentionally survives when the menu app quits and launchd restarts it after an unexpected exit. Updates unregister it, wait for it to exit, replace the app, and register it again; failed updates restore the prior registration. The uninstaller unregisters it before removing the app, preventing `KeepAlive` from racing replacement or leaving an orphan daemon. Disabling UsageTracker under **System Settings → General → Login Items** is treated as an explicit stop and is preserved across updates; enable it there and reopen the app to resume collection.
 
 ## Opening the unnotarized app
 
@@ -26,7 +34,7 @@ See [Apple's official app-opening safety guide](https://support.apple.com/102445
 
 | Symptom | What to check |
 | --- | --- |
-| Socket missing | Start the app or run `cargo run -p usage-daemon`. Make sure the CLI and daemon share the same `USAGE_TRACKER_HOME` or socket override. |
+| Socket missing | Open the installed app so it can reconcile its LaunchAgent, or run `cargo run -p usage-daemon` for development. Make sure a manually run CLI and daemon share the same `USAGE_TRACKER_HOME` or socket override. |
 | Connection refused | The file may be stale after a crash. Starting the daemon clears stale socket files automatically — though it won't remove a path that isn't a socket. |
 | Another daemon is running | Startup won't take over a socket that's still accepting connections. Stop the existing app/daemon, or use a different socket. |
 | Restart never finishes | The app waits for both the socket and old daemon process to stop. After the bounded graceful shutdown period it sends `SIGKILL`, confirms the process exited, and only then launches a replacement. |
