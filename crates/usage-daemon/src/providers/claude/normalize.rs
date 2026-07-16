@@ -33,8 +33,16 @@ pub(super) fn normalize_usage(
         )
     })?;
 
-    let mut windows = utilization_windows(response.utilization.as_ref());
-    windows.extend(recursive_utilization_windows(payload));
+    // Newer usage responses expose the complete, display-ready quota list in
+    // `limits`. In particular, scoped model limits (for example Fable) only
+    // appear there while their legacy top-level field remains null. Prefer the
+    // canonical list so the legacy five_hour/seven_day fields do not duplicate
+    // the same quotas.
+    let mut windows = limit_windows(response.limits.as_ref());
+    if windows.is_empty() {
+        windows = utilization_windows(response.utilization.as_ref());
+        windows.extend(recursive_utilization_windows(payload));
+    }
     if let Some(extra_usage) = response.extra_usage.as_ref().and_then(extra_usage_window) {
         windows.push(extra_usage);
     }
@@ -71,7 +79,22 @@ struct ClaudeUsageResponse {
     #[serde(default)]
     utilization: Option<BTreeMap<String, ClaudeUtilizationEntry>>,
     #[serde(default)]
+    limits: Option<Value>,
+    #[serde(default)]
     extra_usage: Option<ClaudeExtraUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeLimit {
+    kind: String,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    percent: Option<NumberLike>,
+    #[serde(default, alias = "resetsAt", alias = "reset_at", alias = "resetAt")]
+    resets_at: Option<Value>,
+    #[serde(default)]
+    scope: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +213,65 @@ impl ClaudeExtraUsage {
     }
 }
 
+fn limit_windows(limits: Option<&Value>) -> Vec<UsageWindow> {
+    limits
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|limit| serde_json::from_value::<ClaudeLimit>(limit.clone()).ok())
+        .filter_map(|limit| {
+            let percent_used = limit.percent.as_ref()?.value()?;
+            let scope = limit.scope.as_ref().and_then(limit_scope_label);
+            let (name, label) = match (limit.kind.as_str(), scope.as_deref()) {
+                // Preserve the established IDs for the two general quotas so
+                // forecasts, alerts, and hidden-window preferences remain stable.
+                ("session", _) => ("five_hour".to_string(), "Claude five hour".to_string()),
+                ("weekly_all", _) => ("seven_day".to_string(), "Claude seven day".to_string()),
+                ("weekly_scoped", Some(scope)) => (
+                    format!("seven_day_{scope}"),
+                    format!("Claude current week ({scope})"),
+                ),
+                (kind, Some(scope)) => (
+                    format!("{kind}_{scope}"),
+                    format!("Claude {} ({scope})", humanize_words(kind)),
+                ),
+                (kind, None) => (kind.to_string(), humanize_window_label(kind)),
+            };
+            let kind_name = limit.group.as_deref().unwrap_or(&limit.kind);
+
+            Some(percent_window(PercentWindowSpec {
+                name,
+                label: Some(label),
+                percent_used,
+                reset_at: limit.resets_at.as_ref().and_then(date_time_from_json_value),
+                kind: Some(usage_kind_from_name(kind_name)),
+            }))
+        })
+        .collect()
+}
+
+fn limit_scope_label(scope: &Value) -> Option<String> {
+    let scope = scope.as_object()?;
+    ["model", "surface"]
+        .into_iter()
+        .filter_map(|key| scope.get(key))
+        .find_map(|value| match value {
+            Value::String(value) => nonempty(value),
+            Value::Object(value) => value
+                .get("display_name")
+                .or_else(|| value.get("name"))
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+                .and_then(nonempty),
+            _ => None,
+        })
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn utilization_windows(
     utilization: Option<&BTreeMap<String, ClaudeUtilizationEntry>>,
 ) -> Vec<UsageWindow> {
@@ -206,6 +288,7 @@ fn utilization_windows(
                     label: None,
                     percent_used: value,
                     reset_at: None,
+                    kind: None,
                 })
             }),
             ClaudeUtilizationEntry::Window(window) => window.percent_used().map(|value| {
@@ -214,6 +297,7 @@ fn utilization_windows(
                     label: window.label(),
                     percent_used: value,
                     reset_at: window.reset_at(),
+                    kind: None,
                 })
             }),
         })
@@ -310,6 +394,7 @@ fn utilization_entry_window(path: &[String], entry: ClaudeUtilizationEntry) -> O
                     label,
                     percent_used: value,
                     reset_at: None,
+                    kind: None,
                 })
             })
         }
@@ -319,6 +404,7 @@ fn utilization_entry_window(path: &[String], entry: ClaudeUtilizationEntry) -> O
                 label: window.label().or(label),
                 percent_used: value,
                 reset_at: window.reset_at(),
+                kind: None,
             })
         }),
     }
@@ -338,6 +424,7 @@ struct PercentWindowSpec {
     label: Option<String>,
     percent_used: f64,
     reset_at: Option<DateTime<Utc>>,
+    kind: Option<UsageWindowKind>,
 }
 
 fn percent_window(spec: PercentWindowSpec) -> UsageWindow {
@@ -352,7 +439,9 @@ fn percent_window(spec: PercentWindowSpec) -> UsageWindow {
         label: spec
             .label
             .unwrap_or_else(|| humanize_window_label(&spec.name)),
-        kind: usage_kind_from_name(&spec.name),
+        kind: spec
+            .kind
+            .unwrap_or_else(|| usage_kind_from_name(&spec.name)),
         used: Some(UsageAmount {
             value: percent_used,
             unit: UsageUnit::Percent,
@@ -436,8 +525,12 @@ fn date_time_from_json_value(value: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
+fn humanize_words(value: impl AsRef<str>) -> String {
+    value.as_ref().replace(['_', '-'], " ")
+}
+
 fn humanize_window_label(value: impl AsRef<str>) -> String {
-    let value = value.as_ref().replace(['_', '-'], " ");
+    let value = humanize_words(value);
     let value = value.trim();
     if value.to_ascii_lowercase().starts_with("claude") {
         value.to_string()
@@ -529,6 +622,78 @@ mod tests {
         assert!(matches!(daily.kind, UsageWindowKind::Daily));
         assert_eq!(daily.percent_used, Some(9.25));
         assert_eq!(daily.remaining.as_ref().unwrap().value, 90.75);
+    }
+
+    #[test]
+    fn normalizes_canonical_limits_including_scoped_models() {
+        let snapshot = normalize_usage(
+            &json!({
+                "five_hour": {
+                    "utilization": 19,
+                    "resets_at": "2026-07-16T09:00:00Z"
+                },
+                "seven_day": {
+                    "utilization": 2,
+                    "resets_at": "2026-07-22T01:00:00Z"
+                },
+                "seven_day_omelette": null,
+                "limits": [
+                    {
+                        "kind": "session",
+                        "group": "session",
+                        "percent": 19,
+                        "resets_at": "2026-07-16T09:00:00Z",
+                        "scope": null,
+                        "is_active": true
+                    },
+                    {
+                        "kind": "weekly_all",
+                        "group": "weekly",
+                        "percent": 2,
+                        "resets_at": "2026-07-22T01:00:00Z",
+                        "scope": null,
+                        "is_active": false
+                    },
+                    {
+                        "kind": "weekly_scoped",
+                        "group": "weekly",
+                        "percent": 4,
+                        "resets_at": "2026-07-22T01:00:00Z",
+                        "scope": {
+                            "model": {"id": null, "display_name": "Fable"},
+                            "surface": null
+                        },
+                        "is_active": false
+                    }
+                ]
+            }),
+            &test_credentials(),
+        )
+        .unwrap()
+        .into_snapshot(AccountId::new("joey"));
+
+        assert_eq!(snapshot.windows.len(), 3);
+
+        let session = find_window(&snapshot.windows, "claude_usage_utilization_five_hour");
+        assert!(matches!(session.kind, UsageWindowKind::Session));
+        assert_eq!(session.percent_used, Some(19.0));
+
+        let weekly = find_window(&snapshot.windows, "claude_usage_utilization_seven_day");
+        assert!(matches!(weekly.kind, UsageWindowKind::Weekly));
+        assert_eq!(weekly.percent_used, Some(2.0));
+
+        let fable = find_window(
+            &snapshot.windows,
+            "claude_usage_utilization_seven_day_fable",
+        );
+        assert!(matches!(fable.kind, UsageWindowKind::Weekly));
+        assert_eq!(fable.label, "Claude current week (Fable)");
+        assert_eq!(fable.percent_used, Some(4.0));
+        assert_eq!(fable.percent_remaining, Some(96.0));
+        assert_eq!(
+            fable.reset_at.unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 22, 1, 0, 0).unwrap()
+        );
     }
 
     #[test]

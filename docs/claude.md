@@ -27,7 +27,7 @@ The CLI fallback runs with the profile's own `CLAUDE_CONFIG_DIR` and is capped o
 
 ## How the numbers are normalized
 
-OAuth utilization values become windows clamped to `0..100`, each with a stable ID derived from its path and a reset time parsed into UTC. Any extra usage shows up as a credit/spend window. The CLI fallback's parser understands Claude's own session and weekly usage text and its reset-time formats.
+OAuth's canonical `limits` list becomes windows clamped to `0..100`, including scoped model limits such as Fable. Stable IDs preserve the legacy five-hour and seven-day window identities, and reset times are parsed into UTC. Older responses without `limits` still use their utilization fields. Any extra usage shows up as a credit/spend window. The CLI fallback's parser understands Claude's own session and weekly usage text and its reset-time formats.
 
 Your local JSONL history is used only for token activity and estimated cost on *this* Mac — never for quota percentages. It's found via `project_roots`, `<claude_config_dir>/projects`, or whichever single profile owns the shared default Claude project roots.
 
