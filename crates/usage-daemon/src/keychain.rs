@@ -498,6 +498,7 @@ fn keyring_failure_response(error: &KeyringError) -> Response {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn is_authentication_failure(error: &KeyringError) -> bool {
     let platform_error = match error {
         KeyringError::PlatformFailure(error) | KeyringError::NoStorageAccess(error) => error,
@@ -506,6 +507,11 @@ fn is_authentication_failure(error: &KeyringError) -> bool {
     platform_error
         .downcast_ref::<security_framework::base::Error>()
         .is_some_and(|error| error.code() == security_framework_sys::base::errSecAuthFailed)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_authentication_failure(_error: &KeyringError) -> bool {
+    false
 }
 
 fn entry(service: &str, account: &str) -> Result<Entry, KeyringError> {
@@ -663,6 +669,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn classifies_macos_authentication_failure_without_conflating_cancel() {
         let authentication =
@@ -732,7 +739,7 @@ mod tests {
 
     #[test]
     fn helper_deadline_contains_a_child_that_never_reads_stdin() {
-        let mut command = Command::new("/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("5");
         let started = Instant::now();
 

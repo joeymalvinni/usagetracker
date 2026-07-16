@@ -36,7 +36,7 @@ The same data is available from the macOS menu bar app and the `usage` CLI.
 
 # Install
 
-UsageTracker requires macOS 14 or newer. Install the app and CLI from the latest release:
+The UsageTracker menu bar app requires macOS 14 or newer. Install the app and CLI from the latest release:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
@@ -90,6 +90,17 @@ To work entirely from the terminal, run the daemon in one window and the CLI in 
 cargo run -p usage-daemon
 cargo run -p usage-cli -- status
 ```
+
+### Nix
+
+The flake packages the daemon and CLI on macOS and Linux. Start the daemon in one terminal, then query it from another:
+
+```sh
+nix run .#daemon
+nix run .#cli -- status
+```
+
+`nix develop` opens a development shell with Rust, Clippy, rustfmt, and `just`. On macOS, the Swift menu bar app still requires Xcode and can be built from that shell with `just app`; Linux supports the daemon and CLI only.
 
 ## Documentation
 
