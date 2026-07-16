@@ -20,10 +20,9 @@ use wait_timeout::ChildExt;
 
 const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTHENTICATION_ATTEMPTS: usize = 3;
-// Discovery and collection commonly read the same credential back-to-back. Keep
-// successful reads briefly so that macOS only has to authorize that item once,
-// while still noticing credentials changed by another process promptly.
-const READ_CACHE_TTL: Duration = Duration::from_secs(60);
+// Successful Keychain reads stay in the broker for the daemon's lifetime. This
+// avoids repeated macOS authorization prompts during polling and discovery.
+// Mutations made through this broker update or invalidate the cached value.
 // A small bounded queue prevents a hung Keychain backend from turning caller
 // bursts into unbounded retained secrets while still absorbing normal polling.
 const QUEUE_CAPACITY: usize = 8;
@@ -178,14 +177,10 @@ enum BrokerReply {
 
 impl Broker {
     fn new(capacity: usize, executor: Executor) -> Self {
-        Self::new_with_cache_ttl(capacity, executor, READ_CACHE_TTL)
-    }
-
-    fn new_with_cache_ttl(capacity: usize, executor: Executor, cache_ttl: Duration) -> Self {
         let (requests, receiver) = mpsc::sync_channel(capacity);
         std::thread::Builder::new()
             .name("usage-keychain-broker".to_string())
-            .spawn(move || run_broker(receiver, executor, cache_ttl))
+            .spawn(move || run_broker(receiver, executor))
             .expect("failed to start Keychain broker");
         Self { requests }
     }
@@ -233,10 +228,9 @@ impl Broker {
 
 struct CachedPassword {
     value: String,
-    expires_at: Instant,
 }
 
-fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor, cache_ttl: Duration) {
+fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor) {
     let mut pending = VecDeque::new();
     let mut read_cache: HashMap<(String, String), CachedPassword> = HashMap::new();
     loop {
@@ -257,17 +251,19 @@ fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor, cache_ttl: 
             continue;
         }
         let request = queued.request.clone();
-        let now = Instant::now();
-        let cached = if matches!(request, Request::Get { .. }) {
-            request.cache_key().and_then(|key| {
-                read_cache.get(&key).and_then(|cached| {
-                    (cached.expires_at > now).then(|| Response::Value {
-                        value: cached.value.clone(),
-                    })
+        let cached = match &request {
+            Request::Get { .. } => request.cache_key().and_then(|key| {
+                read_cache.get(&key).map(|cached| Response::Value {
+                    value: cached.value.clone(),
                 })
-            })
-        } else {
-            None
+            }),
+            Request::SetIfChanged { password, .. } => request.cache_key().and_then(|key| {
+                read_cache
+                    .get(&key)
+                    .filter(|cached| cached.value == *password)
+                    .map(|_| Response::Ok)
+            }),
+            Request::CompareAndSet { .. } | Request::Delete { .. } => None,
         };
         let result = if let Some(response) = cached {
             Ok(response)
@@ -282,7 +278,7 @@ fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor, cache_ttl: 
                 }
             }
         };
-        update_read_cache(&mut read_cache, &request, &result, cache_ttl);
+        update_read_cache(&mut read_cache, &request, &result);
         let _ = queued.replies.send(BrokerReply::Finished(result.clone()));
         let mut coalescing_allowed = true;
         while let Ok(candidate) = receiver.try_recv() {
@@ -309,7 +305,6 @@ fn update_read_cache(
     cache: &mut HashMap<(String, String), CachedPassword>,
     request: &Request,
     result: &Result<Response, Error>,
-    cache_ttl: Duration,
 ) {
     let Some(key) = request.cache_key() else {
         return;
@@ -327,13 +322,7 @@ fn update_read_cache(
         _ => return,
     };
     if let Some(value) = value {
-        cache.insert(
-            key,
-            CachedPassword {
-                value,
-                expires_at: Instant::now() + cache_ttl,
-            },
-        );
+        cache.insert(key, CachedPassword { value });
     } else {
         cache.remove(&key);
     }
@@ -863,10 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn broker_caches_sequential_successful_reads_briefly() {
+    fn broker_caches_successful_reads_for_its_lifetime() {
         let calls = Arc::new(AtomicUsize::new(0));
         let executor_calls = calls.clone();
-        let broker = Broker::new_with_cache_ttl(
+        let broker = Broker::new(
             1,
             Arc::new(move |_, _| {
                 executor_calls.fetch_add(1, Ordering::SeqCst);
@@ -874,10 +863,9 @@ mod tests {
                     value: "secret".to_string(),
                 })
             }),
-            Duration::from_secs(1),
         );
 
-        for _ in 0..2 {
+        for _ in 0..100 {
             assert!(matches!(
                 broker.invoke(request(), Duration::from_secs(1)),
                 Ok(Response::Value { value }) if value == "secret"
@@ -887,29 +875,35 @@ mod tests {
     }
 
     #[test]
-    fn broker_expires_cached_reads() {
+    fn broker_uses_cached_value_to_skip_an_unchanged_write() {
         let calls = Arc::new(AtomicUsize::new(0));
         let executor_calls = calls.clone();
-        let broker = Broker::new_with_cache_ttl(
+        let broker = Broker::new(
             1,
             Arc::new(move |_, _| {
-                let call = executor_calls.fetch_add(1, Ordering::SeqCst);
+                executor_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(Response::Value {
-                    value: format!("secret-{call}"),
+                    value: "secret".to_string(),
                 })
             }),
-            Duration::ZERO,
         );
 
         assert!(matches!(
             broker.invoke(request(), Duration::from_secs(1)),
-            Ok(Response::Value { value }) if value == "secret-0"
+            Ok(Response::Value { value }) if value == "secret"
         ));
         assert!(matches!(
-            broker.invoke(request(), Duration::from_secs(1)),
-            Ok(Response::Value { value }) if value == "secret-1"
+            broker.invoke(
+                Request::SetIfChanged {
+                    service: "test".to_string(),
+                    account: "account".to_string(),
+                    password: "secret".to_string(),
+                },
+                Duration::from_secs(1),
+            ),
+            Ok(Response::Ok)
         ));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
