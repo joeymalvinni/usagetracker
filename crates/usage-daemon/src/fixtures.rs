@@ -493,7 +493,7 @@ fn fixture_metadata(
             serde_json::json!({
                 "date": bucket.date.to_string(),
                 "tokens": bucket.tokens,
-                "activity_tokens": bucket.tokens.saturating_sub(cached_input_tokens),
+                "activity_tokens": bucket.tokens,
                 "cached_input_tokens": cached_input_tokens,
                 "priced_tokens": bucket.tokens,
                 "cost_usd": bucket.cost_usd,

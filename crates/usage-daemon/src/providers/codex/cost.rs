@@ -44,7 +44,7 @@ impl CodexUsageCostExt for ProviderUsage {
                 "undated_cached_input_tokens": report.undated_cached_input_tokens,
                 "undated_cost_usd": report.undated_cost_usd,
                 "total_cached_input_tokens": report.total_cached_input_tokens,
-                "total_activity_tokens": report.total_tokens.saturating_sub(report.total_cached_input_tokens),
+                "total_activity_tokens": report.total_tokens,
                 "priced_tokens": report.priced_tokens,
                 "unpriced_tokens": report.unpriced_tokens,
                 "unpriced_models": unpriced_model_rows(&report.unpriced_models),
@@ -55,13 +55,6 @@ impl CodexUsageCostExt for ProviderUsage {
             return;
         }
 
-        let today_activity_tokens = report
-            .today_tokens
-            .saturating_sub(report.today_cached_input_tokens);
-        let lookback_activity_tokens = report
-            .lookback_tokens
-            .saturating_sub(report.lookback_cached_input_tokens);
-
         if report.today_cost_usd > 0.0 {
             self.windows.push(cost_window(
                 "codex_estimated_spend_today",
@@ -69,11 +62,11 @@ impl CodexUsageCostExt for ProviderUsage {
                 report.today_cost_usd,
             ));
         }
-        if include_token_activity && today_activity_tokens > 0 {
+        if include_token_activity && report.today_tokens > 0 {
             self.windows.push(token_window(
                 "codex_tokens_today",
                 "Codex tokens today",
-                today_activity_tokens,
+                report.today_tokens,
                 UsageWindowKind::Daily,
             ));
         }
@@ -85,11 +78,11 @@ impl CodexUsageCostExt for ProviderUsage {
                 report.lookback_cost_usd,
             ));
         }
-        if include_token_activity && lookback_activity_tokens > 0 {
+        if include_token_activity && report.lookback_tokens > 0 {
             self.windows.push(token_window(
                 "codex_tokens_30d",
                 "Codex tokens 30 days",
-                lookback_activity_tokens,
+                report.lookback_tokens,
                 UsageWindowKind::Monthly,
             ));
         }
@@ -107,16 +100,16 @@ impl CodexUsageCostExt for ProviderUsage {
             "today_cost_usd": report.today_cost_usd,
             "today_tokens": report.today_tokens,
             "today_cached_input_tokens": report.today_cached_input_tokens,
-            "today_activity_tokens": today_activity_tokens,
+            "today_activity_tokens": report.today_tokens,
             "lookback_days": COST_LOOKBACK_DAYS,
             "lookback_cost_usd": report.lookback_cost_usd,
             "lookback_tokens": report.lookback_tokens,
             "lookback_cached_input_tokens": report.lookback_cached_input_tokens,
-            "lookback_activity_tokens": lookback_activity_tokens,
+            "lookback_activity_tokens": report.lookback_tokens,
             "total_cost_usd": report.total_cost_usd,
             "total_tokens": report.total_tokens,
             "total_cached_input_tokens": report.total_cached_input_tokens,
-            "total_activity_tokens": report.total_tokens.saturating_sub(report.total_cached_input_tokens),
+            "total_activity_tokens": report.total_tokens,
             "undated_cost_usd": report.undated_cost_usd,
             "undated_tokens": report.undated_tokens,
             "undated_cached_input_tokens": report.undated_cached_input_tokens,

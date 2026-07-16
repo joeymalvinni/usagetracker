@@ -106,7 +106,7 @@ pub(crate) fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) ->
             date: date.to_string(),
             cost_usd: summary.cost_usd,
             tokens: summary.tokens,
-            activity_tokens: summary.tokens.saturating_sub(summary.cached_input_tokens),
+            activity_tokens: summary.tokens,
             cached_input_tokens: summary.cached_input_tokens,
             priced_tokens: summary.priced_tokens,
             unpriced_tokens: summary.unpriced_tokens,
@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daily_rows_publish_activity_without_cached_input() {
+    fn daily_rows_publish_processed_activity_with_cached_input() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 11).unwrap();
         let rows = daily_cost_rows(&BTreeMap::from([(
             date,
@@ -142,7 +142,7 @@ mod tests {
 
         assert_eq!(value[0]["tokens"], 1_100);
         assert_eq!(value[0]["cached_input_tokens"], 800);
-        assert_eq!(value[0]["activity_tokens"], 300);
+        assert_eq!(value[0]["activity_tokens"], 1_100);
     }
 
     #[test]
