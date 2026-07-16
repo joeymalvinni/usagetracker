@@ -14,7 +14,7 @@ Cookie headers are resolved in this order:
 2. A filtered header cached in the Keychain.
 3. `auth` and `__Host-auth` imported from a supported Chrome-family, Dia, or Firefox store for `opencode.ai` / `app.opencode.ai` — then cached for next time.
 
-The Keychain cache is updated only when the filtered header changes. Its read-and-conditional-write operation shares UsageTracker's serialized Keychain helper, so overlapping discovery and refresh work can't write the cache concurrently.
+The Keychain cache is updated only when the filtered header changes. Successful Keychain reads stay in memory for the daemon's lifetime, and an unchanged conditional write uses that in-memory value, so polling does not repeatedly prompt for the same item. Keychain operations share UsageTracker's serialized helper, so overlapping discovery and refresh work can't write the cache concurrently.
 
 Workspace selection follows the same idea: a configured `workspace_id` first, then `USAGE_TRACKER_OPENCODE_GO_WORKSPACE_ID`, then automatic discovery.
 

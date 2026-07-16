@@ -51,7 +51,7 @@ Diagnostics can note things like the collection mode, profile ID, Keychain servi
 
 ## A few security notes
 
-Reading or refreshing credentials in the Keychain can prompt macOS for permission. UsageTracker distinguishes a rejected Keychain password from Claude rejecting an OAuth token, and successful reads are cached briefly so discovery and collection do not repeat an accepted prompt. Managed login and launch commands only ever see their own profile directory — use the app's per-profile launch action so activity gets attributed correctly. Your local history may contain project paths and model names, but UsageTracker doesn't copy whole records into its own storage.
+Reading or refreshing credentials in the Keychain can prompt macOS for permission. UsageTracker distinguishes a rejected Keychain password from Claude rejecting an OAuth token, and successful Keychain reads are cached in memory for the daemon's lifetime so discovery and collection do not repeat an accepted prompt. Writes made through UsageTracker update that cache; changes made by another process are picked up after the daemon restarts. Managed login and launch commands only ever see their own profile directory — use the app's per-profile launch action so activity gets attributed correctly. Your local history may contain project paths and model names, but UsageTracker doesn't copy whole records into its own storage.
 
 ## Tests and fixtures
 
