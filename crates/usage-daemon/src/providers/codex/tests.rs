@@ -81,6 +81,7 @@ fn account_activity_is_diagnostic_while_local_logs_drive_visible_tokens() {
         DailyCostSummary {
             cost_usd: 1.25,
             tokens: 100,
+            cached_input_tokens: 80,
             priced_tokens: 100,
             ..Default::default()
         },
@@ -89,10 +90,13 @@ fn account_activity_is_diagnostic_while_local_logs_drive_visible_tokens() {
         CodexCostReport {
             today_cost_usd: 1.25,
             today_tokens: 100,
+            today_cached_input_tokens: 80,
             lookback_cost_usd: 1.25,
             lookback_tokens: 100,
+            lookback_cached_input_tokens: 80,
             total_cost_usd: 1.25,
             total_tokens: 100,
+            total_cached_input_tokens: 80,
             by_day,
             ..Default::default()
         },
@@ -102,6 +106,11 @@ fn account_activity_is_diagnostic_while_local_logs_drive_visible_tokens() {
     assert_eq!(usage.metadata["codex_activity"]["lifetime_tokens"], 300);
     assert_eq!(usage.metadata["codex_activity"]["by_day"][1]["tokens"], 100);
     assert_eq!(usage.metadata["codex_cost"]["partial"], true);
+    assert_eq!(usage.metadata["codex_cost"]["today_activity_tokens"], 100);
+    assert_eq!(
+        usage.metadata["codex_cost"]["today_cached_input_tokens"],
+        80
+    );
     let token_window = usage
         .windows
         .iter()

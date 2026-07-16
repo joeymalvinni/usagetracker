@@ -70,16 +70,14 @@ fn account_summary(
         .unwrap_or_else(|| synthesized_today_point(cost));
     let (activity_source, activity_metadata, activity_days, activity_lifetime_tokens) =
         if provider_id == "codex" {
-            // Codex's account endpoint reports an opaque processed-token total with
-            // no cached-input split. Use local logs for the activity graph so cached
-            // context can be excluded and keep account-wide data for quota only.
+            // Codex's account endpoint reports an opaque processed-token total. Use
+            // local logs for a cost-aligned activity graph that includes cached input
+            // once, and keep account-wide data as diagnostics only.
             (
                 cost_source,
                 cost,
-                cost_rows
-                    .map(|rows| activity_daily_points(rows))
-                    .unwrap_or_default(),
-                cost.and_then(|value| value.get("total_activity_tokens"))
+                cost_rows.map(|rows| daily_points(rows)).unwrap_or_default(),
+                cost.and_then(|value| value.get("total_tokens"))
                     .and_then(Value::as_u64),
             )
         } else {
@@ -260,40 +258,6 @@ fn timestamp(
                 .and_then(Value::as_f64)
                 .and_then(|seconds| DateTime::from_timestamp(seconds as i64, 0))
         })
-}
-
-fn activity_daily_points(rows: &[Value]) -> Vec<DailyUsagePoint> {
-    let mut by_date = BTreeMap::new();
-    for row in rows.iter().filter_map(Value::as_object) {
-        let Some(date) = row
-            .get("date")
-            .and_then(Value::as_str)
-            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
-        else {
-            continue;
-        };
-        let processed_tokens = row.get("tokens").and_then(Value::as_u64).unwrap_or(0);
-        let cached_input_tokens = row
-            .get("cached_input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .min(processed_tokens);
-        let tokens = row
-            .get("activity_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| processed_tokens.saturating_sub(cached_input_tokens));
-        by_date.insert(
-            date,
-            DailyUsagePoint {
-                date,
-                tokens,
-                cost_usd: None,
-                priced_tokens: 0,
-                unpriced_tokens: 0,
-            },
-        );
-    }
-    by_date.into_values().collect()
 }
 
 fn daily_points(rows: &[Value]) -> Vec<DailyUsagePoint> {
@@ -480,7 +444,7 @@ mod tests {
     use crate::storage::StoredDailyUsage;
 
     #[test]
-    fn codex_dashboard_uses_local_uncached_activity_without_scaling_cost() {
+    fn codex_dashboard_uses_local_processed_activity_without_scaling_cost() {
         let collected_at = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
         let snapshots = vec![
             UsageSnapshot {
@@ -494,6 +458,7 @@ mod tests {
                         "source":"local_session_logs",
                         "estimate":true,
                         "partial":true,
+                        "total_tokens":1_400_000_100_u64,
                         "total_activity_tokens":100,
                         "by_day":[{
                             "date":"2026-07-11",
@@ -524,7 +489,7 @@ mod tests {
         assert!(dashboard.provenance.mixed_scope);
         assert!(dashboard.provenance.partial);
         assert!(dashboard.provenance.estimated);
-        assert_eq!(dashboard.days[0].tokens, 300);
+        assert_eq!(dashboard.days[0].tokens, 1_400_000_300);
         assert_eq!(dashboard.days[0].cost_usd, Some(2.0));
         assert_eq!(dashboard.pricing.priced_tokens, 1_400_000_200);
         assert_eq!(dashboard.pricing.unpriced_tokens, 100);
@@ -533,8 +498,14 @@ mod tests {
             .iter()
             .find(|account| account.provider_id.as_str() == "codex")
             .unwrap();
-        assert_eq!(codex.activity.as_ref().unwrap().lookback_tokens, 100);
-        assert_eq!(codex.activity.as_ref().unwrap().lifetime_tokens, Some(100));
+        assert_eq!(
+            codex.activity.as_ref().unwrap().lookback_tokens,
+            1_400_000_100
+        );
+        assert_eq!(
+            codex.activity.as_ref().unwrap().lifetime_tokens,
+            Some(1_400_000_100)
+        );
         assert_eq!(codex.cost.as_ref().unwrap().lookback_cost_usd, 1.5);
         assert!(dashboard
             .provenance

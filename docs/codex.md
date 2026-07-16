@@ -20,7 +20,7 @@ Rate-limit trouble can fall through to WHAM, but local logs never stand in for r
 
 ## How the numbers are normalized
 
-Provider windows become percent, credit, or amount windows, each with a stable ID and a UTC reset time. The daily buckets from `account/usage/read` are retained as account diagnostics, but they combine cached and uncached activity without exposing the split, so they do not drive the activity graph. Visible Codex tokens come from local logs and count fresh input plus output while excluding cached input. Cost is estimated from those same logs with cached input charged at its discounted catalog rate; it is never scaled to the opaque account-wide token total. Models that aren't in the bundled, versioned catalog stay clearly marked as unpriced.
+Provider windows become percent, credit, or amount windows, each with a stable ID and a UTC reset time. The daily buckets from `account/usage/read` are retained as account diagnostics, but their opaque account-wide totals do not drive the activity graph. Visible Codex tokens come from local logs and count processed input plus output, including cached input once. Cost is estimated from those same logs with cached input charged at its discounted catalog rate; it is never scaled to the account-wide token total. Models that aren't in the bundled, versioned catalog stay clearly marked as unpriced.
 
 ## Refresh timing and rate limits
 
