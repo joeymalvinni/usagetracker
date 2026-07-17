@@ -7,6 +7,7 @@ mod health;
 mod instance;
 mod keychain;
 mod local_logs;
+mod managed_log;
 mod notifications;
 mod polling;
 mod providers;
@@ -38,6 +39,9 @@ struct Args {
     /// Run against a reset, synthetic development database.
     #[arg(long, env = "USAGE_TRACKER_FIXTURE", value_enum)]
     fixture: Option<fixtures::FixtureScenario>,
+    /// Run as the macOS LaunchAgent and write bounded logs to the app directory.
+    #[arg(long, hide = true)]
+    managed: bool,
     /// Internal one-operation Keychain subprocess.
     #[arg(long, hide = true)]
     keychain_helper: bool,
@@ -49,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     if args.keychain_helper {
         return keychain::run_helper();
     }
-    init_tracing(&args.log_level)?;
+    init_tracing(&args.log_level, args.managed)?;
 
     let (config_path, db_path, socket_path) = fixture_path_overrides(&args)?;
     let mut config = match args.fixture {
@@ -120,11 +124,21 @@ fn fixture_path_overrides(
     ))
 }
 
-fn init_tracing(log_level: &str) -> anyhow::Result<()> {
+fn init_tracing(log_level: &str, managed: bool) -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new(log_level))?;
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    if managed {
+        let root = default_app_dir().context("failed to resolve managed daemon log directory")?;
+        let writer = managed_log::ManagedLogWriter::open(&root)
+            .context("failed to open managed daemon log")?;
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(writer))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
     Ok(())
 }

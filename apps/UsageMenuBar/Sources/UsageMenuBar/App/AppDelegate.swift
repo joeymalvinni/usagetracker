@@ -1,10 +1,15 @@
 import AppKit
 import Combine
+import Darwin
 import SwiftUI
 import UserNotifications
 
 @main enum UsageMenuBar {
     static func main() {
+        if let status = DaemonLaunchAgentCommand.runIfRequested() {
+            Darwin.exit(status)
+        }
+
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

@@ -626,7 +626,12 @@ private enum PendingAction {
             if allowDaemonStart, await daemonSupervisor.ensureRunning(socketPath: socketPath) {
                 await performLoad(allowDaemonStart: false)
             } else {
-                fail(error); build()
+                if await daemonSupervisor.launchAgentRequiresApproval() {
+                    fail(DaemonLaunchAgentError.requiresApproval)
+                } else {
+                    fail(error)
+                }
+                build()
             }
         }
     }

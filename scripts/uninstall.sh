@@ -7,6 +7,7 @@ purge_data=0
 force=0
 daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
 daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
+launch_agent_label="engineering.super.usagetracker.daemon"
 
 usage() {
   cat <<'EOF'
@@ -77,6 +78,15 @@ wait_for_processes() {
     sleep 0.25
   done
   return 1
+}
+
+unregister_launch_agent() {
+  local executable="$app_path/Contents/MacOS/UsageMenuBar"
+  local plist="$app_path/Contents/Library/LaunchAgents/$launch_agent_label.plist"
+  if [[ -x "$executable" && -f "$plist" ]]; then
+    "$executable" --unregister-daemon-agent >/dev/null 2>&1 || return 1
+  fi
+  launchctl bootout "gui/$(id -u)/$launch_agent_label" >/dev/null 2>&1 || true
 }
 
 stop_daemons() {
@@ -152,6 +162,10 @@ if pgrep -x UsageMenuBar >/dev/null 2>&1; then
   fi
 fi
 
+if ! unregister_launch_agent; then
+  echo "UsageTracker background service could not be unregistered." >&2
+  exit 1
+fi
 if ! stop_daemons; then
   echo "UsageTracker background service could not be stopped." >&2
   exit 1
