@@ -46,6 +46,7 @@ private enum PendingAction {
     @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
     @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
+    @Published var providerAuthenticationURLs = [String: String]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
     @Published var serverProviderOrder = [String]()
     @Published var onboardingDiscoveryStarted = false
@@ -95,6 +96,7 @@ private enum PendingAction {
     private var loadTask: Task<Void, Never>?
     private var automaticRecoveryTask: Task<Void, Never>?
     private var lastAutomaticRecoveryAt: Date?
+    private var onboardingProviderDefaultsPending = true
     private var refreshActivityCount = 0
     private var refreshingProviderCounts = [String: Int]()
     private let automaticRecoveryCooldown: TimeInterval = 30
@@ -110,6 +112,7 @@ private enum PendingAction {
         }
         self.socketPath = socketPath
         self.client = DaemonClient(socketPath: socketPath)
+        self.onboardingProviderDefaultsPending = !ui.onboardingCompleted
     }
 
     init(socketPath: String) {
@@ -121,6 +124,7 @@ private enum PendingAction {
         }
         self.socketPath = socketPath
         self.client = DaemonClient(socketPath: socketPath)
+        self.onboardingProviderDefaultsPending = !ui.onboardingCompleted
     }
 
     func bootstrap() async {
@@ -164,10 +168,11 @@ private enum PendingAction {
     func refreshAll() async {
         guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         let providerIDs = enabledProviderIDs()
+        guard !providerIDs.isEmpty else { return }
         beginRefreshing(providerIDs)
         defer { endRefreshing(providerIDs) }
         do {
-            let report = try await client.refresh(nil)
+            let report = try await client.refresh(Array(providerIDs).sorted())
             applyRefreshOutcome(report)
             await load()
         } catch {
@@ -250,8 +255,10 @@ private enum PendingAction {
         }
         pendingAccountProviders.insert(providerId)
         defer { pendingAccountProviders.remove(providerId) }
+        providerAuthenticationURLs.removeValue(forKey: providerId)
         do {
             let response = try await client.addProviderAccount(providerId: providerId, displayName: nil)
+            rememberAuthenticationURL(response.authenticationUrl, for: providerId)
             actionError = nil
             actionMessage = "Finish signing in to \(providerName(providerId)) in your browser. This account will appear automatically."
             await waitForProviderAccount(providerId: providerId, profileId: response.profileId)
@@ -403,8 +410,10 @@ private enum PendingAction {
             return
         }
         let startedAt = Date()
+        providerAuthenticationURLs.removeValue(forKey: providerId)
         await perform(.accountProvider(providerId)) {
             let response = try await client.repairProvider(providerId: providerId, accountId: accountId)
+            rememberAuthenticationURL(response.authenticationUrl, for: providerId)
             actionMessage = response.message
             if supportsMultipleAccounts(providerId) {
                 await waitForProviderRepair(
@@ -438,6 +447,7 @@ private enum PendingAction {
             ui.lastSeenReleaseNotesVersion = updater.currentVersion
         }
         ui.onboardingCompleted = true
+        onboardingProviderDefaultsPending = false
         actionError = nil
         actionMessage = "Setup complete. Usage will update automatically."
     }
@@ -446,6 +456,7 @@ private enum PendingAction {
         // The daemon is already running for an existing installation, so rerunning
         // setup can go straight to account discovery and provider controls.
         onboardingDiscoveryStarted = true
+        onboardingProviderDefaultsPending = false
         ui.onboardingCompleted = false
     }
 
@@ -465,9 +476,22 @@ private enum PendingAction {
         }
 
         do {
-            // A nil filter intentionally asks every collector to discover accounts,
-            // including providers that are not enabled in the menu yet.
-            let firstScan = try await client.refresh(nil)
+            if onboardingProviderDefaultsPending {
+                let toggles = Self.onboardingDefaultProviderToggles(
+                    providerIDs: serverProviderOrder
+                )
+                config = try await client.updateConfig(
+                    pollIntervalSeconds: nil,
+                    providers: toggles
+                )
+                onboardingProviderDefaultsPending = false
+                build()
+            }
+
+            // Only inspect providers the user has enabled. Enabling a provider from
+            // onboarding performs its own targeted refresh, so credentials for other
+            // providers are never touched without an explicit opt-in.
+            let firstScan = try await client.refresh(Array(enabledProviderIDs()).sorted())
             await load()
 
             let discoveredAccountIDs = Set(firstScan.providerResults.compactMap(\.accountId))
@@ -494,7 +518,7 @@ private enum PendingAction {
             await load()
 
             if discoveredAccounts.isEmpty {
-                actionError = "No signed-in accounts were found. Sign in to a provider, then scan again."
+                actionError = "No signed-in accounts were found. Sign in to an enabled provider, then check again."
             } else {
                 let noun = discoveredAccounts.count == 1 ? "account" : "accounts"
                 let failedProviders = firstScan.providerResults.filter {
@@ -506,11 +530,19 @@ private enum PendingAction {
                 let suffix = failedProviders.isEmpty
                     ? ""
                     : " You can retry any provider that still needs attention below."
-                actionMessage = "Found and enabled \(discoveredAccounts.count) \(noun).\(suffix)"
+                actionMessage = "Found \(discoveredAccounts.count) \(noun).\(suffix)"
             }
         } catch {
             actionError = "Account discovery failed: \(describe(error))"
         }
+    }
+
+    static func onboardingDefaultProviderToggles(providerIDs: [String]) -> [String: Bool] {
+        Dictionary(
+            uniqueKeysWithValues: Set(providerIDs)
+                .union(["codex"])
+                .map { ($0, $0 == "codex") }
+        )
     }
 
     var lastSuccessfulRefresh: Date? {
@@ -730,6 +762,7 @@ private enum PendingAction {
                 let discovered = try await client.accounts()
                 if discovered.contains(where: { $0.providerId == providerId && $0.profileId == profileId }) {
                     accounts = discovered
+                    providerAuthenticationURLs.removeValue(forKey: providerId)
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) account connected."
                     await load()
@@ -755,6 +788,7 @@ private enum PendingAction {
                         && $0.status != .authFailed
                 }
                 if repaired != nil {
+                    providerAuthenticationURLs.removeValue(forKey: providerId)
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) login connected."
                     await load()
@@ -766,6 +800,11 @@ private enum PendingAction {
             try? await Task.sleep(for: .seconds(1))
         }
         actionMessage = "\(providerName(providerId)) sign-in is still pending. You can retry from Settings."
+    }
+
+    private func rememberAuthenticationURL(_ url: String?, for providerId: String) {
+        guard let url, !url.isEmpty else { return }
+        providerAuthenticationURLs[providerId] = url
     }
     private func fail(_ error: Error) {
         daemon = .offline

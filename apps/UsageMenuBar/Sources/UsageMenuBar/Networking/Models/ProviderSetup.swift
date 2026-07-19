@@ -93,4 +93,5 @@ struct ProviderProfileOption: Decodable, Identifiable, Equatable {
 struct ProviderActionResponse: Decodable, Equatable {
     let providerId: String
     let message: String
+    let authenticationUrl: String?
 }

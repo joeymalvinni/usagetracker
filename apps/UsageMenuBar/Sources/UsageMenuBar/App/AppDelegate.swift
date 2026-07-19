@@ -85,6 +85,16 @@ import UserNotifications
             guard let self else { return }
             _ = self.popoverController.view
             self.popoverController.view.layoutSubtreeIfNeeded()
+
+            // A new installation has no Dock icon or ordinary app window to
+            // introduce itself. Open the setup popover from the menu bar on its
+            // first launch, before starting the daemon or touching credentials.
+            if !self.state.ui.onboardingCompleted,
+               ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] != "1"
+            {
+                NSApp.activate(ignoringOtherApps: true)
+                self.showPopover(selection: .summary)
+            }
         }
 
         if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] == "1" { showDebugWindow() }

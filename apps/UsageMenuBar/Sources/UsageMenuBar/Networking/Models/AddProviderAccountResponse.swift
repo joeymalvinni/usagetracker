@@ -5,4 +5,5 @@ struct AddProviderAccountResponse: Decodable, Equatable {
     let profileId: String
     let displayName: String?
     let profilePath: String
+    let authenticationUrl: String?
 }

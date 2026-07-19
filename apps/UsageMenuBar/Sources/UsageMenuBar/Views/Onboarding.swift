@@ -1,43 +1,139 @@
+import AppKit
 import SwiftUI
 
 struct Onboarding: View {
     @EnvironmentObject var state: AppState
+    @State private var welcomeAcknowledged = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
-            VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                Text("Welcome to UsageTracker")
-                    .font(Theme.Typography.title)
-                Text(introText)
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
+        Group {
             if state.onboardingDiscoveryStarted {
-                discoveryResults
+                setupContent
+            } else if welcomeAcknowledged {
+                providerAccessContent
             } else {
-                keychainExplanation
-                Spacer()
-                Button("Find my accounts") {
-                    Task { await state.discoverAccountsForOnboarding() }
-                }
-                .buttonStyle(.borderedProminent)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                welcomeContent
             }
         }
         .padding(Theme.Spacing.lg)
         .frame(width: Theme.Popover.width, height: Theme.Popover.height)
     }
 
-    private var keychainExplanation: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            Label("Keychain access is required", systemImage: "key.fill")
+    private var welcomeContent: some View {
+        VStack(spacing: Theme.Spacing.xl) {
+            Spacer()
+
+            Image(systemName: "chart.bar.xaxis")
+                .font(.system(size: 48, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+
+            VStack(spacing: Theme.Spacing.sm) {
+                Text("Welcome to UsageTracker")
+                    .font(.title2.bold())
+                Text("See your AI usage and limits at a glance, without leaving your menu bar.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+                welcomeFeature(
+                    "Always close by",
+                    detail: "Click the UsageTracker icon in the menu bar whenever you want an update.",
+                    symbol: "menubar.rectangle"
+                )
+                welcomeFeature(
+                    "Only the providers you choose",
+                    detail: "Start with Codex, then add Claude, OpenCode Go, or Grok at any time.",
+                    symbol: "checkmark.circle"
+                )
+                welcomeFeature(
+                    "Private by design",
+                    detail: "Your usage data stays on this Mac.",
+                    symbol: "lock.shield"
+                )
+            }
+            .surfaceCard()
+
+            Spacer()
+
+            Button("Get Started") {
+                welcomeAcknowledged = true
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+    }
+
+    private func welcomeFeature(_ title: String, detail: String, symbol: String) -> some View {
+        HStack(alignment: .top, spacing: Theme.Spacing.md) {
+            Image(systemName: symbol)
                 .font(Theme.Typography.headline)
-            Text("UsageTracker needs access to credentials already stored in your macOS Keychain so it can find your signed-in AI accounts and read their usage.")
+                .foregroundStyle(.tint)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(Theme.Typography.headline)
+                Text(detail)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var providerAccessContent: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
+            onboardingHeader(
+                title: "Before UsageTracker checks Codex",
+                subtitle: "You stay in control of which providers UsageTracker can inspect."
+            )
+            providerAccessExplanation
+            Spacer()
+            HStack {
+                Button("Back") { welcomeAcknowledged = false }
+                Spacer()
+                Button("Check Codex") {
+                    Task { await state.discoverAccountsForOnboarding() }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    private var setupContent: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
+            onboardingHeader(
+                title: "Set up your providers",
+                subtitle: "Turn on another provider to check it. Providers left off are not scanned."
+            )
+            discoveryResults
+        }
+    }
+
+    private func onboardingHeader(title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            Text(title)
+                .font(Theme.Typography.title)
+            Text(subtitle)
+                .font(Theme.Typography.body)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var providerAccessExplanation: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            Label("Provider access is opt-in", systemImage: "checkmark.shield.fill")
+                .font(Theme.Typography.headline)
+            Text("Codex is enabled by default. UsageTracker will not inspect credentials for Claude, OpenCode Go, Grok, or other providers unless you turn them on.")
                 .font(Theme.Typography.body)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("After you continue, macOS will show a Keychain prompt. Press **Always Allow** so UsageTracker can refresh usage automatically in the background without asking again.")
+            Text("When you enable a provider that uses the macOS Keychain, macOS may ask for access. Choose **Always Allow** if you want background refreshes without repeated prompts.")
                 .font(Theme.Typography.body)
                 .fixedSize(horizontal: false, vertical: true)
             Label("Credentials stay in provider files or Keychain and usage data stays on this Mac.", systemImage: "lock.shield")
@@ -56,7 +152,7 @@ struct Onboarding: View {
             } else if let message = state.actionMessage {
                 SetupNotice(text: message, isError: false)
             } else if state.onboardingDiscoveryRunning {
-                SetupNotice(text: "Finding and enabling signed-in accounts…", isError: false)
+                SetupNotice(text: "Checking enabled providers…", isError: false)
             }
 
             ScrollView {
@@ -68,7 +164,7 @@ struct Onboarding: View {
             }
 
             HStack {
-                Button("Scan again") {
+                Button("Check enabled") {
                     Task { await state.discoverAccountsForOnboarding() }
                 }
                 .disabled(state.onboardingDiscoveryRunning)
@@ -78,12 +174,6 @@ struct Onboarding: View {
                     .disabled(state.daemon != .online || state.onboardingDiscoveryRunning)
             }
         }
-    }
-
-    private var introText: String {
-        state.onboardingDiscoveryStarted
-            ? "UsageTracker automatically finds signed-in accounts and enables the ones it discovers."
-            : "First, a quick note about the permission needed to find your accounts."
     }
 }
 
@@ -155,6 +245,13 @@ struct ProviderSetupControls: View {
                     .disabled(busy || state.daemon == .offline)
                 }
 
+                if let authenticationURL {
+                    Button("Copy link", systemImage: "doc.on.doc") {
+                        copyAuthenticationURL(authenticationURL)
+                    }
+                    .help("Copy the sign-in link to open it in another browser")
+                }
+
                 if state.supportsAddAccount(providerId), !accounts.isEmpty {
                     Button("Add another account") { Task { await state.addProviderAccount(providerId) } }
                         .disabled(busy)
@@ -190,6 +287,17 @@ struct ProviderSetupControls: View {
         accounts.isEmpty
             ? state.supportsAddAccount(providerId) || state.supportsRepair(providerId)
             : state.supportsRepair(providerId)
+    }
+
+    private var authenticationURL: String? {
+        state.providerAuthenticationURLs[providerId]
+    }
+
+    private func copyAuthenticationURL(_ url: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        state.actionError = nil
+        state.actionMessage = "\(ProviderCatalog.name(for: providerId)) sign-in link copied."
     }
 
     private func connectOrRepair() async {

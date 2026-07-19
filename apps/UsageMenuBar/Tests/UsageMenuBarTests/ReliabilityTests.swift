@@ -330,6 +330,21 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertNil(object["workspace_id"])
     }
 
+    func testDecodesProviderAuthenticationURL() throws {
+        let response = try JSONDecoder.usage.decode(
+            DaemonResponse.self,
+            from: Data(#"{"api_version":3,"type":"provider_action","action":{"provider_id":"codex","message":"Sign in","authentication_url":"https://auth.openai.com/oauth/authorize?state=test"}}"#.utf8)
+        )
+        guard case let .providerAction(action) = response else {
+            return XCTFail("expected provider action")
+        }
+
+        XCTAssertEqual(
+            action.authenticationUrl,
+            "https://auth.openai.com/oauth/authorize?state=test"
+        )
+    }
+
     func testResponseLineBufferRejectsDataBeyondItsLimit() throws {
         var buffer = ResponseLineBuffer(maxBytes: 4)
         try buffer.append([1, 2, 3, 4])
@@ -743,6 +758,19 @@ final class DaemonLogRotatorTests: XCTestCase {
     private func fileSize(_ url: URL) throws -> UInt64 {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         return try XCTUnwrap(attributes[.size] as? NSNumber).uint64Value
+    }
+}
+
+final class AppStateTests: XCTestCase {
+    @MainActor func testOnboardingDefaultsEnableOnlyCodex() {
+        let toggles = AppState.onboardingDefaultProviderToggles(
+            providerIDs: ["codex", "claude", "opencode_go", "grok"]
+        )
+
+        XCTAssertEqual(toggles["codex"], true)
+        XCTAssertEqual(toggles["claude"], false)
+        XCTAssertEqual(toggles["opencode_go"], false)
+        XCTAssertEqual(toggles["grok"], false)
     }
 }
 
