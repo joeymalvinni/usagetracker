@@ -121,6 +121,20 @@ impl RefreshCoordinator {
         *self.providers.write().await = providers;
     }
 
+    pub(crate) async fn invalidate_cached_credentials(
+        &self,
+        provider_id: &ProviderId,
+        profile_id: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let providers = self.providers.read().await.clone();
+        for provider in providers {
+            if provider.provider_id() == *provider_id {
+                provider.invalidate_cached_credentials(profile_id).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn notification_manager(&self) -> Arc<NotificationManager> {
         self.notifications.clone()
     }

@@ -20,8 +20,8 @@ use wait_timeout::ChildExt;
 
 const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTHENTICATION_ATTEMPTS: usize = 3;
-// Successful Keychain reads stay in the broker for the daemon's lifetime. This
-// avoids repeated macOS authorization prompts during polling and discovery.
+// Successful Keychain reads stay in the broker until explicitly invalidated.
+// This avoids repeated macOS authorization prompts during polling and discovery.
 // Mutations made through this broker update or invalidate the cached value.
 // A small bounded queue prevents a hung Keychain backend from turning caller
 // bursts into unbounded retained secrets while still absorbing normal polling.
@@ -108,6 +108,18 @@ pub(crate) fn delete_password(service: &str, account: &str) -> Result<(), Error>
     })
     .and_then(expect_ok);
     observe_error("delete", &result);
+    result
+}
+
+/// Drops a brokered read without modifying the underlying Keychain item.
+/// Call this after an external process may have replaced a credential.
+pub(crate) fn invalidate_password_cache(service: &str, account: &str) -> Result<(), Error> {
+    let result = invoke(Request::Invalidate {
+        service: service.to_string(),
+        account: account.to_string(),
+    })
+    .and_then(expect_ok);
+    observe_error("invalidate", &result);
     result
 }
 
@@ -263,6 +275,7 @@ fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor) {
                     .filter(|cached| cached.value == *password)
                     .map(|_| Response::Ok)
             }),
+            Request::Invalidate { .. } => Some(Response::Ok),
             Request::CompareAndSet { .. } | Request::Delete { .. } => None,
         };
         let result = if let Some(response) = cached {
@@ -315,9 +328,12 @@ fn update_read_cache(
         | (Request::CompareAndSet { password, .. }, Ok(Response::Ok)) => Some(password.clone()),
         // A failed mutation leaves the actual Keychain state uncertain. Deletes
         // and missing reads must not preserve an older successful read.
-        (Request::Get { .. }, Ok(Response::Missing)) | (Request::Delete { .. }, Ok(_)) => None,
+        (Request::Get { .. }, Ok(Response::Missing))
+        | (Request::Invalidate { .. }, Ok(Response::Ok))
+        | (Request::Delete { .. }, Ok(_)) => None,
         (Request::SetIfChanged { .. }, _)
         | (Request::CompareAndSet { .. }, _)
+        | (Request::Invalidate { .. }, _)
         | (Request::Delete { .. }, _) => None,
         _ => return,
     };
@@ -469,6 +485,9 @@ fn perform(request: Request) -> Response {
                 Err(error) => keyring_failure_response(&error),
             }
         }
+        // Cache invalidation is handled by the broker and never needs to reach
+        // the helper. Keep the protocol arm defensive if it is invoked directly.
+        Request::Invalidate { .. } => Response::Ok,
     }
 }
 
@@ -579,6 +598,10 @@ enum Request {
         service: String,
         account: String,
     },
+    Invalidate {
+        service: String,
+        account: String,
+    },
 }
 
 impl Request {
@@ -591,7 +614,8 @@ impl Request {
             | Self::CompareAndSet {
                 service, account, ..
             }
-            | Self::Delete { service, account } => Some((service.clone(), account.clone())),
+            | Self::Delete { service, account }
+            | Self::Invalidate { service, account } => Some((service.clone(), account.clone())),
         }
     }
 
@@ -879,6 +903,48 @@ mod tests {
             ));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn broker_invalidation_reloads_an_externally_changed_value() {
+        let value = Arc::new(Mutex::new("old".to_string()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor_value = value.clone();
+        let executor_calls = calls.clone();
+        let broker = Broker::new(
+            1,
+            Arc::new(move |_, _| {
+                executor_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::Value {
+                    value: executor_value.lock().unwrap().clone(),
+                })
+            }),
+        );
+
+        assert!(matches!(
+            broker.invoke(request(), Duration::from_secs(1)),
+            Ok(Response::Value { value }) if value == "old"
+        ));
+        *value.lock().unwrap() = "new".to_string();
+        assert!(matches!(
+            broker.invoke(request(), Duration::from_secs(1)),
+            Ok(Response::Value { value }) if value == "old"
+        ));
+        assert!(matches!(
+            broker.invoke(
+                Request::Invalidate {
+                    service: "test".to_string(),
+                    account: "account".to_string(),
+                },
+                Duration::from_secs(1),
+            ),
+            Ok(Response::Ok)
+        ));
+        assert!(matches!(
+            broker.invoke(request(), Duration::from_secs(1)),
+            Ok(Response::Value { value }) if value == "new"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

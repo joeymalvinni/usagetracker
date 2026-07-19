@@ -35,14 +35,13 @@ pub(super) fn normalize_usage(
 
     // Newer usage responses expose the complete, display-ready quota list in
     // `limits`. In particular, scoped model limits (for example Fable) only
-    // appear there while their legacy top-level field remains null. Prefer the
-    // canonical list so the legacy five_hour/seven_day fields do not duplicate
-    // the same quotas.
+    // appear there while their legacy top-level field remains null. Keep every
+    // canonical window that parses, then fill only missing stable IDs from the
+    // legacy shapes so one malformed canonical entry cannot hide a valid quota.
     let mut windows = limit_windows(response.limits.as_ref());
-    if windows.is_empty() {
-        windows = utilization_windows(response.utilization.as_ref());
-        windows.extend(recursive_utilization_windows(payload));
-    }
+    let mut legacy_windows = utilization_windows(response.utilization.as_ref());
+    legacy_windows.extend(recursive_utilization_windows(payload));
+    merge_missing_windows(&mut windows, legacy_windows);
     if let Some(extra_usage) = response.extra_usage.as_ref().and_then(extra_usage_window) {
         windows.push(extra_usage);
     }
@@ -257,12 +256,10 @@ fn limit_scope_label(scope: &Value) -> Option<String> {
         .filter_map(|key| scope.get(key))
         .find_map(|value| match value {
             Value::String(value) => nonempty(value),
-            Value::Object(value) => value
-                .get("display_name")
-                .or_else(|| value.get("name"))
-                .or_else(|| value.get("id"))
-                .and_then(Value::as_str)
-                .and_then(nonempty),
+            Value::Object(value) => ["display_name", "name", "id"]
+                .into_iter()
+                .filter_map(|key| value.get(key).and_then(Value::as_str).and_then(nonempty))
+                .next(),
             _ => None,
         })
 }
@@ -270,6 +267,17 @@ fn limit_scope_label(scope: &Value) -> Option<String> {
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn merge_missing_windows(windows: &mut Vec<UsageWindow>, candidates: Vec<UsageWindow>) {
+    for candidate in candidates {
+        if windows
+            .iter()
+            .all(|window| window.window_id != candidate.window_id)
+        {
+            windows.push(candidate);
+        }
+    }
 }
 
 fn utilization_windows(
@@ -693,6 +701,79 @@ mod tests {
         assert_eq!(
             fable.reset_at.unwrap(),
             Utc.with_ymd_and_hms(2026, 7, 22, 1, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_limit_uses_first_nonempty_identity_field() {
+        let snapshot = normalize_usage(
+            &json!({
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 4,
+                    "scope": {
+                        "model": {
+                            "display_name": null,
+                            "name": "  ",
+                            "id": "claude-fable"
+                        }
+                    }
+                }]
+            }),
+            &test_credentials(),
+        )
+        .unwrap()
+        .into_snapshot(AccountId::new("joey"));
+
+        let scoped = find_window(
+            &snapshot.windows,
+            "claude_usage_utilization_seven_day_claude_fable",
+        );
+        assert_eq!(scoped.label, "Claude current week (claude-fable)");
+        assert_eq!(scoped.percent_used, Some(4.0));
+    }
+
+    #[test]
+    fn fills_missing_canonical_limits_from_legacy_windows() {
+        let snapshot = normalize_usage(
+            &json!({
+                "five_hour": {
+                    "utilization": 99,
+                    "resets_at": "2026-07-16T09:00:00Z"
+                },
+                "seven_day": {
+                    "utilization": 2,
+                    "resets_at": "2026-07-22T01:00:00Z"
+                },
+                "limits": [
+                    {
+                        "kind": "session",
+                        "group": "session",
+                        "percent": 19,
+                        "resets_at": "2026-07-16T09:00:00Z"
+                    },
+                    {
+                        "kind": "weekly_all",
+                        "group": "weekly",
+                        "percent": null,
+                        "resets_at": "2026-07-22T01:00:00Z"
+                    }
+                ]
+            }),
+            &test_credentials(),
+        )
+        .unwrap()
+        .into_snapshot(AccountId::new("joey"));
+
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(
+            find_window(&snapshot.windows, "claude_usage_utilization_five_hour").percent_used,
+            Some(19.0)
+        );
+        assert_eq!(
+            find_window(&snapshot.windows, "claude_usage_utilization_seven_day").percent_used,
+            Some(2.0)
         );
     }
 

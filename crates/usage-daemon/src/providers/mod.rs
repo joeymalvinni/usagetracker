@@ -381,6 +381,15 @@ pub trait ProviderCollector: Send + Sync {
         account: &DiscoveredAccount,
     ) -> Result<CollectionOutcome, ProviderError>;
 
+    /// Clears credentials cached by the collector and any shared credential
+    /// broker after a successful external login.
+    async fn invalidate_cached_credentials(
+        &self,
+        _profile_id: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Reconciles reproducible local sources without performing account
     /// discovery, remote requests, or changing authoritative provider health.
     async fn collect_local_usage(

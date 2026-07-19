@@ -18,6 +18,7 @@ use usage_core::{
 
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
+    keychain,
     providers::{
         paths::expand_home_path, AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome,
         DiscoveredAccount, ProviderCollectionResult, ProviderCollector, ProviderError,
@@ -80,7 +81,8 @@ impl ClaudeCollector {
         &self,
         profile: &ClaudeProfile,
     ) -> Result<ClaudeCredentials, ProviderError> {
-        if let Some(credentials) = profile.credentials_cache.lock().await.clone() {
+        let mut cache = profile.credentials_cache.lock().await;
+        if let Some(credentials) = cache.clone() {
             return Ok(credentials);
         }
 
@@ -91,7 +93,7 @@ impl ClaudeCollector {
         )
         .await?;
 
-        *profile.credentials_cache.lock().await = Some(credentials.clone());
+        *cache = Some(credentials.clone());
         Ok(credentials)
     }
 
@@ -99,13 +101,14 @@ impl ClaudeCollector {
         &self,
         profile: &ClaudeProfile,
     ) -> Result<ClaudeCredentials, ProviderError> {
+        let mut cache = profile.credentials_cache.lock().await;
         let credentials = load_credentials(
             profile.keychain_service.clone(),
             profile.keychain_account.clone(),
             profile.credentials_file_path.clone(),
         )
         .await?;
-        *profile.credentials_cache.lock().await = Some(credentials.clone());
+        *cache = Some(credentials.clone());
         Ok(credentials)
     }
 
@@ -681,6 +684,55 @@ impl ProviderCollector for ClaudeCollector {
             },
             supplemental,
         ))
+    }
+
+    async fn invalidate_cached_credentials(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let mut matched = false;
+        let mut first_error = None;
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|profile| profile_id.is_none_or(|profile_id| profile.id == profile_id))
+        {
+            matched = true;
+            let mut cache = profile.credentials_cache.lock().await;
+            let service = profile.keychain_service.clone();
+            let account = profile.keychain_account.clone();
+            let invalidation = tokio::task::spawn_blocking(move || {
+                keychain::invalidate_password_cache(&service, &account)
+            })
+            .await;
+            *cache = None;
+
+            let error = match invalidation {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(ProviderError::new(
+                    ProviderErrorKind::KeychainAccessFailed,
+                    format!("failed to invalidate Claude Keychain cache: {error:?}"),
+                )),
+                Err(error) => Some(ProviderError::new(
+                    ProviderErrorKind::KeychainAccessFailed,
+                    format!("Claude Keychain cache invalidation task failed: {error}"),
+                )),
+            };
+            if first_error.is_none() {
+                first_error = error;
+            }
+        }
+
+        if !matched {
+            return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                format!(
+                    "Claude profile {} no longer exists",
+                    profile_id.unwrap_or("unknown")
+                ),
+            ));
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn collect_local_usage(
