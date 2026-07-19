@@ -241,9 +241,10 @@ impl AddAccountHandler for CodexAdapter {
             })
             .await?;
 
-        let child = launchers::launch_codex_login(&profile_path)?;
+        let login = launchers::launch_codex_login(&profile_path)?;
+        let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
-            child,
+            login.child,
             runtime.refresh(),
             PROVIDER_ID,
             Some(profile_id.clone()),
@@ -259,6 +260,7 @@ impl AddAccountHandler for CodexAdapter {
             profile_id,
             display_name: profile_name,
             profile_path: profile_path.display().to_string(),
+            authentication_url,
         })
     }
 }
@@ -300,12 +302,19 @@ impl RepairHandler for CodexAdapter {
         let profile_id = profile
             .and_then(|profile| profile.id.clone())
             .unwrap_or_else(|| "default".to_string());
-        let child = launchers::launch_codex_login(&home)?;
-        launchers::monitor_login(child, runtime.refresh(), PROVIDER_ID, Some(profile_id));
+        let login = launchers::launch_codex_login(&home)?;
+        let authentication_url = login.authentication_url.clone();
+        launchers::monitor_login(
+            login.child,
+            runtime.refresh(),
+            PROVIDER_ID,
+            Some(profile_id),
+        );
         Ok(ProviderActionResponse {
             provider_id: ProviderId::new(PROVIDER_ID),
             message: "Finish signing in to Codex in your browser. UsageTracker will refresh automatically."
                 .to_string(),
+            authentication_url,
         })
     }
 }

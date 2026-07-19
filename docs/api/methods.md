@@ -70,7 +70,7 @@ See [refresh jobs](refresh-jobs.md) for polling and failure details.
 | Method | Validation and side effects | Idempotency / persistence | Expected errors |
 | --- | --- | --- | --- |
 | `update_config` | Omitted or `null` fields stay as they are. `providers` is a partial toggle map. `notifications` replaces the whole notification policy. Polling must be at least 60 seconds; the notification rules are in [configuration](../configuration.md). Rebuilds collectors and polling as needed. | Set-like and persistent. Retrying the same complete update is safe. | `invalid_argument` |
-| `add_provider_account` | The provider must support `add_account` (Codex, Claude, Grok). A blank or whitespace `display_name` is treated as omitted. Creates and persists an isolated profile, then starts login. | Not idempotent; the profile survives a restart. | `unknown_provider`, `unsupported_operation`, `internal` |
+| `add_provider_account` | The provider must support `add_account` (Codex, Claude, Grok). A blank or whitespace `display_name` is treated as omitted. Creates and persists an isolated profile, then starts login. The response includes `authentication_url` when the provider CLI exposes its one-time browser link. | Not idempotent; the profile survives a restart. | `unknown_provider`, `unsupported_operation`, `internal` |
 | `update_account` | The account must exist. Omitted or `null` `display_name`, `hidden`, or `collection_enabled` leaves that field alone. A blank name also leaves the name alone — v3 can't clear a name to null. | Set-like and persistent. | `unknown_account`, `storage_unavailable`, `internal` |
 | `remove_account` | Sets `hidden: true` and `collection_enabled: false` and keeps the history. | Idempotent and persistent. | `unknown_account`, `storage_unavailable`, `internal` |
 | `delete_account` | Deletes the database history and tombstones or removes the profile. Irreversible. | Not response-idempotent: retry after success and you get `unknown_account`. | `unknown_account`, `storage_unavailable`, `internal` |
@@ -80,7 +80,7 @@ See [refresh jobs](refresh-jobs.md) for polling and failure details.
 
 | Method | Effect | Retry and restart | Expected errors |
 | --- | --- | --- | --- |
-| `repair_provider` | Validates an optional `account_id`, then opens the provider's login/repair flow. The provider must advertise `repair`. | Not idempotent — it may open several Terminal or login sessions. The configuration itself persists. | `unknown_provider`, `unknown_account`, `storage_unavailable`, `unsupported_operation`, `internal` |
+| `repair_provider` | Validates an optional `account_id`, then opens the provider's login/repair flow. The provider must advertise `repair`. The response includes `authentication_url` when a browser link is available. | Not idempotent — it may open several Terminal or login sessions. The configuration itself persists. | `unknown_provider`, `unknown_account`, `storage_unavailable`, `unsupported_operation`, `internal` |
 | `launch_provider_account` | Opens the provider with the account's isolated profile. The provider and account must support launch. | Not idempotent — it may open several sessions. No job persists. | `unknown_account`, `storage_unavailable`, `unsupported_operation` |
 
 These action methods can expose local profile paths to the launched provider process and cause visible Terminal or app activity. Fixture mode rejects sign-in, repair, and launch operations.

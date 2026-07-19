@@ -1,23 +1,36 @@
 use std::{
     fs::OpenOptions,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{mpsc, Arc, LazyLock},
+    thread,
+    time::{Duration, Instant},
 };
 
+use regex::Regex;
 use tracing::{info, warn};
 use usage_core::{default_app_dir, AccountId, ProviderId};
 
 use crate::polling::RefreshCoordinator;
 
-pub(crate) fn launch_codex_login(codex_home: &Path) -> anyhow::Result<std::process::Child> {
+const AUTH_URL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_AUTH_OUTPUT_BYTES: usize = 128 * 1024;
+static HTTPS_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https://[^\s\x1b<>\"']+"#).expect("valid auth URL regex"));
+
+pub(crate) struct LoginProcess {
+    pub(crate) child: std::process::Child,
+    pub(crate) authentication_url: Option<String>,
+}
+
+pub(crate) fn launch_codex_login(codex_home: &Path) -> anyhow::Result<LoginProcess> {
     let mut direct = Command::new("codex");
     direct.arg("login");
     configure_codex_stdio(&mut direct, codex_home);
-    match direct.spawn() {
-        Ok(child) => Ok(child),
+    let mut child = match direct.spawn() {
+        Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
             let mut fallback = Command::new(shell);
@@ -25,29 +38,31 @@ pub(crate) fn launch_codex_login(codex_home: &Path) -> anyhow::Result<std::proce
             configure_codex_stdio(&mut fallback, codex_home);
             fallback.spawn().map_err(|fallback_err| {
                 anyhow::anyhow!("failed to start Codex login: {fallback_err}")
-            })
+            })?
         }
-        Err(err) => Err(anyhow::anyhow!("failed to start Codex login: {err}")),
-    }
+        Err(err) => return Err(anyhow::anyhow!("failed to start Codex login: {err}")),
+    };
+    Ok(LoginProcess {
+        authentication_url: capture_authentication_url(&mut child, &["openai.com", "chatgpt.com"]),
+        child,
+    })
 }
 
 fn configure_codex_stdio(command: &mut Command, codex_home: &Path) {
     command
         .env("CODEX_HOME", codex_home)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 }
 
-pub(crate) fn launch_claude_login(
-    config_dir: Option<&Path>,
-) -> anyhow::Result<std::process::Child> {
+pub(crate) fn launch_claude_login(config_dir: Option<&Path>) -> anyhow::Result<LoginProcess> {
     let mut direct = Command::new("claude");
     direct.args(["auth", "login"]);
     configure_claude_environment(&mut direct, config_dir);
     configure_browser_stdio(&mut direct);
-    match direct.spawn() {
-        Ok(child) => Ok(child),
+    let mut child = match direct.spawn() {
+        Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
             let mut fallback = Command::new(shell);
@@ -56,23 +71,31 @@ pub(crate) fn launch_claude_login(
             configure_browser_stdio(&mut fallback);
             fallback.spawn().map_err(|fallback_err| {
                 anyhow::anyhow!("failed to start Claude login: {fallback_err}")
-            })
+            })?
         }
-        Err(err) => Err(anyhow::anyhow!("failed to start Claude login: {err}")),
-    }
+        Err(err) => return Err(anyhow::anyhow!("failed to start Claude login: {err}")),
+    };
+    Ok(LoginProcess {
+        authentication_url: capture_authentication_url(
+            &mut child,
+            &["anthropic.com", "claude.ai", "claude.com"],
+        ),
+        child,
+    })
 }
 
-pub(crate) fn launch_grok_login(
-    binary: &Path,
-    grok_home: &Path,
-) -> anyhow::Result<std::process::Child> {
+pub(crate) fn launch_grok_login(binary: &Path, grok_home: &Path) -> anyhow::Result<LoginProcess> {
     let mut command = Command::new(binary);
     command.arg("login");
     command.env("GROK_HOME", grok_home);
     configure_browser_stdio(&mut command);
-    command
+    let mut child = command
         .spawn()
-        .map_err(|err| anyhow::anyhow!("failed to start Grok login: {err}"))
+        .map_err(|err| anyhow::anyhow!("failed to start Grok login: {err}"))?;
+    Ok(LoginProcess {
+        authentication_url: capture_authentication_url(&mut child, &["x.ai", "grok.com"]),
+        child,
+    })
 }
 
 fn configure_claude_environment(command: &mut Command, config_dir: Option<&Path>) {
@@ -86,8 +109,85 @@ fn configure_claude_environment(command: &mut Command, config_dir: Option<&Path>
 fn configure_browser_stdio(command: &mut Command) {
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+}
+
+fn capture_authentication_url(
+    child: &mut std::process::Child,
+    allowed_domains: &'static [&'static str],
+) -> Option<String> {
+    let (sender, receiver) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        drain_login_output(stdout, sender.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drain_login_output(stderr, sender.clone());
+    }
+    drop(sender);
+
+    let deadline = Instant::now() + AUTH_URL_CAPTURE_TIMEOUT;
+    let mut output = Vec::new();
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match receiver.recv_timeout(remaining) {
+            Ok(chunk) => {
+                if output.len() < MAX_AUTH_OUTPUT_BYTES {
+                    let remaining_capacity = MAX_AUTH_OUTPUT_BYTES - output.len();
+                    output.extend_from_slice(&chunk[..chunk.len().min(remaining_capacity)]);
+                }
+                if let Some(url) = extract_authentication_url(&output, allowed_domains, false) {
+                    return Some(url);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    extract_authentication_url(&output, allowed_domains, true)
+}
+
+fn drain_login_output(mut stream: impl Read + Send + 'static, sender: mpsc::Sender<Vec<u8>>) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 2048];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    // Keep draining even after the short URL-capture window closes so the
+                    // provider process cannot block on a full stdout or stderr pipe.
+                    if sender.send(buffer[..count].to_vec()).is_err() {
+                        let _ = std::io::copy(&mut stream, &mut std::io::sink());
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn extract_authentication_url(
+    output: &[u8],
+    allowed_domains: &[&str],
+    allow_at_end: bool,
+) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    HTTPS_URL.find_iter(&text).find_map(|candidate| {
+        if !allow_at_end && candidate.end() == text.len() {
+            return None;
+        }
+        let value = candidate
+            .as_str()
+            .trim_end_matches(['.', ',', ')', ']', '}']);
+        let parsed = reqwest::Url::parse(value).ok()?;
+        let host = parsed.host_str()?;
+        allowed_domains
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+            .then(|| value.to_string())
+    })
 }
 
 pub(crate) fn monitor_login(
@@ -202,5 +302,24 @@ mod tests {
 
         let legacy = claude_launcher_contents(None);
         assert!(legacy.contains("unset CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn extracts_only_complete_urls_from_allowed_authentication_domains() {
+        let output = b"Update docs: https://example.com/help\nSign in: https://auth.openai.com/oauth/authorize?state=secret\n";
+        assert_eq!(
+            extract_authentication_url(output, &["openai.com"], false).as_deref(),
+            Some("https://auth.openai.com/oauth/authorize?state=secret")
+        );
+
+        let partial = b"Sign in: https://auth.openai.com/oauth/authorize?state=part";
+        assert_eq!(
+            extract_authentication_url(partial, &["openai.com"], false),
+            None
+        );
+        assert_eq!(
+            extract_authentication_url(partial, &["openai.com"], true).as_deref(),
+            Some("https://auth.openai.com/oauth/authorize?state=part")
+        );
     }
 }

@@ -212,9 +212,10 @@ impl AddAccountHandler for ClaudeAdapter {
             .config_dir
             .clone()
             .ok_or_else(|| anyhow::anyhow!("managed Claude profile is missing its config path"))?;
-        let child = launchers::launch_claude_login(Some(&profile_path))?;
+        let login = launchers::launch_claude_login(Some(&profile_path))?;
+        let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
-            child,
+            login.child,
             runtime.refresh(),
             PROVIDER_ID,
             Some(target.profile_id.clone()),
@@ -230,6 +231,7 @@ impl AddAccountHandler for ClaudeAdapter {
             profile_id: target.profile_id,
             display_name: target.display_name,
             profile_path: profile_path.display().to_string(),
+            authentication_url,
         })
     }
 }
@@ -242,9 +244,10 @@ impl RepairHandler for ClaudeAdapter {
         account_id: Option<AccountId>,
     ) -> anyhow::Result<ProviderActionResponse> {
         let target = prepare_login_profile(runtime, account_id.as_ref()).await?;
-        let child = launchers::launch_claude_login(target.config_dir.as_deref())?;
+        let login = launchers::launch_claude_login(target.config_dir.as_deref())?;
+        let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
-            child,
+            login.child,
             runtime.refresh(),
             PROVIDER_ID,
             Some(target.profile_id),
@@ -253,6 +256,7 @@ impl RepairHandler for ClaudeAdapter {
             provider_id: ProviderId::new(PROVIDER_ID),
             message: "Finish signing in to Claude in your browser. UsageTracker will refresh automatically."
                 .to_string(),
+            authentication_url,
         })
     }
 }
@@ -301,6 +305,7 @@ impl LaunchHandler for ClaudeAdapter {
                 "Opened a Claude session for {}. Activity from this terminal stays with this profile.",
                 account.display_name.as_deref().unwrap_or(profile_id)
             ),
+            authentication_url: None,
         })
     }
 }

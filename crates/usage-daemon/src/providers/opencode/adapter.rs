@@ -95,6 +95,7 @@ impl RepairHandler for OpenCodeAdapter {
             message:
                 "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
                     .to_string(),
+            authentication_url: Some("https://opencode.ai".to_string()),
         })
     }
 }

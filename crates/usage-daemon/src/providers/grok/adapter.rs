@@ -120,17 +120,21 @@ impl AddAccountHandler for GrokAdapter {
             })
             .await?;
 
-        if let Some(binary) = binary {
-            let child = launchers::launch_grok_login(&binary, &target.grok_home)?;
+        let authentication_url = if let Some(binary) = binary {
+            let login = launchers::launch_grok_login(&binary, &target.grok_home)?;
+            let authentication_url = login.authentication_url.clone();
             launchers::monitor_login(
-                child,
+                login.child,
                 runtime.refresh(),
                 PROVIDER_ID,
                 Some(target.profile_id.clone()),
             );
+            authentication_url
         } else {
-            launchers::open_url("https://grok.com/?_s=usage")?;
-        }
+            let url = "https://grok.com/?_s=usage";
+            launchers::open_url(url)?;
+            Some(url.to_string())
+        };
         info!(
             provider_id = PROVIDER_ID,
             profile_id = target.profile_id.as_str(),
@@ -142,6 +146,7 @@ impl AddAccountHandler for GrokAdapter {
             profile_id: target.profile_id,
             display_name: target.display_name,
             profile_path: target.grok_home.display().to_string(),
+            authentication_url,
         })
     }
 }
@@ -153,20 +158,24 @@ impl RepairHandler for GrokAdapter {
         runtime: ProviderRuntime<'_>,
         account_id: Option<AccountId>,
     ) -> anyhow::Result<ProviderActionResponse> {
-        let message = if let Some(binary) = find_grok_binary() {
+        let (message, authentication_url) = if let Some(binary) = find_grok_binary() {
             let target = prepare_login_profile(runtime, account_id.as_ref()).await?;
             if target.profile_id == "default" {
                 clear_cached_cookie_cache().await?;
             }
-            let child = launchers::launch_grok_login(&binary, &target.grok_home)?;
+            let login = launchers::launch_grok_login(&binary, &target.grok_home)?;
+            let authentication_url = login.authentication_url.clone();
             launchers::monitor_login(
-                child,
+                login.child,
                 runtime.refresh(),
                 PROVIDER_ID,
                 Some(target.profile_id),
             );
-            "Finish signing in to Grok in your browser. UsageTracker will refresh automatically."
-                .to_string()
+            (
+                "Finish signing in to Grok in your browser. UsageTracker will refresh automatically."
+                    .to_string(),
+                authentication_url,
+            )
         } else {
             let requested_profile = match account_id.as_ref() {
                 Some(id) => runtime
@@ -183,13 +192,18 @@ impl RepairHandler for GrokAdapter {
                 anyhow::bail!("reconnecting this Grok account requires the Grok Build CLI");
             }
             clear_cached_cookie_cache().await?;
-            launchers::open_url("https://grok.com/?_s=usage")?;
-            "Grok opened in your browser. Sign in there, or install Grok Build for CLI billing."
-                .to_string()
+            let url = "https://grok.com/?_s=usage";
+            launchers::open_url(url)?;
+            (
+                "Grok opened in your browser. Sign in there, or install Grok Build for CLI billing."
+                    .to_string(),
+                Some(url.to_string()),
+            )
         };
         Ok(ProviderActionResponse {
             provider_id: ProviderId::new(PROVIDER_ID),
             message,
+            authentication_url,
         })
     }
 }

@@ -476,6 +476,8 @@ pub struct AddProviderAccountResponse {
     pub profile_id: String,
     pub display_name: Option<String>,
     pub profile_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -524,6 +526,8 @@ pub struct ProviderProfileResponse {
 pub struct ProviderActionResponse {
     pub provider_id: ProviderId,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]

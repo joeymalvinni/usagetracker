@@ -152,6 +152,12 @@
     },
     "AddProviderAccountResponse": {
       "properties": {
+        "authentication_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "display_name": {
           "type": [
             "string",
@@ -627,6 +633,12 @@
     },
     "ProviderActionResponse": {
       "properties": {
+        "authentication_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "message": {
           "type": "string"
         },
