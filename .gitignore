@@ -1,5 +1,7 @@
 target/
 .build/
 .dev/
+.claude/
+.sc/
 planning/
 usage.sqlite3
