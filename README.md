@@ -84,6 +84,13 @@ just app
 
 That builds the app with the daemon included and opens it.
 
+Alternatively, if you use [Nix with flakes enabled](https://nix.dev/concepts/flakes), enter the pinned development environment first (Xcode is still required):
+
+```sh
+nix develop
+just app
+```
+
 To work entirely from the terminal, run the daemon in one window and the CLI in another:
 
 ```sh
