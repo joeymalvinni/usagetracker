@@ -205,6 +205,17 @@ pub(crate) fn monitor_login(
             );
             runtime.spawn(async move {
                 let provider = ProviderId::new(provider_id);
+                if let Err(error) = refresh
+                    .invalidate_cached_credentials(&provider, profile_id.as_deref())
+                    .await
+                {
+                    warn!(
+                        provider_id,
+                        profile_id,
+                        error = %error,
+                        "failed to invalidate credentials after provider login"
+                    );
+                }
                 let report = refresh.refresh(Some(std::slice::from_ref(&provider))).await;
                 info!(
                     provider_id,
