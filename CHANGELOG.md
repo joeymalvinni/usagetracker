@@ -4,6 +4,30 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.5 — 2026-07-19
+
+### App
+
+- Moved the daemon to a per-user macOS LaunchAgent so usage collection and the CLI continue working after the menu bar app closes.
+- Reworked first-run setup so Codex starts enabled, other providers are inspected only after explicit opt-in, and captured provider sign-in links can be copied from the app.
+
+### Usage tracking
+
+- Corrected Codex activity and cost estimates to use local session logs, count cached input once, apply its discounted price, and avoid scaling local costs to opaque account totals.
+- Added Claude scoped limits such as Fable and preserved five-hour and seven-day windows when canonical API responses need legacy utilization fallbacks.
+
+### Reliability
+
+- Cached successful Keychain reads for the daemon lifetime to avoid repeated authorization prompts, while invalidating Claude credential caches after managed sign-in completes.
+
+### Installation
+
+- Coordinated install, update, and uninstall operations with the LaunchAgent while preserving an explicitly disabled background service across updates.
+
+### Development
+
+- Added a Nix flake for building and running the daemon and CLI on macOS and Linux, plus a reproducible Rust development shell.
+
 ## 0.1.4 — 2026-07-15
 
 ### CLI
