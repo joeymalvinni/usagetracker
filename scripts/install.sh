@@ -262,7 +262,10 @@ app_is_running() {
   local pid executable
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
-    executable="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    # macOS truncates `comm` to the terminal width unless wide output is
+    # requested. A truncated path makes a live app look unrelated and allows
+    # its bundle to be moved out from underneath it during an update.
+    executable="$(ps -ww -p "$pid" -o comm= 2>/dev/null || true)"
     if [[ "$executable" == "$app_path/Contents/MacOS/UsageMenuBar" ]]; then
       return 0
     fi
@@ -525,7 +528,10 @@ if [[ "$install_cli" == "1" ]]; then
 fi
 
 if [[ "$install_app" == "1" && "$launch_app" == "1" ]]; then
-  open "$app_dir/UsageTracker.app" || true
+  if ! open -n "$app_dir/UsageTracker.app"; then
+    echo "UsageTracker was installed, but the updated app could not be opened." >&2
+    exit 1
+  fi
 fi
 
 printf '\n'
