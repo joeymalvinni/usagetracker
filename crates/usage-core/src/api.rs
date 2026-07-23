@@ -946,7 +946,7 @@ mod tests {
         assert_eq!(launch, None);
         assert!(!remember_dangerously_skip_permissions);
 
-        // A bare request must serialize without the three new keys so old
+        // A bare request must serialize to the exact legacy shape so old
         // daemons see byte-identical launch requests from new clients.
         let serialized =
             serde_json::to_value(RequestEnvelope::new(ApiRequest::LaunchProviderAccount {
@@ -956,10 +956,13 @@ mod tests {
                 remember_dangerously_skip_permissions: false,
             }))
             .unwrap();
-        let object = serialized.as_object().unwrap();
-        assert!(!object.contains_key("working_directory"));
-        assert!(!object.contains_key("launch"));
-        assert!(!object.contains_key("remember_dangerously_skip_permissions"));
+        assert_eq!(
+            serialized,
+            serde_json::from_str::<serde_json::Value>(
+                r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1"}"#
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -988,6 +991,21 @@ mod tests {
             .unwrap()
             .get("dangerously_skip_permissions")
             .is_none());
+
+        // working_directory and launch are both skipped when None.
+        let bare_response = ResponseEnvelope::new(ApiResponse::AccountLaunchSettings {
+            settings: AccountLaunchSettingsResponse {
+                provider_id: ProviderId::new("claude"),
+                account_id: AccountId::new("account-1"),
+                working_directory: None,
+                launch: None,
+                has_managed_config_dir: false,
+            },
+        });
+        let bare_value = serde_json::to_value(&bare_response).unwrap();
+        let settings = bare_value["settings"].as_object().unwrap();
+        assert!(settings.get("working_directory").is_none());
+        assert!(settings.get("launch").is_none());
     }
 
     #[test]

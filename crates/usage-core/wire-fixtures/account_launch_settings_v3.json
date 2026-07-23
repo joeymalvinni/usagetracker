@@ -1,1 +1,15 @@
-{"api_version":3,"type":"account_launch_settings","settings":{"provider_id":"claude","account_id":"account-1","working_directory":"~/Projects/demo","launch":{"model":"fable","effort":"xhigh","dangerously_skip_permissions":true},"has_managed_config_dir":true}}
+{
+  "api_version": 3,
+  "type": "account_launch_settings",
+  "settings": {
+    "provider_id": "claude",
+    "account_id": "account-1",
+    "working_directory": "~/Projects/demo",
+    "launch": {
+      "model": "fable",
+      "effort": "xhigh",
+      "dangerously_skip_permissions": true
+    },
+    "has_managed_config_dir": true
+  }
+}
