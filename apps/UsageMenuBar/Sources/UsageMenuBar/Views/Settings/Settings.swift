@@ -434,7 +434,16 @@ private struct AccountSettingsRow: View {
         Menu {
             if state.supportsLaunchAccount(account.providerId), !isRemoved {
                 Button("Open \(ProviderCatalog.name(for: account.providerId)) session") {
-                    Task { await state.launchProviderAccount(account.id) }
+                    if state.supportsLaunchOptions(account.providerId) {
+                        Task { @MainActor in
+                            await state.prepareOpenSession(account.id)
+                            if let model = state.openSession {
+                                OpenSessionWindow.shared.present(state: state, model: model)
+                            }
+                        }
+                    } else {
+                        Task { await state.launchProviderAccount(account.id) }
+                    }
                 }
                 Divider()
             }

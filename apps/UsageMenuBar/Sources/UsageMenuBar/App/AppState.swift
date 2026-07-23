@@ -49,6 +49,8 @@ private enum PendingAction {
     @Published var providerAuthenticationURLs = [String: String]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
     @Published var serverProviderOrder = [String]()
+    /// Non-nil while the confirm-on-open sheet should be shown; cleared on
+    /// successful open, or by the view on cancel/window close.
     @Published var openSession: OpenSessionModel?
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
@@ -463,6 +465,8 @@ private enum PendingAction {
     }
 
     func confirmOpenSession(_ model: OpenSessionModel) async {
+        // Sync the view's edited copy so a failed launch keeps the sheet
+        // (and its edits) alive.
         openSession = model
         await perform(.account(model.accountId)) {
             let response = try await client.launchProviderAccount(
