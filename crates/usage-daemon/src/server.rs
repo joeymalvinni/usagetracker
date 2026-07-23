@@ -408,7 +408,7 @@ impl SocketServer {
                     }
                 }
             }
-            ApiRequest::LaunchProviderAccount { account_id } => {
+            ApiRequest::LaunchProviderAccount { account_id, .. } => {
                 if let Some(error) = self.account_validation_error(&account_id).await {
                     error
                 } else {
@@ -419,6 +419,16 @@ impl SocketServer {
                             ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
                         }
                     }
+                }
+            }
+            ApiRequest::GetAccountLaunchSettings { account_id } => {
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    ApiResponse::error(
+                        ApiErrorCode::UnsupportedOperation,
+                        "account launch settings are not implemented yet",
+                    )
                 }
             }
         }

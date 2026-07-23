@@ -119,6 +119,15 @@ pub enum ApiRequest {
     },
     LaunchProviderAccount {
         account_id: AccountId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch: Option<LaunchFlags>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        remember_dangerously_skip_permissions: bool,
+    },
+    GetAccountLaunchSettings {
+        account_id: AccountId,
     },
 }
 
@@ -145,6 +154,7 @@ impl ApiRequest {
                 | "update_provider_setup"
                 | "repair_provider"
                 | "launch_provider_account"
+                | "get_account_launch_settings"
         )
     }
 }
@@ -152,6 +162,51 @@ impl ApiRequest {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderToggle {
     pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl LaunchEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Structured launch flags for provider sessions. Structured on purpose —
+/// values are validated and shell-quoted by the daemon; never free-form argv.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct LaunchFlags {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<LaunchEffort>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dangerously_skip_permissions: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AccountLaunchSettingsResponse {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchFlags>,
+    pub has_managed_config_dir: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -338,6 +393,9 @@ pub enum ApiResponse {
     ProviderAction {
         action: ProviderActionResponse,
     },
+    AccountLaunchSettings {
+        settings: AccountLaunchSettingsResponse,
+    },
     Error {
         error: ApiErrorResponse,
     },
@@ -407,6 +465,10 @@ pub struct ProviderCapabilities {
     pub add_account: bool,
     pub repair: bool,
     pub launch_account: bool,
+    /// The launch handler accepts working-directory / flag overrides and
+    /// exposes per-account launch settings.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub launch_options: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub setup: bool,
     /// Deprecated alias retained for v3 clients.
@@ -698,7 +760,7 @@ mod tests {
 
         assert_eq!(request.api_version, API_VERSION);
         match request.request {
-            ApiRequest::LaunchProviderAccount { account_id } => {
+            ApiRequest::LaunchProviderAccount { account_id, .. } => {
                 assert_eq!(account_id.as_str(), "account-1");
             }
             _ => panic!("unexpected request variant"),
@@ -827,6 +889,75 @@ mod tests {
         };
         assert_eq!(snapshots.len(), 1);
         assert!(window_provenance[0].authoritative);
+    }
+
+    #[test]
+    fn launch_request_decodes_optional_overrides_and_defaults() {
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1","working_directory":"~/Projects/demo","launch":{"model":"fable","effort":"xhigh","dangerously_skip_permissions":true},"remember_dangerously_skip_permissions":true}"#,
+        )
+        .unwrap();
+        let ApiRequest::LaunchProviderAccount {
+            account_id,
+            working_directory,
+            launch,
+            remember_dangerously_skip_permissions,
+        } = request.request
+        else {
+            panic!("unexpected request variant");
+        };
+        assert_eq!(account_id.as_str(), "account-1");
+        assert_eq!(working_directory.as_deref(), Some("~/Projects/demo"));
+        let launch = launch.unwrap();
+        assert_eq!(launch.model.as_deref(), Some("fable"));
+        assert_eq!(launch.effort, Some(LaunchEffort::Xhigh));
+        assert!(launch.dangerously_skip_permissions);
+        assert!(remember_dangerously_skip_permissions);
+
+        let bare: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1"}"#,
+        )
+        .unwrap();
+        let ApiRequest::LaunchProviderAccount {
+            working_directory,
+            launch,
+            remember_dangerously_skip_permissions,
+            ..
+        } = bare.request
+        else {
+            panic!("unexpected request variant");
+        };
+        assert_eq!(working_directory, None);
+        assert_eq!(launch, None);
+        assert!(!remember_dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn account_launch_settings_are_supported_and_round_trip() {
+        assert!(ApiRequest::supports_method("get_account_launch_settings"));
+
+        let response = ResponseEnvelope::new(ApiResponse::AccountLaunchSettings {
+            settings: AccountLaunchSettingsResponse {
+                provider_id: ProviderId::new("claude"),
+                account_id: AccountId::new("account-1"),
+                working_directory: Some("~/Projects/demo".to_string()),
+                launch: Some(LaunchFlags {
+                    model: Some("fable".to_string()),
+                    effort: Some(LaunchEffort::Xhigh),
+                    dangerously_skip_permissions: false,
+                }),
+                has_managed_config_dir: true,
+            },
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "account_launch_settings");
+        assert_eq!(value["settings"]["launch"]["effort"], "xhigh");
+        // dangerously_skip_permissions is skipped when false.
+        assert!(value["settings"]["launch"]
+            .as_object()
+            .unwrap()
+            .get("dangerously_skip_permissions")
+            .is_none());
     }
 
     #[test]

@@ -400,6 +400,8 @@ pub(crate) trait ProviderAdapter: Send + Sync {
                 add_account: self.add_account_handler().is_some(),
                 repair: self.repair_handler().is_some(),
                 launch_account: self.launch_handler().is_some(),
+                // Staged off until the handler advertises override support (Task 6).
+                launch_options: false,
                 // `workspace_setup` is a deprecated v3 wire alias. Both fields
                 // intentionally derive from the same generic setup handler.
                 setup: self.setup_handler().is_some(),

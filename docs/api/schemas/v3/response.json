@@ -67,6 +67,41 @@
       ],
       "type": "string"
     },
+    "AccountLaunchSettingsResponse": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "has_managed_config_dir": {
+          "type": "boolean"
+        },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchFlags"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "working_directory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id",
+        "has_managed_config_dir"
+      ],
+      "type": "object"
+    },
     "AccountUsageSummary": {
       "properties": {
         "account_id": {
@@ -427,6 +462,41 @@
       ],
       "type": "string"
     },
+    "LaunchEffort": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "type": "string"
+    },
+    "LaunchFlags": {
+      "description": "Structured launch flags for provider sessions. Structured on purpose —\nvalues are validated and shell-quoted by the daemon; never free-form argv.",
+      "properties": {
+        "dangerously_skip_permissions": {
+          "type": "boolean"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "NotificationConfig": {
       "properties": {
         "cooldown_minutes": {
@@ -658,6 +728,10 @@
           "type": "boolean"
         },
         "launch_account": {
+          "type": "boolean"
+        },
+        "launch_options": {
+          "description": "The launch handler accepts working-directory / flag overrides and\nexposes per-account launch settings.",
           "type": "boolean"
         },
         "multiple_accounts": {
@@ -1818,6 +1892,22 @@
       "required": [
         "type",
         "action"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "settings": {
+          "$ref": "#/$defs/AccountLaunchSettingsResponse"
+        },
+        "type": {
+          "const": "account_launch_settings",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "settings"
       ],
       "type": "object"
     },
