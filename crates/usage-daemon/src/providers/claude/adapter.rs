@@ -4,7 +4,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use tracing::info;
 use usage_core::{
-    Account, AccountId, AddProviderAccountResponse, ProviderActionResponse, ProviderId,
+    Account, AccountId, AccountLaunchSettingsResponse, AddProviderAccountResponse,
+    ProviderActionResponse, ProviderId,
 };
 
 use crate::{
@@ -18,11 +19,14 @@ use crate::{
         },
         ProviderCollector,
     },
-    runtime::provider_adapter::{
-        plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-        ExecutionPolicy, InvalidLaunchRequest, LaunchHandler, LaunchOverrides,
-        LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter, ProviderManifest, ProviderRuntime,
-        RepairHandler,
+    runtime::{
+        managed_profiles,
+        provider_adapter::{
+            plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
+            ExecutionPolicy, InvalidLaunchRequest, LaunchHandler, LaunchOverrides,
+            LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter, ProviderManifest,
+            ProviderRuntime, RepairHandler,
+        },
     },
 };
 
@@ -321,6 +325,25 @@ pub(crate) fn resolve_launch_plan(
     })
 }
 
+pub(crate) fn account_launch_settings_response(
+    account: &Account,
+    settings: &settings::ClaudeProfileSettings,
+) -> AccountLaunchSettingsResponse {
+    let has_managed_config_dir = settings.claude_config_dir.as_ref().is_some_and(|dir| {
+        managed_profiles::is_managed_profile(&expand_home_path(dir), PROVIDER_ID)
+    });
+    AccountLaunchSettingsResponse {
+        provider_id: account.provider_id.clone(),
+        account_id: account.id.clone(),
+        working_directory: settings
+            .working_directory
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        launch: settings.launch.clone(),
+        has_managed_config_dir,
+    }
+}
+
 #[async_trait]
 impl LaunchHandler for ClaudeAdapter {
     async fn launch(
@@ -434,6 +457,31 @@ impl LaunchHandler for ClaudeAdapter {
 
     fn supports_launch_options(&self) -> bool {
         true
+    }
+
+    async fn launch_settings(
+        &self,
+        runtime: ProviderRuntime<'_>,
+        account: Account,
+    ) -> anyhow::Result<AccountLaunchSettingsResponse> {
+        let profile_id = account
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?;
+        let config = runtime.config().await;
+        let saved = config
+            .providers
+            .get(PROVIDER_ID)
+            .and_then(|provider| {
+                provider
+                    .profiles
+                    .iter()
+                    .find(|profile| is_active_profile(profile, profile_id))
+            })
+            .map(settings::profile)
+            .transpose()?
+            .unwrap_or_default();
+        Ok(account_launch_settings_response(&account, &saved))
     }
 }
 
@@ -684,6 +732,46 @@ mod tests {
             assert!(watch.roots.contains(&managed));
             assert!(!watch.roots.contains(&managed.join("managed/projects")));
         }
+    }
+
+    #[test]
+    fn launch_settings_response_reports_managed_dir_and_prefs() {
+        let now = chrono::Utc::now();
+        let account = Account {
+            id: usage_core::AccountId::new("account-1"),
+            provider_id: ProviderId::new(PROVIDER_ID),
+            external_account_id: "user@example.com".to_string(),
+            profile_id: Some("work".to_string()),
+            display_name: None,
+            display_name_source: usage_core::AccountDisplayNameSource::Generated,
+            email: None,
+            hidden: false,
+            collection_enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let managed_dir =
+            usage_core::default_app_dir().map(|root| root.join("profiles/claude/work"));
+        let settings = settings::ClaudeProfileSettings {
+            claude_config_dir: managed_dir,
+            working_directory: Some(PathBuf::from("/tmp/work")),
+            launch: Some(usage_core::LaunchFlags {
+                model: Some("fable".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let response = account_launch_settings_response(&account, &settings);
+        assert_eq!(response.account_id.as_str(), "account-1");
+        assert_eq!(response.working_directory.as_deref(), Some("/tmp/work"));
+        assert_eq!(response.launch.unwrap().model.as_deref(), Some("fable"));
+        assert!(response.has_managed_config_dir);
+
+        let unmanaged =
+            account_launch_settings_response(&account, &settings::ClaudeProfileSettings::default());
+        assert!(!unmanaged.has_managed_config_dir);
+        assert_eq!(unmanaged.working_directory, None);
     }
 
     #[test]

@@ -590,6 +590,37 @@ impl DaemonRuntime {
             .await
     }
 
+    /// Read-only, so fixture mode is allowed — the Open sheet stays demoable
+    /// via `just fixture` even though the launch itself is rejected there.
+    pub async fn account_launch_settings(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<usage_core::AccountLaunchSettingsResponse> {
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.launch_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "launch settings are not supported for {}",
+                account.provider_id
+            )
+        })?;
+        anyhow::ensure!(
+            handler.supports_launch_options(),
+            "launch settings are not supported for {}",
+            account.provider_id
+        );
+        handler
+            .launch_settings(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                account,
+            )
+            .await
+    }
+
     fn publish_local_log_config(&self, config: &Config) {
         self.local_log_config_tx
             .send_replace(local_logs::LocalLogConfig::from_config(config));

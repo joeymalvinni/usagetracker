@@ -295,7 +295,6 @@ pub(crate) trait LaunchHandler: Send + Sync {
         false
     }
 
-    #[allow(dead_code)] // Called from GetAccountLaunchSettings starting in Task 7.
     async fn launch_settings(
         &self,
         _runtime: ProviderRuntime<'_>,

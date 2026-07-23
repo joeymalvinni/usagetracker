@@ -439,10 +439,13 @@ impl SocketServer {
                 if let Some(error) = self.account_validation_error(&account_id).await {
                     error
                 } else {
-                    ApiResponse::error(
-                        ApiErrorCode::UnsupportedOperation,
-                        "account launch settings are not implemented yet",
-                    )
+                    match self.runtime.account_launch_settings(account_id).await {
+                        Ok(settings) => ApiResponse::AccountLaunchSettings { settings },
+                        Err(err) => {
+                            warn!(error = %err, "account launch settings lookup failed");
+                            ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+                        }
+                    }
                 }
             }
         }
@@ -1245,6 +1248,65 @@ mod tests {
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn account_launch_settings_route_by_provider_capability() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+
+        let unknown = server
+            .handle_request(ApiRequest::GetAccountLaunchSettings {
+                account_id: usage_core::AccountId::new("definitely-unknown"),
+            })
+            .await;
+        let ApiResponse::Error { error } = unknown else {
+            panic!("unexpected response: {unknown:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnknownAccount);
+
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let codex = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "codex")
+            .expect("fixture codex account");
+        let unsupported = server
+            .handle_request(ApiRequest::GetAccountLaunchSettings {
+                account_id: codex.id.clone(),
+            })
+            .await;
+        let ApiResponse::Error { error } = unsupported else {
+            panic!("unexpected response: {unsupported:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+        let supported = server
+            .handle_request(ApiRequest::GetAccountLaunchSettings {
+                account_id: claude.id.clone(),
+            })
+            .await;
+        let ApiResponse::AccountLaunchSettings { settings } = supported else {
+            panic!("unexpected response: {supported:?}")
+        };
+        assert_eq!(settings.provider_id.as_str(), "claude");
+        assert_eq!(settings.working_directory, None);
+        assert!(!settings.has_managed_config_dir);
+
         let _ = std::fs::remove_dir_all(env.root);
     }
 
