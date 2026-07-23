@@ -845,6 +845,7 @@ mod tests {
             include_str!("../wire-fixtures/refresh_job_v3.json"),
             include_str!("../wire-fixtures/error_v3.json"),
             include_str!("../wire-fixtures/usage_v3.json"),
+            include_str!("../wire-fixtures/account_launch_settings_v3.json"),
         ] {
             let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
             let response: ResponseEnvelope = serde_json::from_value(expected.clone()).unwrap();
@@ -892,6 +893,20 @@ mod tests {
     }
 
     #[test]
+    fn fixture_account_launch_settings_decodes() {
+        let response: ResponseEnvelope = serde_json::from_str(include_str!(
+            "../wire-fixtures/account_launch_settings_v3.json"
+        ))
+        .unwrap();
+        let ApiResponse::AccountLaunchSettings { settings } = response.response else {
+            panic!("unexpected fixture response");
+        };
+        assert_eq!(settings.provider_id.as_str(), "claude");
+        assert_eq!(settings.launch.unwrap().effort, Some(LaunchEffort::Xhigh));
+        assert!(settings.has_managed_config_dir);
+    }
+
+    #[test]
     fn launch_request_decodes_optional_overrides_and_defaults() {
         let request: RequestEnvelope = serde_json::from_str(
             r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1","working_directory":"~/Projects/demo","launch":{"model":"fable","effort":"xhigh","dangerously_skip_permissions":true},"remember_dangerously_skip_permissions":true}"#,
@@ -930,6 +945,21 @@ mod tests {
         assert_eq!(working_directory, None);
         assert_eq!(launch, None);
         assert!(!remember_dangerously_skip_permissions);
+
+        // A bare request must serialize without the three new keys so old
+        // daemons see byte-identical launch requests from new clients.
+        let serialized =
+            serde_json::to_value(RequestEnvelope::new(ApiRequest::LaunchProviderAccount {
+                account_id: AccountId::new("account-1"),
+                working_directory: None,
+                launch: None,
+                remember_dangerously_skip_permissions: false,
+            }))
+            .unwrap();
+        let object = serialized.as_object().unwrap();
+        assert!(!object.contains_key("working_directory"));
+        assert!(!object.contains_key("launch"));
+        assert!(!object.contains_key("remember_dangerously_skip_permissions"));
     }
 
     #[test]
