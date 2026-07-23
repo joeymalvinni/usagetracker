@@ -389,6 +389,28 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(requests.count, 1)
     }
 
+    func testUsageEventsRequestAndResponse() async throws {
+        let response = #"{"api_version":3,"type":"usage_events","page":{"account_id":"cursor:one","events":[{"event_id":"event-1","occurred_at":"2026-07-23T18:00:00Z","model":"claude-4-sonnet","kind":"included","input_tokens":10,"output_tokens":20,"cache_read_tokens":30,"cache_write_tokens":40,"request_units":1.0,"vendor_cost_usd":0.02,"metered_cost_usd":0.01,"provider_fee_usd":0.001,"chargeable":true,"token_based":true,"headless":false}],"offset":20,"total_count":22,"next_offset":21}}"#
+        let transport = RecordingTransport(response: response)
+        let client = DaemonClient(socketPath: "/tmp/usage.sock", transport: transport)
+
+        let page = try await client.usageEvents(accountId: "cursor:one", offset: 20, limit: 1)
+
+        XCTAssertEqual(page.totalCount, 22)
+        XCTAssertEqual(page.nextOffset, 21)
+        XCTAssertEqual(page.events.first?.eventId, "event-1")
+        XCTAssertEqual(page.events.first?.meteredCostUsd, 0.01)
+        let recordedRequest = await transport.lastRequest()
+        let request = try XCTUnwrap(recordedRequest)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["method"] as? String, "get_usage_events")
+        XCTAssertEqual(object["account_id"] as? String, "cursor:one")
+        XCTAssertEqual(object["offset"] as? Int, 20)
+        XCTAssertEqual(object["limit"] as? Int, 1)
+    }
+
     func testDecodesCheckedInRustWireFixtures() throws {
         let usageURL = rustWireFixture("usage_v3.json")
         let usage = try JSONDecoder.usage.decode(DaemonResponse.self, from: Data(contentsOf: usageURL))
@@ -424,6 +446,10 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertFalse(codex.workspaceSetup)
 
         XCTAssertTrue(try XCTUnwrap(providers["claude"]?.capabilities).launchAccount)
+        let cursor = try XCTUnwrap(providers["cursor"]?.capabilities)
+        XCTAssertTrue(cursor.multipleAccounts)
+        XCTAssertFalse(cursor.addAccount)
+        XCTAssertFalse(cursor.repair)
         XCTAssertFalse(try XCTUnwrap(providers["grok"]?.capabilities).launchAccount)
 
         let openCode = try XCTUnwrap(providers["opencode_go"]?.capabilities)
@@ -779,11 +805,12 @@ final class DaemonLogRotatorTests: XCTestCase {
 final class AppStateTests: XCTestCase {
     @MainActor func testOnboardingDefaultsEnableOnlyCodex() {
         let toggles = AppState.onboardingDefaultProviderToggles(
-            providerIDs: ["codex", "claude", "opencode_go", "grok"]
+            providerIDs: ["codex", "claude", "cursor", "opencode_go", "grok"]
         )
 
         XCTAssertEqual(toggles["codex"], true)
         XCTAssertEqual(toggles["claude"], false)
+        XCTAssertEqual(toggles["cursor"], false)
         XCTAssertEqual(toggles["opencode_go"], false)
         XCTAssertEqual(toggles["grok"], false)
     }
@@ -791,7 +818,8 @@ final class AppStateTests: XCTestCase {
 
 final class ProviderCatalogTests: XCTestCase {
     func testBuiltInCatalogProvidesOptionalPresentationDecorations() {
-        XCTAssertEqual(ProviderCatalog.supportedIDs, ["codex", "claude", "opencode_go", "grok"])
+        XCTAssertEqual(ProviderCatalog.supportedIDs, ["codex", "claude", "cursor", "opencode_go", "grok"])
+        XCTAssertTrue(ProviderCatalog.supports("cursor"))
         XCTAssertTrue(ProviderCatalog.supports("grok"))
         XCTAssertTrue(ProviderCatalog.supports("opencode_go"))
         XCTAssertFalse(ProviderCatalog.supports("opencode"))

@@ -307,6 +307,10 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 
     fn execution_policy(&self) -> ExecutionPolicy;
 
+    fn supports_multiple_accounts(&self) -> bool {
+        self.add_account_handler().is_some()
+    }
+
     /// Flattened setting keys owned by this adapter. The config loader removes
     /// other keys with a warning so stale configuration cannot prevent startup.
     fn provider_setting_keys(&self) -> &'static [&'static str] {
@@ -399,7 +403,7 @@ pub(crate) trait ProviderAdapter: Send + Sync {
             display_name: manifest.display_name.to_string(),
             minimum_refresh_interval_seconds: manifest.minimum_refresh_interval_seconds,
             capabilities: ProviderCapabilities {
-                multiple_accounts: self.add_account_handler().is_some(),
+                multiple_accounts: self.supports_multiple_accounts(),
                 add_account: self.add_account_handler().is_some(),
                 repair: self.repair_handler().is_some(),
                 launch_account: self.launch_handler().is_some(),

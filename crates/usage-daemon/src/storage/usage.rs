@@ -1,21 +1,22 @@
 use std::collections::{BTreeSet, HashMap};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection, Row};
 use serde::Deserialize;
 use usage_core::{
-    AccountId, DatasetProvenance, ProviderHealth, ProviderId, UsageSnapshot, UsageWindowKind,
+    AccountId, DatasetProvenance, ProviderId, UsageEvent, UsageEventPage, UsageSnapshot,
+    UsageWindowKind,
 };
 use uuid::Uuid;
 
-use crate::providers::{DailyUsageBucket, UsageDataset};
+use crate::providers::{DailyUsageBucket, ProviderUsageEventBatch, UsageDataset};
 
 use super::{
     accounts::{accounts_from_conn, looks_like_email},
     backoff::{delete_provider_backoff_conn, upsert_provider_backoff_conn},
     health::{health_status_to_sql, provider_health_from_conn},
-    parse_time_sql, Storage, StoredDailyUsage, StoredDailyUsageHistory, StoredForecastHistory,
-    StoredProviderBackoff, StoredUsageDashboard, StoredWindowObservation,
+    parse_time_sql, CollectionRecord, Storage, StoredDailyUsage, StoredDailyUsageHistory,
+    StoredForecastHistory, StoredUsageDashboard, StoredWindowObservation,
     FORECAST_OBSERVATIONS_QUERY, MAX_SNAPSHOTS_PER_ACCOUNT, SNAPSHOT_RETENTION_DAYS,
     UPSERT_DAILY_USAGE_QUERY,
 };
@@ -265,17 +266,19 @@ impl Storage {
         .await
     }
 
-    pub async fn record_collection(
-        &self,
-        snapshot: &UsageSnapshot,
-        daily_usage: &[DailyUsageBucket],
-        health: &ProviderHealth,
-        email: Option<&str>,
-        backoff: Option<&StoredProviderBackoff>,
-        clear_backoff: bool,
-    ) -> anyhow::Result<()> {
+    pub async fn record_collection(&self, record: CollectionRecord<'_>) -> anyhow::Result<()> {
+        let CollectionRecord {
+            snapshot,
+            daily_usage,
+            usage_events,
+            health,
+            email,
+            backoff,
+            clear_backoff,
+        } = record;
         let snapshot = snapshot.clone();
         let daily_usage = daily_usage.to_vec();
+        let usage_events = usage_events.cloned();
         let health = health.clone();
         let backoff = backoff.cloned();
         let email = email
@@ -288,6 +291,21 @@ impl Storage {
             let collected_at = snapshot.collected_at.to_rfc3339();
             let transaction = conn.unchecked_transaction()?;
 
+            if let Some(batch) = usage_events.as_ref() {
+                transaction.execute(
+                    "DELETE FROM provider_daily_usage
+                     WHERE provider_id = ?1 AND account_id = ?2
+                       AND source = ?3
+                       AND usage_date >= ?4 AND usage_date <= ?5",
+                    params![
+                        snapshot.provider_id.as_str(),
+                        snapshot.account_id.as_str(),
+                        batch.daily_source.as_str(),
+                        batch.period_start.with_timezone(&Local).date_naive().to_string(),
+                        batch.period_end.with_timezone(&Local).date_naive().to_string(),
+                    ],
+                )?;
+            }
             upsert_daily_usage_buckets(
                 &transaction,
                 &snapshot.provider_id,
@@ -295,6 +313,15 @@ impl Storage {
                 daily_usage,
                 &collected_at,
             )?;
+            if let Some(batch) = usage_events {
+                replace_usage_events(
+                    &transaction,
+                    &snapshot.provider_id,
+                    &snapshot.account_id,
+                    batch,
+                    &collected_at,
+                )?;
+            }
 
             transaction.execute(
                 "INSERT INTO usage_snapshots
@@ -389,6 +416,48 @@ impl Storage {
         self.with_connection(latest_usage_from_conn).await
     }
 
+    pub async fn usage_events(
+        &self,
+        account_id: &AccountId,
+        offset: u32,
+        limit: u16,
+    ) -> anyhow::Result<UsageEventPage> {
+        let account_id = account_id.clone();
+        self.with_connection(move |conn| {
+            let total_count = conn.query_row(
+                "SELECT COUNT(*) FROM provider_usage_events WHERE account_id = ?1",
+                params![account_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let total_count = u64::try_from(total_count)?;
+            let mut statement = conn.prepare(
+                "SELECT normalized_json FROM provider_usage_events
+                 WHERE account_id = ?1
+                 ORDER BY occurred_at DESC, event_id DESC
+                 LIMIT ?2 OFFSET ?3",
+            )?;
+            let events = statement
+                .query_map(
+                    params![account_id.as_str(), i64::from(limit), i64::from(offset),],
+                    |row| row.get::<_, String>(0),
+                )?
+                .map(|row| Ok(serde_json::from_str::<UsageEvent>(&row?)?))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let returned = u32::try_from(events.len())?;
+            let next = offset
+                .checked_add(returned)
+                .filter(|next| u64::from(*next) < total_count);
+            Ok(UsageEventPage {
+                account_id,
+                events,
+                offset,
+                total_count,
+                next_offset: next,
+            })
+        })
+        .await
+    }
+
     #[cfg(test)]
     pub async fn recent_usage(
         &self,
@@ -422,6 +491,50 @@ impl Storage {
         })
         .await
     }
+}
+
+fn replace_usage_events(
+    conn: &Connection,
+    provider_id: &ProviderId,
+    account_id: &AccountId,
+    batch: ProviderUsageEventBatch,
+    collected_at: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        batch.period_start <= batch.period_end,
+        "usage event replacement period was invalid"
+    );
+    conn.execute(
+        "DELETE FROM provider_usage_events
+         WHERE provider_id = ?1 AND account_id = ?2
+           AND occurred_at >= ?3 AND occurred_at <= ?4",
+        params![
+            provider_id.as_str(),
+            account_id.as_str(),
+            batch.period_start.to_rfc3339(),
+            batch.period_end.to_rfc3339(),
+        ],
+    )?;
+    let mut statement = conn.prepare_cached(
+        "INSERT INTO provider_usage_events
+         (provider_id, account_id, event_id, occurred_at, collected_at, normalized_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for event in batch.events {
+        anyhow::ensure!(
+            event.occurred_at >= batch.period_start && event.occurred_at <= batch.period_end,
+            "usage event fell outside its replacement period"
+        );
+        statement.execute(params![
+            provider_id.as_str(),
+            account_id.as_str(),
+            event.event_id,
+            event.occurred_at.to_rfc3339(),
+            collected_at,
+            serde_json::to_string(&event)?,
+        ])?;
+    }
+    Ok(())
 }
 
 fn validate_local_usage_overlay(
@@ -856,6 +969,15 @@ pub(super) fn prune_account_history(
             account_id.as_str(),
             retention_cutoff.to_rfc3339(),
             max_snapshots,
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM provider_usage_events
+         WHERE provider_id = ?1 AND account_id = ?2 AND occurred_at < ?3",
+        params![
+            provider_id.as_str(),
+            account_id.as_str(),
+            retention_cutoff.to_rfc3339(),
         ],
     )?;
     Ok(())

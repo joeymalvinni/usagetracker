@@ -204,6 +204,7 @@ impl CodexCollector {
             ProviderCollectionResult {
                 usage,
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "codex_local_logs".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -556,6 +557,7 @@ impl ProviderCollector for CodexCollector {
             ProviderCollectionResult {
                 usage: collected.usage,
                 daily_usage: collected.daily_usage,
+                usage_events: None,
                 collection_mode: collected.collection_mode,
                 account_email: collected.account_display_name,
                 warnings: collected.warnings,

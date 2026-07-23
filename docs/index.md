@@ -1,6 +1,6 @@
 # UsageTracker documentation
 
-Developer guides: [Adding a provider](adding-a-provider.md) · [Proposed CLI interface](cli-interface-spec.md)
+Developer guides: [Adding a provider](adding-a-provider.md) · [Maintaining model pricing](model-pricing.md) · [Proposed CLI interface](cli-interface-spec.md)
 
 New here? Start with the [README](../README.md) — it walks you through building the app, running the daemon and CLI, and making your first request.
 
@@ -20,6 +20,7 @@ When you need the details, these pages have them.
 
 - [Codex](codex.md)
 - [Claude](claude.md)
+- [Cursor](cursor.md)
 - [OpenCode Go](opencode.md)
 - [Grok](grok.md)
 - [Multiple accounts](multi-account.md)

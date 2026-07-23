@@ -209,6 +209,7 @@ impl ClaudeCollector {
             ProviderCollectionResult {
                 usage,
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "claude_local_logs".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -678,6 +679,7 @@ impl ProviderCollector for ClaudeCollector {
             ProviderCollectionResult {
                 usage,
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode,
                 account_email: account.email.clone(),
                 warnings,

@@ -100,6 +100,7 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     let sparkline: [Double]
     let costDashboard: CostDashboardVM
     let subAccounts: [ProviderVM]?
+    var modelCosts: [ModelCostSummary] = []
     /// Non-nil when this provider/account is in an actionable alert state.
     /// Format: "provider|account|statusCode". Acknowledgements key off this exact value.
     var alertSignature: String? = nil

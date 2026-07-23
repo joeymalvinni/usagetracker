@@ -7,7 +7,7 @@ UsageTracker has no backend. Everything stays on your Mac, except for the reques
 | Where | What's in it |
 | --- | --- |
 | `config.json` | Provider toggles, profile paths and labels, your notification policy, workspace selection, and any manual cookie headers. |
-| `usage.sqlite3` | Provider and account IDs, your email when a provider reports it, normalized snapshots and diagnostics, daily usage and cost, health, backoff, and notification state. |
+| `usage.sqlite3` | Provider and account IDs, your email when a provider reports it, normalized snapshots and diagnostics, daily usage and cost, normalized provider usage events, health, backoff, and notification state. |
 | `usage-daemon.log*` | Operational messages and sanitized failure details. |
 | `ui/config.json` | Menu presentation preferences. |
 | Keychain | Provider credentials, or filtered cached cookie headers, wherever a provider integration uses them. |
@@ -18,6 +18,7 @@ Raw provider response bodies are parsed in memory and never written to disk. Loc
 
 - **Normalized snapshots:** 90 days, and at most 10,000 per account.
 - **Daily usage and cost:** kept until you permanently delete the account.
+- **Normalized provider usage events:** kept until you permanently delete the account.
 - **Provider health and backoff:** just the latest state per provider/account.
 - **Pending notifications:** the newest 1,000 are stored; a read returns the oldest 100.
 - **Refresh jobs:** in memory only — the newest 64 completed jobs, cleared when the daemon restarts.

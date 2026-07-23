@@ -11,6 +11,7 @@ enum ProviderSignInAction: String, Encodable {
 
 enum DaemonRequest: Encodable {
     case getServerInfo, getState, getUsage, refresh([String]?), getRefreshJob(String)
+    case getUsageEvents(accountId: String, offset: UInt32, limit: UInt16?)
     case getProviderHealth, getAccounts, getConfig, getPendingNotifications
     case acknowledgeNotifications([Int64])
     case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notifications: NotificationConfig?)
@@ -29,6 +30,11 @@ enum DaemonRequest: Encodable {
         case .getServerInfo: try c.encode("get_server_info", forKey: .method)
         case .getState: try c.encode("get_state", forKey: .method)
         case .getUsage: try c.encode("get_usage", forKey: .method)
+        case .getUsageEvents(let accountId, let offset, let limit):
+            try c.encode("get_usage_events", forKey: .method)
+            try c.encode(accountId, forKey: .accountId)
+            try c.encode(offset, forKey: .offset)
+            try c.encodeIfPresent(limit, forKey: .limit)
         case .getProviderHealth: try c.encode("get_provider_health", forKey: .method)
         case .getAccounts: try c.encode("get_accounts", forKey: .method)
         case .getConfig: try c.encode("get_config", forKey: .method)
@@ -81,7 +87,7 @@ enum DaemonRequest: Encodable {
     }
     enum K: String, CodingKey {
         case apiVersion = "api_version"
-        case method, providers, notifications, hidden, ids, settings
+        case method, providers, notifications, hidden, ids, settings, offset, limit
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
@@ -211,6 +217,7 @@ func providerSupports(
 
 enum DaemonResponse: Decodable {
     case serverInfo(ServerInfo), state(StateResponse), usage(UsageResponse)
+    case usageEvents(UsageEventPage)
     case refreshStarted(job: RefreshJob, coalesced: Bool), refreshJob(RefreshJob)
     case providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse)
     case pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64])
@@ -230,6 +237,7 @@ enum DaemonResponse: Decodable {
         case "server_info": self = .serverInfo(try c.decode(ServerInfo.self, forKey: .server))
         case "state": self = .state(try c.decode(StateResponse.self, forKey: .state))
         case "usage": self = .usage(try UsageResponse(from: decoder))
+        case "usage_events": self = .usageEvents(try c.decode(UsageEventPage.self, forKey: .page))
         case "refresh_started": self = .refreshStarted(
             job: try c.decode(RefreshJob.self, forKey: .job),
             coalesced: try c.decode(Bool.self, forKey: .coalesced)
@@ -251,7 +259,7 @@ enum DaemonResponse: Decodable {
     }
     enum K: String, CodingKey {
         case apiVersion, type, snapshots, health, accounts, config, notifications, ids
-        case server, state, job, coalesced, account, setup, action, error, accountId
+        case server, state, job, coalesced, account, setup, action, error, accountId, page
     }
 }
 

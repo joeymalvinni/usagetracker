@@ -3,7 +3,7 @@
   "type": "server_info",
   "server": {
     "api_version": 3,
-    "capabilities": ["typed_errors", "usage_provenance", "refresh_jobs", "refresh_coalescing", "combined_state"],
+    "capabilities": ["typed_errors", "usage_provenance", "refresh_jobs", "refresh_coalescing", "combined_state", "usage_events"],
     "providers": [
       {
         "id": "codex",
@@ -16,6 +16,12 @@
         "display_name": "Claude",
         "minimum_refresh_interval_seconds": 60,
         "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "workspace_setup": false}
+      },
+      {
+        "id": "cursor",
+        "display_name": "Cursor",
+        "minimum_refresh_interval_seconds": 60,
+        "capabilities": {"multiple_accounts": true, "add_account": false, "repair": false, "launch_account": false, "workspace_setup": false}
       },
       {
         "id": "opencode_go",

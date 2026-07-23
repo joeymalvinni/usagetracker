@@ -7,7 +7,11 @@ use usage_core::{
     UsageSnapshot, UsageUnit, UsageWindow, UsageWindowKind,
 };
 
-use crate::{notifications::NotificationManager, providers::DailyUsageBucket, storage::Storage};
+use crate::{
+    notifications::NotificationManager,
+    providers::DailyUsageBucket,
+    storage::{CollectionRecord, Storage},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum FixtureScenario {
@@ -124,7 +128,15 @@ async fn seed_account(
             &[]
         };
         storage
-            .record_collection(&snapshot, buckets, &health, fixture.email, None, true)
+            .record_collection(CollectionRecord {
+                snapshot: &snapshot,
+                daily_usage: buckets,
+                usage_events: None,
+                health: &health,
+                email: fixture.email,
+                backoff: None,
+                clear_backoff: true,
+            })
             .await?;
         latest = Some(snapshot);
     }

@@ -8,7 +8,7 @@ use thiserror::Error;
 use usage_core::{
     Account, DataProvenance, DatasetProvenance, ProviderFailureCode, ProviderId,
     UsageDataCompleteness, UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource,
-    UsageSnapshot, UsageWindow,
+    UsageEvent, UsageSnapshot, UsageWindow,
 };
 
 macro_rules! settings_accessors {
@@ -51,6 +51,7 @@ pub(crate) use settings_accessors;
 pub(crate) mod browser_cookies;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod grok;
 pub(crate) mod launchers;
 pub(crate) mod local_usage;
@@ -211,9 +212,19 @@ impl FromIterator<DiscoveredAccount> for AccountDiscovery {
 pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
     pub daily_usage: Vec<DailyUsageBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_events: Option<ProviderUsageEventBatch>,
     pub collection_mode: String,
     pub account_email: Option<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderUsageEventBatch {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub daily_source: String,
+    pub events: Vec<UsageEvent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -227,12 +238,27 @@ pub struct UsageDataset {
 
 impl UsageDataset {
     pub fn authoritative(collection: ProviderCollectionResult) -> Self {
+        Self::authoritative_scoped(collection, UsageDataScope::AccountWide)
+    }
+
+    pub fn authoritative_scoped(
+        collection: ProviderCollectionResult,
+        scope: UsageDataScope,
+    ) -> Self {
+        Self::authoritative_named_scoped("provider_reported", collection, scope)
+    }
+
+    pub fn authoritative_named_scoped(
+        source_id: impl Into<String>,
+        collection: ProviderCollectionResult,
+        scope: UsageDataScope,
+    ) -> Self {
         Self {
-            source_id: "provider_reported".to_string(),
+            source_id: source_id.into(),
             collection,
             provenance: DataProvenance {
                 source: UsageDataSource::ProviderReported,
-                scope: UsageDataScope::AccountWide,
+                scope,
                 quality: UsageDataQuality::Authoritative,
                 completeness: UsageDataCompleteness::Complete,
                 confidence: UsageDataConfidence::High,
@@ -323,6 +349,19 @@ impl CollectionOutcome {
     ) -> Self {
         Self {
             authoritative: AuthoritativeOutcome::Collected(UsageDataset::authoritative(collection)),
+            supplemental,
+        }
+    }
+
+    pub fn collected_scoped_with_supplemental(
+        collection: ProviderCollectionResult,
+        scope: UsageDataScope,
+        supplemental: Vec<UsageDataset>,
+    ) -> Self {
+        Self {
+            authoritative: AuthoritativeOutcome::Collected(UsageDataset::authoritative_scoped(
+                collection, scope,
+            )),
             supplemental,
         }
     }

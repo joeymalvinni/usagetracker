@@ -537,6 +537,7 @@ mod tests {
                     catalog_source: None,
                     catalog_effective_from: None,
                 },
+                models: Vec::new(),
             }),
             reset_credits: None,
         }]);

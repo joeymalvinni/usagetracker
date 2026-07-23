@@ -27,7 +27,7 @@ use crate::{
         UsageDataset,
     },
     runtime::provider_registry,
-    storage::{Storage, StoredProviderBackoff},
+    storage::{CollectionRecord, Storage, StoredProviderBackoff},
 };
 
 const RATE_LIMIT_BACKOFF_SECONDS: [i64; 5] = [5 * 60, 10 * 60, 20 * 60, 40 * 60, 60 * 60];
@@ -1099,17 +1099,18 @@ impl RefreshCoordinator {
         let store_started = Instant::now();
         if let Err(err) = self
             .storage
-            .record_collection(
-                &snapshot,
-                &result.daily_usage,
-                &state.health,
-                result.account_email.as_deref(),
-                match &state.backoff {
+            .record_collection(CollectionRecord {
+                snapshot: &snapshot,
+                daily_usage: &result.daily_usage,
+                usage_events: result.usage_events.as_ref(),
+                health: &state.health,
+                email: result.account_email.as_deref(),
+                backoff: match &state.backoff {
                     CollectionBackoff::Set(backoff) => Some(backoff),
                     CollectionBackoff::Preserve | CollectionBackoff::Clear => None,
                 },
-                matches!(state.backoff, CollectionBackoff::Clear),
-            )
+                clear_backoff: matches!(state.backoff, CollectionBackoff::Clear),
+            })
             .await
         {
             warn!(
@@ -1272,6 +1273,9 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
             serde_json::to_value(provenance_record).expect("dataset provenance is serializable"),
         );
         result.daily_usage.extend(incoming.daily_usage);
+        if result.usage_events.is_none() {
+            result.usage_events = incoming.usage_events;
+        }
         result.warnings.extend(incoming.warnings);
         if result.account_email.is_none() {
             result.account_email = incoming.account_email;
@@ -1471,6 +1475,7 @@ mod tests {
                         metadata: json!({"claude_cost": {"tokens": 42}}),
                     },
                     daily_usage: Vec::new(),
+                    usage_events: None,
                     collection_mode: "claude_local_logs".to_string(),
                     account_email: None,
                     warnings: Vec::new(),
@@ -1534,6 +1539,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "live".to_string(),
                 account_email: Some("claude@example.com".to_string()),
                 warnings: vec![],
@@ -1573,6 +1579,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1624,6 +1631,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: account.email.clone(),
                 warnings: vec![],
@@ -1673,6 +1681,7 @@ mod tests {
                     }),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: account.email.clone(),
                 warnings: vec![],
@@ -1719,6 +1728,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1781,6 +1791,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1865,6 +1876,7 @@ mod tests {
                         metadata: json!({}),
                     },
                     daily_usage: Vec::new(),
+                    usage_events: None,
                     collection_mode: "local".to_string(),
                     account_email: None,
                     warnings: Vec::new(),
@@ -1914,6 +1926,7 @@ mod tests {
                     metadata: json!({}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1998,6 +2011,7 @@ mod tests {
                 }),
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "web".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -2019,6 +2033,7 @@ mod tests {
                     }),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "local".to_string(),
                 account_email: None,
                 warnings: Vec::new(),

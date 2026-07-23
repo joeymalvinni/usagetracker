@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Account, AccountId, ProviderHealth, ProviderId, RefreshJobId, UsageDashboardSummary,
-    UsageForecast, UsageSnapshot, UsageWindowProvenance,
+    UsageEventPage, UsageForecast, UsageSnapshot, UsageWindowProvenance,
 };
 
 pub const API_VERSION: u16 = 3;
@@ -58,6 +58,13 @@ pub enum ApiRequest {
     GetServerInfo,
     GetState,
     GetUsage,
+    GetUsageEvents {
+        account_id: AccountId,
+        #[serde(default)]
+        offset: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
+    },
     Refresh {
         providers: Option<Vec<ProviderId>>,
     },
@@ -147,6 +154,7 @@ impl ApiRequest {
             "get_server_info"
                 | "get_state"
                 | "get_usage"
+                | "get_usage_events"
                 | "refresh"
                 | "get_refresh_job"
                 | "get_provider_health"
@@ -319,6 +327,9 @@ pub enum ApiResponse {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         window_provenance: Vec<UsageWindowProvenance>,
     },
+    UsageEvents {
+        page: UsageEventPage,
+    },
     RefreshStarted {
         job: RefreshJob,
         coalesced: bool,
@@ -393,6 +404,7 @@ impl ServerInfo {
                 ApiCapability::RefreshJobs,
                 ApiCapability::RefreshCoalescing,
                 ApiCapability::CombinedState,
+                ApiCapability::UsageEvents,
             ],
             providers,
         }
@@ -407,6 +419,7 @@ pub enum ApiCapability {
     CombinedState,
     TypedErrors,
     UsageProvenance,
+    UsageEvents,
     RefreshJobs,
     RefreshCoalescing,
 }
@@ -821,7 +834,7 @@ mod tests {
         };
         assert_eq!(server.api_version, API_VERSION);
         assert!(server.capabilities.contains(&ApiCapability::RefreshJobs));
-        assert_eq!(server.providers.len(), 4);
+        assert_eq!(server.providers.len(), 5);
         assert!(server
             .providers
             .iter()

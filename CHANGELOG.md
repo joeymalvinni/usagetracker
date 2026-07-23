@@ -4,6 +4,15 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+### Usage tracking
+
+- Added Cursor usage collection for included plan limits, Auto/API lanes, Enterprise personal caps and team pools, legacy request quotas, and personal or team on-demand budgets.
+- Added complete Cursor billing-cycle usage-event collection with bounded pagination, individual event history, per-day and per-model costs, and vendor-versus-metered comparisons.
+
+### Reliability
+
+- Bound cached Cursor web sessions to validated account identities, re-read Cursor.app authentication during collection, and prevented account fallback after transient or rate-limit failures.
+
 ## 0.1.5 — 2026-07-19
 
 ### App

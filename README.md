@@ -26,7 +26,7 @@
 
 ## What UsageTracker tracks
 
-- Multiple Codex, Claude, and Grok accounts, with separate profiles and history
+- Multiple Codex, Claude, Cursor, and Grok accounts, with separate history
 - Remaining usage and reset times for each available limit
 - Pace forecasts based on usage and time elapsed
 - Notifications for thresholds, projected exhaustion, and resets
@@ -61,6 +61,7 @@ Releases are not currently notarized by Apple, so macOS may ask you to approve t
 | --- | --- | --- |
 | [Codex](docs/codex.md) | Rate limits, reset credits, account activity, and local token cost | Multiple |
 | [Claude](docs/claude.md) | Usage limits, extra usage, and local token cost | Multiple |
+| [Cursor](docs/cursor.md) | Included usage, Auto/API lanes, legacy request quotas, and on-demand budgets | Discovered sessions |
 | [OpenCode Go](docs/opencode.md) | Rolling, weekly, and monthly usage, history, and balance | One workspace |
 | [Grok](docs/grok.md) | Included and on-demand usage from Grok Build or grok.com | Multiple |
 

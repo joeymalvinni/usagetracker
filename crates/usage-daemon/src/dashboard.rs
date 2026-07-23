@@ -4,8 +4,9 @@ use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde_json::Value;
 use usage_core::{
     AccountUsageSummary, ActivitySummary, CostSummary, DailyUsagePoint, DataProvenance,
-    PricingCoverage, ResetCredit, ResetCreditSummary, UsageDashboardSummary, UsageDataCompleteness,
-    UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource, UsageSnapshot,
+    ModelCostSummary, PricingCoverage, ResetCredit, ResetCreditSummary, UsageDashboardSummary,
+    UsageDataCompleteness, UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource,
+    UsageSnapshot,
 };
 
 use crate::storage::StoredDailyUsageHistory;
@@ -168,6 +169,7 @@ fn account_summary(
                 catalog_effective_from: string(metadata, "pricing_effective_from")
                     .and_then(|value| NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()),
             },
+            models: model_costs(metadata),
             days: cost_days,
         }
     });
@@ -286,13 +288,37 @@ fn daily_points(rows: &[Value]) -> Vec<DailyUsagePoint> {
             DailyUsagePoint {
                 date,
                 tokens,
-                cost_usd: row.get("cost_usd").and_then(Value::as_f64),
+                cost_usd: row
+                    .get("cost_usd")
+                    .or_else(|| row.get("metered_cost_usd"))
+                    .and_then(Value::as_f64),
                 priced_tokens,
                 unpriced_tokens,
             },
         );
     }
     by_date.into_values().collect()
+}
+
+fn model_costs(metadata: &serde_json::Map<String, Value>) -> Vec<ModelCostSummary> {
+    metadata
+        .get("by_model")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .filter_map(|row| {
+            Some(ModelCostSummary {
+                model: row.get("model")?.as_str()?.to_string(),
+                event_count: row.get("event_count")?.as_u64()?,
+                tokens: row.get("tokens")?.as_u64()?,
+                vendor_cost_usd: row.get("vendor_cost_usd")?.as_f64()?,
+                metered_cost_usd: row.get("metered_cost_usd")?.as_f64()?,
+                chargeable_cost_usd: row.get("chargeable_cost_usd")?.as_f64()?,
+                provider_fee_usd: row.get("provider_fee_usd")?.as_f64()?,
+            })
+        })
+        .collect()
 }
 
 fn synthesized_today_point(

@@ -24,6 +24,16 @@ struct DaemonClient: Sendable {
     func accounts() async throws -> [Account] { guard case let .accounts(v) = try await send(.getAccounts) else { throw DaemonError.badResponse }; return v }
     func health() async throws -> [ProviderHealth] { guard case let .providerHealth(v) = try await send(.getProviderHealth) else { throw DaemonError.badResponse }; return v }
     func usage() async throws -> UsageResponse { guard case let .usage(v) = try await send(.getUsage) else { throw DaemonError.badResponse }; return v }
+    func usageEvents(
+        accountId: String,
+        offset: UInt32 = 0,
+        limit: UInt16? = nil
+    ) async throws -> UsageEventPage {
+        guard case let .usageEvents(page) = try await send(
+            .getUsageEvents(accountId: accountId, offset: offset, limit: limit)
+        ) else { throw DaemonError.badResponse }
+        return page
+    }
     func pendingNotifications() async throws -> [PendingNotification] { guard case let .pendingNotifications(v) = try await send(.getPendingNotifications) else { throw DaemonError.badResponse }; return v }
     func acknowledgeNotifications(_ ids: [Int64]) async throws {
         guard case let .notificationsAcknowledged(acknowledged) = try await send(.acknowledgeNotifications(ids)), acknowledged == ids else { throw DaemonError.badResponse }
@@ -130,7 +140,7 @@ struct DaemonClient: Sendable {
 private enum DaemonRequestTimeout {
     static func seconds(for request: DaemonRequest) -> TimeInterval {
         switch request {
-        case .getServerInfo, .getState, .getUsage, .getRefreshJob, .getProviderHealth,
+        case .getServerInfo, .getState, .getUsage, .getUsageEvents, .getRefreshJob, .getProviderHealth,
              .getAccounts, .getConfig, .getPendingNotifications,
              .acknowledgeNotifications:
             3

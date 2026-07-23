@@ -18,7 +18,7 @@ From highest priority to lowest:
 | --- | --- | --- |
 | `poll_interval_seconds` | `300` | A whole number, at least `60`. |
 | `notifications` | See below | Your notification policy. |
-| `providers` | Codex on, the rest off | A map keyed by `codex`, `claude`, `opencode_go`, or `grok`. Any supported provider you leave out is added at startup. |
+| `providers` | Codex on, the rest off | A map keyed by `codex`, `claude`, `cursor`, `opencode_go`, or `grok`. Any supported provider you leave out is added at startup. |
 
 The old `debug_capture_raw_payloads` field is still accepted so old files load, but it does nothing and gets removed the next time the file is written.
 
@@ -78,6 +78,7 @@ Codex, Claude, and Grok deliberately share the same set of profile fields:
       ]
     },
     "claude": { "enabled": false },
+    "cursor": { "enabled": false },
     "opencode_go": { "enabled": false },
     "grok": { "enabled": false, "source_mode": "auto" }
   }
@@ -94,6 +95,7 @@ Paths starting with `~` are expanded by provider code. Relative override paths a
 | `USAGE_TRACKER_CONFIG`, `USAGE_TRACKER_DB`, `USAGE_TRACKER_SOCKET` | Override individual daemon paths. |
 | `USAGE_TRACKER_LOG_LEVEL` | The tracing filter; defaults to `info`. `RUST_LOG` wins when it's valid. |
 | `USAGE_TRACKER_POLL_INTERVAL_SECONDS` | Override the polling interval at startup. |
+| `USAGE_TRACKER_CURSOR_COOKIE` | A manual Cursor cookie header. It remains in the daemon environment and is never copied into config or SQLite. |
 | `USAGE_TRACKER_OPENCODE_GO_COOKIE` | A manual OpenCode cookie header. The legacy `USAGE_TRACKER_OPENCODE_COOKIE` also works. |
 | `USAGE_TRACKER_OPENCODE_GO_WORKSPACE_ID` | Override the OpenCode workspace. |
 | `USAGE_TRACKER_GROK_COOKIE` | A manual Grok cookie header for the default profile. |

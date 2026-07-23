@@ -43,6 +43,11 @@ enum ProviderBrand {
             progressStart: Color(red: 0.38, green: 0.76, blue: 0.74),
             progressEnd: Color(red: 0.23, green: 0.53, blue: 0.54)
         ),
+        "cursor": ProviderPalette(
+            chart: Color(red: 0.48, green: 0.56, blue: 0.92),
+            progressStart: Color(red: 0.64, green: 0.70, blue: 1.00),
+            progressEnd: Color(red: 0.35, green: 0.42, blue: 0.80)
+        ),
         "opencode_go": ProviderPalette(
             chart: Color(red: 0.48, green: 0.42, blue: 0.90),
             progressStart: Color(red: 0.65, green: 0.59, blue: 1.00),
@@ -60,6 +65,7 @@ enum ProviderBrand {
         let name: String? = switch id {
         case "codex": "chatgpt"
         case "claude": "claude"
+        case "cursor": "cursor"
         case "opencode_go": "opencode"
         case "grok": "grok"
         default: nil

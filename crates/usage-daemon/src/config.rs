@@ -514,6 +514,7 @@ mod tests {
         let config = FileConfig::default();
         assert!(config.providers["codex"].enabled);
         assert!(!config.providers["claude"].enabled);
+        assert!(!config.providers["cursor"].enabled);
         assert!(!config.providers["grok"].enabled);
         assert!(config.notifications.enabled);
     }
@@ -632,9 +633,10 @@ mod tests {
 
         add_missing_default_providers(&mut config);
 
-        assert_eq!(config.providers.len(), 4);
+        assert_eq!(config.providers.len(), 5);
         assert!(!config.providers["codex"].enabled);
         assert!(config.providers.contains_key("claude"));
+        assert!(config.providers.contains_key("cursor"));
         assert!(config.providers.contains_key("opencode_go"));
         assert!(config.providers.contains_key("grok"));
         assert!(!is_supported_provider("unknown"));
@@ -929,11 +931,11 @@ mod tests {
             crate::runtime::provider_registry::build_collectors(&loaded)
                 .unwrap()
                 .len(),
-            4
+            5
         );
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        for provider in ["codex", "claude", "opencode_go", "grok"] {
+        for provider in ["codex", "claude", "cursor", "opencode_go", "grok"] {
             let provider = &persisted["providers"][provider];
             assert!(provider.get("cookie_header").is_none());
             assert!(provider.get("workspace_id").is_none());
@@ -979,7 +981,7 @@ mod tests {
             crate::runtime::provider_registry::build_collectors(&loaded)
                 .unwrap()
                 .len(),
-            4
+            5
         );
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
