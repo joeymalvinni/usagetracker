@@ -1300,7 +1300,8 @@ mod tests {
 
     #[test]
     fn claude_launcher_pins_activity_to_the_profile_config_directory() {
-        let contents = launchers::claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")));
+        let contents =
+            launchers::claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")), None, None);
 
         assert!(contents.contains("unset CLAUDE_SECURESTORAGE_CONFIG_DIR"));
         assert!(contents.contains("export CLAUDE_CONFIG_DIR='/tmp/Claude'\"'\"'s Work'"));
@@ -1309,7 +1310,7 @@ mod tests {
 
     #[test]
     fn legacy_claude_launcher_clears_profile_overrides() {
-        let contents = launchers::claude_launcher_contents(None);
+        let contents = launchers::claude_launcher_contents(None, None, None);
 
         assert!(contents.contains("unset CLAUDE_CONFIG_DIR"));
         assert!(!contents.contains("export CLAUDE_CONFIG_DIR"));

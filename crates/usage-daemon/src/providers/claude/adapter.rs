@@ -298,8 +298,12 @@ impl LaunchHandler for ClaudeAdapter {
                 .claude_config_dir
                 .map(expand_home_path)
         };
-        let launcher =
-            launchers::write_claude_profile_launcher(&account.id, config_dir.as_deref())?;
+        let launcher = launchers::write_claude_profile_launcher(
+            &account.id,
+            config_dir.as_deref(),
+            None,
+            None,
+        )?;
         launchers::open_terminal(&launcher)?;
         Ok(ProviderActionResponse {
             provider_id: account.provider_id,
