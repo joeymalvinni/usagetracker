@@ -83,6 +83,8 @@ pub enum ApiRequest {
         provider_id: ProviderId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "ProviderSignInAction::is_open")]
+        sign_in_action: ProviderSignInAction,
     },
     UpdateAccount {
         account_id: AccountId,
@@ -116,10 +118,26 @@ pub enum ApiRequest {
         provider_id: ProviderId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<AccountId>,
+        #[serde(default, skip_serializing_if = "ProviderSignInAction::is_open")]
+        sign_in_action: ProviderSignInAction,
     },
     LaunchProviderAccount {
         account_id: AccountId,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSignInAction {
+    #[default]
+    Open,
+    CopyLink,
+}
+
+impl ProviderSignInAction {
+    fn is_open(value: &Self) -> bool {
+        *value == Self::Open
+    }
 }
 
 impl ApiRequest {
@@ -703,6 +721,53 @@ mod tests {
             }
             _ => panic!("unexpected request variant"),
         }
+    }
+
+    #[test]
+    fn provider_sign_in_requests_default_to_open_for_existing_clients() {
+        let add: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"add_provider_account","provider_id":"codex"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            add.request,
+            ApiRequest::AddProviderAccount {
+                sign_in_action: ProviderSignInAction::Open,
+                ..
+            }
+        ));
+
+        let repair: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"repair_provider","provider_id":"codex"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            repair.request,
+            ApiRequest::RepairProvider {
+                sign_in_action: ProviderSignInAction::Open,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copy_link_sign_in_action_round_trips_on_the_wire() {
+        let request = RequestEnvelope::new(ApiRequest::RepairProvider {
+            provider_id: ProviderId::new("codex"),
+            account_id: None,
+            sign_in_action: ProviderSignInAction::CopyLink,
+        });
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["sign_in_action"], "copy_link");
+
+        let decoded: RequestEnvelope = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded.request,
+            ApiRequest::RepairProvider {
+                sign_in_action: ProviderSignInAction::CopyLink,
+                ..
+            }
+        ));
     }
 
     #[test]

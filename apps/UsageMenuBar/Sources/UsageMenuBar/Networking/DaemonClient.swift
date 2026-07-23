@@ -45,8 +45,16 @@ struct DaemonClient: Sendable {
         guard case let .config(v) = try await send(.updateConfig(pollIntervalSeconds: pollIntervalSeconds, providers: providers, notifications: notifications)) else { throw DaemonError.badResponse }
         return v
     }
-    func addProviderAccount(providerId: String, displayName: String?) async throws -> AddProviderAccountResponse {
-        guard case let .addProviderAccount(v) = try await send(.addProviderAccount(providerId: providerId, displayName: displayName)) else { throw DaemonError.badResponse }
+    func addProviderAccount(
+        providerId: String,
+        displayName: String?,
+        signInAction: ProviderSignInAction = .open
+    ) async throws -> AddProviderAccountResponse {
+        guard case let .addProviderAccount(v) = try await send(.addProviderAccount(
+            providerId: providerId,
+            displayName: displayName,
+            signInAction: signInAction
+        )) else { throw DaemonError.badResponse }
         return v
     }
     func updateAccount(accountId: String, displayName: String? = nil, hidden: Bool? = nil, collectionEnabled: Bool? = nil) async throws -> Account {
@@ -68,8 +76,16 @@ struct DaemonClient: Sendable {
         guard case let .providerSetup(v) = try await send(.updateProviderSetup(providerId: providerId, settings: settings)) else { throw DaemonError.badResponse }
         return v
     }
-    func repairProvider(providerId: String, accountId: String?) async throws -> ProviderActionResponse {
-        guard case let .providerAction(v) = try await send(.repairProvider(providerId: providerId, accountId: accountId)) else { throw DaemonError.badResponse }
+    func repairProvider(
+        providerId: String,
+        accountId: String?,
+        signInAction: ProviderSignInAction = .open
+    ) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(.repairProvider(
+            providerId: providerId,
+            accountId: accountId,
+            signInAction: signInAction
+        )) else { throw DaemonError.badResponse }
         return v
     }
     func launchProviderAccount(accountId: String) async throws -> ProviderActionResponse {

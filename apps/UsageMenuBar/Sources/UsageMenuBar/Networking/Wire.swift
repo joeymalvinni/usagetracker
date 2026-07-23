@@ -4,18 +4,23 @@ enum DaemonWireProtocol {
     static let currentVersion = 3
 }
 
+enum ProviderSignInAction: String, Encodable {
+    case open
+    case copyLink = "copy_link"
+}
+
 enum DaemonRequest: Encodable {
     case getServerInfo, getState, getUsage, refresh([String]?), getRefreshJob(String)
     case getProviderHealth, getAccounts, getConfig, getPendingNotifications
     case acknowledgeNotifications([Int64])
     case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notifications: NotificationConfig?)
-    case addProviderAccount(providerId: String, displayName: String?)
+    case addProviderAccount(providerId: String, displayName: String?, signInAction: ProviderSignInAction)
     case updateAccount(accountId: String, displayName: String?, hidden: Bool?, collectionEnabled: Bool?)
     case removeAccount(accountId: String)
     case deleteAccount(accountId: String)
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, settings: [String: String?])
-    case repairProvider(providerId: String, accountId: String?)
+    case repairProvider(providerId: String, accountId: String?, signInAction: ProviderSignInAction)
     case launchProviderAccount(accountId: String)
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: K.self)
@@ -40,10 +45,11 @@ enum DaemonRequest: Encodable {
             try c.encodeIfPresent(interval, forKey: .pollIntervalSeconds)
             try c.encodeIfPresent(providers?.mapValues { ProviderToggle(enabled: $0) }, forKey: .providers)
             try c.encodeIfPresent(notifications, forKey: .notifications)
-        case .addProviderAccount(let providerId, let displayName):
+        case .addProviderAccount(let providerId, let displayName, let signInAction):
             try c.encode("add_provider_account", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(displayName, forKey: .displayName)
+            try c.encode(signInAction, forKey: .signInAction)
         case .updateAccount(let accountId, let displayName, let hidden, let collectionEnabled):
             try c.encode("update_account", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
@@ -63,10 +69,11 @@ enum DaemonRequest: Encodable {
             try c.encode("update_provider_setup", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encode(settings, forKey: .settings)
-        case .repairProvider(let providerId, let accountId):
+        case .repairProvider(let providerId, let accountId, let signInAction):
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(accountId, forKey: .accountId)
+            try c.encode(signInAction, forKey: .signInAction)
         case .launchProviderAccount(let accountId):
             try c.encode("launch_provider_account", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
@@ -80,6 +87,7 @@ enum DaemonRequest: Encodable {
         case accountId = "account_id"
         case jobId = "job_id"
         case displayName = "display_name"
+        case signInAction = "sign_in_action"
         case collectionEnabled = "collection_enabled"
         case workspaceId = "workspace_id"
     }

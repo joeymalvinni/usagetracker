@@ -11,7 +11,8 @@ use tokio::sync::{watch, Mutex, RwLock};
 use tracing::{info, warn};
 use usage_core::{
     Account, AccountId, AddProviderAccountResponse, ConfigResponse, NotificationConfig,
-    ProviderActionResponse, ProviderId, ProviderSetupResponse, ProviderToggle,
+    ProviderActionResponse, ProviderId, ProviderSetupResponse, ProviderSignInAction,
+    ProviderToggle,
 };
 
 #[cfg(test)]
@@ -45,8 +46,6 @@ pub struct DaemonRuntime {
     fixture_mode: bool,
 }
 
-const HIDDEN_PROVIDER_POLL_SECONDS: u64 = 30 * 60;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PollSchedule {
     initial: Vec<ProviderId>,
@@ -68,17 +67,13 @@ impl PollSchedule {
         let mut initial = Vec::new();
         let mut by_interval = BTreeMap::<u64, Vec<ProviderId>>::new();
         for descriptor in descriptors {
-            let visible = config.provider_enabled(descriptor.id.as_str());
-            if visible {
-                initial.push(descriptor.id.clone());
+            if !config.provider_enabled(descriptor.id.as_str()) {
+                continue;
             }
-            let requested_interval = if visible {
-                config.poll_interval_seconds
-            } else {
-                HIDDEN_PROVIDER_POLL_SECONDS
-            };
-            let effective_interval =
-                requested_interval.max(descriptor.minimum_refresh_interval_seconds);
+            initial.push(descriptor.id.clone());
+            let effective_interval = config
+                .poll_interval_seconds
+                .max(descriptor.minimum_refresh_interval_seconds);
             by_interval
                 .entry(effective_interval)
                 .or_default()
@@ -407,6 +402,7 @@ impl DaemonRuntime {
         &self,
         provider_id: ProviderId,
         display_name: Option<String>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<AddProviderAccountResponse> {
         if self.fixture_mode {
             anyhow::bail!("account sign-in is unavailable in development fixture mode");
@@ -422,6 +418,7 @@ impl DaemonRuntime {
             .add_account(
                 crate::runtime::provider_adapter::ProviderRuntime::new(self),
                 display_name,
+                sign_in_action,
             )
             .await
     }
@@ -537,6 +534,7 @@ impl DaemonRuntime {
         &self,
         provider_id: ProviderId,
         account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         if self.fixture_mode {
             anyhow::bail!("provider repair is unavailable in development fixture mode");
@@ -549,6 +547,7 @@ impl DaemonRuntime {
             .repair(
                 crate::runtime::provider_adapter::ProviderRuntime::new(self),
                 account_id,
+                sign_in_action,
             )
             .await
     }
@@ -1083,30 +1082,20 @@ mod tests {
     }
 
     #[test]
-    fn poll_schedule_assigns_hidden_providers_to_the_slow_scope() {
+    fn poll_schedule_excludes_disabled_providers() {
         let root =
             std::env::temp_dir().join(format!("usage-poll-scope-test-{}", uuid::Uuid::new_v4()));
         let config = test_config(&root);
         let schedule = PollSchedule::from_config(&config);
 
         assert_eq!(schedule.initial, vec![ProviderId::new(CODEX_PROVIDER_ID)]);
-        let visible = schedule
-            .groups
-            .iter()
-            .find(|group| group.interval_seconds == config.poll_interval_seconds)
-            .unwrap();
-        assert_eq!(visible.providers, [ProviderId::new(CODEX_PROVIDER_ID)]);
-        let hidden = schedule
-            .groups
-            .iter()
-            .find(|group| group.interval_seconds == HIDDEN_PROVIDER_POLL_SECONDS)
-            .unwrap();
-        assert!(hidden
-            .providers
-            .contains(&ProviderId::new(CLAUDE_PROVIDER_ID)));
-        assert!(hidden
-            .providers
-            .contains(&ProviderId::new(OPENCODE_GO_PROVIDER_ID)));
+        assert_eq!(
+            schedule.groups,
+            vec![PollGroup {
+                providers: vec![ProviderId::new(CODEX_PROVIDER_ID)],
+                interval_seconds: config.poll_interval_seconds,
+            }]
+        );
     }
 
     #[test]

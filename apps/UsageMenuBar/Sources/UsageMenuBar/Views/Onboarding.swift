@@ -239,17 +239,16 @@ struct ProviderSetupControls: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             HStack(spacing: Theme.Spacing.sm) {
                 if canConnectOrRepair {
-                    Button(repairLabel) {
+                    Button("Open sign-in") {
                         Task { await connectOrRepair() }
                     }
                     .disabled(busy || state.daemon == .offline)
-                }
 
-                if let authenticationURL {
-                    Button("Copy link", systemImage: "doc.on.doc") {
-                        copyAuthenticationURL(authenticationURL)
+                    Button("Copy sign-in link", systemImage: "doc.on.doc") {
+                        Task { await copyAuthenticationURL() }
                     }
                     .help("Copy the sign-in link to open it in another browser")
+                    .disabled(busy || state.daemon == .offline)
                 }
 
                 if state.supportsAddAccount(providerId), !accounts.isEmpty {
@@ -289,11 +288,11 @@ struct ProviderSetupControls: View {
             : state.supportsRepair(providerId)
     }
 
-    private var authenticationURL: String? {
-        state.providerAuthenticationURLs[providerId]
-    }
-
-    private func copyAuthenticationURL(_ url: String) {
+    private func copyAuthenticationURL() async {
+        guard let url = await state.providerSignInLink(
+            providerId,
+            accountId: accounts.first?.id
+        ) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
         state.actionError = nil
@@ -306,12 +305,6 @@ struct ProviderSetupControls: View {
         } else if state.supportsRepair(providerId) {
             await state.repairProvider(providerId, accountId: accounts.first?.id)
         }
-    }
-
-    private var repairLabel: String {
-        accounts.isEmpty
-            ? "Connect \(state.settingsProviders.first { $0.providerId == providerId }?.name ?? ProviderCatalog.name(for: providerId))"
-            : "Sign in again"
     }
 
     private var helpText: String {

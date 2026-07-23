@@ -130,6 +130,13 @@
       },
       "type": "object"
     },
+    "ProviderSignInAction": {
+      "enum": [
+        "open",
+        "copy_link"
+      ],
+      "type": "string"
+    },
     "ProviderToggle": {
       "properties": {
         "enabled": {
@@ -338,6 +345,9 @@
         },
         "provider_id": {
           "type": "string"
+        },
+        "sign_in_action": {
+          "$ref": "#/$defs/ProviderSignInAction"
         }
       },
       "required": [
@@ -475,6 +485,9 @@
         },
         "provider_id": {
           "type": "string"
+        },
+        "sign_in_action": {
+          "$ref": "#/$defs/ProviderSignInAction"
         }
       },
       "required": [

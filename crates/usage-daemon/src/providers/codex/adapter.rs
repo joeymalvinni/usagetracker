@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tracing::info;
 use usage_core::{
     Account, AccountId, AddProviderAccountResponse, ProviderActionResponse, ProviderId,
+    ProviderSignInAction,
 };
 
 use crate::{
@@ -214,6 +215,7 @@ impl AddAccountHandler for CodexAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         display_name: Option<String>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<AddProviderAccountResponse> {
         let (profile_id, profile_path, profile_name) = runtime
             .mutate_config(|config| {
@@ -241,7 +243,7 @@ impl AddAccountHandler for CodexAdapter {
             })
             .await?;
 
-        let login = launchers::launch_codex_login(&profile_path)?;
+        let login = launchers::launch_codex_login(&profile_path, sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,
@@ -271,6 +273,7 @@ impl RepairHandler for CodexAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         let config = runtime.config().await;
         let account = match account_id.as_ref() {
@@ -302,7 +305,7 @@ impl RepairHandler for CodexAdapter {
         let profile_id = profile
             .and_then(|profile| profile.id.clone())
             .unwrap_or_else(|| "default".to_string());
-        let login = launchers::launch_codex_login(&home)?;
+        let login = launchers::launch_codex_login(&home, sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,

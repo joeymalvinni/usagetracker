@@ -22,6 +22,11 @@ private enum PendingAction {
     case provider(String), accountProvider(String), account(String), interval, notifications
 }
 
+private enum ProviderSignInFollowUp {
+    case addedAccount(profileId: String)
+    case repairedAccount(accountId: String?, startedAt: Date)
+}
+
 @MainActor final class AppState: ObservableObject {
     let updater = AppUpdater()
     @Published var daemon: DaemonState = .unknown
@@ -46,7 +51,6 @@ private enum PendingAction {
     @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
     @Published var notificationAuthorizationAvailable = AppState.isRunningFromAppBundle
     @Published var providerSetups = [String: ProviderSetupResponse]()
-    @Published var providerAuthenticationURLs = [String: String]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
     @Published var serverProviderOrder = [String]()
     @Published var onboardingDiscoveryStarted = false
@@ -255,16 +259,93 @@ private enum PendingAction {
         }
         pendingAccountProviders.insert(providerId)
         defer { pendingAccountProviders.remove(providerId) }
-        providerAuthenticationURLs.removeValue(forKey: providerId)
         do {
             let response = try await client.addProviderAccount(providerId: providerId, displayName: nil)
-            rememberAuthenticationURL(response.authenticationUrl, for: providerId)
             actionError = nil
             actionMessage = "Finish signing in to \(providerName(providerId)) in your browser. This account will appear automatically."
             await waitForProviderAccount(providerId: providerId, profileId: response.profileId)
         } catch {
             actionMessage = nil
             actionError = describe(error)
+        }
+    }
+
+    func providerSignInLink(
+        _ providerId: String,
+        accountId: String? = nil,
+        addAccount: Bool = false
+    ) async -> String? {
+        pendingAccountProviders.insert(providerId)
+        defer { pendingAccountProviders.remove(providerId) }
+        do {
+            let url: String?
+            let followUp: ProviderSignInFollowUp
+            let hasAccounts = accounts.contains { $0.providerId == providerId }
+            if supportsAddAccount(providerId), addAccount || !hasAccounts {
+                let response = try await client.addProviderAccount(
+                    providerId: providerId,
+                    displayName: nil,
+                    signInAction: .copyLink
+                )
+                url = response.authenticationUrl
+                followUp = .addedAccount(profileId: response.profileId)
+            } else if supportsRepair(providerId) {
+                let repairAccountId = accountId
+                    ?? accounts.first { $0.providerId == providerId }?.id
+                let startedAt = Date()
+                let response = try await client.repairProvider(
+                    providerId: providerId,
+                    accountId: repairAccountId,
+                    signInAction: .copyLink
+                )
+                url = response.authenticationUrl
+                followUp = .repairedAccount(
+                    accountId: repairAccountId,
+                    startedAt: startedAt
+                )
+            } else if supportsAddAccount(providerId) {
+                let response = try await client.addProviderAccount(
+                    providerId: providerId,
+                    displayName: nil,
+                    signInAction: .copyLink
+                )
+                url = response.authenticationUrl
+                followUp = .addedAccount(profileId: response.profileId)
+            } else {
+                actionError = "\(providerName(providerId)) does not support sign-in."
+                return nil
+            }
+
+            guard let url, !url.isEmpty else {
+                actionError = "\(providerName(providerId)) did not provide a sign-in link."
+                return nil
+            }
+            actionError = nil
+            monitorProviderSignIn(providerId: providerId, followUp: followUp)
+            return url
+        } catch {
+            actionMessage = nil
+            actionError = describe(error)
+            return nil
+        }
+    }
+
+    private func monitorProviderSignIn(
+        providerId: String,
+        followUp: ProviderSignInFollowUp
+    ) {
+        Task { [weak self] in
+            guard let self else { return }
+            switch followUp {
+            case .addedAccount(let profileId):
+                await waitForProviderAccount(providerId: providerId, profileId: profileId)
+            case .repairedAccount(let accountId, let startedAt):
+                await waitForProviderRepair(
+                    providerId: providerId,
+                    accountId: accountId,
+                    startedAt: startedAt
+                )
+            }
         }
     }
 
@@ -410,10 +491,8 @@ private enum PendingAction {
             return
         }
         let startedAt = Date()
-        providerAuthenticationURLs.removeValue(forKey: providerId)
         await perform(.accountProvider(providerId)) {
             let response = try await client.repairProvider(providerId: providerId, accountId: accountId)
-            rememberAuthenticationURL(response.authenticationUrl, for: providerId)
             actionMessage = response.message
             if supportsMultipleAccounts(providerId) {
                 await waitForProviderRepair(
@@ -762,7 +841,6 @@ private enum PendingAction {
                 let discovered = try await client.accounts()
                 if discovered.contains(where: { $0.providerId == providerId && $0.profileId == profileId }) {
                     accounts = discovered
-                    providerAuthenticationURLs.removeValue(forKey: providerId)
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) account connected."
                     await load()
@@ -788,7 +866,6 @@ private enum PendingAction {
                         && $0.status != .authFailed
                 }
                 if repaired != nil {
-                    providerAuthenticationURLs.removeValue(forKey: providerId)
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) login connected."
                     await load()
@@ -802,10 +879,6 @@ private enum PendingAction {
         actionMessage = "\(providerName(providerId)) sign-in is still pending. You can retry from Settings."
     }
 
-    private func rememberAuthenticationURL(_ url: String?, for providerId: String) {
-        guard let url, !url.isEmpty else { return }
-        providerAuthenticationURLs[providerId] = url
-    }
     private func fail(_ error: Error) {
         daemon = .offline
         message = describe(error)

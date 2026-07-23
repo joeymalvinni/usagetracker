@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private struct HiddenWindowEntry: Identifiable {
@@ -300,9 +301,14 @@ private struct ProviderAccountCard: View {
 
             if hasPrimaryAction {
                 HStack(spacing: Theme.Spacing.sm) {
-                    Button(actionLabel) { Task { await primaryAction() } }
+                    Button("Open sign-in") { Task { await primaryAction() } }
                         .buttonStyle(.chipProminent)
                         .disabled(busy || state.daemon == .offline)
+                    Button("Copy sign-in link", systemImage: "doc.on.doc") {
+                        Task { await copySignInLink() }
+                    }
+                    .buttonStyle(.chip)
+                    .disabled(busy || state.daemon == .offline)
                     if busy { ProgressView().controlSize(.small) }
                     Spacer()
                 }
@@ -323,14 +329,6 @@ private struct ProviderAccountCard: View {
         )
     }
 
-    private var actionLabel: String {
-        if state.supportsAddAccount(provider.providerId) {
-            accounts.isEmpty ? "Connect account" : "Add account"
-        } else {
-            accounts.isEmpty ? "Sign in" : "Reconnect"
-        }
-    }
-
     private var hasPrimaryAction: Bool {
         state.supportsAddAccount(provider.providerId) || state.supportsRepair(provider.providerId)
     }
@@ -341,6 +339,18 @@ private struct ProviderAccountCard: View {
         } else if state.supportsRepair(provider.providerId) {
             await state.repairProvider(provider.providerId, accountId: accounts.first?.id)
         }
+    }
+
+    private func copySignInLink() async {
+        guard let url = await state.providerSignInLink(
+            provider.providerId,
+            accountId: accounts.first?.id,
+            addAccount: state.supportsAddAccount(provider.providerId)
+        ) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        state.actionError = nil
+        state.actionMessage = "\(provider.name) sign-in link copied."
     }
 
     private func accountLabel(_ account: Account) -> String {
