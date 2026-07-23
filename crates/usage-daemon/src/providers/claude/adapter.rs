@@ -459,6 +459,9 @@ impl LaunchHandler for ClaudeAdapter {
         true
     }
 
+    /// Unresolvable profiles intentionally fall back to defaults so the read
+    /// path never blocks the sheet; a confirm still surfaces the real launch
+    /// error.
     async fn launch_settings(
         &self,
         runtime: ProviderRuntime<'_>,

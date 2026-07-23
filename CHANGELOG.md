@@ -4,6 +4,10 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+### App
+
+- Added per-account Claude launch preferences: a saved working directory and structured launch flags (model, effort, dangerously-skip-permissions) applied by the session launcher, persisted on successful open. The dangerous flag is use-once unless explicitly remembered.
+
 ## 0.1.5 — 2026-07-19
 
 ### App

@@ -1291,6 +1291,8 @@ mod tests {
         };
         assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
 
+        // test_env's config has no claude profiles, so the read serves defaults —
+        // the assertion below is about the config, not the fixture seed data.
         let claude = accounts
             .iter()
             .find(|account| account.provider_id.as_str() == "claude")
