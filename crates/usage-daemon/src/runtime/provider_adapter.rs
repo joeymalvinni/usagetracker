@@ -267,12 +267,18 @@ pub(crate) trait RepairHandler: Send + Sync {
 /// to the account's saved preferences; the sheet always sends the full
 /// `launch` object, so an override replaces the whole flag set.
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)] // Threaded through LaunchHandler in Task 6.
 pub(crate) struct LaunchOverrides {
     pub(crate) working_directory: Option<String>,
     pub(crate) launch: Option<usage_core::LaunchFlags>,
     pub(crate) remember_dangerously_skip_permissions: bool,
 }
+
+/// A launch request the daemon understood but must reject as caller error
+/// (bad working directory, malformed flags). The server maps this to
+/// `invalid_argument`; everything else stays `unsupported_operation`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct InvalidLaunchRequest(pub(crate) String);
 
 #[async_trait]
 pub(crate) trait LaunchHandler: Send + Sync {
@@ -280,7 +286,26 @@ pub(crate) trait LaunchHandler: Send + Sync {
         &self,
         runtime: ProviderRuntime<'_>,
         account: Account,
+        overrides: LaunchOverrides,
     ) -> anyhow::Result<ProviderActionResponse>;
+
+    /// Advertised as the `launch_options` capability: this handler honors
+    /// LaunchOverrides and serves per-account launch settings.
+    fn supports_launch_options(&self) -> bool {
+        false
+    }
+
+    #[allow(dead_code)] // Called from GetAccountLaunchSettings starting in Task 7.
+    async fn launch_settings(
+        &self,
+        _runtime: ProviderRuntime<'_>,
+        account: Account,
+    ) -> anyhow::Result<usage_core::AccountLaunchSettingsResponse> {
+        anyhow::bail!(
+            "launch settings are not supported for {}",
+            account.provider_id
+        )
+    }
 }
 
 #[async_trait]
@@ -411,8 +436,9 @@ pub(crate) trait ProviderAdapter: Send + Sync {
                 add_account: self.add_account_handler().is_some(),
                 repair: self.repair_handler().is_some(),
                 launch_account: self.launch_handler().is_some(),
-                // Staged off until the handler advertises override support (Task 6).
-                launch_options: false,
+                launch_options: self
+                    .launch_handler()
+                    .is_some_and(|handler| handler.supports_launch_options()),
                 // `workspace_setup` is a deprecated v3 wire alias. Both fields
                 // intentionally derive from the same generic setup handler.
                 setup: self.setup_handler().is_some(),

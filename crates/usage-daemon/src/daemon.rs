@@ -556,6 +556,7 @@ impl DaemonRuntime {
     pub async fn launch_provider_account(
         &self,
         account_id: AccountId,
+        overrides: crate::runtime::provider_adapter::LaunchOverrides,
     ) -> anyhow::Result<ProviderActionResponse> {
         if self.fixture_mode {
             anyhow::bail!("provider launch is unavailable in development fixture mode");
@@ -572,10 +573,19 @@ impl DaemonRuntime {
                 account.provider_id
             )
         })?;
+        if !handler.supports_launch_options()
+            && (overrides.working_directory.is_some() || overrides.launch.is_some())
+        {
+            anyhow::bail!(
+                "launch overrides are not supported for {}",
+                account.provider_id
+            );
+        }
         handler
             .launch(
                 crate::runtime::provider_adapter::ProviderRuntime::new(self),
                 account,
+                overrides,
             )
             .await
     }
@@ -1325,5 +1335,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(launchable, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
+    }
+
+    #[test]
+    fn launch_options_capability_is_claude_only() {
+        let with_options = provider_registry::descriptors()
+            .into_iter()
+            .filter(|provider| provider.capabilities.launch_options)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(with_options, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
     }
 }

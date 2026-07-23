@@ -408,15 +408,29 @@ impl SocketServer {
                     }
                 }
             }
-            ApiRequest::LaunchProviderAccount { account_id, .. } => {
+            ApiRequest::LaunchProviderAccount {
+                account_id,
+                working_directory,
+                launch,
+                remember_dangerously_skip_permissions,
+            } => {
                 if let Some(error) = self.account_validation_error(&account_id).await {
                     error
                 } else {
-                    match self.runtime.launch_provider_account(account_id).await {
+                    let overrides = crate::runtime::provider_adapter::LaunchOverrides {
+                        working_directory,
+                        launch,
+                        remember_dangerously_skip_permissions,
+                    };
+                    match self
+                        .runtime
+                        .launch_provider_account(account_id, overrides)
+                        .await
+                    {
                         Ok(action) => ApiResponse::ProviderAction { action },
                         Err(err) => {
                             warn!(error = %err, "provider account launch failed");
-                            ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+                            launch_failure_response(err)
                         }
                     }
                 }
@@ -850,6 +864,17 @@ fn storage_error(err: anyhow::Error) -> ApiResponse {
     ApiResponse::error(ApiErrorCode::StorageUnavailable, err.to_string())
 }
 
+fn launch_failure_response(err: anyhow::Error) -> ApiResponse {
+    if err
+        .downcast_ref::<crate::runtime::provider_adapter::InvalidLaunchRequest>()
+        .is_some()
+    {
+        ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
+    } else {
+        ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,6 +1150,25 @@ mod tests {
         assert_eq!(error.code, ApiErrorCode::InvalidArgument);
 
         let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[test]
+    fn launch_failures_map_invalid_requests_to_invalid_argument() {
+        let invalid = launch_failure_response(anyhow::Error::new(
+            crate::runtime::provider_adapter::InvalidLaunchRequest(
+                "working directory /nope does not exist".to_string(),
+            ),
+        ));
+        let ApiResponse::Error { error } = invalid else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+
+        let other = launch_failure_response(anyhow::anyhow!("Claude is not configured"));
+        let ApiResponse::Error { error } = other else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
     }
 
     #[tokio::test]

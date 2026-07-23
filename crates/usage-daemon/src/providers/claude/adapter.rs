@@ -19,8 +19,9 @@ use crate::{
     },
     runtime::provider_adapter::{
         plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-        ExecutionPolicy, LaunchHandler, LaunchOverrides, LocalUsagePathMatcher, LocalUsageWatch,
-        ProviderAdapter, ProviderManifest, ProviderRuntime, RepairHandler,
+        ExecutionPolicy, InvalidLaunchRequest, LaunchHandler, LaunchOverrides,
+        LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter, ProviderManifest, ProviderRuntime,
+        RepairHandler,
     },
 };
 
@@ -263,14 +264,14 @@ impl RepairHandler for ClaudeAdapter {
     }
 }
 
-#[allow(dead_code)] // Wired into LaunchHandler::launch in Task 6.
 pub(crate) struct LaunchPlan {
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) flags: Option<usage_core::LaunchFlags>,
     pub(crate) persist: Option<PersistedLaunchPrefs>,
 }
 
-#[allow(dead_code)] // Wired into LaunchHandler::launch in Task 6.
+/// When present in a LaunchPlan, replaces both saved fields wholesale on a
+/// successful open; a None field here clears the saved value.
 pub(crate) struct PersistedLaunchPrefs {
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) launch: Option<usage_core::LaunchFlags>,
@@ -279,7 +280,6 @@ pub(crate) struct PersistedLaunchPrefs {
 /// Merges saved prefs with per-open overrides. Working directory + model +
 /// effort persist whenever the sheet sent anything; the dangerous flag
 /// persists only when explicitly remembered.
-#[allow(dead_code)] // Called from LaunchHandler::launch starting in Task 6.
 pub(crate) fn resolve_launch_plan(
     saved: &settings::ClaudeProfileSettings,
     overrides: &LaunchOverrides,
@@ -322,6 +322,7 @@ impl LaunchHandler for ClaudeAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         account: Account,
+        overrides: LaunchOverrides,
     ) -> anyhow::Result<ProviderActionResponse> {
         if !account.collection_enabled {
             anyhow::bail!("enable Claude account tracking before opening a profile session");
@@ -335,8 +336,10 @@ impl LaunchHandler for ClaudeAdapter {
             .providers
             .get(PROVIDER_ID)
             .ok_or_else(|| anyhow::anyhow!("Claude is not configured"))?;
-        let config_dir = if provider.profiles.is_empty() && profile_id == "default" {
-            None
+        let (config_dir, saved, has_profile_entry) = if provider.profiles.is_empty()
+            && profile_id == "default"
+        {
+            (None, settings::ClaudeProfileSettings::default(), false)
         } else {
             let profile = provider
                 .profiles
@@ -347,17 +350,68 @@ impl LaunchHandler for ClaudeAdapter {
                 .ok_or_else(|| {
                     anyhow::anyhow!("Claude profile {profile_id} is no longer configured")
                 })?;
-            settings::profile(profile)?
+            let saved = settings::profile(profile)?;
+            let config_dir = saved
                 .claude_config_dir
-                .map(expand_home_path)
+                .clone()
+                .map(|dir| expand_home_path(&dir));
+            (config_dir, saved, true)
         };
+
+        let plan = resolve_launch_plan(&saved, &overrides)
+            .map_err(|err| anyhow::Error::new(InvalidLaunchRequest(err.to_string())))?;
+        let working_directory = match &plan.working_directory {
+            Some(dir) => {
+                let expanded = expand_home_path(dir);
+                // Absolute is required: zsh treats `cd -- '-'` as $OLDPWD, and a
+                // relative path is meaningless in a launcher run from an
+                // arbitrary Terminal cwd.
+                if !expanded.is_absolute() {
+                    return Err(InvalidLaunchRequest(format!(
+                        "working directory {} must be an absolute path",
+                        expanded.display()
+                    ))
+                    .into());
+                }
+                if !expanded.is_dir() {
+                    return Err(InvalidLaunchRequest(format!(
+                        "working directory {} does not exist",
+                        expanded.display()
+                    ))
+                    .into());
+                }
+                Some(expanded)
+            }
+            None => None,
+        };
+
         let launcher = launchers::write_claude_profile_launcher(
             &account.id,
             config_dir.as_deref(),
-            None,
-            None,
+            working_directory.as_deref(),
+            plan.flags.as_ref(),
         )?;
         launchers::open_terminal(&launcher)?;
+
+        if let (Some(persist), true) = (plan.persist, has_profile_entry) {
+            runtime
+                .mutate_config(|config| {
+                    let provider = config.providers.entry(PROVIDER_ID.to_string()).or_default();
+                    if let Some(profile) = provider.profiles.iter_mut().find(|profile| {
+                        profile.enabled
+                            && !profile.deleted
+                            && profile.id.as_deref() == Some(profile_id)
+                    }) {
+                        settings::update_profile(profile, |settings| {
+                            settings.working_directory = persist.working_directory.clone();
+                            settings.launch = persist.launch.clone();
+                        })?;
+                    }
+                    Ok(())
+                })
+                .await?;
+        }
+
         Ok(ProviderActionResponse {
             provider_id: account.provider_id,
             message: format!(
@@ -366,6 +420,10 @@ impl LaunchHandler for ClaudeAdapter {
             ),
             authentication_url: None,
         })
+    }
+
+    fn supports_launch_options(&self) -> bool {
+        true
     }
 }
 
@@ -474,6 +532,7 @@ mod tests {
         let persisted_flags = persist.launch.unwrap();
         assert_eq!(persisted_flags.effort, Some(usage_core::LaunchEffort::Max));
         assert!(!persisted_flags.dangerously_skip_permissions);
+        assert_eq!(persisted_flags.model, None);
     }
 
     #[test]
@@ -495,6 +554,23 @@ mod tests {
                 .unwrap()
                 .dangerously_skip_permissions
         );
+    }
+
+    #[test]
+    fn launch_plan_forgetting_the_dangerous_flag_normalizes_to_no_persisted_flags() {
+        let saved = saved_settings(None, None);
+        let overrides = LaunchOverrides {
+            working_directory: None,
+            launch: Some(usage_core::LaunchFlags {
+                dangerously_skip_permissions: true,
+                ..Default::default()
+            }),
+            remember_dangerously_skip_permissions: false,
+        };
+        let plan = resolve_launch_plan(&saved, &overrides).unwrap();
+        // The dangerous flag resets to the (unset) saved value, which
+        // collapses the persisted flags back down to "nothing saved".
+        assert_eq!(plan.persist.unwrap().launch, None);
     }
 
     #[test]
