@@ -4,6 +4,13 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.6 — 2026-07-23
+
+### App
+
+- Added Cursor to onboarding, Settings, dashboard summaries, provider details, and activity views.
+- Made provider sign-in links available to copy when browser-based authentication needs manual follow-up.
+
 ### Usage tracking
 
 - Added Cursor usage collection for included plan limits, Auto/API lanes, Enterprise personal caps and team pools, legacy request quotas, and personal or team on-demand budgets.
@@ -12,6 +19,8 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 ### Reliability
 
 - Bound cached Cursor web sessions to validated account identities, re-read Cursor.app authentication during collection, and prevented account fallback after transient or rate-limit failures.
+- Restored Codex rate-limit reset timestamps from app-server responses.
+- Prevented stale menu bar app processes from surviving an update.
 
 ## 0.1.5 — 2026-07-19
 
