@@ -89,6 +89,12 @@ struct OpenSessionSheet: View {
                 }
             }
 
+            if !model.hasManagedConfigDir {
+                Text("This account has no managed profile, so these choices apply to this session only.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let error = state.actionError {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
