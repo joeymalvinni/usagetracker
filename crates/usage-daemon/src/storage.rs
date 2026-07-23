@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use usage_core::{Account, AccountId, ProviderHealth, ProviderId, UsageSnapshot};
 
+use crate::providers::{DailyUsageBucket, ProviderUsageEventBatch};
+
 mod accounts;
 mod backoff;
 mod health;
@@ -123,6 +125,16 @@ pub struct StoredProviderBackoff {
     pub retry_at: DateTime<Utc>,
     pub last_failure_at: DateTime<Utc>,
     pub error_message: String,
+}
+
+pub(crate) struct CollectionRecord<'a> {
+    pub snapshot: &'a UsageSnapshot,
+    pub daily_usage: &'a [DailyUsageBucket],
+    pub usage_events: Option<&'a ProviderUsageEventBatch>,
+    pub health: &'a ProviderHealth,
+    pub email: Option<&'a str>,
+    pub backoff: Option<&'a StoredProviderBackoff>,
+    pub clear_backoff: bool,
 }
 
 #[derive(Clone)]

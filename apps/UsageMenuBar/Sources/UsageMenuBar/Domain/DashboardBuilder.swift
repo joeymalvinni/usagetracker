@@ -255,6 +255,7 @@ struct DashboardBuilder {
             sparkline: aggregatedSparkline,
             costDashboard: buildCostDashboard(filter: { snap in snap.providerId == providerId }),
             subAccounts: accountVMs.count > 1 ? accountVMs : nil,
+            modelCosts: modelCosts(providerId: providerId, accountId: nil),
             alertSignature: worstAccount?.alertSignature,
             hasUnseenAlert: accountVMs.contains(where: \.hasUnseenAlert),
             lastSuccessAt: accountVMs.compactMap(\.lastSuccessAt).max(),
@@ -316,6 +317,7 @@ struct DashboardBuilder {
             sparkline: sparkline,
             costDashboard: buildCostDashboard(filter: { snap in snap.providerId == providerId && snap.accountId == accountId }),
             subAccounts: nil,
+            modelCosts: modelCosts(providerId: providerId, accountId: accountId),
             alertSignature: signature,
             hasUnseenAlert: signature.map { !ui.seenAlerts.contains($0) } ?? false,
             lastSuccessAt: h?.lastSuccessAt,
@@ -425,6 +427,33 @@ struct DashboardBuilder {
             )
         }
         return CostDashboardVM(days: days, providers: providers)
+    }
+
+    private func modelCosts(providerId: String, accountId: String?) -> [ModelCostSummary] {
+        let summaries = dashboard.accounts.filter {
+            $0.providerId == providerId
+                && (accountId == nil || $0.accountId == accountId)
+                && !hiddenAccountIdSet.contains($0.accountId)
+        }
+        var totals = [String: ModelCostSummary]()
+        for model in summaries.compactMap(\.cost).flatMap(\.models) {
+            let current = totals[model.model]
+            totals[model.model] = ModelCostSummary(
+                model: model.model,
+                eventCount: (current?.eventCount ?? 0).saturatingAdd(model.eventCount),
+                tokens: (current?.tokens ?? 0).saturatingAdd(model.tokens),
+                vendorCostUsd: (current?.vendorCostUsd ?? 0) + model.vendorCostUsd,
+                meteredCostUsd: (current?.meteredCostUsd ?? 0) + model.meteredCostUsd,
+                chargeableCostUsd: (current?.chargeableCostUsd ?? 0) + model.chargeableCostUsd,
+                providerFeeUsd: (current?.providerFeeUsd ?? 0) + model.providerFeeUsd
+            )
+        }
+        return totals.values.sorted {
+            if $0.meteredCostUsd != $1.meteredCostUsd {
+                return $0.meteredCostUsd > $1.meteredCostUsd
+            }
+            return $0.model < $1.model
+        }
     }
 
     private var knownProviderIds: [String] {

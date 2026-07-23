@@ -8,13 +8,13 @@ use crate::{
     config::{Config, ProviderConfig},
     providers::{
         claude::adapter::ADAPTER as CLAUDE, codex::adapter::ADAPTER as CODEX,
-        grok::adapter::ADAPTER as GROK, opencode::adapter::ADAPTER as OPENCODE_GO,
-        ProviderCollector,
+        cursor::adapter::ADAPTER as CURSOR, grok::adapter::ADAPTER as GROK,
+        opencode::adapter::ADAPTER as OPENCODE_GO, ProviderCollector,
     },
     runtime::provider_adapter::{ExecutionPolicy, ProviderAdapter},
 };
 
-const PROVIDERS: &[&dyn ProviderAdapter] = &[&CODEX, &CLAUDE, &OPENCODE_GO, &GROK];
+const PROVIDERS: &[&dyn ProviderAdapter] = &[&CODEX, &CLAUDE, &CURSOR, &OPENCODE_GO, &GROK];
 
 pub(crate) fn adapter(provider_id: &ProviderId) -> anyhow::Result<&'static dyn ProviderAdapter> {
     find(provider_id.as_str()).ok_or_else(|| anyhow::anyhow!("unknown provider: {provider_id}"))
@@ -172,7 +172,7 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "claude", "opencode_go", "grok"]
+            ["codex", "claude", "cursor", "opencode_go", "grok"]
         );
     }
 
@@ -180,6 +180,10 @@ mod tests {
     fn capabilities_are_derived_from_registered_handlers() {
         for provider in PROVIDERS {
             let descriptor = provider.descriptor();
+            assert_eq!(
+                descriptor.capabilities.multiple_accounts,
+                provider.supports_multiple_accounts()
+            );
             assert_eq!(
                 descriptor.capabilities.add_account,
                 provider.add_account_handler().is_some()

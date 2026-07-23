@@ -1,6 +1,6 @@
 # Multiple accounts
 
-Codex, Claude, and Grok let you manage as many profiles as you want. OpenCode Go is the exception — it shows one workspace at a time.
+Codex, Claude, and Grok let you manage as many isolated profiles as you want. Cursor can discover distinct validated desktop or browser sessions, while OpenCode Go shows one workspace at a time.
 
 ## How identity works
 

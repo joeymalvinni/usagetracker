@@ -15,6 +15,7 @@ A reminder on trust: read methods can surface account emails, local paths, usage
 | `get_server_info` | `{"method":"get_server_info"}` | `server_info` |
 | `get_state` | `{"method":"get_state"}` | `state` |
 | `get_usage` | `{"method":"get_usage"}` | `usage` |
+| `get_usage_events` | `{"method":"get_usage_events","account_id":"ACCOUNT"}` | `usage_events` |
 | `refresh` | `{"method":"refresh"}` | `refresh_started` |
 | `get_refresh_job` | `{"method":"get_refresh_job","job_id":"JOB"}` | `refresh_job` |
 | `get_provider_health` | `{"method":"get_provider_health"}` | `provider_health` |
@@ -48,6 +49,7 @@ The exact shapes come from the [schemas](index.md) and [models](models.md).
 | `get_server_info` | Current capabilities and providers, in fixed provider order. | Protocol errors only. | 3s |
 | `get_state` | The main config/accounts/health/usage/dashboard/forecast view. Storage components come from a single SQLite read transaction; config is read afterward. Lists use the ordering in [models](models.md). | `storage_unavailable` | 3s |
 | `get_usage` | The latest visible snapshot per account, plus 30 local-calendar days of dashboard activity and forecasts drawn from at most 35 days / 1,024 observations. Hidden accounts are left out. | `storage_unavailable` | 3s |
+| `get_usage_events` | One account's normalized provider events, newest first. `offset` defaults to 0 and `limit` defaults to 100 and must be 1–200. Events are returned separately from state and usage responses so large histories remain paginated. | `unknown_account`, `invalid_argument`, `storage_unavailable` | 3s |
 | `get_refresh_job` | The current retained job. Jobs live in memory, so unknown or expired IDs fail. | `unknown_refresh_job` | 3s |
 | `get_provider_health` | Health for visible supported providers and accounts, ordered by provider then account. | `storage_unavailable` | 3s |
 | `get_accounts` | Every supported account — including hidden, disabled, and removed — ordered by provider, profile, then external ID. | `storage_unavailable` | 3s |

@@ -53,7 +53,7 @@ See [Apple's official app-opening safety guide](https://support.apple.com/102445
 | `parse` | The provider's response changed or came back incomplete. Grab your logs, version info, collection mode, and safe diagnostics — never credentials or cookies. |
 | `disabled` | Enable the provider or account if you want collection to resume. |
 
-Each provider's sources and fallbacks are spelled out on its own page: [Codex](codex.md), [Claude](claude.md), [OpenCode Go](opencode.md), and [Grok](grok.md).
+Each provider's sources and fallbacks are spelled out on its own page: [Codex](codex.md), [Claude](claude.md), [Cursor](cursor.md), [OpenCode Go](opencode.md), and [Grok](grok.md).
 
 Keychain work is serialized across providers and daemon instances. After a successful read, the daemon keeps that Keychain credential in memory until it exits, so later polls do not trigger another authorization prompt for the same item. UsageTracker's own writes update or invalidate the cached value; restart the daemon to pick up Keychain changes made externally. If a Keychain call hangs, its isolated helper is killed after 20 seconds; later refreshes can continue without leaving an unkillable Keychain thread inside the daemon. Repeated failures after that usually mean macOS denied Keychain access or the source item is unavailable, so repair the provider login and check `usage-daemon.log`.
 

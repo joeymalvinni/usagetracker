@@ -5,6 +5,10 @@ struct Detail: View {
     let providerId: String
     let initialAccountId: String?
     @State private var selectedAccountId: String?
+    @State private var usageEvents = [UsageEvent]()
+    @State private var nextEventOffset: UInt32?
+    @State private var loadingEvents = false
+    @State private var eventError: String?
 
     private var group: ProviderVM? {
         state.providers.first { $0.id == providerId || $0.providerId == providerId }
@@ -62,6 +66,30 @@ struct Detail: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                         ProviderActivityCard(provider: activeProvider, dashboard: activeProvider.costDashboard)
+                        if !usageEvents.isEmpty || loadingEvents || eventError != nil {
+                            ProviderSection(title: "Recent usage") {
+                                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                                    ForEach(usageEvents) { event in
+                                        UsageEventRow(event: event)
+                                    }
+                                    if let eventError {
+                                        Text(eventError)
+                                            .font(Theme.Typography.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if loadingEvents {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else if nextEventOffset != nil {
+                                        Button("Load more") {
+                                            Task { await loadUsageEvents(reset: false) }
+                                        }
+                                        .buttonStyle(.plain)
+                                        .font(Theme.Typography.caption.weight(.medium))
+                                    }
+                                }
+                            }
+                        }
                         if !limitWindows(activeProvider).isEmpty {
                             ProviderSection(title: "Limits") {
                                 ForEach(limitWindows(activeProvider)) { window in
@@ -108,6 +136,39 @@ struct Detail: View {
         }
         .onChange(of: selectedAccountId) { _, _ in
             state.markAlertSeen(activeProvider)
+        }
+        .task(id: activeProvider.accountId) {
+            await loadUsageEvents(reset: true)
+        }
+    }
+
+    private func loadUsageEvents(reset: Bool) async {
+        guard let accountId = activeProvider.accountId else {
+            usageEvents = []
+            nextEventOffset = nil
+            return
+        }
+        let offset: UInt32
+        if reset {
+            offset = 0
+        } else if let nextEventOffset {
+            offset = nextEventOffset
+        } else {
+            return
+        }
+        loadingEvents = true
+        eventError = nil
+        defer { loadingEvents = false }
+        do {
+            let page = try await state.usageEvents(accountId: accountId, offset: offset, limit: 20)
+            guard activeProvider.accountId == accountId else { return }
+            usageEvents = reset ? page.events : usageEvents + page.events
+            nextEventOffset = page.nextOffset
+        } catch {
+            guard activeProvider.accountId == accountId else { return }
+            if reset { usageEvents = [] }
+            nextEventOffset = nil
+            eventError = "Usage events unavailable: \(error.localizedDescription)"
         }
     }
 
@@ -504,6 +565,24 @@ private struct ProviderActivityCard: View {
                 Divider().frame(height: 24)
                 CostKPI(title: "Peak", value: peakValue)
             }
+
+            if !provider.modelCosts.isEmpty {
+                Divider()
+                ForEach(provider.modelCosts.prefix(5), id: \.model) { model in
+                    HStack(spacing: Theme.Spacing.sm) {
+                        Text(model.model)
+                            .lineLimit(1)
+                        Spacer()
+                        Text(
+                            "\(formatUsd(model.meteredCostUsd)) metered · "
+                                + "\(formatUsd(model.vendorCostUsd)) vendor"
+                        )
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    }
+                    .font(Theme.Typography.caption)
+                }
+            }
         }
         .surfaceCard()
         .animation(.spring(duration: 0.3), value: range)
@@ -545,6 +624,40 @@ private struct ProviderActivityCard: View {
 
     private func hoverText(_ day: CostProviderDayVM) -> String {
         "\(shortDate(day.date)): \(formatted(day))"
+    }
+}
+
+private struct UsageEventRow: View {
+    let event: UsageEvent
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.model)
+                    .lineLimit(1)
+                Text(event.occurredAt.formatted(date: .omitted, time: .shortened))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(formatUsd(event.meteredCostUsd))
+                    .monospacedDigit()
+                Text(formatTokens(totalTokens))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .font(Theme.Typography.caption)
+        .surfaceInset()
+    }
+
+    private var totalTokens: UInt64 {
+        [
+            event.inputTokens,
+            event.outputTokens,
+            event.cacheReadTokens,
+            event.cacheWriteTokens,
+        ].reduce(0) { $0.saturatingAdd($1) }
     }
 }
 

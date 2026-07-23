@@ -173,6 +173,33 @@ impl SocketServer {
                     Err(err) => storage_error(err),
                 }
             }
+            ApiRequest::GetUsageEvents {
+                account_id,
+                offset,
+                limit,
+            } => {
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    let limit = limit.unwrap_or(100);
+                    if !(1..=200).contains(&limit) {
+                        ApiResponse::error(
+                            ApiErrorCode::InvalidArgument,
+                            "usage event limit must be between 1 and 200",
+                        )
+                    } else {
+                        match self
+                            .runtime
+                            .storage
+                            .usage_events(&account_id, offset, limit)
+                            .await
+                        {
+                            Ok(page) => ApiResponse::UsageEvents { page },
+                            Err(error) => storage_error(error),
+                        }
+                    }
+                }
+            }
             ApiRequest::Refresh { providers } => match validated_refresh_scope(providers) {
                 Ok(providers) => {
                     let started = self

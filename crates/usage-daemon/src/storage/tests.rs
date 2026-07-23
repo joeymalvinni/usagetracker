@@ -6,11 +6,15 @@ use std::os::unix::fs::PermissionsExt;
 use usage_core::{
     AccountDisplayNameSource, DataProvenance, DatasetProvenance, ProviderHealth,
     ProviderHealthStatus, UsageAmount, UsageDataCompleteness, UsageDataConfidence,
-    UsageDataQuality, UsageDataScope, UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
+    UsageDataQuality, UsageDataScope, UsageDataSource, UsageEvent, UsageUnit, UsageWindow,
+    UsageWindowKind,
 };
 use uuid::Uuid;
 
-use crate::providers::{DailyUsageBucket, ProviderCollectionResult, ProviderUsage, UsageDataset};
+use crate::providers::{
+    DailyUsageBucket, ProviderCollectionResult, ProviderUsage, ProviderUsageEventBatch,
+    UsageDataset,
+};
 
 #[tokio::test]
 async fn stores_and_reads_accounts_snapshots_and_health() {
@@ -144,6 +148,7 @@ async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
                 metadata: json!({"codex_cost": {"tokens": 25}}),
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "codex_local_logs".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -256,6 +261,7 @@ async fn local_overlay_preserves_colliding_values_owned_by_the_remote_dataset() 
                 }),
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "opencode_go_local_sqlite".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -350,6 +356,7 @@ async fn successful_empty_local_reconciliation_removes_stale_overlays() {
                 metadata: json!({"claude_cost": {"tokens": 42}}),
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "claude_local_logs".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -604,6 +611,146 @@ async fn upserts_and_retains_daily_usage_by_account_and_date() {
 
     storage.delete_account(&account.id).await.unwrap();
     assert!(storage.daily_usage_history().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn atomically_replaces_pages_and_prunes_normalized_usage_events() {
+    let storage = test_storage();
+    let provider_id = ProviderId::new("cursor");
+    let account = storage
+        .upsert_account(&provider_id, "cursor-user", None, None, None)
+        .await
+        .unwrap();
+    let start = Utc::now() - chrono::TimeDelta::days(30);
+    let first = start + chrono::TimeDelta::days(1);
+    let second = start + chrono::TimeDelta::days(2);
+    let end = start + chrono::TimeDelta::days(30);
+    let event = |event_id: &str, occurred_at| UsageEvent {
+        event_id: event_id.to_string(),
+        occurred_at,
+        model: "claude-sonnet".to_string(),
+        kind: "usage_based".to_string(),
+        input_tokens: 1,
+        output_tokens: 2,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        request_units: 1.0,
+        vendor_cost_usd: 0.01,
+        metered_cost_usd: 0.02,
+        provider_fee_usd: 0.01,
+        chargeable: true,
+        token_based: true,
+        headless: false,
+    };
+    let snapshot = UsageSnapshot {
+        provider_id: provider_id.clone(),
+        account_id: account.id.clone(),
+        collected_at: end,
+        windows: Vec::new(),
+        metadata: json!({}),
+    };
+    let health = ProviderHealth {
+        provider_id: provider_id.clone(),
+        account_id: Some(account.id.clone()),
+        status: ProviderHealthStatus::Ok,
+        collection_mode: Some("cursor_web".to_string()),
+        last_success_at: Some(end),
+        last_failure_at: None,
+        last_error_code: None,
+        last_error_message: None,
+        updated_at: end,
+    };
+    storage
+        .record_collection(CollectionRecord {
+            snapshot: &snapshot,
+            daily_usage: &[],
+            usage_events: Some(&ProviderUsageEventBatch {
+                period_start: start,
+                period_end: end,
+                daily_source: "cursor_usage_events".to_string(),
+                events: vec![event("one", first), event("two", second)],
+            }),
+            health: &health,
+            email: None,
+            backoff: None,
+            clear_backoff: true,
+        })
+        .await
+        .unwrap();
+
+    let first_page = storage.usage_events(&account.id, 0, 1).await.unwrap();
+    assert_eq!(first_page.total_count, 2);
+    assert_eq!(first_page.events[0].event_id, "two");
+    assert_eq!(first_page.next_offset, Some(1));
+
+    let plan_account_id = account.id.clone();
+    let (count_plan, page_plan) = storage
+        .with_connection(move |conn| {
+            let count_plan = conn.query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM provider_usage_events WHERE account_id = ?1",
+                params![plan_account_id.as_str()],
+                |row| row.get::<_, String>(3),
+            )?;
+            let page_plan = conn.query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT normalized_json FROM provider_usage_events
+                 WHERE account_id = ?1
+                 ORDER BY occurred_at DESC, event_id DESC
+                 LIMIT 10 OFFSET 0",
+                params![plan_account_id.as_str()],
+                |row| row.get::<_, String>(3),
+            )?;
+            Ok((count_plan, page_plan))
+        })
+        .await
+        .unwrap();
+    assert!(count_plan.contains("provider_usage_events_account_time"));
+    assert!(page_plan.contains("provider_usage_events_account_time"));
+
+    storage
+        .record_collection(CollectionRecord {
+            snapshot: &snapshot,
+            daily_usage: &[],
+            usage_events: Some(&ProviderUsageEventBatch {
+                period_start: start,
+                period_end: end,
+                daily_source: "cursor_usage_events".to_string(),
+                events: vec![event("replacement", first)],
+            }),
+            health: &health,
+            email: None,
+            backoff: None,
+            clear_backoff: true,
+        })
+        .await
+        .unwrap();
+    let replaced = storage.usage_events(&account.id, 0, 100).await.unwrap();
+    assert_eq!(replaced.total_count, 1);
+    assert_eq!(replaced.events[0].event_id, "replacement");
+
+    let prune_provider_id = provider_id.clone();
+    let prune_account_id = account.id.clone();
+    storage
+        .with_connection(move |conn| {
+            prune_account_history(
+                conn,
+                &prune_provider_id,
+                &prune_account_id,
+                second,
+                MAX_SNAPSHOTS_PER_ACCOUNT,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .usage_events(&account.id, 0, 100)
+            .await
+            .unwrap()
+            .total_count,
+        0
+    );
 }
 
 #[tokio::test]

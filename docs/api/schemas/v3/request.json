@@ -189,6 +189,37 @@
     },
     {
       "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "limit": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "method": {
+          "const": "get_usage_events",
+          "type": "string"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
         "method": {
           "const": "refresh",
           "type": "string"

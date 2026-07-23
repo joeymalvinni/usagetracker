@@ -223,6 +223,7 @@
         "combined_state",
         "typed_errors",
         "usage_provenance",
+        "usage_events",
         "refresh_jobs",
         "refresh_coalescing"
       ],
@@ -325,6 +326,12 @@
           "format": "double",
           "type": "number"
         },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ModelCostSummary"
+          },
+          "type": "array"
+        },
         "pricing": {
           "$ref": "#/$defs/PricingCoverage"
         },
@@ -426,6 +433,49 @@
         "exhausted"
       ],
       "type": "string"
+    },
+    "ModelCostSummary": {
+      "properties": {
+        "chargeable_cost_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "event_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "metered_cost_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider_fee_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vendor_cost_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "model",
+        "event_count",
+        "tokens",
+        "vendor_cost_usd",
+        "metered_cost_usd",
+        "chargeable_cost_usd",
+        "provider_fee_usd"
+      ],
+      "type": "object"
     },
     "NotificationConfig": {
       "properties": {
@@ -1251,6 +1301,7 @@
     "UsageDataScope": {
       "enum": [
         "account_wide",
+        "organization",
         "this_device",
         "selected_local_roots",
         "workspace"
@@ -1265,6 +1316,124 @@
         "synthetic_local_estimate"
       ],
       "type": "string"
+    },
+    "UsageEvent": {
+      "properties": {
+        "cache_read_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_write_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chargeable": {
+          "type": "boolean"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "headless": {
+          "type": "boolean"
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "metered_cost_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "model": {
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider_fee_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "request_units": {
+          "format": "double",
+          "type": "number"
+        },
+        "token_based": {
+          "type": "boolean"
+        },
+        "vendor_cost_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "event_id",
+        "occurred_at",
+        "model",
+        "kind",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "request_units",
+        "vendor_cost_usd",
+        "metered_cost_usd",
+        "provider_fee_usd",
+        "chargeable",
+        "token_based",
+        "headless"
+      ],
+      "type": "object"
+    },
+    "UsageEventPage": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/UsageEvent"
+          },
+          "type": "array"
+        },
+        "next_offset": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account_id",
+        "events",
+        "offset",
+        "total_count"
+      ],
+      "type": "object"
     },
     "UsageForecast": {
       "properties": {
@@ -1609,6 +1778,22 @@
         "type",
         "snapshots",
         "dashboard"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "page": {
+          "$ref": "#/$defs/UsageEventPage"
+        },
+        "type": {
+          "const": "usage_events",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "page"
       ],
       "type": "object"
     },

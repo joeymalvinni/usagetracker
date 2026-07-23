@@ -152,6 +152,14 @@ private enum ProviderSignInFollowUp {
             await deliverPendingNotifications()
         }
     }
+
+    func usageEvents(
+        accountId: String,
+        offset: UInt32 = 0,
+        limit: UInt16? = nil
+    ) async throws -> UsageEventPage {
+        try await client.usageEvents(accountId: accountId, offset: offset, limit: limit)
+    }
     func refreshForPopoverOpen() async {
         guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         await load()
@@ -281,15 +289,11 @@ private enum ProviderSignInFollowUp {
             let url: String?
             let followUp: ProviderSignInFollowUp
             let hasAccounts = accounts.contains { $0.providerId == providerId }
-            if supportsAddAccount(providerId), addAccount || !hasAccounts {
-                let response = try await client.addProviderAccount(
-                    providerId: providerId,
-                    displayName: nil,
-                    signInAction: .copyLink
-                )
-                url = response.authenticationUrl
-                followUp = .addedAccount(profileId: response.profileId)
-            } else if supportsRepair(providerId) {
+            let canAddAccount = supportsAddAccount(providerId)
+            let canRepair = supportsRepair(providerId)
+            let shouldRepair = canRepair
+                && (!canAddAccount || (hasAccounts && !addAccount))
+            if shouldRepair {
                 let repairAccountId = accountId
                     ?? accounts.first { $0.providerId == providerId }?.id
                 let startedAt = Date()
@@ -303,7 +307,7 @@ private enum ProviderSignInFollowUp {
                     accountId: repairAccountId,
                     startedAt: startedAt
                 )
-            } else if supportsAddAccount(providerId) {
+            } else if canAddAccount {
                 let response = try await client.addProviderAccount(
                     providerId: providerId,
                     displayName: nil,

@@ -292,6 +292,7 @@ impl GrokCollector {
         ProviderCollectionResult {
             usage,
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: collection_mode.to_string(),
             account_email: credentials.and_then(|value| value.email.clone()),
             warnings,
@@ -321,6 +322,7 @@ impl GrokCollector {
                     metadata: json!({"local_sessions": summary.metadata()}),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "grok_local_sessions".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -693,6 +695,7 @@ mod tests {
                         metadata: json!({"remote": true}),
                     },
                     daily_usage: Vec::new(),
+                    usage_events: None,
                     collection_mode: "grok_cli_billing_rpc".to_string(),
                     account_email: None,
                     warnings: Vec::new(),

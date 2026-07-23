@@ -126,7 +126,8 @@ impl UsageSnapshot {
         window: &UsageWindow,
     ) -> UsageWindowProvenance {
         if let Some(dataset) = dataset {
-            let quota_like = (window.percent_used.is_some() || window.percent_remaining.is_some())
+            let quota_like = dataset.provenance.scope != UsageDataScope::Organization
+                && (window.percent_used.is_some() || window.percent_remaining.is_some())
                 && !matches!(
                     window.kind,
                     UsageWindowKind::Credits | UsageWindowKind::Tokens
@@ -244,6 +245,7 @@ pub enum UsageDataSource {
 #[serde(rename_all = "snake_case")]
 pub enum UsageDataScope {
     AccountWide,
+    Organization,
     ThisDevice,
     SelectedLocalRoots,
     Workspace,
@@ -315,6 +317,48 @@ pub struct CostSummary {
     pub today_cost_usd: f64,
     pub lookback_cost_usd: f64,
     pub pricing: PricingCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelCostSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub struct ModelCostSummary {
+    pub model: String,
+    pub event_count: u64,
+    pub tokens: u64,
+    pub vendor_cost_usd: f64,
+    pub metered_cost_usd: f64,
+    pub chargeable_cost_usd: f64,
+    pub provider_fee_usd: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub struct UsageEvent {
+    pub event_id: String,
+    pub occurred_at: DateTime<Utc>,
+    pub model: String,
+    pub kind: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub request_units: f64,
+    pub vendor_cost_usd: f64,
+    pub metered_cost_usd: f64,
+    pub provider_fee_usd: f64,
+    pub chargeable: bool,
+    pub token_based: bool,
+    pub headless: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+pub struct UsageEventPage {
+    pub account_id: AccountId,
+    pub events: Vec<UsageEvent>,
+    pub offset: u32,
+    pub total_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -457,7 +501,9 @@ pub fn aggregate_usage_dashboard(accounts: Vec<AccountUsageSummary>) -> UsageDas
     });
     let mixed_scope = scopes.len() > 1;
     let explanation = if mixed_scope {
-        "Combined activity mixes account-wide provider data with this Mac or selected local logs; totals are not directly comparable billing records."
+        "Combined activity mixes data scopes; totals are not directly comparable billing records."
+    } else if scopes.contains(&UsageDataScope::Organization) {
+        "Activity is organization-wide and may include usage from other members."
     } else if scopes.contains(&UsageDataScope::AccountWide) {
         "Activity is account-wide; cost remains an estimate unless explicitly reported as a provider bill."
     } else {
@@ -740,6 +786,31 @@ mod tests {
     }
 
     #[test]
+    fn organization_windows_are_not_personal_quota_alert_inputs() {
+        let mut snapshot = snapshot(serde_json::json!({}), UsageWindowKind::Monthly);
+        snapshot.metadata = serde_json::json!({
+            "dataset_provenance": [{
+                "source_id": "provider_reported",
+                "authoritative": true,
+                "provenance": {
+                    "source": "provider_reported",
+                    "scope": "organization",
+                    "quality": "authoritative",
+                    "completeness": "complete",
+                    "confidence": "high"
+                },
+                "window_ids": ["window"]
+            }]
+        });
+
+        let provenance = snapshot.window_provenance(&snapshot.windows[0]);
+
+        assert_eq!(provenance.scope, UsageDataScope::Organization);
+        assert!(!provenance.quota_like);
+        assert!(!snapshot.window_is_authoritative_quota(&snapshot.windows[0]));
+    }
+
+    #[test]
     fn indexed_provenance_preserves_first_dataset_match() {
         let mut datasets = (0..5)
             .map(|_| {
@@ -803,6 +874,7 @@ mod tests {
                     catalog_source: None,
                     catalog_effective_from: None,
                 },
+                models: Vec::new(),
             }),
             reset_credits: None,
         }]);

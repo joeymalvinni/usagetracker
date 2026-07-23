@@ -437,7 +437,7 @@ mod tests {
     #[ignore = "release-mode performance benchmark"]
     fn benchmark_cli_response_pipeline_status() {
         let now = Utc::now();
-        let provider_ids = ["codex", "claude", "opencode_go", "grok"]
+        let provider_ids = ["codex", "claude", "cursor", "opencode_go", "grok"]
             .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
