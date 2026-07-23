@@ -23,15 +23,66 @@ pub(crate) struct ClaudeProfileSettings {
     pub(crate) project_roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "crate::config::is_false")]
     pub(crate) owns_default_claude_activity: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) working_directory: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch: Option<usage_core::LaunchFlags>,
 }
 
 pub(crate) fn validate(config: &ProviderConfig) -> anyhow::Result<()> {
     config.ensure_settings_empty("Claude provider")?;
     for (index, profile) in config.profiles.iter().enumerate() {
-        self::profile(profile)
+        let settings = self::profile(profile)
             .with_context(|| format!("invalid Claude profile configuration at index {index}"))?;
+        if let Some(flags) = &settings.launch {
+            validate_launch_flags(flags)
+                .with_context(|| format!("invalid Claude launch flags at index {index}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Effort is a closed enum at the wire layer; the model string is constrained
+/// here because both end up inside a generated shell script.
+pub(crate) fn validate_launch_flags(flags: &usage_core::LaunchFlags) -> anyhow::Result<()> {
+    if let Some(model) = &flags.model {
+        anyhow::ensure!(!model.trim().is_empty(), "launch model cannot be blank");
+        anyhow::ensure!(model.len() <= 128, "launch model is too long");
+        anyhow::ensure!(
+            model
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || "._:/-".contains(ch)),
+            "launch model contains unsupported characters"
+        );
     }
     Ok(())
 }
 
 settings_accessors!(profile: ClaudeProfileSettings);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use usage_core::LaunchFlags;
+
+    #[test]
+    fn launch_flag_validation_constrains_the_model_string() {
+        let valid = LaunchFlags {
+            model: Some("claude-fable-5".to_string()),
+            ..LaunchFlags::default()
+        };
+        assert!(validate_launch_flags(&valid).is_ok());
+
+        let long = "a".repeat(129);
+        for model in ["", "   ", "model'; rm -rf /", long.as_str()] {
+            let flags = LaunchFlags {
+                model: Some(model.to_string()),
+                ..LaunchFlags::default()
+            };
+            assert!(
+                validate_launch_flags(&flags).is_err(),
+                "model {model:?} should be rejected"
+            );
+        }
+    }
+}

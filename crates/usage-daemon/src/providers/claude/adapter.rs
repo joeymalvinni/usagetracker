@@ -53,6 +53,8 @@ impl ProviderAdapter for ClaudeAdapter {
             "cli_enabled",
             "project_roots",
             "owns_default_claude_activity",
+            "working_directory",
+            "launch",
         ]
     }
 
@@ -407,6 +409,35 @@ mod tests {
         {
             assert!(watch.roots.contains(&managed));
             assert!(!watch.roots.contains(&managed.join("managed/projects")));
+        }
+    }
+
+    #[test]
+    fn profile_setting_keys_cover_every_serialized_settings_field() {
+        // Dual-registration guard: a field missing from profile_setting_keys()
+        // is silently stripped and persisted away at the next config load.
+        let settings = settings::ClaudeProfileSettings {
+            keychain_account: Some("user".to_string()),
+            keychain_service: Some("service".to_string()),
+            credentials_file: Some(PathBuf::from("/tmp/credentials.json")),
+            claude_config_dir: Some(PathBuf::from("/tmp/profile")),
+            cli_enabled: Some(true),
+            project_roots: vec![PathBuf::from("/tmp/projects")],
+            owns_default_claude_activity: true,
+            working_directory: Some(PathBuf::from("/tmp/work")),
+            launch: Some(usage_core::LaunchFlags {
+                model: Some("fable".to_string()),
+                effort: Some(usage_core::LaunchEffort::Xhigh),
+                dangerously_skip_permissions: true,
+            }),
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        let keys = ADAPTER.profile_setting_keys();
+        for field in value.as_object().unwrap().keys() {
+            assert!(
+                keys.contains(&field.as_str()),
+                "profile_setting_keys() is missing {field}"
+            );
         }
     }
 }
