@@ -303,6 +303,7 @@ final class DaemonClientTests: XCTestCase {
                 addAccount: true,
                 repair: false,
                 launchAccount: true,
+                launchOptions: true,
                 workspaceSetup: false
             )
         )]
@@ -311,8 +312,56 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(providerSupports("fixture", capability: \.addAccount, in: providers))
         XCTAssertFalse(providerSupports("fixture", capability: \.repair, in: providers))
         XCTAssertTrue(providerSupports("fixture", capability: \.launchAccount, in: providers))
+        XCTAssertTrue(providerSupports("fixture", capability: \.launchOptions, in: providers))
         XCTAssertFalse(providerSupports("fixture", capability: \.workspaceSetup, in: providers))
         XCTAssertFalse(providerSupports("fixture", capability: \.setup, in: providers))
+    }
+
+    func testEncodesLaunchOverridesAndOmitsThemWhenAbsent() throws {
+        let full = DaemonRequest.launchProviderAccount(
+            accountId: "account-1",
+            workingDirectory: "/tmp/demo",
+            launch: LaunchFlags(model: "fable", effort: "xhigh", dangerouslySkipPermissions: true),
+            rememberDangerouslySkipPermissions: true
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(full)) as? [String: Any]
+        )
+        XCTAssertEqual(object["method"] as? String, "launch_provider_account")
+        XCTAssertEqual(object["working_directory"] as? String, "/tmp/demo")
+        XCTAssertEqual(object["remember_dangerously_skip_permissions"] as? Bool, true)
+        let launch = try XCTUnwrap(object["launch"] as? [String: Any])
+        XCTAssertEqual(launch["model"] as? String, "fable")
+        XCTAssertEqual(launch["effort"] as? String, "xhigh")
+        XCTAssertEqual(launch["dangerously_skip_permissions"] as? Bool, true)
+
+        let bare = DaemonRequest.launchProviderAccount(
+            accountId: "account-1",
+            workingDirectory: nil,
+            launch: nil,
+            rememberDangerouslySkipPermissions: false
+        )
+        let bareObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(bare)) as? [String: Any]
+        )
+        XCTAssertNil(bareObject["working_directory"])
+        XCTAssertNil(bareObject["launch"])
+        XCTAssertNil(bareObject["remember_dangerously_skip_permissions"])
+    }
+
+    func testDecodesAccountLaunchSettingsFixture() throws {
+        let url = rustWireFixture("account_launch_settings_v3.json")
+        let response = try JSONDecoder.usage.decode(DaemonResponse.self, from: Data(contentsOf: url))
+        guard case let .accountLaunchSettings(settings) = response else {
+            return XCTFail("expected account launch settings")
+        }
+        XCTAssertEqual(settings.providerId, "claude")
+        XCTAssertEqual(settings.accountId, "account-1")
+        XCTAssertEqual(settings.workingDirectory, "~/Projects/demo")
+        XCTAssertEqual(settings.launch?.model, "fable")
+        XCTAssertEqual(settings.launch?.effort, "xhigh")
+        XCTAssertEqual(settings.launch?.dangerouslySkipPermissions, true)
+        XCTAssertTrue(settings.hasManagedConfigDir)
     }
 
     func testGenericProviderSetupCanExplicitlyClearAValue() throws {

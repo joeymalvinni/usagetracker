@@ -16,7 +16,13 @@ enum DaemonRequest: Encodable {
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, settings: [String: String?])
     case repairProvider(providerId: String, accountId: String?)
-    case launchProviderAccount(accountId: String)
+    case launchProviderAccount(
+        accountId: String,
+        workingDirectory: String?,
+        launch: LaunchFlags?,
+        rememberDangerouslySkipPermissions: Bool
+    )
+    case getAccountLaunchSettings(accountId: String)
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: K.self)
         try c.encode(DaemonWireProtocol.currentVersion, forKey: .apiVersion)
@@ -67,14 +73,20 @@ enum DaemonRequest: Encodable {
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(accountId, forKey: .accountId)
-        case .launchProviderAccount(let accountId):
+        case .launchProviderAccount(let accountId, let workingDirectory, let launch, let remember):
             try c.encode("launch_provider_account", forKey: .method)
+            try c.encode(accountId, forKey: .accountId)
+            try c.encodeIfPresent(workingDirectory, forKey: .workingDirectory)
+            try c.encodeIfPresent(launch, forKey: .launch)
+            if remember { try c.encode(true, forKey: .rememberDangerouslySkipPermissions) }
+        case .getAccountLaunchSettings(let accountId):
+            try c.encode("get_account_launch_settings", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
         }
     }
     enum K: String, CodingKey {
         case apiVersion = "api_version"
-        case method, providers, notifications, hidden, ids, settings
+        case method, providers, notifications, hidden, ids, settings, launch
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
@@ -82,6 +94,8 @@ enum DaemonRequest: Encodable {
         case displayName = "display_name"
         case collectionEnabled = "collection_enabled"
         case workspaceId = "workspace_id"
+        case workingDirectory = "working_directory"
+        case rememberDangerouslySkipPermissions = "remember_dangerously_skip_permissions"
     }
 }
 
@@ -159,6 +173,7 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
     let addAccount: Bool
     let repair: Bool
     let launchAccount: Bool
+    let launchOptions: Bool
     let setup: Bool
     let workspaceSetup: Bool
 
@@ -167,6 +182,7 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
         addAccount: Bool,
         repair: Bool,
         launchAccount: Bool,
+        launchOptions: Bool = false,
         workspaceSetup: Bool,
         setup: Bool? = nil
     ) {
@@ -174,6 +190,7 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
         self.addAccount = addAccount
         self.repair = repair
         self.launchAccount = launchAccount
+        self.launchOptions = launchOptions
         self.workspaceSetup = workspaceSetup
         self.setup = setup ?? workspaceSetup
     }
@@ -184,12 +201,13 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
         addAccount = try c.decode(Bool.self, forKey: .addAccount)
         repair = try c.decode(Bool.self, forKey: .repair)
         launchAccount = try c.decode(Bool.self, forKey: .launchAccount)
+        launchOptions = try c.decodeIfPresent(Bool.self, forKey: .launchOptions) ?? false
         workspaceSetup = try c.decode(Bool.self, forKey: .workspaceSetup)
         setup = try c.decodeIfPresent(Bool.self, forKey: .setup) ?? workspaceSetup
     }
 
     private enum CodingKeys: String, CodingKey {
-        case multipleAccounts, addAccount, repair, launchAccount, setup, workspaceSetup
+        case multipleAccounts, addAccount, repair, launchAccount, launchOptions, setup, workspaceSetup
     }
 }
 
@@ -208,6 +226,7 @@ enum DaemonResponse: Decodable {
     case pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64])
     case addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String)
     case providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
+    case accountLaunchSettings(AccountLaunchSettingsResponse)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         let version = try c.decodeIfPresent(Int.self, forKey: .apiVersion)
@@ -238,12 +257,16 @@ enum DaemonResponse: Decodable {
         case "provider_setup": self = .providerSetup(try c.decode(ProviderSetupResponse.self, forKey: .setup))
         case "provider_action": self = .providerAction(try c.decode(ProviderActionResponse.self, forKey: .action))
         case "error": self = .error(try c.decode(ApiError.self, forKey: .error))
+        case "account_launch_settings":
+            self = .accountLaunchSettings(
+                try c.decode(AccountLaunchSettingsResponse.self, forKey: .settings)
+            )
         default: throw DecodingError.dataCorrupted(.init(codingPath: c.codingPath, debugDescription: "unknown response"))
         }
     }
     enum K: String, CodingKey {
         case apiVersion, type, snapshots, health, accounts, config, notifications, ids
-        case server, state, job, coalesced, account, setup, action, error, accountId
+        case server, state, job, coalesced, account, setup, action, error, accountId, settings
     }
 }
 

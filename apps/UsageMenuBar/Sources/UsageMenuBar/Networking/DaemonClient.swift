@@ -72,8 +72,23 @@ struct DaemonClient: Sendable {
         guard case let .providerAction(v) = try await send(.repairProvider(providerId: providerId, accountId: accountId)) else { throw DaemonError.badResponse }
         return v
     }
-    func launchProviderAccount(accountId: String) async throws -> ProviderActionResponse {
-        guard case let .providerAction(v) = try await send(.launchProviderAccount(accountId: accountId)) else { throw DaemonError.badResponse }
+    func launchProviderAccount(
+        accountId: String,
+        workingDirectory: String? = nil,
+        launch: LaunchFlags? = nil,
+        rememberDangerouslySkipPermissions: Bool = false
+    ) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(.launchProviderAccount(
+            accountId: accountId,
+            workingDirectory: workingDirectory,
+            launch: launch,
+            rememberDangerouslySkipPermissions: rememberDangerouslySkipPermissions
+        )) else { throw DaemonError.badResponse }
+        return v
+    }
+
+    func accountLaunchSettings(accountId: String) async throws -> AccountLaunchSettingsResponse {
+        guard case let .accountLaunchSettings(v) = try await send(.getAccountLaunchSettings(accountId: accountId)) else { throw DaemonError.badResponse }
         return v
     }
 
@@ -116,7 +131,7 @@ private enum DaemonRequestTimeout {
         switch request {
         case .getServerInfo, .getState, .getUsage, .getRefreshJob, .getProviderHealth,
              .getAccounts, .getConfig, .getPendingNotifications,
-             .acknowledgeNotifications:
+             .acknowledgeNotifications, .getAccountLaunchSettings:
             3
         case .updateConfig, .updateAccount, .removeAccount:
             5
