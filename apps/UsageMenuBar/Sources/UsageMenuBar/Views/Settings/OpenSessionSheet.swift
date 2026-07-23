@@ -25,7 +25,7 @@ final class OpenSessionWindow: NSObject, NSWindowDelegate {
         window.delegate = self
         window.center()
         self.window = window
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -79,6 +79,9 @@ struct OpenSessionSheet: View {
                     }
                 }
                 Toggle("Skip permission prompts (dangerous)", isOn: $model.dangerouslySkipPermissions)
+                    .onChange(of: model.dangerouslySkipPermissions) { _, isOn in
+                        if !isOn { model.rememberDangerous = false }
+                    }
                 if model.dangerouslySkipPermissions {
                     Toggle("Remember for this account", isOn: $model.rememberDangerous)
                         .padding(.leading, 20)
@@ -96,6 +99,8 @@ struct OpenSessionSheet: View {
                     state.openSession = nil
                     dismiss()
                 }
+                .keyboardShortcut(.cancelAction)
+                .disabled(isOpening)
                 Button("Open") {
                     isOpening = true
                     Task {

@@ -444,6 +444,10 @@ private enum PendingAction {
     }
 
     func prepareOpenSession(_ accountId: String) async {
+        // Clear any stale sheet model up front: Settings.swift treats a non-nil
+        // `openSession` after this call as "prepare succeeded," so a leftover
+        // model from a different account must not survive a failed prepare.
+        openSession = nil
         guard let account = accounts.first(where: { $0.id == accountId }) else {
             actionError = "The selected account is no longer available."
             return
