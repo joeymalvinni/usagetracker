@@ -51,7 +51,7 @@ pub(crate) fn validate_launch_flags(flags: &usage_core::LaunchFlags) -> anyhow::
         anyhow::ensure!(
             model
                 .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || "._:/-".contains(ch)),
+                .all(|ch| ch.is_ascii_alphanumeric() || "._:/-@".contains(ch)),
             "launch model contains unsupported characters"
         );
     }
@@ -72,6 +72,20 @@ mod tests {
             ..LaunchFlags::default()
         };
         assert!(validate_launch_flags(&valid).is_ok());
+
+        for model in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4@20250514",
+        ] {
+            let flags = LaunchFlags {
+                model: Some(model.to_string()),
+                ..LaunchFlags::default()
+            };
+            assert!(
+                validate_launch_flags(&flags).is_ok(),
+                "model {model:?} should be accepted"
+            );
+        }
 
         let long = "a".repeat(129);
         for model in ["", "   ", "model'; rm -rf /", long.as_str()] {

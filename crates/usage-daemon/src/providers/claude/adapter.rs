@@ -432,12 +432,17 @@ mod tests {
             }),
         };
         let value = serde_json::to_value(&settings).unwrap();
-        let keys = ADAPTER.profile_setting_keys();
-        for field in value.as_object().unwrap().keys() {
-            assert!(
-                keys.contains(&field.as_str()),
-                "profile_setting_keys() is missing {field}"
-            );
-        }
+        let serialized_fields: BTreeSet<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let declared_keys: BTreeSet<&str> =
+            ADAPTER.profile_setting_keys().iter().copied().collect();
+        assert_eq!(
+            declared_keys, serialized_fields,
+            "profile_setting_keys() must exactly match ClaudeProfileSettings serialized fields"
+        );
     }
 }
