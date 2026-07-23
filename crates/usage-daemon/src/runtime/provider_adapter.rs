@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use usage_core::{
     Account, AccountId, AddProviderAccountResponse, ProviderActionResponse, ProviderCapabilities,
     ProviderDescriptor, ProviderId, ProviderProfileResponse, ProviderSetupResponse,
+    ProviderSignInAction,
 };
 
 use crate::{
@@ -251,6 +252,7 @@ pub(crate) trait AddAccountHandler: Send + Sync {
         &self,
         runtime: ProviderRuntime<'_>,
         display_name: Option<String>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<AddProviderAccountResponse>;
 }
 
@@ -260,6 +262,7 @@ pub(crate) trait RepairHandler: Send + Sync {
         &self,
         runtime: ProviderRuntime<'_>,
         account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse>;
 }
 

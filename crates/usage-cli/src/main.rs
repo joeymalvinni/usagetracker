@@ -335,6 +335,7 @@ async fn run_accounts(
                 .request(ApiRequest::AddProviderAccount {
                     provider_id: ProviderId::new(provider),
                     display_name: name,
+                    sign_in_action: usage_core::ProviderSignInAction::Open,
                 })
                 .await?;
             print_action_response(response, style, color)
@@ -472,6 +473,7 @@ async fn run_providers(
                     .request(ApiRequest::RepairProvider {
                         provider_id: ProviderId::new(provider),
                         account_id: account.map(AccountId::new),
+                        sign_in_action: usage_core::ProviderSignInAction::Open,
                     })
                     .await?,
                 style,

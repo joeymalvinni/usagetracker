@@ -254,6 +254,7 @@ impl SocketServer {
             ApiRequest::AddProviderAccount {
                 provider_id,
                 display_name,
+                sign_in_action,
             } => {
                 if let Some(error) = provider_validation_error(&provider_id) {
                     error
@@ -267,7 +268,7 @@ impl SocketServer {
                 } else {
                     match self
                         .runtime
-                        .add_provider_account(provider_id, display_name)
+                        .add_provider_account(provider_id, display_name, sign_in_action)
                         .await
                     {
                         Ok(account) => ApiResponse::AddProviderAccount { account },
@@ -382,6 +383,7 @@ impl SocketServer {
             ApiRequest::RepairProvider {
                 provider_id,
                 account_id,
+                sign_in_action,
             } => {
                 let account_error = match account_id.as_ref() {
                     Some(account_id) => self.account_validation_error(account_id).await,
@@ -399,7 +401,11 @@ impl SocketServer {
                 } else if let Some(error) = account_error {
                     error
                 } else {
-                    match self.runtime.repair_provider(provider_id, account_id).await {
+                    match self
+                        .runtime
+                        .repair_provider(provider_id, account_id, sign_in_action)
+                        .await
+                    {
                         Ok(action) => ApiResponse::ProviderAction { action },
                         Err(err) => {
                             warn!(error = %err, "provider repair failed");

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use usage_core::{
     Account, AccountId, ProviderActionResponse, ProviderId, ProviderProfileResponse,
-    ProviderSetupField, ProviderSetupFieldKind, ProviderSetupResponse,
+    ProviderSetupField, ProviderSetupFieldKind, ProviderSetupResponse, ProviderSignInAction,
 };
 
 use crate::{
@@ -87,15 +87,22 @@ impl RepairHandler for OpenCodeAdapter {
         &self,
         _runtime: ProviderRuntime<'_>,
         _account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         clear_cached_cookie_cache().await?;
-        launchers::open_url("https://opencode.ai")?;
+        let url = launchers::handle_sign_in_url("https://opencode.ai", sign_in_action)?;
+        let message = match sign_in_action {
+            ProviderSignInAction::Open => {
+                "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
+            }
+            ProviderSignInAction::CopyLink => {
+                "Paste the OpenCode sign-in link into a browser, then discover workspaces and refresh."
+            }
+        };
         Ok(ProviderActionResponse {
             provider_id: ProviderId::new(OPENCODE_GO_PROVIDER_ID),
-            message:
-                "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
-                    .to_string(),
-            authentication_url: Some("https://opencode.ai".to_string()),
+            message: message.to_string(),
+            authentication_url: Some(url),
         })
     }
 }

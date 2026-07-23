@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tracing::info;
 use usage_core::{
     Account, AccountId, AddProviderAccountResponse, ProviderActionResponse, ProviderId,
+    ProviderSignInAction,
 };
 
 use crate::{
@@ -187,6 +188,7 @@ impl AddAccountHandler for ClaudeAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         display_name: Option<String>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<AddProviderAccountResponse> {
         let connected_profiles = runtime
             .storage()
@@ -212,7 +214,7 @@ impl AddAccountHandler for ClaudeAdapter {
             .config_dir
             .clone()
             .ok_or_else(|| anyhow::anyhow!("managed Claude profile is missing its config path"))?;
-        let login = launchers::launch_claude_login(Some(&profile_path))?;
+        let login = launchers::launch_claude_login(Some(&profile_path), sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,
@@ -242,9 +244,10 @@ impl RepairHandler for ClaudeAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         let target = prepare_login_profile(runtime, account_id.as_ref()).await?;
-        let login = launchers::launch_claude_login(target.config_dir.as_deref())?;
+        let login = launchers::launch_claude_login(target.config_dir.as_deref(), sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,

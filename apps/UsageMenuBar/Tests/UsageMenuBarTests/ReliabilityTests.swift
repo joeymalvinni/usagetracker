@@ -330,6 +330,21 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertNil(object["workspace_id"])
     }
 
+    func testCopySignInLinkActionIsExplicitOnTheWire() throws {
+        let request = DaemonRequest.repairProvider(
+            providerId: "codex",
+            accountId: nil,
+            signInAction: .copyLink
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(request))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["method"] as? String, "repair_provider")
+        XCTAssertEqual(object["sign_in_action"] as? String, "copy_link")
+    }
+
     func testDecodesProviderAuthenticationURL() throws {
         let response = try JSONDecoder.usage.decode(
             DaemonResponse.self,
