@@ -47,6 +47,10 @@ pub(crate) fn validate(config: &ProviderConfig) -> anyhow::Result<()> {
 pub(crate) fn validate_launch_flags(flags: &usage_core::LaunchFlags) -> anyhow::Result<()> {
     if let Some(model) = &flags.model {
         anyhow::ensure!(!model.trim().is_empty(), "launch model cannot be blank");
+        anyhow::ensure!(
+            !model.trim_start().starts_with('-'),
+            "launch model cannot start with a dash"
+        );
         anyhow::ensure!(model.len() <= 128, "launch model is too long");
         anyhow::ensure!(
             model
@@ -88,7 +92,13 @@ mod tests {
         }
 
         let long = "a".repeat(129);
-        for model in ["", "   ", "model'; rm -rf /", long.as_str()] {
+        for model in [
+            "",
+            "   ",
+            "model'; rm -rf /",
+            "--dangerously-skip-permissions",
+            long.as_str(),
+        ] {
             let flags = LaunchFlags {
                 model: Some(model.to_string()),
                 ..LaunchFlags::default()

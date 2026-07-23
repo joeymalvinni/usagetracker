@@ -378,6 +378,15 @@ mod tests {
     }
 
     #[test]
+    fn launcher_emits_cd_guard_without_requiring_flags() {
+        // Guards against a future refactor accidentally gating cd emission on
+        // flags being present.
+        let directory_only = claude_launcher_contents(None, Some(Path::new("/tmp/wd")), None);
+        assert!(directory_only.contains("cd -- '/tmp/wd' || exit 1"));
+        assert!(directory_only.ends_with("exec claude\n"));
+    }
+
+    #[test]
     fn extracts_only_complete_urls_from_allowed_authentication_domains() {
         let output = b"Update docs: https://example.com/help\nSign in: https://auth.openai.com/oauth/authorize?state=secret\n";
         assert_eq!(
