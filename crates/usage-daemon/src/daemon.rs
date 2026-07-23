@@ -20,6 +20,7 @@ use usage_core::default_app_dir;
 
 use crate::{
     config::Config,
+    connectivity::ConnectivityMonitor,
     fixtures::{self, FixtureScenario},
     local_logs,
     notifications::NotificationManager,
@@ -127,10 +128,11 @@ impl Daemon {
         let storage = Storage::open(&config.paths.db)?;
         fixtures::seed(&storage, scenario).await?;
         let notifications = NotificationManager::new(storage.clone(), true);
-        let refresh = Arc::new(RefreshCoordinator::with_notifications(
+        let refresh = Arc::new(RefreshCoordinator::with_notifications_and_connectivity(
             storage.clone(),
             Vec::new(),
             notifications,
+            ConnectivityMonitor::fixed(usage_core::ConnectivityStatus::Online),
         ));
         let (runtime, poll_schedule_rx) =
             DaemonRuntime::new_with_fixture_mode(config, storage, refresh, true);

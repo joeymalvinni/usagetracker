@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
 use serde::Serialize;
 use usage_core::{
-    AggregateProvenance, PricingCoverage, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+    AggregateProvenance, ConnectivityStatus, PricingCoverage, UsageAmount, UsageUnit, UsageWindow,
+    UsageWindowKind,
 };
 
 use crate::selection::{latest_snapshots, SelectedState};
@@ -13,6 +14,7 @@ pub struct SummaryView {
     #[serde(rename = "type")]
     response_type: &'static str,
     pub generated_at: DateTime<Utc>,
+    pub connectivity: ConnectivityStatus,
     pub providers: Vec<SummaryProvider>,
 }
 
@@ -162,6 +164,7 @@ impl SummaryView {
         Self {
             response_type: "summary",
             generated_at: selected.generated_at,
+            connectivity: selected.connectivity.status,
             providers,
         }
     }

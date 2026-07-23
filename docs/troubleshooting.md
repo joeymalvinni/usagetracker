@@ -46,6 +46,7 @@ See [Apple's official app-opening safety guide](https://support.apple.com/102445
 
 | Status | What to do |
 | --- | --- |
+| Machine offline | UsageTracker keeps showing last-known usage and skips remote collection until macOS reports a usable route again. This is shown once at the summary level rather than as one error per provider. |
 | `credentials_missing` | Sign in with the provider, or confirm the Keychain/file/browser source you configured actually exists. |
 | `credentials_invalid` / `unauthorized` | Run `providers repair PROVIDER`, or repair a specific account with `--account`. |
 | `rate_limited` / `backing_off` | Wait it out. Rate limits use the provider's own retry info, or a bounded exponential backoff — hammering refresh won't get you past it. |

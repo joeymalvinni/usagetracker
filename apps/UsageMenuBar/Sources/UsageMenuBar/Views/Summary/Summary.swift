@@ -67,6 +67,7 @@ struct Summary: View {
 
     private var summarySubtitle: HeaderSubtitleStyle {
         if state.daemon == .offline { return .offline }
+        if state.connectivity.status == .offline { return .networkOffline }
         guard let date = state.lastSuccessfulRefresh else { return .custom("waiting for first successful refresh") }
         return .custom("last refreshed \(DateFormats.relative.localizedString(for: date, relativeTo: Date()))")
     }

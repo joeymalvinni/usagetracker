@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 use crate::render::style::{relative_time, truncate, visible_len, Theme};
 use crate::views::{DataState, SummaryLimit, SummaryProvider, SummaryView};
+use usage_core::ConnectivityStatus;
 
 pub fn render_summary(view: &SummaryView, color: bool, width: usize) -> String {
     let theme = Theme::new(color);
@@ -26,7 +27,12 @@ pub fn render_summary(view: &SummaryView, color: bool, width: usize) -> String {
         }
         columns.retain(|column| *column != removable);
     }
-    render_table(view, &columns, theme, width)
+    let table = render_table(view, &columns, theme, width);
+    if view.connectivity == ConnectivityStatus::Offline {
+        format!("Offline — showing last known usage.\n\n{table}")
+    } else {
+        table
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

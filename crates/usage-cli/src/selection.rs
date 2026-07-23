@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, Context};
 use usage_core::{
-    aggregate_usage_dashboard, Account, ConfigResponse, ProviderCapabilities, ProviderDescriptor,
-    ProviderHealth, StateSnapshot, UsageDashboardSummary, UsageForecast, UsageSnapshot,
-    UsageWindowProvenance,
+    aggregate_usage_dashboard, Account, ConfigResponse, Connectivity, ProviderCapabilities,
+    ProviderDescriptor, ProviderHealth, StateSnapshot, UsageDashboardSummary, UsageForecast,
+    UsageSnapshot, UsageWindowProvenance,
 };
 
 const ALIASES: &[(&str, &str)] = &[
@@ -214,6 +214,7 @@ pub struct SelectionRequest {
 #[derive(Debug)]
 pub struct SelectedState {
     pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub connectivity: Connectivity,
     pub catalog: ProviderCatalog,
     pub provider_ids: Vec<String>,
     pub config: ConfigResponse,
@@ -284,6 +285,7 @@ impl SelectedState {
 
         Ok(Self {
             generated_at: state.generated_at,
+            connectivity: state.connectivity,
             catalog,
             provider_ids,
             config: state.config,

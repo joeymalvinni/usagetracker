@@ -3,6 +3,115 @@ import XCTest
 @testable import UsageMenuBar
 
 final class DashboardBuilderTests: XCTestCase {
+    func testOfflineProviderWithoutCachedUsageRemainsStale() throws {
+        let output = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [],
+            health: [],
+            snapshots: [],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            connectivity: .offline,
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.primary, "No data")
+        XCTAssertEqual(provider.status, .stale)
+    }
+
+    func testOfflineMutesBarsAndSuppressesOnlyNetworkHealth() throws {
+        let account = account(id: "codex-account", providerId: "codex")
+        let snapshot = UsageSnapshot(
+            providerId: "codex",
+            accountId: account.id,
+            collectedAt: Date().addingTimeInterval(-3_600),
+            windows: [
+                UsageWindow(
+                    windowId: "weekly",
+                    label: "Weekly limit",
+                    kind: .weekly,
+                    used: nil,
+                    limit: nil,
+                    remaining: nil,
+                    percentUsed: 20,
+                    percentRemaining: 80,
+                    resetAt: nil
+                ),
+            ]
+        )
+        let networkHealth = ProviderHealth(
+            providerId: "codex",
+            accountId: account.id,
+            status: .providerError,
+            collectionMode: "oauth",
+            lastSuccessAt: snapshot.collectedAt,
+            lastFailureAt: Date(),
+            lastErrorCode: "network",
+            lastErrorMessage: "error fetching URL",
+            updatedAt: Date()
+        )
+        let output = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [account],
+            health: [networkHealth],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            connectivity: .offline,
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.status, .normal)
+        XCTAssertNil(provider.errorDetail)
+        XCTAssertTrue(try XCTUnwrap(provider.windows.first).isMuted)
+
+        let onlineOutput = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [account],
+            health: [networkHealth],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            connectivity: .online,
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+        XCTAssertEqual(try XCTUnwrap(onlineOutput.providers.first).status, .error)
+
+        let authHealth = ProviderHealth(
+            providerId: "codex",
+            accountId: account.id,
+            status: .authFailed,
+            collectionMode: "oauth",
+            lastSuccessAt: snapshot.collectedAt,
+            lastFailureAt: Date(),
+            lastErrorCode: "unauthorized",
+            lastErrorMessage: "Sign in again",
+            updatedAt: Date()
+        )
+        let authOutput = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [account],
+            health: [authHealth],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            connectivity: .offline,
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        XCTAssertEqual(try XCTUnwrap(authOutput.providers.first).status, .error)
+    }
+
     func testStaleProviderShowsRefreshingOnlyWhileThatProviderRefreshes() throws {
         let snapshot = UsageSnapshot(
             providerId: "codex",

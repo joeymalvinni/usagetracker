@@ -103,6 +103,7 @@ fn run_dashboard_with_state(
             all_providers: args.all_providers,
         },
     )?;
+    let offline = selected.connectivity.status == usage_core::ConnectivityStatus::Offline;
     if style == OutputStyle::Json {
         return print_json(&ApiResponse::Usage {
             snapshots: selected.snapshots,
@@ -150,6 +151,9 @@ fn run_dashboard_with_state(
             output.push_str("\n\n");
         }
         output.push_str(&empty_states);
+    }
+    if offline {
+        output = format!("Offline — showing last known usage.\n\n{output}");
     }
     println!("{output}");
     Ok(())
@@ -273,6 +277,10 @@ async fn run_refresh(
     }
 
     let state = fetch_state(client).await?;
+    if job.skipped_offline {
+        println!("Refresh skipped — no internet connection. Last-known usage was preserved.");
+        return Ok(());
+    }
     let started_at = job.started_at.unwrap_or(job.created_at);
     let finished_at = job.finished_at.unwrap_or_else(Utc::now);
     println!(

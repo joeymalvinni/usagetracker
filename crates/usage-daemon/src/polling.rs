@@ -19,6 +19,7 @@ use usage_core::{
 };
 
 use crate::{
+    connectivity::ConnectivityMonitor,
     health,
     notifications::NotificationManager,
     providers::{
@@ -51,6 +52,7 @@ struct CollectionState {
 #[derive(Clone)]
 pub struct RefreshCoordinator {
     storage: Storage,
+    connectivity: ConnectivityMonitor,
     notifications: Arc<NotificationManager>,
     providers: Arc<RwLock<Vec<Arc<dyn ProviderCollector>>>>,
     jobs: Arc<Mutex<RefreshJobs>>,
@@ -99,7 +101,22 @@ impl RefreshCoordinator {
     #[cfg(test)]
     pub fn new(storage: Storage, providers: Vec<Arc<dyn ProviderCollector>>) -> Self {
         let notifications = NotificationManager::new(storage.clone(), false);
-        Self::with_notifications(storage, providers, notifications)
+        Self::with_notifications_and_connectivity(
+            storage,
+            providers,
+            notifications,
+            ConnectivityMonitor::fixed(usage_core::ConnectivityStatus::Online),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn new_with_connectivity(
+        storage: Storage,
+        providers: Vec<Arc<dyn ProviderCollector>>,
+        connectivity: ConnectivityMonitor,
+    ) -> Self {
+        let notifications = NotificationManager::new(storage.clone(), false);
+        Self::with_notifications_and_connectivity(storage, providers, notifications, connectivity)
     }
 
     pub fn with_notifications(
@@ -107,14 +124,33 @@ impl RefreshCoordinator {
         providers: Vec<Arc<dyn ProviderCollector>>,
         notifications: Arc<NotificationManager>,
     ) -> Self {
+        Self::with_notifications_and_connectivity(
+            storage,
+            providers,
+            notifications,
+            ConnectivityMonitor::system(),
+        )
+    }
+
+    pub(crate) fn with_notifications_and_connectivity(
+        storage: Storage,
+        providers: Vec<Arc<dyn ProviderCollector>>,
+        notifications: Arc<NotificationManager>,
+        connectivity: ConnectivityMonitor,
+    ) -> Self {
         Self {
             storage,
+            connectivity,
             notifications,
             providers: Arc::new(RwLock::new(providers)),
             jobs: Arc::new(Mutex::new(RefreshJobs::default())),
             provider_flights: Arc::new(Mutex::new(HashMap::new())),
             local_provider_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn connectivity(&self) -> usage_core::Connectivity {
+        self.connectivity.current()
     }
 
     pub async fn set_providers(&self, providers: Vec<Arc<dyn ProviderCollector>>) {
@@ -340,6 +376,7 @@ impl RefreshCoordinator {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            skipped_offline: false,
             provider_results: Vec::new(),
             failure_message: None,
         };
@@ -379,6 +416,7 @@ impl RefreshCoordinator {
             job.status = RefreshJobStatus::Completed;
             job.started_at = Some(report.started_at);
             job.finished_at = Some(report.finished_at);
+            job.skipped_offline = report.skipped_offline;
             job.provider_results = report.provider_results;
             job.id.clone()
         };
@@ -436,6 +474,39 @@ impl RefreshCoordinator {
             "refresh started"
         );
 
+        if self.connectivity.current().status == usage_core::ConnectivityStatus::Offline {
+            let provider_ids = providers
+                .into_iter()
+                .filter_map(|provider| {
+                    let provider_id = provider.provider_id();
+                    should_refresh_provider(&provider_id, filter).then_some(provider_id)
+                })
+                .collect::<Vec<_>>();
+            let local_datasets = self.refresh_local(&provider_ids).await;
+            let provider_results = provider_ids
+                .into_iter()
+                .map(|provider_id| ProviderRefreshResult {
+                    provider_id,
+                    account_id: None,
+                    status: ProviderRefreshStatus::Network,
+                    collection_mode: None,
+                    collected_at: None,
+                    message: Some("No internet connection. Showing last known usage.".to_string()),
+                })
+                .collect::<Vec<_>>();
+            let finished_at = Utc::now();
+            info!(
+                results = provider_results.len(),
+                local_datasets, "refresh skipped because the machine is offline"
+            );
+            return RefreshReport {
+                started_at,
+                finished_at,
+                skipped_offline: true,
+                provider_results,
+            };
+        }
+
         let refreshes = providers.into_iter().filter_map(|provider| {
             let provider_id = provider.provider_id();
             if should_refresh_provider(&provider_id, filter) {
@@ -463,6 +534,7 @@ impl RefreshCoordinator {
         RefreshReport {
             started_at,
             finished_at,
+            skipped_offline: false,
             provider_results,
         }
     }
@@ -1182,6 +1254,16 @@ impl RefreshCoordinator {
             error = %error,
             "provider refresh failed"
         );
+        if error.kind() == ProviderErrorKind::Network
+            && self.connectivity.current().status == usage_core::ConnectivityStatus::Offline
+        {
+            info!(
+                provider_id = provider_id.as_str(),
+                account_id = account_id.as_ref().map(AccountId::as_str),
+                "preserving provider health because the machine is offline"
+            );
+            return provider_error_result(provider_id, account_id, error);
+        }
         let provider_health =
             health::from_provider_error(provider_id.clone(), account_id.clone(), &error);
         if let Err(err) = self.storage.upsert_health(&provider_health).await {
@@ -1316,6 +1398,7 @@ fn jittered_backoff_seconds(
 pub struct RefreshReport {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    pub skipped_offline: bool,
     pub provider_results: Vec<ProviderRefreshResult>,
 }
 
@@ -1324,6 +1407,7 @@ impl RefreshReport {
         Self {
             started_at: job.started_at.unwrap_or(job.created_at),
             finished_at: job.finished_at.unwrap_or_else(Utc::now),
+            skipped_offline: job.skipped_offline,
             provider_results: job.provider_results,
         }
     }
@@ -1979,6 +2063,64 @@ mod tests {
             .windows
             .iter()
             .any(|window| window.window_id == "remote_quota"));
+        assert_eq!(snapshot.metadata["remote"], true);
+        assert_eq!(snapshot.metadata["claude_cost"]["tokens"], 42);
+    }
+
+    #[tokio::test]
+    async fn offline_refresh_skips_collectors_and_preserves_provider_health() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account = storage
+            .upsert_account(&provider_id, "claude-account", Some("default"), None, None)
+            .await
+            .unwrap();
+        storage
+            .insert_snapshot(&usage_core::UsageSnapshot {
+                provider_id: provider_id.clone(),
+                account_id: account.id,
+                collected_at: Utc::now() - chrono::TimeDelta::minutes(2),
+                windows: Vec::new(),
+                metadata: json!({"remote": true}),
+            })
+            .await
+            .unwrap();
+        let existing = ProviderHealth {
+            provider_id,
+            account_id: None,
+            status: ProviderHealthStatus::Ok,
+            collection_mode: Some("oauth".to_string()),
+            last_success_at: Some(Utc::now() - chrono::TimeDelta::minutes(2)),
+            last_failure_at: None,
+            last_error_code: None,
+            last_error_message: None,
+            updated_at: Utc::now() - chrono::TimeDelta::minutes(2),
+        };
+        storage.upsert_health(&existing).await.unwrap();
+        let remote_attempts = Arc::new(AtomicUsize::new(0));
+        let coordinator = RefreshCoordinator::new_with_connectivity(
+            storage.clone(),
+            vec![Arc::new(LocalOnlyProvider {
+                remote_attempts: remote_attempts.clone(),
+            })],
+            ConnectivityMonitor::fixed(usage_core::ConnectivityStatus::Offline),
+        );
+
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(remote_attempts.load(Ordering::SeqCst), 0);
+        assert!(report.skipped_offline);
+        assert_eq!(report.provider_results.len(), 1);
+        assert_eq!(
+            report.provider_results[0].status,
+            ProviderRefreshStatus::Network
+        );
+        let health = storage.provider_health().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+        assert_eq!(health[0].last_success_at, existing.last_success_at);
+        assert!(health[0].last_error_code.is_none());
+        let snapshot = storage.latest_usage().await.unwrap().remove(0);
         assert_eq!(snapshot.metadata["remote"], true);
         assert_eq!(snapshot.metadata["claude_cost"]["tokens"], 42);
     }

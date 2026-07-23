@@ -56,6 +56,7 @@ enum MenuBarProgressIcon {
     }
 
     private static func fillColor(for row: MenuBarProviderVM) -> NSColor {
+        if row.isMuted { return .secondaryLabelColor }
         switch row.status {
         case .warning:
             return .systemOrange
@@ -75,6 +76,13 @@ enum MenuBarProgressIcon {
         case .stale, .refreshing, .disabled, .normal:
             nil
         }
-        return MenuBarProviderVM(id: "usage", providerId: "usage", short: "", percent: percent, status: status)
+        return MenuBarProviderVM(
+            id: "usage",
+            providerId: "usage",
+            short: "",
+            percent: percent,
+            status: status,
+            isMuted: status == .offline
+        )
     }
 }

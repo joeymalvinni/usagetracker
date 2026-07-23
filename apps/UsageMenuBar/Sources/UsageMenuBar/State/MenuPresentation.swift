@@ -2,6 +2,7 @@ extension AppState {
     nonisolated static func menuContent(
         providers: [ProviderVM],
         daemon: DaemonState,
+        connectivity: ConnectivityStatus = .unknown,
         ui: UIConfig,
         eligibleProviderIDs: Set<String>
     ) -> (preview: String, status: DisplayStatus, bars: [MenuBarProviderVM]) {
@@ -26,10 +27,14 @@ extension AppState {
                 providerId: provider.providerId,
                 short: provider.short,
                 percent: displayed,
-                status: provider.status
+                status: provider.status,
+                isMuted: connectivity == .offline
             )
         }
         guard !preview.isEmpty else { return ("Usage", .stale, []) }
+        if connectivity == .offline {
+            return ("Offline · showing last known usage", .offline, bars)
+        }
         return (preview, shown.map(\.status).max { $0.severity < $1.severity } ?? .stale, bars)
     }
 

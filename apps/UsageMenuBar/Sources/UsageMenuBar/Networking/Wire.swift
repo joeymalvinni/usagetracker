@@ -118,6 +118,7 @@ struct UsageResponse: Decodable {
 
 struct StateResponse: Decodable {
     let generatedAt: Date
+    let connectivity: Connectivity
     let server: ServerInfo
     let config: ConfigResponse
     let accounts: [Account]
@@ -130,6 +131,7 @@ struct StateResponse: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        connectivity = try c.decodeIfPresent(Connectivity.self, forKey: .connectivity) ?? .unknown
         server = try c.decode(ServerInfo.self, forKey: .server)
         config = try c.decode(ConfigResponse.self, forKey: .config)
         accounts = try c.decode([Account].self, forKey: .accounts)
@@ -144,7 +146,7 @@ struct StateResponse: Decodable {
     }
 
     private enum K: String, CodingKey {
-        case generatedAt, server, config, accounts, health, snapshots, forecasts, dashboard
+        case generatedAt, connectivity, server, config, accounts, health, snapshots, forecasts, dashboard
         case windowProvenance
     }
 }

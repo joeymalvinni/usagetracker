@@ -468,9 +468,25 @@ final class DaemonClientTests: XCTestCase {
         guard case let .state(snapshot) = state else {
             return XCTFail("expected state fixture")
         }
+        XCTAssertEqual(snapshot.connectivity.status, .online)
         XCTAssertEqual(snapshot.config.pollIntervalSeconds, 300)
         XCTAssertEqual(snapshot.config.providers["codex"]?.enabled, true)
         XCTAssertEqual(snapshot.dashboard.pricing.coveredPercent, 100)
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any]
+        )
+        var legacyState = try XCTUnwrap(legacyObject["state"] as? [String: Any])
+        legacyState.removeValue(forKey: "connectivity")
+        legacyObject["state"] = legacyState
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        guard case let .state(legacySnapshot) = try JSONDecoder.usage.decode(
+            DaemonResponse.self,
+            from: legacyData
+        ) else {
+            return XCTFail("expected legacy state fixture")
+        }
+        XCTAssertEqual(legacySnapshot.connectivity.status, .unknown)
     }
 
     private func rustWireFixture(_ name: String) -> URL {
@@ -547,7 +563,7 @@ final class DaemonClientTests: XCTestCase {
             {"api_version":3,"type":"refresh_started","coalesced":true,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
             """,
             """
-            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"completed","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":"2026-07-11T12:00:01Z","provider_results":[{"provider_id":"codex","account_id":"account-1","status":"ok","collection_mode":"provider_api","collected_at":"2026-07-11T12:00:01Z","message":null}],"failure_message":null}}
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"completed","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":"2026-07-11T12:00:01Z","skipped_offline":true,"provider_results":[{"provider_id":"codex","account_id":"account-1","status":"network","collection_mode":null,"collected_at":null,"message":"No internet connection. Showing last known usage."}],"failure_message":null}}
             """,
         ])
         let client = DaemonClient(
@@ -558,6 +574,7 @@ final class DaemonClientTests: XCTestCase {
         )
 
         let response = try await client.refresh(["codex"])
+        XCTAssertTrue(response.skippedOffline)
         XCTAssertEqual(response.providerResults.count, 1)
         XCTAssertEqual(response.providerResults[0].providerId, "codex")
 
@@ -828,6 +845,23 @@ final class ProviderCatalogTests: XCTestCase {
 }
 
 final class MenuBarPresentationTests: XCTestCase {
+    func testOfflineMenuKeepsPercentagesButMutesEveryBar() {
+        let providers = [provider("codex", short: "C", percent: 80)]
+
+        let presentation = AppState.menuContent(
+            providers: providers,
+            daemon: .online,
+            connectivity: .offline,
+            ui: UIConfig(),
+            eligibleProviderIDs: ["codex"]
+        )
+
+        XCTAssertEqual(presentation.preview, "Offline · showing last known usage")
+        XCTAssertEqual(presentation.status, .offline)
+        XCTAssertEqual(presentation.bars.first?.percent, 80)
+        XCTAssertEqual(presentation.bars.first?.isMuted, true)
+    }
+
     func testDarkModeIsEnabledByDefault() throws {
         XCTAssertTrue(UIConfig().darkModeEnabled)
 

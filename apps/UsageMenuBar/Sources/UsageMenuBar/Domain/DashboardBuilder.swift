@@ -42,6 +42,7 @@ struct DashboardBuilder {
     let forecasts: [UsageForecast]
     let dashboard: UsageDashboardSummary
     let windowProvenance: [UsageWindowProvenance]
+    let connectivity: ConnectivityStatus
     let serverProviders: [String: ServerProviderDescriptor]
     let serverProviderOrder: [String]
     let ui: UIConfig
@@ -64,6 +65,7 @@ struct DashboardBuilder {
         forecasts: [UsageForecast],
         dashboard: UsageDashboardSummary,
         windowProvenance: [UsageWindowProvenance],
+        connectivity: ConnectivityStatus = .unknown,
         serverProviders: [String: ServerProviderDescriptor] = [:],
         serverProviderOrder: [String] = [],
         ui: UIConfig,
@@ -77,6 +79,7 @@ struct DashboardBuilder {
         self.forecasts = forecasts
         self.dashboard = dashboard
         self.windowProvenance = windowProvenance
+        self.connectivity = connectivity
         self.serverProviders = serverProviders
         self.serverProviderOrder = serverProviderOrder
         self.ui = ui
@@ -596,7 +599,7 @@ struct DashboardBuilder {
     }
 
     private func selectedHealth(providerId: String, accountId: String?) -> ProviderHealth? {
-        let providerHealth = healthByProvider[providerId] ?? []
+        let providerHealth = (healthByProvider[providerId] ?? []).filter { !suppressesHealth($0) }
         if let accountId, let accountHealth = providerHealth.first(where: { $0.accountId == accountId }) {
             return accountHealth
         }
@@ -604,7 +607,7 @@ struct DashboardBuilder {
     }
 
     private func worstHealthText(providerId: String) -> String {
-        let providerHealth = healthByProvider[providerId] ?? []
+        let providerHealth = (healthByProvider[providerId] ?? []).filter { !suppressesHealth($0) }
         let accountHealth = providerHealth.filter { $0.accountId != nil }
         let relevant = accountHealth.isEmpty ? providerHealth : accountHealth
         let worst = relevant.max {
@@ -634,6 +637,10 @@ struct DashboardBuilder {
         }
     }
 
+    private func suppressesHealth(_ health: ProviderHealth) -> Bool {
+        connectivity == .offline && health.lastErrorCode == "network"
+    }
+
     private func window(_ w: UsageWindow, providerId: String, accountId: String) -> WindowVM {
         let percent = (w.percentRemaining ?? computedPercent(w)).map { max(0, min(100, $0)) }
         let status: DisplayStatus = percent.map { $0 < 10 ? .critical : ($0 < 25 ? .warning : .normal) } ?? .normal
@@ -651,7 +658,8 @@ struct DashboardBuilder {
             percent: percent,
             status: status,
             resetAt: w.resetAt,
-            forecast: matchingForecast.map(windowForecast)
+            forecast: matchingForecast.map(windowForecast),
+            isMuted: connectivity == .offline
         )
     }
 
@@ -714,11 +722,15 @@ struct DashboardBuilder {
         case .backingOff?: return .warning
         default: return .error
         }
-        if let latest, Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) {
+        if connectivity != .offline,
+           let latest,
+           Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) {
             return refreshingProviderIDs.contains(id) ? .refreshing : .stale
         }
         if let percent { return percent < 10 ? .critical : (percent < 25 ? .warning : .normal) }
-        if latest == nil { return refreshingProviderIDs.contains(id) ? .refreshing : .stale }
+        if latest == nil {
+            return refreshingProviderIDs.contains(id) ? .refreshing : .stale
+        }
         return .normal
     }
 

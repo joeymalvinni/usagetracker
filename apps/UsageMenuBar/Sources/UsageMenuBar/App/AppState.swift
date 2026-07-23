@@ -30,6 +30,7 @@ private enum ProviderSignInFollowUp {
 @MainActor final class AppState: ObservableObject {
     let updater = AppUpdater()
     @Published var daemon: DaemonState = .unknown
+    @Published var connectivity: Connectivity = .unknown
     @Published var config: ConfigResponse?
     @Published var accounts = [Account]()
     @Published var health = [ProviderHealth]()
@@ -185,8 +186,8 @@ private enum ProviderSignInFollowUp {
         defer { endRefreshing(providerIDs) }
         do {
             let report = try await client.refresh(Array(providerIDs).sorted())
-            applyRefreshOutcome(report)
             await load()
+            applyRefreshOutcome(report)
         } catch {
             actionError = describe(error)
         }
@@ -197,8 +198,8 @@ private enum ProviderSignInFollowUp {
         defer { endRefreshing(providerIDs) }
         do {
             let report = try await client.refresh([id])
-            applyRefreshOutcome(report)
             await load()
+            applyRefreshOutcome(report)
         } catch {
             actionError = describe(error)
         }
@@ -208,8 +209,9 @@ private enum ProviderSignInFollowUp {
         await perform(.provider(id)) {
             config = try await client.updateConfig(pollIntervalSeconds: nil, providers: [id: enabled])
             build()
-            if enabled { applyRefreshOutcome(try await client.refresh([id])) }
+            let report = enabled ? try await client.refresh([id]) : nil
             await load()
+            if let report { applyRefreshOutcome(report) }
         }
     }
 
@@ -363,10 +365,12 @@ private enum ProviderSignInFollowUp {
     func setAccountCollectionEnabled(_ id: String, _ enabled: Bool) async {
         await perform(.account(id)) {
             _ = try await client.updateAccount(accountId: id, hidden: enabled ? false : nil, collectionEnabled: enabled)
+            var report: RefreshResponse?
             if enabled, let providerId = accounts.first(where: { $0.id == id })?.providerId {
-                applyRefreshOutcome(try await client.refresh([providerId]))
+                report = try await client.refresh([providerId])
             }
             await load()
+            if let report { applyRefreshOutcome(report) }
         }
     }
 
@@ -484,8 +488,9 @@ private enum ProviderSignInFollowUp {
                 settings: values
             )
             actionMessage = "\(providerName(providerId)) setup updated."
-            applyRefreshOutcome(try await client.refresh([providerId]))
+            let report = try await client.refresh([providerId])
             await load()
+            applyRefreshOutcome(report)
         }
     }
 
@@ -723,6 +728,7 @@ private enum ProviderSignInFollowUp {
                 uniqueKeysWithValues: state.server.providers.map { ($0.id, $0) }
             )
             if config != state.config { config = state.config }
+            if connectivity != state.connectivity { connectivity = state.connectivity }
             updateSocketPath(from: state.config)
             if accounts != state.accounts { accounts = state.accounts }
             if health != state.health { health = state.health }
@@ -786,8 +792,8 @@ private enum ProviderSignInFollowUp {
             defer { endRefreshing(providerIDs) }
             do {
                 let report = try await client.refresh(Array(providerIDs).sorted())
-                applyRefreshOutcome(report)
                 await load()
+                applyRefreshOutcome(report)
             } catch {
                 actionError = describe(error)
             }
@@ -922,6 +928,11 @@ private enum ProviderSignInFollowUp {
         (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
     private func applyRefreshOutcome(_ report: RefreshResponse) {
+        if report.skippedOffline {
+            actionError = nil
+            actionMessage = "No internet connection. Showing last known usage."
+            return
+        }
         let failures = report.providerResults.filter {
             switch $0.status {
             case .ok, .disabled: false
@@ -994,6 +1005,7 @@ private enum ProviderSignInFollowUp {
         let ui = ui
         let refreshingProviderIDs = Set(refreshingProviderCounts.keys)
         let daemon = daemon
+        let connectivity = connectivity.status
         let menuEligibleProviderIDs = Self.providerIDsWithDataOrConnection(
             accounts: accounts,
             snapshots: snapshots
@@ -1013,6 +1025,7 @@ private enum ProviderSignInFollowUp {
                     forecasts: forecasts,
                     dashboard: dashboardSummary,
                     windowProvenance: windowProvenance,
+                    connectivity: connectivity,
                     serverProviders: serverProviders,
                     serverProviderOrder: serverProviderOrder,
                     ui: ui,
@@ -1022,6 +1035,7 @@ private enum ProviderSignInFollowUp {
                 return Self.derive(
                     from: engine.build(),
                     daemon: daemon,
+                    connectivity: connectivity,
                     ui: ui,
                     menuEligibleProviderIDs: menuEligibleProviderIDs
                 )
@@ -1039,6 +1053,7 @@ private enum ProviderSignInFollowUp {
     nonisolated private static func derive(
         from output: DashboardBuilder.Output,
         daemon: DaemonState,
+        connectivity: ConnectivityStatus,
         ui: UIConfig,
         menuEligibleProviderIDs: Set<String>
     ) -> DerivedState {
@@ -1046,6 +1061,7 @@ private enum ProviderSignInFollowUp {
         let menu = menuContent(
             providers: visibleProviders,
             daemon: daemon,
+            connectivity: connectivity,
             ui: ui,
             eligibleProviderIDs: menuEligibleProviderIDs
         )
@@ -1075,6 +1091,7 @@ private enum ProviderSignInFollowUp {
         let menu = Self.menuContent(
             providers: state.providers,
             daemon: daemon,
+            connectivity: connectivity.status,
             ui: ui,
             eligibleProviderIDs: eligibleProviderIDs
         )

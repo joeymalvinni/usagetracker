@@ -118,6 +118,7 @@ struct MenuBarProviderVM: Identifiable, Equatable, Sendable {
     let short: String
     let percent: Double?
     let status: DisplayStatus
+    var isMuted: Bool = false
 }
 
 struct WindowVM: Identifiable, Equatable, Sendable {
@@ -130,6 +131,7 @@ struct WindowVM: Identifiable, Equatable, Sendable {
     /// the explicit-date disclosure; `reset` is its pre-rendered short form.
     var resetAt: Date? = nil
     var forecast: WindowForecastVM? = nil
+    var isMuted: Bool = false
 }
 
 struct WindowForecastVM: Equatable, Sendable {

@@ -3,6 +3,10 @@
   "type": "state",
   "state": {
     "generated_at": "2026-07-11T12:00:00Z",
+    "connectivity": {
+      "status": "online",
+      "changed_at": "2026-07-11T11:59:00Z"
+    },
     "server": {
       "api_version": 3,
       "capabilities": ["typed_errors", "usage_provenance", "refresh_jobs", "refresh_coalescing", "combined_state", "usage_events"],

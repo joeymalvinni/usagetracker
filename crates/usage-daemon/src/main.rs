@@ -1,4 +1,5 @@
 mod config;
+mod connectivity;
 mod daemon;
 mod dashboard;
 mod fixtures;

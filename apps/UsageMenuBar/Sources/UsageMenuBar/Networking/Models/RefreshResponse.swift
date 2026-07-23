@@ -2,11 +2,13 @@ import Foundation
 
 struct RefreshResponse: Decodable, Equatable {
     let startedAt, finishedAt: Date
+    let skippedOffline: Bool
     let providerResults: [ProviderRefreshResult]
 
     init(job: RefreshJob) {
         startedAt = job.startedAt ?? job.createdAt
         finishedAt = job.finishedAt ?? job.startedAt ?? job.createdAt
+        skippedOffline = job.skippedOffline
         providerResults = job.providerResults
     }
 }
@@ -18,6 +20,7 @@ struct RefreshJob: Decodable, Equatable, Sendable {
     let status: RefreshJobStatus
     let createdAt: Date
     let startedAt, finishedAt: Date?
+    let skippedOffline: Bool
     let providerResults: [ProviderRefreshResult]
     let failureMessage: String?
 
@@ -30,6 +33,7 @@ struct RefreshJob: Decodable, Equatable, Sendable {
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
         finishedAt = try container.decodeIfPresent(Date.self, forKey: .finishedAt)
+        skippedOffline = try container.decodeIfPresent(Bool.self, forKey: .skippedOffline) ?? false
         providerResults = try container.decodeIfPresent(
             [ProviderRefreshResult].self,
             forKey: .providerResults
@@ -39,7 +43,7 @@ struct RefreshJob: Decodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, scope, trigger, status, createdAt, startedAt, finishedAt
-        case providerResults, failureMessage
+        case skippedOffline, providerResults, failureMessage
     }
 }
 

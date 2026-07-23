@@ -506,6 +506,7 @@ impl SocketServer {
         ApiResponse::State {
             state: StateSnapshot {
                 generated_at,
+                connectivity: self.runtime.refresh.connectivity(),
                 server: ServerInfo::current(crate::runtime::provider_registry::descriptors()),
                 config,
                 accounts,
@@ -1207,6 +1208,10 @@ mod tests {
         assert_eq!(state.accounts.len(), 6);
         assert_eq!(state.snapshots.len(), 6);
         assert_eq!(state.server.api_version, API_VERSION);
+        assert_eq!(
+            state.connectivity.status,
+            usage_core::ConnectivityStatus::Online
+        );
         assert!(state
             .server
             .capabilities

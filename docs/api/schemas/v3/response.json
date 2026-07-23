@@ -314,6 +314,33 @@
       ],
       "type": "object"
     },
+    "Connectivity": {
+      "description": "Transient machine-wide network reachability reported by the daemon.\n\nThis deliberately lives outside provider health: losing the computer's\nnetwork route is not a durable failure of every configured provider.",
+      "properties": {
+        "changed_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ConnectivityStatus"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "ConnectivityStatus": {
+      "enum": [
+        "online",
+        "offline",
+        "unknown"
+      ],
+      "type": "string"
+    },
     "CostSummary": {
       "properties": {
         "days": {
@@ -1041,6 +1068,10 @@
         "scope": {
           "$ref": "#/$defs/RefreshScope"
         },
+        "skipped_offline": {
+          "description": "True when the daemon completed the job without remote collection\nbecause machine-wide reachability was definitively offline.",
+          "type": "boolean"
+        },
         "started_at": {
           "format": "date-time",
           "type": [
@@ -1183,6 +1214,12 @@
         },
         "config": {
           "$ref": "#/$defs/ConfigResponse"
+        },
+        "connectivity": {
+          "$ref": "#/$defs/Connectivity",
+          "default": {
+            "status": "unknown"
+          }
         },
         "dashboard": {
           "$ref": "#/$defs/UsageDashboardSummary"

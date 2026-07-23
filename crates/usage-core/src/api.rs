@@ -375,6 +375,8 @@ pub enum ApiResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct StateSnapshot {
     pub generated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub connectivity: Connectivity,
     pub server: ServerInfo,
     pub config: ConfigResponse,
     pub accounts: Vec<Account>,
@@ -385,6 +387,26 @@ pub struct StateSnapshot {
     pub forecasts: Vec<UsageForecast>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub window_provenance: Vec<UsageWindowProvenance>,
+}
+
+/// Transient machine-wide network reachability reported by the daemon.
+///
+/// This deliberately lives outside provider health: losing the computer's
+/// network route is not a durable failure of every configured provider.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct Connectivity {
+    pub status: ConnectivityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityStatus {
+    Online,
+    Offline,
+    #[default]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -495,6 +517,10 @@ pub struct RefreshJob {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// True when the daemon completed the job without remote collection
+    /// because machine-wide reachability was definitively offline.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_offline: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_results: Vec<ProviderRefreshResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -849,8 +875,26 @@ mod tests {
             panic!("unexpected fixture response");
         };
         assert_eq!(state.server.api_version, API_VERSION);
+        assert_eq!(state.connectivity.status, ConnectivityStatus::Online);
         assert_eq!(state.config.poll_interval_seconds, 300);
         assert!(state.snapshots.is_empty());
+    }
+
+    #[test]
+    fn state_without_connectivity_defaults_to_unknown() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../wire-fixtures/state_v3.json")).unwrap();
+        value["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectivity");
+
+        let response: ResponseEnvelope = serde_json::from_value(value).unwrap();
+        let ApiResponse::State { state } = response.response else {
+            panic!("unexpected fixture response");
+        };
+
+        assert_eq!(state.connectivity, Connectivity::default());
     }
 
     #[test]
@@ -877,6 +921,7 @@ mod tests {
             panic!("unexpected fixture response");
         };
         assert_eq!(job.status, RefreshJobStatus::Completed);
+        assert!(!job.skipped_offline);
         assert_eq!(job.provider_results.len(), 1);
     }
 

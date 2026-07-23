@@ -47,7 +47,7 @@ The exact shapes come from the [schemas](index.md) and [models](models.md).
 | Method | What it returns, and in what order | Expected errors | Budget |
 | --- | --- | --- | --- |
 | `get_server_info` | Current capabilities and providers, in fixed provider order. | Protocol errors only. | 3s |
-| `get_state` | The main config/accounts/health/usage/dashboard/forecast view. Storage components come from a single SQLite read transaction; config is read afterward. Lists use the ordering in [models](models.md). | `storage_unavailable` | 3s |
+| `get_state` | The main connectivity/config/accounts/health/usage/dashboard/forecast view. Connectivity is transient macOS reachability; storage components come from a single SQLite read transaction and config is read afterward. Lists use the ordering in [models](models.md). | `storage_unavailable` | 3s |
 | `get_usage` | The latest visible snapshot per account, plus 30 local-calendar days of dashboard activity and forecasts drawn from at most 35 days / 1,024 observations. Hidden accounts are left out. | `storage_unavailable` | 3s |
 | `get_usage_events` | One account's normalized provider events, newest first. `offset` defaults to 0 and `limit` defaults to 100 and must be 1–200. Events are returned separately from state and usage responses so large histories remain paginated. | `unknown_account`, `invalid_argument`, `storage_unavailable` | 3s |
 | `get_refresh_job` | The current retained job. Jobs live in memory, so unknown or expired IDs fail. | `unknown_refresh_job` | 3s |
@@ -62,7 +62,7 @@ Read results reflect storage at the moment each method reads it. They aren't sub
 
 | Method | Parameters, effects, retry, persistence | Expected errors |
 | --- | --- | --- |
-| `refresh` | Omitted or `null` `providers` means every enabled collector. A non-empty list is sorted and deduplicated; `[]` is invalid. Starts or joins background work and returns right away. Asking again while overlapping work is active can hand back the same job (`coalesced: true`). Job state isn't persistent, but successful provider data is. | `invalid_argument`, `unknown_provider` |
+| `refresh` | Omitted or `null` `providers` means every enabled collector. A non-empty list is sorted and deduplicated; `[]` is invalid. Starts or joins background work and returns right away. Asking again while overlapping work is active can hand back the same job (`coalesced: true`). When reachability is definitively offline, remote collectors are skipped and existing provider health is preserved. Job state isn't persistent, but successful provider data is. | `invalid_argument`, `unknown_provider` |
 | `acknowledge_notifications` | `ids` is required; `[]` is a valid no-op. Deletes matching queued rows in one transaction and echoes back every ID you sent, including ones already gone. Idempotent and persistent. | `storage_unavailable` |
 
 See [refresh jobs](refresh-jobs.md) for polling and failure details.

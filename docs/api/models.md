@@ -41,9 +41,11 @@ The generated [request](schemas/v3/request.json) and [response](schemas/v3/respo
 
 ## Health and refresh results
 
+`StateSnapshot.connectivity` is transient machine-wide reachability, separate from durable provider health. `offline` means macOS reports no usable default network route, `online` means a route is available (not that every provider is healthy), and `unknown` means reachability could not be determined. `changed_at` is when the daemon last observed a status transition. No external connectivity probe is sent.
+
 `ProviderHealth` is the durable latest state, and it can hold both the last success and last failure times at once. `last_error_*` is sanitized operational text, not an API error object. Health statuses are `ok`, `credentials_missing`, `auth_failed`, `rate_limited`, `provider_error`, `parse_error`, `backing_off`, and `disabled`.
 
-`ProviderRefreshResult` is one provider/account outcome inside a completed job. Its statuses are `ok`, `credentials_missing`, `credentials_invalid`, `unauthorized`, `rate_limited`, `network`, `parse`, `provider_unavailable`, `storage_error`, and `disabled`. A job can be `completed` even when some of these are failures.
+`ProviderRefreshResult` is one provider/account outcome inside a completed job. Its statuses are `ok`, `credentials_missing`, `credentials_invalid`, `unauthorized`, `rate_limited`, `network`, `parse`, `provider_unavailable`, `storage_error`, and `disabled`. A job can be `completed` even when some of these are failures. `RefreshJob.skipped_offline` identifies jobs where remote collection was skipped because machine-wide reachability was definitively offline; clients should use this job-scoped value instead of sampling connectivity again when presenting the outcome.
 
 ## Ordering
 
