@@ -49,6 +49,7 @@ private enum PendingAction {
     @Published var providerAuthenticationURLs = [String: String]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
     @Published var serverProviderOrder = [String]()
+    @Published var openSession: OpenSessionModel?
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
     @Published private(set) var derived = DerivedState.empty
@@ -437,6 +438,41 @@ private enum PendingAction {
         await perform(.account(accountId)) {
             let response = try await client.launchProviderAccount(accountId: accountId)
             actionMessage = response.message
+        }
+    }
+
+    func prepareOpenSession(_ accountId: String) async {
+        guard let account = accounts.first(where: { $0.id == accountId }) else {
+            actionError = "The selected account is no longer available."
+            return
+        }
+        guard supportsLaunchOptions(account.providerId) else {
+            await launchProviderAccount(accountId)
+            return
+        }
+        await perform(.account(accountId)) {
+            let settings = try await client.accountLaunchSettings(accountId: accountId)
+            let title = account.displayName?.isEmpty == false ? account.displayName! : account.externalAccountId
+            openSession = OpenSessionModel(
+                accountId: account.id,
+                accountTitle: title,
+                providerId: account.providerId,
+                settings: settings
+            )
+        }
+    }
+
+    func confirmOpenSession(_ model: OpenSessionModel) async {
+        openSession = model
+        await perform(.account(model.accountId)) {
+            let response = try await client.launchProviderAccount(
+                accountId: model.accountId,
+                workingDirectory: model.trimmedWorkingDirectory,
+                launch: model.wireFlags,
+                rememberDangerouslySkipPermissions: model.rememberDangerous
+            )
+            actionMessage = response.message
+            openSession = nil
         }
     }
 
@@ -881,6 +917,10 @@ private enum PendingAction {
 
     func supportsLaunchAccount(_ providerId: String) -> Bool {
         providerSupports(providerId, capability: \.launchAccount, in: serverProviders)
+    }
+
+    func supportsLaunchOptions(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.launchOptions, in: serverProviders)
     }
 
     func supportsSetup(_ providerId: String) -> Bool {
