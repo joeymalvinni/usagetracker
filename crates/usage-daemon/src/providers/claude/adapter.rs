@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use tracing::info;
 use usage_core::{
@@ -270,6 +271,10 @@ pub(crate) struct LaunchPlan {
     pub(crate) persist: Option<PersistedLaunchPrefs>,
 }
 
+fn is_active_profile(profile: &crate::config::ProviderProfileConfig, profile_id: &str) -> bool {
+    profile.enabled && !profile.deleted && profile.id.as_deref() == Some(profile_id)
+}
+
 /// When present in a LaunchPlan, replaces both saved fields wholesale on a
 /// successful open; a None field here clears the saved value.
 pub(crate) struct PersistedLaunchPrefs {
@@ -286,7 +291,7 @@ pub(crate) fn resolve_launch_plan(
 ) -> anyhow::Result<LaunchPlan> {
     let working_directory = match &overrides.working_directory {
         Some(value) if value.trim().is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
+        Some(value) => Some(PathBuf::from(value.trim())),
         None => saved.working_directory.clone(),
     };
     let flags = overrides.launch.clone().or_else(|| saved.launch.clone());
@@ -336,27 +341,24 @@ impl LaunchHandler for ClaudeAdapter {
             .providers
             .get(PROVIDER_ID)
             .ok_or_else(|| anyhow::anyhow!("Claude is not configured"))?;
-        let (config_dir, saved, has_profile_entry) = if provider.profiles.is_empty()
-            && profile_id == "default"
-        {
-            (None, settings::ClaudeProfileSettings::default(), false)
-        } else {
-            let profile = provider
-                .profiles
-                .iter()
-                .find(|profile| {
-                    profile.enabled && !profile.deleted && profile.id.as_deref() == Some(profile_id)
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Claude profile {profile_id} is no longer configured")
-                })?;
-            let saved = settings::profile(profile)?;
-            let config_dir = saved
-                .claude_config_dir
-                .clone()
-                .map(|dir| expand_home_path(&dir));
-            (config_dir, saved, true)
-        };
+        let (config_dir, saved, has_profile_entry) =
+            if provider.profiles.is_empty() && profile_id == "default" {
+                (None, settings::ClaudeProfileSettings::default(), false)
+            } else {
+                let profile = provider
+                    .profiles
+                    .iter()
+                    .find(|profile| is_active_profile(profile, profile_id))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Claude profile {profile_id} is no longer configured")
+                    })?;
+                let saved = settings::profile(profile)?;
+                let config_dir = saved
+                    .claude_config_dir
+                    .clone()
+                    .map(|dir| expand_home_path(&dir));
+                (config_dir, saved, true)
+            };
 
         let plan = resolve_launch_plan(&saved, &overrides)
             .map_err(|err| anyhow::Error::new(InvalidLaunchRequest(err.to_string())))?;
@@ -394,22 +396,30 @@ impl LaunchHandler for ClaudeAdapter {
         launchers::open_terminal(&launcher)?;
 
         if let (Some(persist), true) = (plan.persist, has_profile_entry) {
-            runtime
-                .mutate_config(|config| {
-                    let provider = config.providers.entry(PROVIDER_ID.to_string()).or_default();
-                    if let Some(profile) = provider.profiles.iter_mut().find(|profile| {
-                        profile.enabled
-                            && !profile.deleted
-                            && profile.id.as_deref() == Some(profile_id)
-                    }) {
-                        settings::update_profile(profile, |settings| {
-                            settings.working_directory = persist.working_directory.clone();
-                            settings.launch = persist.launch.clone();
-                        })?;
-                    }
-                    Ok(())
-                })
-                .await?;
+            let unchanged = persist.working_directory == saved.working_directory
+                && persist.launch == saved.launch;
+            // Unchanged prefs skip the config rewrite (and collector rebuild) entirely.
+            if !unchanged {
+                runtime
+                    .mutate_config(|config| {
+                        let Some(provider) = config.providers.get_mut(PROVIDER_ID) else {
+                            return Ok(());
+                        };
+                        if let Some(profile) = provider
+                            .profiles
+                            .iter_mut()
+                            .find(|profile| is_active_profile(profile, profile_id))
+                        {
+                            settings::update_profile(profile, |settings| {
+                                settings.working_directory = persist.working_directory.clone();
+                                settings.launch = persist.launch.clone();
+                            })?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .context("the Claude session opened, but saving launch preferences failed")?;
+            }
         }
 
         Ok(ProviderActionResponse {
@@ -591,6 +601,19 @@ mod tests {
         assert_eq!(persist.working_directory, None);
         // All-default flags normalize to "no flags saved".
         assert_eq!(persist.launch, None);
+
+        // A padded working directory is trimmed once at acceptance, not left
+        // to trip the launch handler's absolute-path check later.
+        let padded = resolve_launch_plan(
+            &saved,
+            &LaunchOverrides {
+                working_directory: Some("  /tmp/padded  ".to_string()),
+                launch: None,
+                remember_dangerously_skip_permissions: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(padded.working_directory, Some(PathBuf::from("/tmp/padded")));
 
         let invalid = resolve_launch_plan(
             &saved,

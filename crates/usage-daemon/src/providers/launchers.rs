@@ -244,6 +244,8 @@ pub(crate) fn write_claude_profile_launcher(
         .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
     let launcher_dir = app_dir.join("launchers");
     std::fs::create_dir_all(&launcher_dir)?;
+    // One launcher file per account: concurrent launches last-write-win, which
+    // is acceptable in the single-user local trust model.
     let launcher = launcher_dir.join(format!("claude-{}.command", account_id.as_str()));
     let temporary = launcher_dir.join(format!(
         ".claude-{}.{}.tmp",
