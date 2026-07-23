@@ -41,7 +41,7 @@ struct LaunchFlags: Equatable, Sendable, Codable {
 struct AccountLaunchSettingsResponse: Decodable, Equatable, Sendable {
     let providerId: String
     let accountId: String
-    var workingDirectory: String?
-    var launch: LaunchFlags?
+    let workingDirectory: String?
+    let launch: LaunchFlags?
     let hasManagedConfigDir: Bool
 }

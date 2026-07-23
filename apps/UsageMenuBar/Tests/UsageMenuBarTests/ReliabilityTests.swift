@@ -347,6 +347,13 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertNil(bareObject["working_directory"])
         XCTAssertNil(bareObject["launch"])
         XCTAssertNil(bareObject["remember_dangerously_skip_permissions"])
+
+        let read = DaemonRequest.getAccountLaunchSettings(accountId: "account-1")
+        let readObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(read)) as? [String: Any]
+        )
+        XCTAssertEqual(readObject["method"] as? String, "get_account_launch_settings")
+        XCTAssertEqual(readObject["account_id"] as? String, "account-1")
     }
 
     func testDecodesAccountLaunchSettingsFixture() throws {
@@ -455,9 +462,12 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(codex.addAccount)
         XCTAssertTrue(codex.repair)
         XCTAssertFalse(codex.launchAccount)
+        XCTAssertFalse(codex.launchOptions)
         XCTAssertFalse(codex.workspaceSetup)
 
-        XCTAssertTrue(try XCTUnwrap(providers["claude"]?.capabilities).launchAccount)
+        let claude = try XCTUnwrap(providers["claude"]?.capabilities)
+        XCTAssertTrue(claude.launchAccount)
+        XCTAssertTrue(claude.launchOptions)
         XCTAssertFalse(try XCTUnwrap(providers["grok"]?.capabilities).launchAccount)
 
         let openCode = try XCTUnwrap(providers["opencode_go"]?.capabilities)
