@@ -2011,6 +2011,8 @@ Expected: PASS (view code compiles under strict concurrency; no new unit tests �
 Run: `just fixture`
 Expected: app launches against fixture data. Claude fixture account → "Open Claude session" opens the confirm window with empty prefs (capability derives from the real adapter registry, so it's on in fixture mode); pressing Open surfaces the fixture-mode launch rejection as an inline error — correct per design (`preview`/read allowed, side effects rejected). Close the app afterward.
 
+- [ ] **Step 4b (carry-forward from Task 8 review): Amend the CHANGELOG bullet** under `## Unreleased` → `### App` to mention the user-visible surface, e.g. append "…persisted on successful open **via a new confirm-on-open sheet**" phrasing. Include `CHANGELOG.md` in this task's commit.
+
 - [ ] **Step 5: Commit**
 
 ```bash
