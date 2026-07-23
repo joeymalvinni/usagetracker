@@ -19,8 +19,8 @@ use crate::{
     },
     runtime::provider_adapter::{
         plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-        ExecutionPolicy, LaunchHandler, LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter,
-        ProviderManifest, ProviderRuntime, RepairHandler,
+        ExecutionPolicy, LaunchHandler, LaunchOverrides, LocalUsagePathMatcher, LocalUsageWatch,
+        ProviderAdapter, ProviderManifest, ProviderRuntime, RepairHandler,
     },
 };
 
@@ -263,6 +263,59 @@ impl RepairHandler for ClaudeAdapter {
     }
 }
 
+#[allow(dead_code)] // Wired into LaunchHandler::launch in Task 6.
+pub(crate) struct LaunchPlan {
+    pub(crate) working_directory: Option<PathBuf>,
+    pub(crate) flags: Option<usage_core::LaunchFlags>,
+    pub(crate) persist: Option<PersistedLaunchPrefs>,
+}
+
+#[allow(dead_code)] // Wired into LaunchHandler::launch in Task 6.
+pub(crate) struct PersistedLaunchPrefs {
+    pub(crate) working_directory: Option<PathBuf>,
+    pub(crate) launch: Option<usage_core::LaunchFlags>,
+}
+
+/// Merges saved prefs with per-open overrides. Working directory + model +
+/// effort persist whenever the sheet sent anything; the dangerous flag
+/// persists only when explicitly remembered.
+#[allow(dead_code)] // Called from LaunchHandler::launch starting in Task 6.
+pub(crate) fn resolve_launch_plan(
+    saved: &settings::ClaudeProfileSettings,
+    overrides: &LaunchOverrides,
+) -> anyhow::Result<LaunchPlan> {
+    let working_directory = match &overrides.working_directory {
+        Some(value) if value.trim().is_empty() => None,
+        Some(value) => Some(PathBuf::from(value)),
+        None => saved.working_directory.clone(),
+    };
+    let flags = overrides.launch.clone().or_else(|| saved.launch.clone());
+    if let Some(flags) = &flags {
+        settings::validate_launch_flags(flags)?;
+    }
+    let persist =
+        (overrides.working_directory.is_some() || overrides.launch.is_some()).then(|| {
+            let mut launch = flags.clone();
+            if !overrides.remember_dangerously_skip_permissions {
+                if let Some(launch) = launch.as_mut() {
+                    launch.dangerously_skip_permissions = saved
+                        .launch
+                        .as_ref()
+                        .is_some_and(|saved| saved.dangerously_skip_permissions);
+                }
+            }
+            PersistedLaunchPrefs {
+                working_directory: working_directory.clone(),
+                launch: launch.filter(|flags| flags != &usage_core::LaunchFlags::default()),
+            }
+        });
+    Ok(LaunchPlan {
+        working_directory,
+        flags,
+        persist,
+    })
+}
+
 #[async_trait]
 impl LaunchHandler for ClaudeAdapter {
     async fn launch(
@@ -358,6 +411,124 @@ async fn prepare_login_profile(
 mod tests {
     use super::*;
     use crate::config::ProviderProfileConfig;
+
+    fn saved_settings(
+        working_directory: Option<&str>,
+        launch: Option<usage_core::LaunchFlags>,
+    ) -> settings::ClaudeProfileSettings {
+        settings::ClaudeProfileSettings {
+            working_directory: working_directory.map(PathBuf::from),
+            launch,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn launch_plan_uses_saved_prefs_when_no_overrides_arrive() {
+        let saved = saved_settings(
+            Some("/tmp/saved"),
+            Some(usage_core::LaunchFlags {
+                model: Some("fable".to_string()),
+                ..Default::default()
+            }),
+        );
+        let plan = resolve_launch_plan(&saved, &LaunchOverrides::default()).unwrap();
+        assert_eq!(plan.working_directory, Some(PathBuf::from("/tmp/saved")));
+        assert_eq!(plan.flags.as_ref().unwrap().model.as_deref(), Some("fable"));
+        // A plain open never rewrites config.
+        assert!(plan.persist.is_none());
+    }
+
+    #[test]
+    fn launch_plan_overrides_replace_whole_flag_object_and_persist() {
+        let saved = saved_settings(
+            Some("/tmp/saved"),
+            Some(usage_core::LaunchFlags {
+                model: Some("old-model".to_string()),
+                effort: Some(usage_core::LaunchEffort::Low),
+                dangerously_skip_permissions: false,
+            }),
+        );
+        let overrides = LaunchOverrides {
+            working_directory: Some("/tmp/override".to_string()),
+            launch: Some(usage_core::LaunchFlags {
+                model: None,
+                effort: Some(usage_core::LaunchEffort::Max),
+                dangerously_skip_permissions: true,
+            }),
+            remember_dangerously_skip_permissions: false,
+        };
+        let plan = resolve_launch_plan(&saved, &overrides).unwrap();
+        // This run uses the override verbatim (dangerous flag on, once).
+        assert_eq!(plan.working_directory, Some(PathBuf::from("/tmp/override")));
+        let flags = plan.flags.as_ref().unwrap();
+        assert_eq!(flags.model, None);
+        assert!(flags.dangerously_skip_permissions);
+        // Persisted prefs keep model/effort/cwd but reset the dangerous flag
+        // to its saved value because remember was not requested.
+        let persist = plan.persist.unwrap();
+        assert_eq!(
+            persist.working_directory,
+            Some(PathBuf::from("/tmp/override"))
+        );
+        let persisted_flags = persist.launch.unwrap();
+        assert_eq!(persisted_flags.effort, Some(usage_core::LaunchEffort::Max));
+        assert!(!persisted_flags.dangerously_skip_permissions);
+    }
+
+    #[test]
+    fn launch_plan_remembers_the_dangerous_flag_only_on_request() {
+        let saved = saved_settings(None, None);
+        let overrides = LaunchOverrides {
+            working_directory: None,
+            launch: Some(usage_core::LaunchFlags {
+                dangerously_skip_permissions: true,
+                ..Default::default()
+            }),
+            remember_dangerously_skip_permissions: true,
+        };
+        let plan = resolve_launch_plan(&saved, &overrides).unwrap();
+        assert!(
+            plan.persist
+                .unwrap()
+                .launch
+                .unwrap()
+                .dangerously_skip_permissions
+        );
+    }
+
+    #[test]
+    fn launch_plan_clears_prefs_and_rejects_invalid_models() {
+        let saved = saved_settings(Some("/tmp/saved"), None);
+        // An empty working directory from the sheet clears the saved value.
+        let cleared = resolve_launch_plan(
+            &saved,
+            &LaunchOverrides {
+                working_directory: Some("   ".to_string()),
+                launch: Some(usage_core::LaunchFlags::default()),
+                remember_dangerously_skip_permissions: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(cleared.working_directory, None);
+        let persist = cleared.persist.unwrap();
+        assert_eq!(persist.working_directory, None);
+        // All-default flags normalize to "no flags saved".
+        assert_eq!(persist.launch, None);
+
+        let invalid = resolve_launch_plan(
+            &saved,
+            &LaunchOverrides {
+                working_directory: None,
+                launch: Some(usage_core::LaunchFlags {
+                    model: Some("bad model; rm".to_string()),
+                    ..Default::default()
+                }),
+                remember_dangerously_skip_permissions: false,
+            },
+        );
+        assert!(invalid.is_err());
+    }
 
     #[test]
     fn local_watch_roots_keep_managed_and_manual_profiles_separate() {

@@ -263,6 +263,17 @@ pub(crate) trait RepairHandler: Send + Sync {
     ) -> anyhow::Result<ProviderActionResponse>;
 }
 
+/// Per-open overrides from the confirm-on-open sheet. `None` fields fall back
+/// to the account's saved preferences; the sheet always sends the full
+/// `launch` object, so an override replaces the whole flag set.
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)] // Threaded through LaunchHandler in Task 6.
+pub(crate) struct LaunchOverrides {
+    pub(crate) working_directory: Option<String>,
+    pub(crate) launch: Option<usage_core::LaunchFlags>,
+    pub(crate) remember_dangerously_skip_permissions: bool,
+}
+
 #[async_trait]
 pub(crate) trait LaunchHandler: Send + Sync {
     async fn launch(
