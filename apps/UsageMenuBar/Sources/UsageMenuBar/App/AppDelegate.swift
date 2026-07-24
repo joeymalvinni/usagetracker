@@ -86,18 +86,23 @@ import UserNotifications
             _ = self.popoverController.view
             self.popoverController.view.layoutSubtreeIfNeeded()
 
-            // A new installation has no Dock icon or ordinary app window to
-            // introduce itself. Open the setup popover from the menu bar on its
-            // first launch, before starting the daemon or touching credentials.
-            if !self.state.ui.onboardingCompleted,
-               ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] != "1"
-            {
-                NSApp.activate(ignoringOtherApps: true)
+            // This accessory app has no Dock icon or ordinary window. A launch
+            // from Finder, `open`, or the installer must therefore surface the
+            // menu bar popover or the app appears not to have opened.
+            if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] != "1" {
                 self.showPopover(selection: .summary)
             }
         }
 
         if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] == "1" { showDebugWindow() }
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        showPopover(selection: .summary)
+        return true
     }
 
     nonisolated func userNotificationCenter(
@@ -152,6 +157,8 @@ import UserNotifications
         navigation.selection = selection
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         configurePopoverWindow()
+        NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
         Task { await state.refreshForPopoverOpen() }
         Task { await state.updater.checkForUpdates() }
     }

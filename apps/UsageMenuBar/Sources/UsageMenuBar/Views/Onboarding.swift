@@ -23,10 +23,11 @@ struct Onboarding: View {
         VStack(spacing: Theme.Spacing.xl) {
             Spacer()
 
-            Image(systemName: "chart.bar.xaxis")
-                .font(.system(size: 48, weight: .semibold))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.tint)
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 72, height: 72)
                 .accessibilityHidden(true)
 
             VStack(spacing: Theme.Spacing.sm) {
