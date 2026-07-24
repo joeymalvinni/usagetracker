@@ -4,6 +4,18 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.7 — 2026-07-23
+
+### App
+
+- Added an optional activity grid alongside the existing bar chart, with the preferred chart style saved in Settings.
+- Made Finder launches and app reopens reliably surface the menu bar popover, and refreshed onboarding with the UsageTracker app icon.
+
+### Reliability
+
+- Kept last-known usage visible while offline, skipped unavailable remote collection without overwriting provider health, and clearly marked cached values in the app and CLI.
+- Prevented copy-link provider sign-in from opening a browser, including when a provider invokes the absolute macOS opener.
+
 ## 0.1.6 — 2026-07-23
 
 ### App
