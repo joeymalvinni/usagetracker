@@ -79,6 +79,15 @@ struct Settings: View {
                             Toggle("", isOn: darkModeBinding)
                                 .labelsHidden()
                         }
+                        LabeledContent("Activity chart") {
+                            Picker("", selection: activityChartStyleBinding) {
+                                ForEach(UIConfig.ActivityChartStyle.allCases, id: \.self) {
+                                    Text($0.label).tag($0)
+                                }
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                        }
                         LabeledContent {
                             if state.pendingNotifications {
                                 ProgressView().controlSize(.small)
@@ -211,6 +220,13 @@ struct Settings: View {
         Binding(
             get: { state.ui.darkModeEnabled },
             set: { state.ui.darkModeEnabled = $0 }
+        )
+    }
+
+    private var activityChartStyleBinding: Binding<UIConfig.ActivityChartStyle> {
+        Binding(
+            get: { state.ui.activityChartStyle },
+            set: { state.ui.activityChartStyle = $0 }
         )
     }
 

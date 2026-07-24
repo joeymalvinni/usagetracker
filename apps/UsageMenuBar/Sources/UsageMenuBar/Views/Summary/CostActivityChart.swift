@@ -27,18 +27,26 @@ struct CostActivityChart: View {
         GeometryReader { geo in
             let chartHeight = max(0, geo.size.height - axisHeight)
             let barSpacing: CGFloat = days.count > 7 ? 2 : 6
+            let cornerRadius = barCornerRadius(
+                chartWidth: geo.size.width,
+                barSpacing: barSpacing
+            )
             VStack(spacing: 0) {
                 ZStack(alignment: .bottom) {
                     gridlines(chartHeight: chartHeight)
                     HStack(alignment: .bottom, spacing: barSpacing) {
                         ForEach(days) { day in
                             ZStack(alignment: .bottom) {
-                                RoundedRectangle(cornerRadius: 4)
+                                RoundedRectangle(cornerRadius: cornerRadius)
                                     .fill(.quaternary.opacity(0.30))
-                                barStack(day: day, maxHeight: chartHeight - 4)
+                                barStack(
+                                    day: day,
+                                    maxHeight: chartHeight - 4,
+                                    cornerRadius: cornerRadius
+                                )
                             }
                             .frame(maxWidth: .infinity)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
                         }
                     }
                     baseline
@@ -51,7 +59,11 @@ struct CostActivityChart: View {
     }
 
     @ViewBuilder
-    private func barStack(day: CostDayVM, maxHeight: CGFloat) -> some View {
+    private func barStack(
+        day: CostDayVM,
+        maxHeight: CGFloat,
+        cornerRadius: CGFloat
+    ) -> some View {
         VStack(spacing: 1) {
             Spacer(minLength: 0)
             // Identify each segment by its stacking position, not by
@@ -63,7 +75,9 @@ struct CostActivityChart: View {
             ForEach(Array(day.providers.reversed().enumerated()), id: \.offset) { index, provider in
                 let visible = value(provider) > 0
                 if visible {
-                    RoundedRectangle(cornerRadius: index == 0 ? 4 : 1)
+                    RoundedRectangle(
+                        cornerRadius: index == 0 ? cornerRadius : min(1, cornerRadius)
+                    )
                         .fill(providerColor ?? Theme.chartColor(provider.providerId))
                         .frame(height: segmentHeight(provider, maxHeight: maxHeight))
                         .contentShape(Rectangle())
@@ -148,6 +162,13 @@ struct CostActivityChart: View {
         let barCenter = CGFloat(index) * (barWidth + barSpacing) + barWidth / 2
         let inset = axisLabelWidth / 2
         return min(max(inset, barCenter), max(inset, chartWidth - inset))
+    }
+
+    private func barCornerRadius(chartWidth: CGFloat, barSpacing: CGFloat) -> CGFloat {
+        guard !days.isEmpty else { return 0 }
+        let spacingWidth = barSpacing * CGFloat(max(0, days.count - 1))
+        let barWidth = max(0, (chartWidth - spacingWidth) / CGFloat(days.count))
+        return min(4, barWidth * 0.2)
     }
 }
 

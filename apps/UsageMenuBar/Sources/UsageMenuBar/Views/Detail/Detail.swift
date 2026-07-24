@@ -499,6 +499,7 @@ private struct SpendLineRow: View {
 }
 
 private struct ProviderActivityCard: View {
+    @EnvironmentObject var state: AppState
     let provider: ProviderVM
     let dashboard: CostDashboardVM
 
@@ -520,42 +521,49 @@ private struct ProviderActivityCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            VStack(spacing: Theme.Spacing.xs) {
-                HStack(alignment: .top, spacing: Theme.Spacing.sm) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Activity").font(Theme.Typography.headline)
-                        Text(hover.map(hoverText) ?? activitySubtitle)
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: Theme.Spacing.sm)
+            HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Activity").font(Theme.Typography.headline)
+                    Text(hover.map(hoverText) ?? activitySubtitle)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                HStack(spacing: Theme.Spacing.xs) {
-                    Spacer()
-                    Picker("", selection: $range) {
-                        ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 82)
-                    Picker("", selection: $metric) {
-                        ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 110)
+                Spacer(minLength: Theme.Spacing.sm)
+                Picker("", selection: $range) {
+                    ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 82)
+                Picker("", selection: $metric) {
+                    ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 110)
             }
 
-            CostActivityChart(
-                days: days,
-                metric: metric,
-                hover: $hover,
-                providerColor: Theme.chartColor(provider.providerId),
-                onSelectProvider: nil
-            )
-                .frame(height: 126)
+            Group {
+                if state.ui.activityChartStyle == .contributions {
+                    ActivityHeatmap(
+                        days: days,
+                        metric: metric,
+                        color: Theme.chartColor(provider.providerId),
+                        hover: $hover,
+                        onSelectProvider: nil
+                    )
+                } else {
+                    CostActivityChart(
+                        days: days,
+                        metric: metric,
+                        hover: $hover,
+                        providerColor: Theme.chartColor(provider.providerId),
+                        onSelectProvider: nil
+                    )
+                }
+            }
+                .frame(height: state.ui.activityChartStyle == .contributions ? 110 : 126)
                 .opacity(hasData ? 1 : 0.55)
 
             HStack(spacing: Theme.Spacing.sm) {
