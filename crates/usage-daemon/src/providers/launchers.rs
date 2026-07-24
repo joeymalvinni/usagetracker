@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs::OpenOptions,
     io::{Read, Write},
     os::unix::{
@@ -20,6 +21,8 @@ use crate::polling::RefreshCoordinator;
 
 const AUTH_URL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_AUTH_OUTPUT_BYTES: usize = 128 * 1024;
+const NO_BROWSER_SANDBOX_PROFILE: &str =
+    "(version 1) (allow default) (deny process-exec (literal \"/usr/bin/open\"))";
 static HTTPS_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https://[^\s\x1b<>\"']+"#).expect("valid auth URL regex"));
 
@@ -32,14 +35,14 @@ pub(crate) fn launch_codex_login(
     codex_home: &Path,
     action: ProviderSignInAction,
 ) -> anyhow::Result<LoginProcess> {
-    let mut direct = Command::new("codex");
+    let mut direct = login_command("codex", action);
     direct.arg("login");
     configure_codex_command(&mut direct, codex_home, action)?;
     let child = match direct.spawn() {
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-            let mut fallback = Command::new(shell);
+            let mut fallback = login_command(shell, action);
             fallback.args(["-lic", "exec codex login"]);
             configure_codex_command(&mut fallback, codex_home, action)?;
             fallback.spawn().map_err(|fallback_err| {
@@ -64,7 +67,7 @@ pub(crate) fn launch_claude_login(
     config_dir: Option<&Path>,
     action: ProviderSignInAction,
 ) -> anyhow::Result<LoginProcess> {
-    let mut direct = Command::new("claude");
+    let mut direct = login_command("claude", action);
     direct.args(["auth", "login"]);
     configure_claude_environment(&mut direct, config_dir);
     configure_login_stdio(&mut direct, action)?;
@@ -72,7 +75,7 @@ pub(crate) fn launch_claude_login(
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-            let mut fallback = Command::new(shell);
+            let mut fallback = login_command(shell, action);
             fallback.args(["-lic", "exec claude auth login"]);
             configure_claude_environment(&mut fallback, config_dir);
             configure_login_stdio(&mut fallback, action)?;
@@ -90,7 +93,7 @@ pub(crate) fn launch_grok_login(
     grok_home: &Path,
     action: ProviderSignInAction,
 ) -> anyhow::Result<LoginProcess> {
-    let mut command = Command::new(binary);
+    let mut command = login_command(binary, action);
     command.arg("login");
     command.env("GROK_HOME", grok_home);
     configure_login_stdio(&mut command, action)?;
@@ -98,6 +101,38 @@ pub(crate) fn launch_grok_login(
         .spawn()
         .map_err(|err| anyhow::anyhow!("failed to start Grok login: {err}"))?;
     finish_login_launch(child, action, &["x.ai", "grok.com"])
+}
+
+fn login_command(program: impl AsRef<OsStr>, action: ProviderSignInAction) -> Command {
+    let program = program.as_ref();
+    if action == ProviderSignInAction::CopyLink && Path::new("/usr/bin/sandbox-exec").is_file() {
+        if let Some(program) = resolve_executable(program) {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command
+                .args(["-p", NO_BROWSER_SANDBOX_PROFILE])
+                .arg(program);
+            return command;
+        }
+    }
+    Command::new(program)
+}
+
+fn resolve_executable(program: &OsStr) -> Option<PathBuf> {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        return is_executable(program_path).then(|| program_path.to_path_buf());
+    }
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|directory| directory.join(program))
+            .find(|candidate| is_executable(candidate))
+    })
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn configure_claude_environment(command: &mut Command, config_dir: Option<&Path>) {
@@ -448,7 +483,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("usage-login-capture-test-{}", uuid::Uuid::new_v4()));
         let shim = ensure_no_browser_shim(&root.join("bin")).unwrap();
-        let mut command = Command::new("/bin/sh");
+        let mut command = login_command("/bin/sh", ProviderSignInAction::CopyLink);
         command
             .args([
                 "-c",
@@ -469,6 +504,71 @@ mod tests {
         let _ = login.child.kill();
         let _ = login.child.wait();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_link_mode_sandboxes_the_provider_command_but_open_mode_does_not() {
+        let copy = login_command("/bin/sh", ProviderSignInAction::CopyLink);
+        assert_eq!(copy.get_program(), OsStr::new("/usr/bin/sandbox-exec"));
+        assert_eq!(
+            copy.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("-p"),
+                OsStr::new(NO_BROWSER_SANDBOX_PROFILE),
+                OsStr::new("/bin/sh"),
+            ]
+        );
+
+        let open = login_command("/bin/sh", ProviderSignInAction::Open);
+        assert_eq!(open.get_program(), OsStr::new("/bin/sh"));
+        assert_eq!(open.get_args().count(), 0);
+    }
+
+    #[test]
+    fn copy_link_mode_blocks_the_absolute_macos_opener() {
+        let unsandboxed_status = Command::new("/usr/bin/open")
+            .arg("-h")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .code()
+            .unwrap();
+        let mut command = login_command("/bin/sh", ProviderSignInAction::CopyLink);
+        command
+            .args([
+                "-c",
+                "/usr/bin/open -h >/dev/null 2>&1; \
+                 printf 'https://auth.openai.com/oauth/authorize?state=%s\\n' \"$?\"; \
+                 exec sleep 30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let child = command.spawn().unwrap();
+        let mut login =
+            finish_login_launch(child, ProviderSignInAction::CopyLink, &["openai.com"]).unwrap();
+        let unsandboxed_url =
+            format!("https://auth.openai.com/oauth/authorize?state={unsandboxed_status}");
+        assert_ne!(
+            login.authentication_url.as_deref(),
+            Some(unsandboxed_url.as_str())
+        );
+        let _ = login.child.kill();
+        let _ = login.child.wait();
+    }
+
+    #[test]
+    fn missing_copy_link_command_preserves_not_found_for_shell_fallback() {
+        let command = login_command(
+            "usage-provider-cli-that-does-not-exist",
+            ProviderSignInAction::CopyLink,
+        );
+        assert_eq!(
+            command.get_program(),
+            OsStr::new("usage-provider-cli-that-does-not-exist")
+        );
     }
 
     #[test]
