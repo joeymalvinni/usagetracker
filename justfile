@@ -9,6 +9,9 @@ fixture_home := justfile_directory() + "/.dev/fixture"
 default:
     @just --list
 
+local-install:
+    ./scripts/test-local-install.sh
+
 # Build the Rust workspace and the development macOS app bundle.
 build: build-rust build-app-dev
 

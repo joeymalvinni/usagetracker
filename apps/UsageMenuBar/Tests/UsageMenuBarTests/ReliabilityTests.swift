@@ -1,3 +1,4 @@
+import AppKit
 import CryptoKit
 import Foundation
 import XCTest
@@ -833,6 +834,53 @@ final class AppStateTests: XCTestCase {
     }
 }
 
+final class StatusItemAnchorSnapshotTests: XCTestCase {
+    func testAcceptsStatusItemAtTopOfScreen() {
+        let snapshot = StatusItemAnchorSnapshot(
+            screenRect: NSRect(x: 1240, y: 1072, width: 36, height: 22),
+            screenFrame: NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        )
+
+        XCTAssertTrue(snapshot.isUsable)
+    }
+
+    func testRejectsLaunchTimeWindowAtScreenOrigin() {
+        let snapshot = StatusItemAnchorSnapshot(
+            screenRect: NSRect(x: 0, y: 0, width: 36, height: 22),
+            screenFrame: NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        )
+
+        XCTAssertFalse(snapshot.isUsable)
+    }
+
+    func testAcceptsStatusItemOnDisplayWithNegativeOrigin() {
+        let snapshot = StatusItemAnchorSnapshot(
+            screenRect: NSRect(x: -840, y: 1410, width: 36, height: 22),
+            screenFrame: NSRect(x: -1440, y: 0, width: 1440, height: 1440)
+        )
+
+        XCTAssertTrue(snapshot.isUsable)
+    }
+
+    func testRequiresConsecutiveStableGeometry() {
+        let first = StatusItemAnchorSnapshot(
+            screenRect: NSRect(x: 1240, y: 1072, width: 36, height: 22),
+            screenFrame: NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        )
+        let settling = StatusItemAnchorSnapshot(
+            screenRect: NSRect(x: 1280, y: 1072, width: 36, height: 22),
+            screenFrame: first.screenFrame
+        )
+        let stable = StatusItemAnchorSnapshot(
+            screenRect: NSRect(x: 1280.25, y: 1072, width: 36, height: 22),
+            screenFrame: first.screenFrame
+        )
+
+        XCTAssertFalse(settling.isStable(comparedTo: first))
+        XCTAssertTrue(stable.isStable(comparedTo: settling))
+    }
+}
+
 final class ProviderCatalogTests: XCTestCase {
     func testBuiltInCatalogProvidesOptionalPresentationDecorations() {
         XCTAssertEqual(ProviderCatalog.supportedIDs, ["codex", "claude", "cursor", "opencode_go", "grok"])
@@ -868,6 +916,17 @@ final class ActivityCalendarTests: XCTestCase {
 }
 
 final class MenuBarPresentationTests: XCTestCase {
+    func testPreDataStatusIconUsesVisiblePlaceholderFill() {
+        XCTAssertEqual(
+            MenuBarProgressIcon.placeholderFillPercent(for: .stale),
+            100
+        )
+        XCTAssertEqual(
+            MenuBarProgressIcon.placeholderFillPercent(for: .refreshing),
+            100
+        )
+    }
+
     func testOfflineMenuKeepsPercentagesButMutesEveryBar() {
         let providers = [provider("codex", short: "C", percent: 80)]
 

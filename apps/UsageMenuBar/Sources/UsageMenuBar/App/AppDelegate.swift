@@ -18,6 +18,45 @@ import UserNotifications
     }
 }
 
+struct StatusItemAnchorSnapshot: Equatable {
+    private static let screenTopTolerance: CGFloat = 80
+    private static let stabilityTolerance: CGFloat = 0.5
+
+    let screenRect: NSRect
+    let screenFrame: NSRect
+
+    var isUsable: Bool {
+        guard screenRect.origin.x.isFinite,
+              screenRect.origin.y.isFinite,
+              screenRect.width.isFinite,
+              screenRect.height.isFinite,
+              screenRect.width > 0,
+              screenRect.height > 0,
+              !screenRect.intersection(screenFrame).isNull
+        else {
+            return false
+        }
+
+        // A status item always lives at the top of one of the attached
+        // displays. AppKit can report a visible status-bar window while it is
+        // still parked at the default screen origin during app launch.
+        return screenRect.midY >= screenFrame.maxY - Self.screenTopTolerance
+            && screenRect.midY <= screenFrame.maxY + Self.screenTopTolerance
+    }
+
+    func isStable(comparedTo previous: Self) -> Bool {
+        approximatelyEqual(screenRect, previous.screenRect)
+            && approximatelyEqual(screenFrame, previous.screenFrame)
+    }
+
+    private func approximatelyEqual(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= Self.stabilityTolerance
+            && abs(lhs.minY - rhs.minY) <= Self.stabilityTolerance
+            && abs(lhs.width - rhs.width) <= Self.stabilityTolerance
+            && abs(lhs.height - rhs.height) <= Self.stabilityTolerance
+    }
+}
+
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private struct MenuIconPresentation: Equatable {
         let status: DisplayStatus
@@ -48,7 +87,9 @@ import UserNotifications
     private var bag = Set<AnyCancellable>()
     private let menuIconSize = NSSize(width: 16, height: 16)
     private let startupPopoverRetryDelay: TimeInterval = 0.05
-    private let startupPopoverMaxAttempts = 40
+    private let startupPopoverMaxAttempts = 120
+    private var popoverRequestID = 0
+    private var fallbackWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         UNUserNotificationCenter.current().delegate = self
@@ -92,7 +133,7 @@ import UserNotifications
             // from Finder, `open`, or the installer must therefore surface the
             // menu bar popover or the app appears not to have opened.
             if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] != "1" {
-                self.showStartupPopover()
+                self.requestPopoverWhenStatusItemIsReady(selection: .summary)
             }
         }
 
@@ -103,7 +144,7 @@ import UserNotifications
         _ sender: NSApplication,
         hasVisibleWindows flag: Bool
     ) -> Bool {
-        showPopover(selection: .summary)
+        requestPopoverWhenStatusItemIsReady(selection: .summary)
         return true
     }
 
@@ -151,11 +192,13 @@ import UserNotifications
 
     private func togglePopover() {
         guard let button = item.button else { return }
+        fallbackWindow?.orderOut(nil)
         if popover.isShown { popover.performClose(nil) } else { showPopover(selection: .summary, relativeTo: button) }
     }
 
     private func showPopover(selection: Selection, relativeTo button: NSStatusBarButton? = nil) {
         guard let button = button ?? item.button else { return }
+        fallbackWindow?.orderOut(nil)
         navigation.selection = selection
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         configurePopoverWindow()
@@ -165,19 +208,95 @@ import UserNotifications
         Task { await state.updater.checkForUpdates() }
     }
 
-    private func showStartupPopover(attempt: Int = 0) {
-        if item.isVisible,
-           let button = item.button,
-           button.window?.isVisible == true,
-           !button.visibleRect.isEmpty
-        {
-            showPopover(selection: .summary, relativeTo: button)
+    private func requestPopoverWhenStatusItemIsReady(selection: Selection) {
+        popoverRequestID &+= 1
+        showPopoverWhenStatusItemIsReady(
+            selection: selection,
+            requestID: popoverRequestID
+        )
+    }
+
+    private func showPopoverWhenStatusItemIsReady(
+        selection: Selection,
+        requestID: Int,
+        attempt: Int = 0,
+        previousAnchor: StatusItemAnchorSnapshot? = nil
+    ) {
+        guard requestID == popoverRequestID else { return }
+        if popover.isShown {
+            navigation.selection = selection
             return
         }
-        guard attempt + 1 < startupPopoverMaxAttempts else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + startupPopoverRetryDelay) { [weak self] in
-            self?.showStartupPopover(attempt: attempt + 1)
+
+        let button = item.button
+        let anchor = button.flatMap(statusItemAnchorSnapshot)
+        if let button,
+           let anchor,
+           let previousAnchor,
+           anchor.isStable(comparedTo: previousAnchor)
+        {
+            showPopover(selection: selection, relativeTo: button)
+            return
         }
+
+        guard attempt + 1 < startupPopoverMaxAttempts else {
+            showFallbackWindow(selection: selection)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + startupPopoverRetryDelay) { [weak self] in
+            self?.showPopoverWhenStatusItemIsReady(
+                selection: selection,
+                requestID: requestID,
+                attempt: attempt + 1,
+                previousAnchor: anchor
+            )
+        }
+    }
+
+    private func statusItemAnchorSnapshot(
+        for button: NSStatusBarButton
+    ) -> StatusItemAnchorSnapshot? {
+        guard item.isVisible,
+              let window = button.window,
+              window.isVisible,
+              let screen = window.screen,
+              button.superview != nil,
+              !button.visibleRect.isEmpty
+        else {
+            return nil
+        }
+
+        window.layoutIfNeeded()
+        button.layoutSubtreeIfNeeded()
+        let rectInWindow = button.convert(button.bounds, to: nil)
+        let snapshot = StatusItemAnchorSnapshot(
+            screenRect: window.convertToScreen(rectInWindow),
+            screenFrame: screen.frame
+        )
+        return snapshot.isUsable ? snapshot : nil
+    }
+
+    private func showFallbackWindow(selection: Selection) {
+        navigation.selection = selection
+        let window: NSWindow
+        if let fallbackWindow {
+            window = fallbackWindow
+        } else {
+            let size = NSSize(width: Theme.Popover.width, height: Theme.Popover.height)
+            window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: size),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "UsageTracker"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = makePopoverController()
+            window.center()
+            fallbackWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
     private func makePopoverController() -> NSViewController {

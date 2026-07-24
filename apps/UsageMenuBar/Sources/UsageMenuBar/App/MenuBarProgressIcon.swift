@@ -70,19 +70,22 @@ enum MenuBarProgressIcon {
     }
 
     private static func placeholderRow(for status: DisplayStatus) -> MenuBarProviderVM {
-        let percent: Double? = switch status {
-        case .offline, .error, .warning, .critical:
-            100
-        case .stale, .refreshing, .disabled, .normal:
-            nil
-        }
-        return MenuBarProviderVM(
+        MenuBarProviderVM(
             id: "usage",
             providerId: "usage",
             short: "",
-            percent: percent,
+            percent: placeholderFillPercent(for: status),
             status: status,
             isMuted: status == .offline
         )
+    }
+
+    static func placeholderFillPercent(for status: DisplayStatus) -> Double? {
+        switch status {
+        case .offline, .error, .warning, .critical, .stale, .refreshing, .disabled:
+            100
+        case .normal:
+            nil
+        }
     }
 }
