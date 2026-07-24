@@ -844,6 +844,29 @@ final class ProviderCatalogTests: XCTestCase {
     }
 }
 
+final class ActivityCalendarTests: XCTestCase {
+    func testCalendarUsesMondayBasedWeekColumns() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .autoupdatingCurrent
+        let monday = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2026,
+            month: 7,
+            day: 20
+        )))
+        let sunday = try XCTUnwrap(calendar.date(byAdding: .day, value: 6, to: monday))
+        let nextMonday = try XCTUnwrap(calendar.date(byAdding: .day, value: 7, to: monday))
+        let days = [monday, sunday, nextMonday].map {
+            CostDayVM(id: "\($0)", date: $0, providers: [])
+        }
+
+        let entries = ActivityCalendar().entries(for: days)
+
+        XCTAssertEqual(entries.map(\.weekday), [0, 6, 0])
+        XCTAssertEqual(entries[0].weekStart, entries[1].weekStart)
+        XCTAssertNotEqual(entries[1].weekStart, entries[2].weekStart)
+    }
+}
+
 final class MenuBarPresentationTests: XCTestCase {
     func testOfflineMenuKeepsPercentagesButMutesEveryBar() {
         let providers = [provider("codex", short: "C", percent: 80)]
@@ -864,10 +887,22 @@ final class MenuBarPresentationTests: XCTestCase {
 
     func testDarkModeIsEnabledByDefault() throws {
         XCTAssertTrue(UIConfig().darkModeEnabled)
+        XCTAssertEqual(UIConfig().activityChartStyle, .bars)
 
         let decoded = try JSONDecoder().decode(UIConfig.self, from: Data("{}".utf8))
         XCTAssertTrue(decoded.darkModeEnabled)
+        XCTAssertEqual(decoded.activityChartStyle, .bars)
         XCTAssertNil(decoded.lastSeenReleaseNotesVersion)
+    }
+
+    func testActivityChartStyleRoundTrips() throws {
+        var ui = UIConfig()
+        ui.activityChartStyle = .contributions
+
+        let encoded = try JSONEncoder().encode(ui)
+        let decoded = try JSONDecoder().decode(UIConfig.self, from: encoded)
+
+        XCTAssertEqual(decoded.activityChartStyle, .contributions)
     }
 
     func testProviderCountControlsBothTooltipAndIconRows() {

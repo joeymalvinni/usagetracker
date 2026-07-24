@@ -11,6 +11,7 @@ enum CostMetric: String, CaseIterable, Hashable {
 }
 
 struct CostDashboard: View {
+    @EnvironmentObject var state: AppState
     let dashboard: CostDashboardVM
     var onSelectProvider: ((String) -> Void)?
 
@@ -22,7 +23,7 @@ struct CostDashboard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            HStack {
+            HStack(alignment: .top, spacing: Theme.Spacing.sm) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Activity").font(Theme.Typography.headline)
                     Text(hover.map(hoverText) ?? activitySubtitle)
@@ -30,7 +31,13 @@ struct CostDashboard: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                Spacer()
+                Spacer(minLength: Theme.Spacing.sm)
+                Picker("", selection: $range) {
+                    ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 82)
                 Picker("", selection: $metric) {
                     ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
@@ -38,14 +45,26 @@ struct CostDashboard: View {
                 .labelsHidden()
                 .frame(width: 110)
             }
-            CostActivityChart(
-                days: days,
-                metric: metric,
-                hover: $hover,
-                providerColor: nil,
-                onSelectProvider: onSelectProvider
-            )
-                .frame(height: 120)
+            Group {
+                if state.ui.activityChartStyle == .contributions {
+                    ActivityHeatmap(
+                        days: days,
+                        metric: metric,
+                        color: .accentColor,
+                        hover: $hover,
+                        onSelectProvider: onSelectProvider
+                    )
+                } else {
+                    CostActivityChart(
+                        days: days,
+                        metric: metric,
+                        hover: $hover,
+                        providerColor: nil,
+                        onSelectProvider: onSelectProvider
+                    )
+                }
+            }
+            .frame(height: state.ui.activityChartStyle == .contributions ? 110 : 120)
             // Single KPI strip driven by the active metric — no longer showing
             // cost and tokens simultaneously (the old 4-grid duplicated the
             // chart). Two figures: today + 30d, in the active metric's units.
@@ -68,8 +87,10 @@ struct CostDashboard: View {
     }
 
     private var activitySubtitle: String {
-        if dashboard.hasData { "\(range.label) \(metric == .cost ? "cost" : "tokens")" }
-        else { "No activity yet" }
+        if dashboard.hasData {
+            return "\(range.label) \(metric == .cost ? "cost" : "tokens")"
+        }
+        return "No activity yet"
     }
     private func hoverText(_ value: CostProviderDayVM) -> String {
         if metric == .cost {
