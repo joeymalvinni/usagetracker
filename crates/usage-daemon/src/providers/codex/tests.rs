@@ -46,7 +46,7 @@ fn does_not_duplicate_standard_codex_session_root() {
 }
 
 #[test]
-fn account_activity_is_diagnostic_while_local_logs_drive_visible_tokens() {
+fn account_activity_and_local_cost_metadata_remain_separate() {
     let today = Local::now().date_naive();
     let yesterday = today.checked_sub_days(Days::new(1)).unwrap();
     let activity = normalize_account_token_usage(&json!({
