@@ -507,8 +507,12 @@ private struct ProviderActivityCard: View {
     @State private var metric: CostMetric = .tokens
     @State private var hover: CostProviderDayVM?
 
+    private var isActivityGrid: Bool {
+        state.ui.activityChartStyle == .contributions
+    }
+
     private var days: [CostDayVM] {
-        dashboard.days.suffix(range.rawValue)
+        isActivityGrid ? dashboard.days : Array(dashboard.days.suffix(range.rawValue))
     }
 
     private var providerDays: [CostProviderDayVM] {
@@ -530,12 +534,14 @@ private struct ProviderActivityCard: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: Theme.Spacing.sm)
-                Picker("", selection: $range) {
-                    ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                if !isActivityGrid {
+                    Picker("", selection: $range) {
+                        ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 82)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 82)
                 Picker("", selection: $metric) {
                     ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
@@ -569,7 +575,10 @@ private struct ProviderActivityCard: View {
             HStack(spacing: Theme.Spacing.sm) {
                 CostKPI(title: "Today", value: todayValue)
                 Divider().frame(height: 24)
-                CostKPI(title: "\(range.label) total", value: totalValue)
+                CostKPI(
+                    title: isActivityGrid ? "All time" : "\(range.label) total",
+                    value: totalValue
+                )
                 Divider().frame(height: 24)
                 CostKPI(title: "Peak", value: peakValue)
             }
@@ -600,7 +609,8 @@ private struct ProviderActivityCard: View {
 
     private var activitySubtitle: String {
         guard hasData else { return "No recent cost or token activity" }
-        return "\(range.label) \(metric == .cost ? "cost" : "tokens")"
+        let period = isActivityGrid ? "All time" : range.label
+        return "\(period) \(metric == .cost ? "cost" : "tokens")"
     }
 
     private var todayValue: String {
@@ -609,6 +619,11 @@ private struct ProviderActivityCard: View {
     }
 
     private var totalValue: String {
+        if isActivityGrid {
+            return metric == .cost
+                ? formatUsd(dashboard.allTimeCost)
+                : formatTokens(dashboard.allTimeTokens)
+        }
         if metric == .cost {
             return formatUsd(providerDays.reduce(0) { $0 + $1.cost })
         }

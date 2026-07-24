@@ -2,8 +2,8 @@ import SwiftUI
 
 /// GitHub-style contribution grid: each column is a local-calendar week
 /// (Monday-based) and each row is a weekday. Cells are square and the grid
-/// fills the card edge to edge — like GitHub's year view, the weeks older
-/// than the 30-day data window render as blank squares padding the left.
+/// fills the card edge to edge — like GitHub's year view. The grid receives
+/// the complete available history and shows as many recent weeks as fit.
 ///
 /// The grid totals each day's providers, so it works for the aggregate
 /// summary (single accent hue) and for a provider page (dashboard already

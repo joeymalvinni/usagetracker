@@ -366,6 +366,80 @@ final class DashboardBuilderTests: XCTestCase {
         XCTAssertEqual(output.settingsProviders.map(\.providerId), ["provider_z", "provider_a"])
     }
 
+    func testActivityDashboardPreservesAvailableHistoryAndLifetimeTotals() throws {
+        let calendar = Calendar(identifier: .gregorian)
+        let today = calendar.startOfDay(for: Date())
+        let oldDate = try XCTUnwrap(calendar.date(byAdding: .day, value: -60, to: today))
+        let oldKey = DateFormats.dayKey.string(from: oldDate)
+        let todayKey = DateFormats.dayKey.string(from: today)
+        let provenance = DataProvenance(
+            source: .localLogs,
+            scope: .thisDevice,
+            quality: .estimated,
+            completeness: .partial,
+            confidence: .high
+        )
+        let oldPoint = DailyUsagePoint(
+            dateKey: oldKey,
+            tokens: 10,
+            costUsd: 1.25,
+            pricedTokens: 10,
+            unpricedTokens: 0
+        )
+        let todayPoint = DailyUsagePoint(
+            dateKey: todayKey,
+            tokens: 20,
+            costUsd: 2.50,
+            pricedTokens: 20,
+            unpricedTokens: 0
+        )
+        let dashboard = UsageDashboardSummary(
+            accounts: [
+                AccountUsageSummary(
+                    providerId: "codex",
+                    accountId: "codex-account",
+                    activity: ActivitySummary(
+                        provenance: provenance,
+                        days: [oldPoint, todayPoint],
+                        todayTokens: 20,
+                        lookbackTokens: 20,
+                        lifetimeTokens: 500
+                    ),
+                    cost: CostSummary(
+                        provenance: provenance,
+                        days: [oldPoint, todayPoint],
+                        todayCostUsd: 2.50,
+                        lookbackCostUsd: 2.50,
+                        pricing: .empty
+                    ),
+                    resetCredits: nil
+                )
+            ],
+            days: [oldPoint, todayPoint],
+            pricing: .empty,
+            provenance: .empty
+        )
+
+        let output = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [],
+            health: [],
+            snapshots: [],
+            forecasts: [],
+            dashboard: dashboard,
+            windowProvenance: [],
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        XCTAssertEqual(output.costDashboard.days.first?.id, oldKey)
+        XCTAssertEqual(output.costDashboard.days.last?.id, todayKey)
+        XCTAssertEqual(output.costDashboard.allTimeCost, 3.75, accuracy: 0.001)
+        XCTAssertEqual(output.costDashboard.allTimeTokens, 500)
+        XCTAssertEqual(output.costDashboard.cost30d, 2.50, accuracy: 0.001)
+        XCTAssertEqual(output.costDashboard.tokens30d, 20)
+    }
+
     private func config(providers: [String: Bool]) -> ConfigResponse {
         ConfigResponse(
             pollIntervalSeconds: 300,

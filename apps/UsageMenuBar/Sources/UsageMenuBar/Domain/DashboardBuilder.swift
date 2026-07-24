@@ -342,10 +342,6 @@ struct DashboardBuilder {
     private func buildCostDashboard(filter: ((UsageSnapshot) -> Bool)?) -> CostDashboardVM {
         let calendar = dayCalendar
         let today = calendar.startOfDay(for: Date())
-        let dayStarts = (0..<30).compactMap { offset in
-            calendar.date(byAdding: .day, value: offset - 29, to: today)
-        }
-        let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
         let allowedAccounts: Set<ProviderAccountKey>? = filter.map { predicate in
             Set(snapshots.filter(predicate).map {
                 ProviderAccountKey(providerId: $0.providerId, accountId: $0.accountId)
@@ -357,6 +353,25 @@ struct DashboardBuilder {
                 ProviderAccountKey(providerId: summary.providerId, accountId: summary.accountId)
             ) ?? true
         }
+        let availableDates = summaries.flatMap { summary in
+            (summary.activity?.days ?? []).compactMap(\.date)
+                + (summary.cost?.days ?? []).compactMap(\.date)
+        }
+        let defaultStart = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+        let firstAvailableDate = availableDates
+            .map { calendar.startOfDay(for: $0) }
+            .filter { $0 <= today }
+            .min()
+        let firstDay = min(firstAvailableDate ?? defaultStart, defaultStart)
+        let dayCount = max(
+            1,
+            (calendar.dateComponents([.day], from: firstDay, to: today).day ?? 0) + 1
+        )
+        let dayStarts = (0..<dayCount).compactMap { offset in
+            calendar.date(byAdding: .day, value: offset, to: firstDay)
+        }
+        let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
+        let includedDayKeys = Set(dayKeys)
 
         var rows = [String: [String: (cost: Double, tokens: UInt64)]]()
         var active = Set<String>()
@@ -366,7 +381,7 @@ struct DashboardBuilder {
                 ? summary.providerId
                 : "\(summary.providerId):\(summary.accountId)"
             if let activity = summary.activity {
-                for point in activity.days where dayKeys.contains(point.dateKey) {
+                for point in activity.days where includedDayKeys.contains(point.dateKey) {
                     let current = rows[rowId]?[point.dateKey] ?? (0, 0)
                     rows[rowId, default: [:]][point.dateKey] = (
                         current.cost,
@@ -376,7 +391,7 @@ struct DashboardBuilder {
                 }
             }
             if let cost = summary.cost {
-                for point in cost.days where dayKeys.contains(point.dateKey) {
+                for point in cost.days where includedDayKeys.contains(point.dateKey) {
                     let current = rows[rowId]?[point.dateKey] ?? (0, 0)
                     rows[rowId, default: [:]][point.dateKey] = (
                         current.cost + (point.costUsd ?? 0),
@@ -387,6 +402,25 @@ struct DashboardBuilder {
                     if point.costUsd ?? 0 > 0 { active.insert(rowId) }
                 }
             }
+        }
+        let allTimeCost = summaries
+            .compactMap(\.cost)
+            .flatMap(\.days)
+            .compactMap(\.costUsd)
+            .reduce(0, +)
+        let allTimeTokens = summaries.reduce(UInt64(0)) { total, summary in
+            let accountTotal: UInt64
+            if let activity = summary.activity {
+                accountTotal = activity.lifetimeTokens
+                    ?? activity.days.reduce(UInt64(0)) {
+                        $0.saturatingAdd($1.tokens)
+                    }
+            } else {
+                accountTotal = (summary.cost?.days ?? []).reduce(UInt64(0)) {
+                    $0.saturatingAdd($1.tokens)
+                }
+            }
+            return total.saturatingAdd(accountTotal)
         }
 
         let activeIds = filter == nil
@@ -429,7 +463,12 @@ struct DashboardBuilder {
                 }
             )
         }
-        return CostDashboardVM(days: days, providers: providers)
+        return CostDashboardVM(
+            days: days,
+            providers: providers,
+            allTimeCost: allTimeCost,
+            allTimeTokens: allTimeTokens
+        )
     }
 
     private func modelCosts(providerId: String, accountId: String?) -> [ModelCostSummary] {
