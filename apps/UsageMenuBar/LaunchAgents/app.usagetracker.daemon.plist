@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>engineering.super.usagetracker.daemon</string>
+    <string>app.usagetracker.daemon</string>
     <key>BundleProgram</key>
     <string>Contents/MacOS/usage-daemon</string>
     <key>ProgramArguments</key>

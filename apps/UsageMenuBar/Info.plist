@@ -5,9 +5,9 @@
     <key>CFBundleExecutable</key>
     <string>UsageMenuBar</string>
     <key>CFBundleIdentifier</key>
-    <string>engineering.super.usagetracker</string>
+    <string>app.usagetracker</string>
     <key>CFBundleName</key>
-    <string>Usage</string>
+    <string>UsageTracker</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>

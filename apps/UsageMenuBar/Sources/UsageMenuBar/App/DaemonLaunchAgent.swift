@@ -1,7 +1,7 @@
 import Foundation
 import ServiceManagement
 
-let daemonLaunchAgentLabel = "engineering.super.usagetracker.daemon"
+let daemonLaunchAgentLabel = "app.usagetracker.daemon"
 let daemonLaunchAgentPlistName = "\(daemonLaunchAgentLabel).plist"
 
 enum DaemonLaunchAgentRegistrationStatus: Equatable, Sendable {
@@ -32,7 +32,7 @@ struct SystemDaemonLaunchAgentController: DaemonLaunchAgentControlling, @uncheck
 
     var isAvailable: Bool {
         guard Self.supportsLaunchAgentEnvironment(environment),
-              bundle.bundleIdentifier == "engineering.super.usagetracker",
+              bundle.bundleIdentifier == "app.usagetracker",
               bundle.bundleURL.pathExtension == "app" else {
             return false
         }

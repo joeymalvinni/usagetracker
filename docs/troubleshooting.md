@@ -11,7 +11,7 @@ The installed app registers the daemon as a per-user macOS LaunchAgent after onb
 Inspect the installed background service with:
 
 ```sh
-launchctl print gui/$(id -u)/engineering.super.usagetracker.daemon
+launchctl print gui/$(id -u)/app.usagetracker.daemon
 ```
 
 The service intentionally survives when the menu app quits and launchd restarts it after an unexpected exit. Updates unregister it, wait for it to exit, replace the app, and register it again; failed updates restore the prior registration. The uninstaller unregisters it before removing the app, preventing `KeepAlive` from racing replacement or leaving an orphan daemon. Disabling UsageTracker under **System Settings → General → Login Items** is treated as an explicit stop and is preserved across updates; enable it there and reopen the app to resume collection.
