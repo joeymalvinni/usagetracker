@@ -47,6 +47,8 @@ import UserNotifications
     private var renderedMenuIcon: MenuIconPresentation?
     private var bag = Set<AnyCancellable>()
     private let menuIconSize = NSSize(width: 16, height: 16)
+    private let startupPopoverRetryDelay: TimeInterval = 0.05
+    private let startupPopoverMaxAttempts = 40
 
     func applicationDidFinishLaunching(_ note: Notification) {
         UNUserNotificationCenter.current().delegate = self
@@ -90,7 +92,7 @@ import UserNotifications
             // from Finder, `open`, or the installer must therefore surface the
             // menu bar popover or the app appears not to have opened.
             if ProcessInfo.processInfo.environment["USAGE_POPOVER_DEBUG"] != "1" {
-                self.showPopover(selection: .summary)
+                self.showStartupPopover()
             }
         }
 
@@ -161,6 +163,21 @@ import UserNotifications
         popover.contentViewController?.view.window?.makeKey()
         Task { await state.refreshForPopoverOpen() }
         Task { await state.updater.checkForUpdates() }
+    }
+
+    private func showStartupPopover(attempt: Int = 0) {
+        if item.isVisible,
+           let button = item.button,
+           button.window?.isVisible == true,
+           !button.visibleRect.isEmpty
+        {
+            showPopover(selection: .summary, relativeTo: button)
+            return
+        }
+        guard attempt + 1 < startupPopoverMaxAttempts else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + startupPopoverRetryDelay) { [weak self] in
+            self?.showStartupPopover(attempt: attempt + 1)
+        }
     }
 
     private func makePopoverController() -> NSViewController {

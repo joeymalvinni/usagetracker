@@ -22,7 +22,7 @@
           inherit (pkgs) lib;
           usageTracker = pkgs.rustPlatform.buildRustPackage {
             pname = "usagetracker";
-            version = "0.1.7";
+            version = "0.1.8";
             src = self;
 
             cargoLock.lockFile = ./Cargo.lock;

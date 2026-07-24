@@ -4,6 +4,17 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.8 — 2026-07-23
+
+### App
+
+- Made first-launch onboarding wait until the menu bar item is visible before opening, avoiding a startup race where the icon appeared without its popover.
+- Standardized the app, updater, and background service under the `app.usagetracker` identity and restored the full UsageTracker app name.
+
+### Installation
+
+- Preserved installer-managed app and CLI upgrades across the identity migration by validating their install receipts and quitting the previously installed app by its actual bundle identifier.
+
 ## 0.1.7 — 2026-07-23
 
 ### App
