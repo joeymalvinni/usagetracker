@@ -15,7 +15,7 @@ The generated [request](schemas/v3/request.json) and [response](schemas/v3/respo
 
 `Account.id` is UsageTracker's own stable management ID. `external_account_id` is the provider's identity, and `profile_id` marks which local credentials the account is isolated to. `display_name` is a local, provider, or generated label — it never establishes identity. `hidden` controls visibility; `collection_enabled` controls collection.
 
-`ServerInfo` reports the protocol capabilities and an ordered list of `ProviderDescriptor` values. A provider's capabilities tell you whether the account-add, repair, launch, or workspace methods even apply to it. `minimum_refresh_interval_seconds` is the fastest cadence a provider will collect at — currently 60.
+`ServerInfo` reports the protocol capabilities and an ordered list of `ProviderDescriptor` values. A provider's capabilities tell you whether the account-add, repair, launch, or setup methods even apply to it. `minimum_refresh_interval_seconds` is the fastest cadence a provider will collect at — currently 60. `detected` is a prompt-free local-presence hint for onboarding. `credential_access_notice`, when present, is provider-owned consent copy shown before connecting may request Keychain or browser-storage access.
 
 ## Usage
 

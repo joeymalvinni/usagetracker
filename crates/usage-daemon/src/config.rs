@@ -40,6 +40,7 @@ pub struct FileConfig {
     /// Accepted only to migrate older config files; raw payload capture was removed.
     #[serde(default, rename = "debug_capture_raw_payloads", skip_serializing)]
     _legacy_debug_capture_raw_payloads: bool,
+    // Missing notification settings stay off until the user grants permission.
     #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default)]
@@ -510,20 +511,21 @@ mod tests {
     }
 
     #[test]
-    fn default_config_enables_codex_only() {
+    fn default_config_keeps_every_provider_disabled_until_connected() {
         let config = FileConfig::default();
-        assert!(config.providers["codex"].enabled);
+        assert!(!config.providers["codex"].enabled);
         assert!(!config.providers["claude"].enabled);
         assert!(!config.providers["cursor"].enabled);
+        assert!(!config.providers["opencode_go"].enabled);
         assert!(!config.providers["grok"].enabled);
-        assert!(config.notifications.enabled);
+        assert!(!config.notifications.enabled);
     }
 
     #[test]
-    fn older_config_defaults_notifications_to_enabled() {
+    fn older_config_defaults_notifications_to_disabled() {
         let config: FileConfig =
             serde_json::from_str(r#"{"poll_interval_seconds":300,"providers":{}}"#).unwrap();
-        assert!(config.notifications.enabled);
+        assert!(!config.notifications.enabled);
     }
 
     #[test]

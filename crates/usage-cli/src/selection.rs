@@ -413,6 +413,8 @@ mod tests {
                 id: ProviderId::new(id),
                 display_name: id.to_uppercase(),
                 minimum_refresh_interval_seconds: 0,
+                detected: false,
+                credential_access_notice: None,
                 capabilities: ProviderCapabilities::default(),
             });
         }

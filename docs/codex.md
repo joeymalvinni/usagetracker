@@ -1,6 +1,6 @@
 # Codex
 
-Codex is on by default.
+Codex is available by default but remains off until you explicitly connect it.
 
 ## Accounts
 

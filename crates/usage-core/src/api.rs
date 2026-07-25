@@ -182,7 +182,7 @@ pub struct ProviderToggle {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct NotificationConfig {
-    #[serde(default = "default_notifications_enabled")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_notification_thresholds")]
     pub thresholds_percent_remaining: Vec<u8>,
@@ -201,7 +201,9 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Notification delivery is a user-facing permission. New installs
+            // remain off until the user opts in from onboarding or Settings.
+            enabled: false,
             thresholds_percent_remaining: default_notification_thresholds(),
             reset_alerts: true,
             predictive_alerts: false,
@@ -292,10 +294,6 @@ fn validate_notification_thresholds(thresholds: &[u8]) -> Result<(), &'static st
         return Err("notification thresholds must be unique");
     }
     Ok(())
-}
-
-fn default_notifications_enabled() -> bool {
-    true
 }
 
 fn default_true() -> bool {
@@ -451,6 +449,15 @@ pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
     pub minimum_refresh_interval_seconds: u64,
+    /// A prompt-free indication that this provider has an app, CLI, or local
+    /// data directory on this Mac. This never reads credentials or contacts
+    /// the provider.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detected: bool,
+    /// Provider-owned copy shown before onboarding may access credentials or
+    /// browser storage. Omitted when connecting is prompt-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_access_notice: Option<String>,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -827,6 +834,13 @@ mod tests {
         assert_eq!(provider_id.as_str(), "future");
         assert_eq!(settings.get("region"), Some(&None));
         assert_eq!(workspace_id, None);
+    }
+
+    #[test]
+    fn notifications_are_off_when_the_setting_is_new_or_omitted() {
+        assert!(!NotificationConfig::default().enabled);
+        let decoded: NotificationConfig = serde_json::from_str("{}").unwrap();
+        assert!(!decoded.enabled);
     }
 
     #[test]

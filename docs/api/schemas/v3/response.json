@@ -278,7 +278,7 @@
           "$ref": "#/$defs/NotificationConfig",
           "default": {
             "cooldown_minutes": 15,
-            "enabled": true,
+            "enabled": false,
             "predictive_alerts": false,
             "reset_alerts": true,
             "thresholds_percent_remaining": [
@@ -513,7 +513,7 @@
           "type": "integer"
         },
         "enabled": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         },
         "predictive_alerts": {
@@ -764,6 +764,17 @@
       "properties": {
         "capabilities": {
           "$ref": "#/$defs/ProviderCapabilities"
+        },
+        "credential_access_notice": {
+          "description": "Provider-owned copy shown before onboarding may access credentials or\nbrowser storage. Omitted when connecting is prompt-free.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detected": {
+          "description": "A prompt-free indication that this provider has an app, CLI, or local\ndata directory on this Mac. This never reads credentials or contacts\nthe provider.",
+          "type": "boolean"
         },
         "display_name": {
           "type": "string"
