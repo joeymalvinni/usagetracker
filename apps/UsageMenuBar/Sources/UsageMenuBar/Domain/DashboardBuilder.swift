@@ -756,9 +756,8 @@ struct DashboardBuilder {
     private func statusValue(id: String, percent: Double?, latest: UsageSnapshot?, health h: ProviderHealth?, enabled: Bool) -> DisplayStatus {
         guard enabled else { return .disabled }
         switch h?.status {
-        case .ok, .none: break
+        case .ok, .backingOff, .none: break
         case .disabled?: return .disabled
-        case .backingOff?: return .warning
         default: return .error
         }
         if connectivity != .offline,
