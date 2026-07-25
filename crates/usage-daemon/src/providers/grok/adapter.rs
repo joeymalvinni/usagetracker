@@ -35,7 +35,6 @@ impl ProviderAdapter for GrokAdapter {
             id: PROVIDER_ID,
             display_name: "Grok",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -75,6 +74,21 @@ impl ProviderAdapter for GrokAdapter {
         config: &ProviderConfig,
     ) -> anyhow::Result<Arc<dyn ProviderCollector>> {
         Ok(Arc::new(GrokCollector::new(config.clone())?))
+    }
+
+    fn detected_locally(&self) -> bool {
+        std::env::var_os("GROK_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))
+            .is_some_and(|home| home.exists())
+            || std::path::Path::new("/Applications/Grok.app").exists()
+    }
+
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        Some(
+            "UsageTracker checks Grok CLI credentials first and may use your browser session as a \
+             fallback. macOS may ask for Keychain access.",
+        )
     }
 
     fn add_account_handler(&self) -> Option<&dyn AddAccountHandler> {

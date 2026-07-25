@@ -167,7 +167,46 @@ struct ServerInfo: Decodable, Equatable, Sendable {
 struct ServerProviderDescriptor: Decodable, Equatable, Sendable {
     let id, displayName: String
     let minimumRefreshIntervalSeconds: UInt64
+    let detected: Bool
+    let credentialAccessNotice: String?
     let capabilities: ProviderCapabilities
+
+    init(
+        id: String,
+        displayName: String,
+        minimumRefreshIntervalSeconds: UInt64,
+        detected: Bool = false,
+        credentialAccessNotice: String? = nil,
+        capabilities: ProviderCapabilities
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.minimumRefreshIntervalSeconds = minimumRefreshIntervalSeconds
+        self.detected = detected
+        self.credentialAccessNotice = credentialAccessNotice
+        self.capabilities = capabilities
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        minimumRefreshIntervalSeconds = try c.decode(
+            UInt64.self,
+            forKey: .minimumRefreshIntervalSeconds
+        )
+        detected = try c.decodeIfPresent(Bool.self, forKey: .detected) ?? false
+        credentialAccessNotice = try c.decodeIfPresent(
+            String.self,
+            forKey: .credentialAccessNotice
+        )
+        capabilities = try c.decode(ProviderCapabilities.self, forKey: .capabilities)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, displayName, minimumRefreshIntervalSeconds, detected, credentialAccessNotice
+        case capabilities
+    }
 }
 
 struct ProviderCapabilities: Decodable, Equatable, Sendable {

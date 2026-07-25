@@ -182,7 +182,7 @@ pub struct ProviderToggle {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct NotificationConfig {
-    #[serde(default = "default_notifications_enabled")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_notification_thresholds")]
     pub thresholds_percent_remaining: Vec<u8>,
@@ -201,7 +201,9 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Notification delivery is a user-facing permission. New installs
+            // remain off until the user opts in from onboarding or Settings.
+            enabled: false,
             thresholds_percent_remaining: default_notification_thresholds(),
             reset_alerts: true,
             predictive_alerts: false,
@@ -292,10 +294,6 @@ fn validate_notification_thresholds(thresholds: &[u8]) -> Result<(), &'static st
         return Err("notification thresholds must be unique");
     }
     Ok(())
-}
-
-fn default_notifications_enabled() -> bool {
-    true
 }
 
 fn default_true() -> bool {
@@ -451,6 +449,15 @@ pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
     pub minimum_refresh_interval_seconds: u64,
+    /// A prompt-free indication that this provider has an app, CLI, or local
+    /// data directory on this Mac. This never reads credentials or contacts
+    /// the provider.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detected: bool,
+    /// Provider-owned copy shown before onboarding may access credentials or
+    /// browser storage. Omitted when connecting is prompt-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_access_notice: Option<String>,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -521,10 +528,21 @@ pub struct RefreshJob {
     /// because machine-wide reachability was definitively offline.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skipped_offline: bool,
+    /// Accounts whose identities were discovered and persisted during this
+    /// refresh. This is populated while collection is still running so clients
+    /// can react to provider-scoped progress without polling global state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_accounts: Vec<RefreshAccountDiscovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_results: Vec<ProviderRefreshResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct RefreshAccountDiscovery {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -830,6 +848,13 @@ mod tests {
     }
 
     #[test]
+    fn notifications_are_off_when_the_setting_is_new_or_omitted() {
+        assert!(!NotificationConfig::default().enabled);
+        let decoded: NotificationConfig = serde_json::from_str("{}").unwrap();
+        assert!(!decoded.enabled);
+    }
+
+    #[test]
     fn decodes_usage_response_without_optional_collections() {
         let response: ResponseEnvelope = serde_json::from_str(
             r#"{"api_version":3,"type":"usage","snapshots":[],"dashboard":{"accounts":[],"days":[],"pricing":{"priced_tokens":0,"unpriced_tokens":0,"covered_percent":100.0},"provenance":{"scopes":[],"qualities":[],"partial":false,"estimated":false,"mixed_scope":false,"explanation":"No usage data."}}}"#,
@@ -922,6 +947,13 @@ mod tests {
         };
         assert_eq!(job.status, RefreshJobStatus::Completed);
         assert!(!job.skipped_offline);
+        assert_eq!(
+            job.discovered_accounts,
+            vec![RefreshAccountDiscovery {
+                provider_id: ProviderId::new("codex"),
+                account_id: AccountId::new("account-1"),
+            }]
+        );
         assert_eq!(job.provider_results.len(), 1);
     }
 

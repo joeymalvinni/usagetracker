@@ -18,7 +18,6 @@ impl ProviderAdapter for CursorAdapter {
             id: CURSOR_PROVIDER_ID,
             display_name: "Cursor",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -39,5 +38,13 @@ impl ProviderAdapter for CursorAdapter {
         config: &ProviderConfig,
     ) -> anyhow::Result<Arc<dyn ProviderCollector>> {
         Ok(Arc::new(CursorCollector::new(config.clone())?))
+    }
+
+    fn detected_locally(&self) -> bool {
+        std::path::Path::new("/Applications/Cursor.app").exists()
+            || dirs::home_dir().is_some_and(|home| {
+                home.join("Applications/Cursor.app").exists()
+                    || home.join("Library/Application Support/Cursor").exists()
+            })
     }
 }

@@ -461,6 +461,18 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(openCode.workspaceSetup)
         XCTAssertTrue(openCode.setup)
 
+        let refreshJob = try JSONDecoder.usage.decode(
+            DaemonResponse.self,
+            from: Data(contentsOf: rustWireFixture("refresh_job_v3.json"))
+        )
+        guard case let .refreshJob(job) = refreshJob else {
+            return XCTFail("expected refresh job fixture")
+        }
+        XCTAssertEqual(
+            job.discoveredAccounts,
+            [RefreshAccountDiscovery(providerId: "codex", accountId: "account-1")]
+        )
+
         let stateURL = rustWireFixture("state_v3.json")
         let state = try JSONDecoder.usage.decode(
             DaemonResponse.self,
@@ -590,6 +602,104 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(start["method"] as? String, "refresh")
         XCTAssertEqual(poll["method"] as? String, "get_refresh_job")
         XCTAssertEqual(poll["job_id"] as? String, "job-1")
+    }
+
+    func testRefreshProgressReturnsAsSoonAsTheScopedJobPublishesDiscovery() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"refresh_started","coalesced":false,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null,"discovered_accounts":[{"provider_id":"codex","account_id":"account-1"}]}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.startRefresh(["codex"])
+        let progress = try await client.waitForRefreshProgress(
+            started,
+            pollInterval: .zero
+        ) { job in
+            job.discoveredAccounts.contains { $0.providerId == "codex" }
+        }
+        XCTAssertEqual(progress.discoveredAccounts.map(\.accountId), ["account-1"])
+
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 2)
+        let start = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(recorded[0].utf8)) as? [String: Any]
+        )
+        let progressLookup = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(recorded[1].utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(start["providers"] as? [String], ["codex"])
+        XCTAssertEqual(progressLookup["method"] as? String, "get_refresh_job")
+    }
+
+    func testRefreshProgressWaitsForTheProviderThatWasClicked() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"refresh_started","coalesced":false,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null,"discovered_accounts":[{"provider_id":"claude","account_id":"other-account"}]}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null,"discovered_accounts":[{"provider_id":"claude","account_id":"other-account"},{"provider_id":"codex","account_id":"account-1"}]}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.startRefresh(["codex"])
+        let progress = try await client.waitForRefreshProgress(
+            started,
+            pollInterval: .zero
+        ) { job in
+            job.discoveredAccounts.contains { $0.providerId == "codex" }
+        }
+        XCTAssertEqual(progress.discoveredAccounts.last?.providerId, "codex")
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 3)
+    }
+
+    func testRefreshProgressReturnsTerminalJobWhenDiscoveryNeverArrives() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"refresh_started","coalesced":false,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"completed","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":"2026-07-11T12:00:01Z","provider_results":[{"provider_id":"codex","account_id":null,"status":"credentials_missing","collection_mode":null,"collected_at":null,"message":"No signed-in account was found."}]}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.startRefresh(["codex"])
+        let progress = try await client.waitForRefreshProgress(
+            started,
+            pollInterval: .zero
+        ) { job in
+            job.discoveredAccounts.contains { $0.providerId == "codex" }
+        }
+        XCTAssertEqual(progress.status, .completed)
+        XCTAssertTrue(progress.discoveredAccounts.isEmpty)
+
+        // Finishing an already-terminal job must not poll again.
+        let report = try await client.finishRefresh(progress)
+        XCTAssertEqual(report.providerResults.first?.status, .credentialsMissing)
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 2)
     }
 }
 
@@ -821,16 +931,123 @@ final class DaemonLogRotatorTests: XCTestCase {
 }
 
 final class AppStateTests: XCTestCase {
-    @MainActor func testOnboardingDefaultsEnableOnlyCodex() {
+    @MainActor func testOnboardingStartsWithoutEnablingAnyProvider() {
         let toggles = AppState.onboardingDefaultProviderToggles(
             providerIDs: ["codex", "claude", "cursor", "opencode_go", "grok"]
         )
 
-        XCTAssertEqual(toggles["codex"], true)
+        XCTAssertEqual(toggles["codex"], false)
         XCTAssertEqual(toggles["claude"], false)
         XCTAssertEqual(toggles["cursor"], false)
         XCTAssertEqual(toggles["opencode_go"], false)
         XCTAssertEqual(toggles["grok"], false)
+    }
+}
+
+final class ProviderConnectionCoordinatorTests: XCTestCase {
+    @MainActor func testStableConnectionStateAlwaysReflectsCurrentAccounts() {
+        let coordinator = ProviderConnectionCoordinator()
+        let descriptor = providerDescriptor(detected: true)
+        let account = Account(
+            id: "account",
+            providerId: "future",
+            externalAccountId: "external",
+            profileId: nil,
+            displayName: nil,
+            email: nil,
+            hidden: false,
+            collectionEnabled: true,
+            createdAt: .now,
+            updatedAt: .now
+        )
+
+        XCTAssertEqual(
+            coordinator.presentation(
+                for: "future",
+                descriptor: descriptor,
+                accounts: [account],
+                health: []
+            ).state,
+            .connected
+        )
+        XCTAssertEqual(
+            coordinator.presentation(
+                for: "future",
+                descriptor: descriptor,
+                accounts: [],
+                health: []
+            ),
+            ProviderConnectionPresentation(
+                state: .idle,
+                message: "Found on this Mac"
+            )
+        )
+    }
+
+    @MainActor func testReplacingMonitorDoesNotLoseNewestTaskHandle() async {
+        let coordinator = ProviderConnectionCoordinator()
+        coordinator.monitor(providerId: "future") {
+            try? await Task.sleep(for: .seconds(60))
+        }
+        await Task.yield()
+
+        coordinator.monitor(providerId: "future") {
+            try? await Task.sleep(for: .seconds(60))
+        }
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(coordinator.isMonitoring("future"))
+        coordinator.cancelMonitor(for: "future")
+    }
+
+    func testProviderDescriptorDecodesProviderOwnedCredentialNotice() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let descriptor = try decoder.decode(
+            ServerProviderDescriptor.self,
+            from: Data(
+                """
+                {
+                  "id": "future",
+                  "display_name": "Future",
+                  "minimum_refresh_interval_seconds": 60,
+                  "detected": true,
+                  "credential_access_notice": "Future may request Keychain access.",
+                  "capabilities": {
+                    "multiple_accounts": false,
+                    "add_account": false,
+                    "repair": false,
+                    "launch_account": false,
+                    "setup": false,
+                    "workspace_setup": false
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(
+            descriptor.credentialAccessNotice,
+            "Future may request Keychain access."
+        )
+    }
+
+    private func providerDescriptor(detected: Bool) -> ServerProviderDescriptor {
+        ServerProviderDescriptor(
+            id: "future",
+            displayName: "Future",
+            minimumRefreshIntervalSeconds: 60,
+            detected: detected,
+            capabilities: ProviderCapabilities(
+                multipleAccounts: false,
+                addAccount: false,
+                repair: false,
+                launchAccount: false,
+                workspaceSetup: false
+            )
+        )
     }
 }
 
@@ -945,13 +1162,20 @@ final class MenuBarPresentationTests: XCTestCase {
     }
 
     func testDarkModeIsEnabledByDefault() throws {
-        XCTAssertTrue(UIConfig().darkModeEnabled)
-        XCTAssertEqual(UIConfig().activityChartStyle, .bars)
+        let fresh = UIConfig()
+        XCTAssertTrue(fresh.darkModeEnabled)
+        XCTAssertEqual(fresh.activityChartStyle, .bars)
+        XCTAssertFalse(fresh.onboardingCompleted)
+        XCTAssertFalse(fresh.onboardingWelcomeCompleted)
+        XCTAssertFalse(fresh.notificationPromptCompleted)
 
         let decoded = try JSONDecoder().decode(UIConfig.self, from: Data("{}".utf8))
         XCTAssertTrue(decoded.darkModeEnabled)
         XCTAssertEqual(decoded.activityChartStyle, .bars)
         XCTAssertNil(decoded.lastSeenReleaseNotesVersion)
+        XCTAssertTrue(decoded.onboardingCompleted)
+        XCTAssertTrue(decoded.onboardingWelcomeCompleted)
+        XCTAssertTrue(decoded.notificationPromptCompleted)
     }
 
     func testActivityChartStyleRoundTrips() throws {

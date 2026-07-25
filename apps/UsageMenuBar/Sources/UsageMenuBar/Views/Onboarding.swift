@@ -3,14 +3,14 @@ import SwiftUI
 
 struct Onboarding: View {
     @EnvironmentObject var state: AppState
-    @State private var welcomeAcknowledged = false
+    @State private var showsOtherProviders = false
 
     var body: some View {
         Group {
-            if state.onboardingDiscoveryStarted {
-                setupContent
-            } else if welcomeAcknowledged {
-                providerAccessContent
+            if state.onboardingShowsNotificationChoice {
+                notificationContent
+            } else if state.onboardingDiscoveryStarted {
+                providerContent
             } else {
                 welcomeContent
             }
@@ -20,7 +20,7 @@ struct Onboarding: View {
     }
 
     private var welcomeContent: some View {
-        VStack(spacing: Theme.Spacing.xl) {
+        VStack(spacing: Theme.Spacing.xxl) {
             Spacer()
 
             Image(nsImage: NSApplication.shared.applicationIconImage)
@@ -33,147 +33,176 @@ struct Onboarding: View {
             VStack(spacing: Theme.Spacing.sm) {
                 Text("Welcome to UsageTracker")
                     .font(.title2.bold())
-                Text("See your AI usage and limits at a glance, without leaving your menu bar.")
+                Text("Track your AI usage and limits from the menu bar.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-                welcomeFeature(
-                    "Always close by",
-                    detail: "Click the UsageTracker icon in the menu bar whenever you want an update.",
-                    symbol: "menubar.rectangle"
-                )
-                welcomeFeature(
-                    "Only the providers you choose",
-                    detail: "Start with Codex, then add Claude, OpenCode Go, or Grok at any time.",
-                    symbol: "checkmark.circle"
-                )
-                welcomeFeature(
-                    "Private by design",
-                    detail: "Your usage data stays on this Mac.",
-                    symbol: "lock.shield"
-                )
+            Label {
+                Text("Your usage history stays on this Mac. Providers are accessed only when you choose to connect them.")
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "lock.shield")
+                    .foregroundStyle(.tint)
             }
+            .font(Theme.Typography.body)
             .surfaceCard()
 
             Spacer()
 
-            Button("Get Started") {
-                welcomeAcknowledged = true
+            Button("Continue") {
+                Task { await state.beginOnboarding() }
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            .buttonStyle(.chipPrimary)
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
-    private func welcomeFeature(_ title: String, detail: String, symbol: String) -> some View {
-        HStack(alignment: .top, spacing: Theme.Spacing.md) {
-            Image(systemName: symbol)
-                .font(Theme.Typography.headline)
-                .foregroundStyle(.tint)
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(Theme.Typography.headline)
-                Text(detail)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private var providerAccessContent: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
+    private var providerContent: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.md) {
             onboardingHeader(
-                title: "Before UsageTracker checks Codex",
-                subtitle: "You stay in control of which providers UsageTracker can inspect."
+                title: "Connect your accounts",
+                subtitle: "We found these tools without opening credentials. Connect only the providers you want to track."
             )
-            providerAccessExplanation
-            Spacer()
-            HStack {
-                Button("Back") { welcomeAcknowledged = false }
-                Spacer()
-                Button("Check Codex") {
-                    Task { await state.discoverAccountsForOnboarding() }
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-    }
-
-    private var setupContent: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.lg) {
-            onboardingHeader(
-                title: "Set up your providers",
-                subtitle: "Turn on another provider to check it. Providers left off are not scanned."
-            )
-            discoveryResults
-        }
-    }
-
-    private func onboardingHeader(title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            Text(title)
-                .font(Theme.Typography.title)
-            Text(subtitle)
-                .font(Theme.Typography.body)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var providerAccessExplanation: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            Label("Provider access is opt-in", systemImage: "checkmark.shield.fill")
-                .font(Theme.Typography.headline)
-            Text("Codex is enabled by default. UsageTracker will not inspect credentials for Claude, OpenCode Go, Grok, or other providers unless you turn them on.")
-                .font(Theme.Typography.body)
-                .fixedSize(horizontal: false, vertical: true)
-            Text("When you enable a provider that uses the macOS Keychain, macOS may ask for access. Choose **Always Allow** if you want background refreshes without repeated prompts.")
-                .font(Theme.Typography.body)
-                .fixedSize(horizontal: false, vertical: true)
-            Label("Credentials stay in provider files or Keychain and usage data stays on this Mac.", systemImage: "lock.shield")
-                .font(Theme.Typography.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(Theme.Spacing.md)
-        .surfaceCard()
-    }
-
-    private var discoveryResults: some View {
-        Group {
             if let error = state.actionError {
                 SetupNotice(text: error, isError: true)
-            } else if let message = state.actionMessage {
-                SetupNotice(text: message, isError: false)
-            } else if state.onboardingDiscoveryRunning {
-                SetupNotice(text: "Checking enabled providers…", isError: false)
-            }
-
-            ScrollView {
-                VStack(spacing: Theme.Spacing.sm) {
-                    ForEach(state.settingsProviders) { provider in
-                        OnboardingProviderCard(providerId: provider.providerId)
+                if state.daemon == .offline {
+                    HStack {
+                        Link(
+                            "Open Login Items",
+                            destination: URL(
+                                string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"
+                            )!
+                        )
+                        .buttonStyle(.link)
+                        Spacer()
+                        Button("Retry service") {
+                            Task { await state.prepareOnboarding() }
+                        }
+                        .buttonStyle(.chipProminent)
                     }
                 }
             }
 
-            HStack {
-                Button("Check enabled") {
-                    Task { await state.discoverAccountsForOnboarding() }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                    if state.onboardingDiscoveryRunning && state.serverProviderOrder.isEmpty {
+                        HStack(spacing: Theme.Spacing.sm) {
+                            ProgressView().controlSize(.small)
+                            Text("Looking for providers on this Mac…")
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, Theme.Spacing.xxl)
+                    } else {
+                        if !state.onboardingFoundProviderIDs.isEmpty {
+                            sectionTitle("Found on this Mac")
+                            ForEach(state.onboardingFoundProviderIDs, id: \.self) {
+                                OnboardingProviderCard(providerId: $0)
+                            }
+                        }
+
+                        if !state.onboardingOtherProviderIDs.isEmpty {
+                            DisclosureGroup(isExpanded: $showsOtherProviders) {
+                                VStack(spacing: Theme.Spacing.sm) {
+                                    ForEach(state.onboardingOtherProviderIDs, id: \.self) {
+                                        OnboardingProviderCard(providerId: $0)
+                                    }
+                                }
+                                .padding(.top, Theme.Spacing.sm)
+                            } label: {
+                                Text("More providers (\(state.onboardingOtherProviderIDs.count))")
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                            }
+                            .surfaceCard()
+                        }
+                    }
                 }
-                .disabled(state.onboardingDiscoveryRunning)
-                Spacer()
-                Button("Finish setup") { state.completeOnboarding() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(state.daemon != .online || state.onboardingDiscoveryRunning)
+                .padding(.bottom, Theme.Spacing.xs)
             }
+
+            HStack {
+                Text(state.onboardingHasConnectedAccounts
+                     ? connectedFooterText
+                     : "You can add providers later from Settings.")
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer()
+                Button(state.onboardingHasConnectedAccounts ? "Start tracking" : "Set up later") {
+                    Task { await state.continueFromOnboarding() }
+                }
+                .buttonStyle(.chipPrimary)
+                .disabled(state.daemon != .online || state.onboardingDiscoveryRunning)
+            }
+        }
+        .task {
+            if state.serverProviderOrder.isEmpty {
+                await state.prepareOnboarding()
+            }
+        }
+    }
+
+    private var connectedFooterText: String {
+        let count = state.onboardingConnectedAccounts.count
+        return count == 1 ? "1 account is ready." : "\(count) accounts are ready."
+    }
+
+    private var notificationContent: some View {
+        VStack(spacing: Theme.Spacing.xl) {
+            Spacer()
+            Image(systemName: "bell.badge")
+                .font(.system(size: 42, weight: .medium))
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            VStack(spacing: Theme.Spacing.sm) {
+                Text("Get a heads-up before you run low?")
+                    .font(.title2.bold())
+                    .multilineTextAlignment(.center)
+                Text("UsageTracker can notify you when a limit is nearly reached or resets.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Label(
+                "macOS will ask for notification permission after you choose Enable alerts.",
+                systemImage: "hand.raised"
+            )
+            .font(Theme.Typography.caption)
+            .foregroundStyle(.secondary)
+            .surfaceCard()
+            Spacer()
+            HStack {
+                Button("Not now") {
+                    state.skipNotificationsAndCompleteOnboarding()
+                }
+                Spacer()
+                Button("Enable alerts") {
+                    Task { await state.enableNotificationsAndCompleteOnboarding() }
+                }
+                .buttonStyle(.chipPrimary)
+            }
+        }
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text.uppercased())
+            .font(Theme.Typography.micro.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, Theme.Spacing.xs)
+    }
+
+    private func onboardingHeader(title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            Text(title).font(Theme.Typography.title)
+            Text(subtitle)
+                .font(Theme.Typography.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -181,49 +210,274 @@ struct Onboarding: View {
 private struct OnboardingProviderCard: View {
     @EnvironmentObject var state: AppState
     let providerId: String
+    @State private var showsAccessExplanation = false
 
-    private var provider: ProviderVM? {
-        state.settingsProviders.first { $0.providerId == providerId }
+    private var connection: ProviderConnectionPresentation {
+        state.onboardingProviderConnection(providerId)
+    }
+
+    private var connectionState: ProviderConnectionState {
+        connection.state
+    }
+
+    private var accounts: [Account] {
+        state.onboardingConnectedAccounts.filter { $0.providerId == providerId }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            HStack {
-                ProviderIcon(id: providerId, symbol: symbol, size: 18)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(name).font(Theme.Typography.headline)
-                    Text(description)
+            HStack(spacing: Theme.Spacing.sm) {
+                ProviderIcon(id: providerId, symbol: ProviderCatalog.symbol(for: providerId), size: 20)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(providerName).font(Theme.Typography.headline)
+                    Label(statusText, systemImage: statusSymbol)
                         .font(Theme.Typography.micro)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(statusColor)
                 }
                 Spacer()
-                Toggle("", isOn: enabledBinding)
-                    .labelsHidden()
-                    .disabled(state.daemon == .offline || state.pendingProviders.contains(providerId))
+                primaryControl
             }
-            if provider?.enabled == true {
-                ProviderSetupControls(providerId: providerId, compact: true)
+
+            if showsAccessExplanation {
+                VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                    Text(accessExplanation)
+                        .font(Theme.Typography.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("Cancel") { showsAccessExplanation = false }
+                            .buttonStyle(.chip)
+                        Spacer()
+                        Button("Continue") {
+                            showsAccessExplanation = false
+                            Task { await state.connectProviderForOnboarding(providerId) }
+                        }
+                        .buttonStyle(.chipProminent)
+                    }
+                }
+                .surfaceInset()
+            }
+
+            if !accounts.isEmpty {
+                VStack(spacing: Theme.Spacing.xs) {
+                    ForEach(accounts) { account in
+                        onboardingAccountRow(account)
+                    }
+                }
+            }
+
+            secondaryControls
+
+            if state.supportsSetup(providerId), let setup = state.providerSetups[providerId] {
+                ProviderSetupFields(providerId: providerId, setup: setup, disabled: isBusy)
             }
         }
         .surfaceCard()
     }
 
-    private var enabledBinding: Binding<Bool> {
-        Binding(
-            get: { provider?.enabled ?? false },
-            set: { enabled in Task { await state.setProviderEnabled(providerId, enabled) } }
+    @ViewBuilder private var primaryControl: some View {
+        if showsAccessExplanation {
+            EmptyView()
+        } else {
+            switch connectionState {
+            case .connecting:
+                ProgressView().controlSize(.small).accessibilityLabel("Connecting \(providerName)")
+            case .connected:
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .accessibilityLabel("\(providerName) connected")
+            case .waitingForSignIn:
+                ProgressView().controlSize(.small).accessibilityLabel("Waiting for \(providerName) sign-in")
+            case .idle:
+                Button("Connect") { requestConnection() }
+                    .buttonStyle(.chipProminent)
+                    .disabled(state.daemon == .offline)
+            case .needsPermission, .failed:
+                Button("Try again") { requestConnection() }
+                    .buttonStyle(.chipProminent)
+                    .disabled(state.daemon == .offline)
+            case .needsSignIn:
+                EmptyView()
+            }
+        }
+    }
+
+    @ViewBuilder private var secondaryControls: some View {
+        switch connectionState {
+        case .needsSignIn:
+            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                if !canSignIn {
+                    Text("Open \(providerName), sign in there, then check again.")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: Theme.Spacing.sm) {
+                    if canSignIn {
+                        Button("Open sign-in") {
+                            Task { await openSignIn() }
+                        }
+                        .buttonStyle(.chipProminent)
+                        Button("Copy link", systemImage: "doc.on.doc") {
+                            Task { await copySignInLink() }
+                        }
+                        .buttonStyle(.chip)
+                    }
+                    Button("Check again") {
+                        Task { await state.checkProviderAfterSignIn(providerId) }
+                    }
+                    .buttonStyle(.chip)
+                }
+            }
+        case .waitingForSignIn:
+            HStack(spacing: Theme.Spacing.sm) {
+                Button("I’ve signed in — check") {
+                    Task { await state.checkProviderAfterSignIn(providerId) }
+                }
+                .buttonStyle(.chipProminent)
+                Button("Cancel") { state.cancelProviderSignIn(providerId) }
+                    .buttonStyle(.chip)
+            }
+        case .connected:
+            HStack(spacing: Theme.Spacing.sm) {
+                if state.supportsAddAccount(providerId) {
+                    Button("Add account") {
+                        Task { await state.addProviderAccount(providerId) }
+                    }
+                    .buttonStyle(.chip)
+                }
+                if state.supportsSetup(providerId) {
+                    Button(state.providerSetups[providerId] == nil ? "Find workspaces" : "Refresh workspaces") {
+                        Task { await state.loadProviderSetup(providerId) }
+                    }
+                    .buttonStyle(.chip)
+                }
+            }
+        case .idle, .connecting, .needsPermission, .failed:
+            EmptyView()
+        }
+    }
+
+    private func onboardingAccountRow(_ account: Account) -> some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            Image(systemName: "person.crop.circle.fill")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(accountTitle(account))
+                    .font(Theme.Typography.caption.weight(.medium))
+                    .lineLimit(1)
+                if let email = account.email, email != accountTitle(account) {
+                    Text(email)
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+            Text("Connected")
+                .font(Theme.Typography.micro)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, Theme.Spacing.sm)
+        .frame(height: 38)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
         )
     }
 
-    private var name: String {
-        provider?.name ?? ProviderCatalog.name(for: providerId)
+    private func requestConnection() {
+        if needsCredentialExplanation {
+            showsAccessExplanation = true
+        } else {
+            Task { await state.connectProviderForOnboarding(providerId) }
+        }
     }
-    private var symbol: String {
-        provider?.symbol ?? ProviderCatalog.symbol(for: providerId)
+
+    private func openSignIn() async {
+        await state.beginProviderSignIn(providerId, accountId: accounts.first?.id)
     }
-    private var description: String {
-        "Usage, limits, and account health"
+
+    private func copySignInLink() async {
+        await ProviderSignInActions.copyLink(
+            state: state,
+            providerId: providerId,
+            displayName: providerName,
+            accountId: accounts.first?.id
+        )
+    }
+
+    private func accountTitle(_ account: Account) -> String {
+        if let name = account.displayName, !name.isEmpty { return name }
+        if let email = account.email, !email.isEmpty { return email }
+        let id = account.externalAccountId
+        guard id.count > 16 else { return id }
+        return "\(id.prefix(8))…\(id.suffix(4))"
+    }
+
+    private var providerName: String {
+        state.serverProviders[providerId]?.displayName ?? ProviderCatalog.name(for: providerId)
+    }
+
+    private var statusText: String {
+        connection.message
+    }
+
+    private var statusSymbol: String {
+        switch connectionState {
+        case .connected: "checkmark.circle.fill"
+        case .connecting, .waitingForSignIn: "clock"
+        case .needsPermission: "lock.trianglebadge.exclamationmark"
+        case .needsSignIn: "person.badge.key"
+        case .failed: "exclamationmark.triangle"
+        case .idle: state.serverProviders[providerId]?.detected == true ? "desktopcomputer" : "plus.circle"
+        }
+    }
+
+    private var statusColor: Color {
+        switch connectionState {
+        case .connected: .green
+        case .needsPermission, .needsSignIn: .orange
+        case .failed: .red
+        case .idle, .connecting, .waitingForSignIn: .secondary
+        }
+    }
+
+    private var isBusy: Bool {
+        connectionState == .connecting || connectionState == .waitingForSignIn
+    }
+
+    private var canSignIn: Bool {
+        state.supportsAddAccount(providerId) || state.supportsRepair(providerId)
+    }
+
+    private var credentialAccessNotice: String? {
+        state.serverProviders[providerId]?.credentialAccessNotice
+    }
+
+    private var needsCredentialExplanation: Bool {
+        credentialAccessNotice != nil
+    }
+
+    private var accessExplanation: String {
+        credentialAccessNotice ?? ""
+    }
+}
+
+@MainActor private enum ProviderSignInActions {
+    static func copyLink(
+        state: AppState,
+        providerId: String,
+        displayName: String,
+        accountId: String?
+    ) async {
+        guard let url = await state.providerSignInLink(
+            providerId,
+            accountId: accountId
+        ) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        state.actionError = nil
+        state.actionMessage = "\(displayName) sign-in link copied."
     }
 }
 
@@ -257,7 +511,7 @@ struct ProviderSetupControls: View {
                         .disabled(busy)
                 }
                 if state.supportsSetup(providerId) {
-                    Button(setup == nil ? "Load setup" : "Reload setup") {
+                    Button(setup == nil ? "Find workspaces" : "Refresh workspaces") {
                         Task { await state.loadProviderSetup(providerId) }
                     }
                     .disabled(busy)
@@ -276,11 +530,6 @@ struct ProviderSetupControls: View {
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .task {
-            if state.providerSetups[providerId] == nil, state.supportsSetup(providerId) {
-                await state.loadProviderSetup(providerId)
-            }
-        }
     }
 
     private var canConnectOrRepair: Bool {
@@ -290,27 +539,22 @@ struct ProviderSetupControls: View {
     }
 
     private func copyAuthenticationURL() async {
-        guard let url = await state.providerSignInLink(
-            providerId,
+        await ProviderSignInActions.copyLink(
+            state: state,
+            providerId: providerId,
+            displayName: state.serverProviders[providerId]?.displayName
+                ?? ProviderCatalog.name(for: providerId),
             accountId: accounts.first?.id
-        ) else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url, forType: .string)
-        state.actionError = nil
-        state.actionMessage = "\(ProviderCatalog.name(for: providerId)) sign-in link copied."
+        )
     }
 
     private func connectOrRepair() async {
-        if accounts.isEmpty, state.supportsAddAccount(providerId) {
-            await state.addProviderAccount(providerId)
-        } else if state.supportsRepair(providerId) {
-            await state.repairProvider(providerId, accountId: accounts.first?.id)
-        }
+        await state.beginProviderSignIn(providerId, accountId: accounts.first?.id)
     }
 
     private var helpText: String {
         state.supportsSetup(providerId)
-            ? "Connect the provider, review its setup options, then refresh usage."
+            ? "Workspace discovery runs only when you choose Find workspaces."
             : "Finish sign-in; the account appears automatically after the next refresh."
     }
 }

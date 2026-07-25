@@ -577,6 +577,7 @@ mod tests {
         let manager = NotificationManager::new(
             storage.clone(),
             NotificationConfig {
+                enabled: true,
                 cooldown_minutes: 0,
                 ..NotificationConfig::default()
             },
@@ -754,6 +755,7 @@ mod tests {
         let manager = NotificationManager::new(
             storage.clone(),
             NotificationConfig {
+                enabled: true,
                 predictive_alerts: true,
                 cooldown_minutes: 0,
                 ..NotificationConfig::default()

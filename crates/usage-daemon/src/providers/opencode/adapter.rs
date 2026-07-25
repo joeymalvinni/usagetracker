@@ -28,7 +28,6 @@ impl ProviderAdapter for OpenCodeAdapter {
             id: OPENCODE_GO_PROVIDER_ID,
             display_name: "OpenCode Go",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -66,6 +65,22 @@ impl ProviderAdapter for OpenCodeAdapter {
         config: &ProviderConfig,
     ) -> anyhow::Result<Arc<dyn ProviderCollector>> {
         Ok(Arc::new(OpenCodeCollector::new(config.clone())?))
+    }
+
+    fn detected_locally(&self) -> bool {
+        std::path::Path::new("/Applications/OpenCode.app").exists()
+            || dirs::home_dir().is_some_and(|home| {
+                home.join("Applications/OpenCode.app").exists()
+                    || home.join(".local/share/opencode").exists()
+                    || home.join(".config/opencode").exists()
+            })
+    }
+
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        Some(
+            "OpenCode Go uses your existing web session. After you continue, macOS may ask for \
+             UsageTracker's cookie cache or your browser's Safe Storage key.",
+        )
     }
 
     fn repair_handler(&self) -> Option<&dyn RepairHandler> {

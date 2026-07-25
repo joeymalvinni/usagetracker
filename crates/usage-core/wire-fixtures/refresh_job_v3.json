@@ -9,6 +9,10 @@
     "created_at": "2026-07-11T12:00:00Z",
     "started_at": "2026-07-11T12:00:00Z",
     "finished_at": "2026-07-11T12:00:01Z",
+    "discovered_accounts": [{
+      "provider_id": "codex",
+      "account_id": "account-1"
+    }],
     "provider_results": [{
       "provider_id": "codex",
       "account_id": "account-1",

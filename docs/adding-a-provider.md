@@ -344,7 +344,6 @@ impl ProviderAdapter for AcmeAdapter {
             id: PROVIDER_ID,
             display_name: "Acme AI",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -370,12 +369,24 @@ impl ProviderAdapter for AcmeAdapter {
     ) -> anyhow::Result<Arc<dyn ProviderCollector>> {
         Ok(Arc::new(AcmeCollector::new(config.clone())?))
     }
+
+    fn detected_locally(&self) -> bool {
+        std::path::Path::new("/Applications/Acme AI.app").exists()
+    }
+
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        Some("Acme AI stores its sign-in in macOS Keychain. macOS may ask UsageTracker for access.")
+    }
 }
 ```
 
 Choose timeouts from measured worst cases, not by copying another provider.
 `minimum_refresh_interval_seconds` is enforced even when the global interval is
 shorter. `max_parallel_accounts` bounds collection within this provider.
+`detected_locally` must remain prompt-free and credential-inert. Add
+`credential_access_notice` only when connecting can cause macOS to request
+Keychain or browser-storage access; onboarding renders this provider-owned copy
+without any provider ID switches in Swift.
 
 Expose optional handlers only when the implementation exists:
 

@@ -53,6 +53,11 @@ struct UIConfig: Codable, Equatable, Sendable {
     var darkModeEnabled = true
     var activityChartStyle = ActivityChartStyle.bars
     var onboardingCompleted = false
+    /// Persists the transition past the welcome screen so an interrupted
+    /// provider connection resumes where the user left it.
+    var onboardingWelcomeCompleted = false
+    /// Records the user's response to the contextual notification offer.
+    var notificationPromptCompleted = false
     /// Alert signatures the user has seen (viewed the account). Clears the rail/chip dot.
     var seenAlerts = Set<String>()
     /// Alert signatures whose banner the user has dismissed.
@@ -82,6 +87,14 @@ struct UIConfig: Codable, Equatable, Sendable {
         ) ?? .bars
         // Existing beta users should not be interrupted; newly created configs keep false.
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
+        onboardingWelcomeCompleted = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .onboardingWelcomeCompleted
+        ) ?? onboardingCompleted
+        notificationPromptCompleted = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .notificationPromptCompleted
+        ) ?? onboardingCompleted
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
         dismissedAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedAlerts) ?? []
         lastSeenReleaseNotesVersion = try c.decodeIfPresent(

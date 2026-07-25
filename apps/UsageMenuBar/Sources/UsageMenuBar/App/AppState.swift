@@ -56,6 +56,7 @@ private enum ProviderSignInFollowUp {
     @Published var serverProviderOrder = [String]()
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
+    @Published var onboardingShowsNotificationChoice = false
     @Published private(set) var derived = DerivedState.empty
     var providers: [ProviderVM] { derived.providers }
     var settingsProviders: [ProviderVM] { derived.settingsProviders }
@@ -95,6 +96,8 @@ private enum ProviderSignInFollowUp {
     private let daemonSupervisor = DaemonSupervisor()
     private let notificationDelivery = NotificationDelivery()
     private let uiConfigStore = UIConfigStore()
+    private let providerConnections = ProviderConnectionCoordinator()
+    private var cancellables = Set<AnyCancellable>()
     private var uiPersistenceTask: Task<Void, Never>?
     private var buildTask: Task<Void, Never>?
     private var buildRevision = 0
@@ -118,6 +121,8 @@ private enum ProviderSignInFollowUp {
         self.socketPath = socketPath
         self.client = DaemonClient(socketPath: socketPath)
         self.onboardingProviderDefaultsPending = !ui.onboardingCompleted
+        self.onboardingDiscoveryStarted = ui.onboardingWelcomeCompleted && !ui.onboardingCompleted
+        observeProviderConnections()
     }
 
     init(socketPath: String) {
@@ -130,6 +135,8 @@ private enum ProviderSignInFollowUp {
         self.socketPath = socketPath
         self.client = DaemonClient(socketPath: socketPath)
         self.onboardingProviderDefaultsPending = !ui.onboardingCompleted
+        self.onboardingDiscoveryStarted = ui.onboardingWelcomeCompleted && !ui.onboardingCompleted
+        observeProviderConnections()
     }
 
     func bootstrap() async {
@@ -142,6 +149,7 @@ private enum ProviderSignInFollowUp {
         // replaces an older daemon instead of silently serving stale data.
         _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
         await load()
+        await refreshAll()
         // Running the notifications fixture is an explicit request to exercise
         // desktop delivery. Development builds use their own bundle identity,
         // so request its authorization on the first fixture launch and then
@@ -227,6 +235,26 @@ private enum ProviderSignInFollowUp {
         if enabled && notificationAuthorization == .notDetermined {
             await requestNotificationAuthorizationIfNeeded()
         }
+        if enabled && !notificationDeliveryIsAuthorized {
+            if config?.notifications.enabled == true {
+                do {
+                    config = try await client.updateConfig(
+                        pollIntervalSeconds: nil,
+                        providers: nil,
+                        notifications: config?.notifications.withEnabled(false)
+                    )
+                    build()
+                } catch {
+                    actionError = "Usage alerts could not be turned off: \(describe(error))"
+                    return
+                }
+            }
+            actionError = nil
+            actionMessage = notificationAuthorization == .denied
+                ? "Notifications are blocked in macOS System Settings. Usage alerts remain off."
+                : "Usage alerts remain off until macOS notification permission is available."
+            return
+        }
         await perform(.notifications) {
             config = try await client.updateConfig(
                 pollIntervalSeconds: nil,
@@ -234,11 +262,7 @@ private enum ProviderSignInFollowUp {
                 notifications: (config?.notifications ?? NotificationConfig(enabled: enabled))
                     .withEnabled(enabled)
             )
-            if enabled && notificationAuthorization == .denied {
-                actionMessage = "Usage alerts are enabled, but notifications are blocked in macOS System Settings."
-            } else {
-                actionMessage = enabled ? "Usage alerts enabled." : "Usage alerts disabled."
-            }
+            actionMessage = enabled ? "Usage alerts enabled." : "Usage alerts disabled."
             build()
             if enabled {
                 await deliverPendingNotifications()
@@ -262,6 +286,21 @@ private enum ProviderSignInFollowUp {
         await refreshNotificationAuthorization()
     }
 
+    private var notificationDeliveryIsAuthorized: Bool {
+        switch notificationAuthorization {
+        case .authorized, .provisional, .ephemeral:
+            true
+        case .denied, .notDetermined:
+            false
+        @unknown default:
+            false
+        }
+    }
+
+    var notificationsEffectivelyEnabled: Bool {
+        config?.notifications.enabled == true && notificationDeliveryIsAuthorized
+    }
+
     func addProviderAccount(_ providerId: String) async {
         guard supportsAddAccount(providerId) else {
             actionError = "\(providerName(providerId)) does not support adding accounts."
@@ -273,10 +312,19 @@ private enum ProviderSignInFollowUp {
             let response = try await client.addProviderAccount(providerId: providerId, displayName: nil)
             actionError = nil
             actionMessage = "Finish signing in to \(providerName(providerId)) in your browser. This account will appear automatically."
-            await waitForProviderAccount(providerId: providerId, profileId: response.profileId)
+            setOnboardingProviderState(
+                providerId,
+                .waitingForSignIn,
+                "Waiting for browser sign-in…"
+            )
+            monitorProviderSignIn(
+                providerId: providerId,
+                followUp: .addedAccount(profileId: response.profileId)
+            )
         } catch {
             actionMessage = nil
             actionError = describe(error)
+            setOnboardingProviderState(providerId, .failed, describe(error))
         }
     }
 
@@ -327,6 +375,11 @@ private enum ProviderSignInFollowUp {
                 return nil
             }
             actionError = nil
+            setOnboardingProviderState(
+                providerId,
+                .waitingForSignIn,
+                "Waiting for browser sign-in…"
+            )
             monitorProviderSignIn(providerId: providerId, followUp: followUp)
             return url
         } catch {
@@ -336,11 +389,22 @@ private enum ProviderSignInFollowUp {
         }
     }
 
+    func beginProviderSignIn(_ providerId: String, accountId: String? = nil) async {
+        let hasAccounts = accounts.contains { $0.providerId == providerId }
+        if !hasAccounts, supportsAddAccount(providerId) {
+            await addProviderAccount(providerId)
+        } else if supportsRepair(providerId) {
+            await repairProvider(providerId, accountId: accountId)
+        } else {
+            actionError = "\(providerName(providerId)) does not support sign-in."
+        }
+    }
+
     private func monitorProviderSignIn(
         providerId: String,
         followUp: ProviderSignInFollowUp
     ) {
-        Task { [weak self] in
+        providerConnections.monitor(providerId: providerId) { [weak self] in
             guard let self else { return }
             switch followUp {
             case .addedAccount(let profileId):
@@ -353,6 +417,15 @@ private enum ProviderSignInFollowUp {
                 )
             }
         }
+    }
+
+    func cancelProviderSignIn(_ providerId: String) {
+        providerConnections.cancelMonitor(for: providerId)
+        setOnboardingProviderState(
+            providerId,
+            .needsSignIn,
+            "Sign-in paused. Continue whenever you’re ready."
+        )
     }
 
     func setAccountHidden(_ id: String, _ hidden: Bool) async {
@@ -503,13 +576,15 @@ private enum ProviderSignInFollowUp {
         await perform(.accountProvider(providerId)) {
             let response = try await client.repairProvider(providerId: providerId, accountId: accountId)
             actionMessage = response.message
-            if supportsMultipleAccounts(providerId) {
-                await waitForProviderRepair(
-                    providerId: providerId,
-                    accountId: accountId,
-                    startedAt: startedAt
-                )
-            }
+            setOnboardingProviderState(
+                providerId,
+                .waitingForSignIn,
+                "Waiting for browser sign-in…"
+            )
+            monitorProviderSignIn(
+                providerId: providerId,
+                followUp: .repairedAccount(accountId: accountId, startedAt: startedAt)
+            )
         }
     }
 
@@ -528,32 +603,17 @@ private enum ProviderSignInFollowUp {
         }
     }
 
-    func completeOnboarding() {
-        // A clean installation has no "previous version," so its current
-        // release is not presented as something that was just updated.
-        if ui.lastSeenReleaseNotesVersion == nil {
-            ui.lastSeenReleaseNotesVersion = updater.currentVersion
-        }
-        ui.onboardingCompleted = true
-        onboardingProviderDefaultsPending = false
-        actionError = nil
-        actionMessage = "Setup complete. Usage will update automatically."
-    }
-
-    func restartOnboarding() {
-        // The daemon is already running for an existing installation, so rerunning
-        // setup can go straight to account discovery and provider controls.
+    func beginOnboarding() async {
+        ui.onboardingWelcomeCompleted = true
         onboardingDiscoveryStarted = true
-        onboardingProviderDefaultsPending = false
-        ui.onboardingCompleted = false
+        await prepareOnboarding()
     }
 
-    func discoverAccountsForOnboarding() async {
+    func prepareOnboarding() async {
         guard !onboardingDiscoveryRunning else { return }
         onboardingDiscoveryStarted = true
         onboardingDiscoveryRunning = true
         actionError = nil
-        actionMessage = nil
         defer { onboardingDiscoveryRunning = false }
 
         _ = await daemonSupervisor.ensureRunning(socketPath: socketPath)
@@ -570,66 +630,306 @@ private enum ProviderSignInFollowUp {
                 )
                 config = try await client.updateConfig(
                     pollIntervalSeconds: nil,
-                    providers: toggles
+                    providers: toggles,
+                    notifications: (config?.notifications ?? NotificationConfig(enabled: false))
+                        .withEnabled(false)
                 )
                 onboardingProviderDefaultsPending = false
                 build()
             }
+        } catch {
+            actionError = "Setup could not be prepared: \(describe(error))"
+        }
+    }
 
-            // Only inspect providers the user has enabled. Enabling a provider from
-            // onboarding performs its own targeted refresh, so credentials for other
-            // providers are never touched without an explicit opt-in.
-            let firstScan = try await client.refresh(Array(enabledProviderIDs()).sorted())
-            await load()
+    func connectProviderForOnboarding(_ providerId: String) async {
+        guard onboardingProviderConnection(providerId).state != .connecting else { return }
+        setOnboardingProviderState(providerId, .connecting, "Checking for an account…")
+        actionError = nil
 
-            let discoveredAccountIDs = Set(firstScan.providerResults.compactMap(\.accountId))
-            let discoveredAccounts = accounts.filter { discoveredAccountIDs.contains($0.id) }
-            for account in discoveredAccounts where !account.collectionEnabled {
-                _ = try await client.updateAccount(
-                    accountId: account.id,
-                    collectionEnabled: true
-                )
+        do {
+            config = try await client.updateConfig(
+                pollIntervalSeconds: nil,
+                providers: [providerId: true]
+            )
+            build()
+            let started = try await client.startRefresh([providerId])
+            let discoveredProvider: (RefreshJob) -> Bool = { job in
+                job.discoveredAccounts.contains { $0.providerId == providerId }
             }
-
-            let providerIDs = Set(discoveredAccounts.map(\.providerId))
-            if !providerIDs.isEmpty {
-                let toggles = Dictionary(uniqueKeysWithValues: providerIDs.map { ($0, true) })
-                config = try await client.updateConfig(
-                    pollIntervalSeconds: nil,
-                    providers: toggles
+            let progress = try await client.waitForRefreshProgress(
+                started,
+                until: discoveredProvider
+            )
+            if discoveredProvider(progress) {
+                await load()
+                let discoveredAccountIDs = Set(
+                    progress.discoveredAccounts
+                        .filter { $0.providerId == providerId }
+                        .map(\.accountId)
                 )
-
-                if discoveredAccounts.contains(where: { !$0.collectionEnabled }) {
-                    _ = try await client.refresh(Array(providerIDs).sorted())
+                if onboardingConnectedAccounts.contains(where: {
+                    discoveredAccountIDs.contains($0.id)
+                }) {
+                    providerConnections.clearOverride(for: providerId)
+                    finishOnboardingUsageRefreshInBackground(progress)
+                    return
                 }
             }
+            let report = try await client.finishRefresh(progress)
             await load()
 
-            if discoveredAccounts.isEmpty {
-                actionError = "No signed-in accounts were found. Sign in to an enabled provider, then check again."
-            } else {
-                let noun = discoveredAccounts.count == 1 ? "account" : "accounts"
-                let failedProviders = firstScan.providerResults.filter {
-                    switch $0.status {
-                    case .ok, .disabled: false
-                    default: true
-                    }
-                }.map(\.providerId)
-                let suffix = failedProviders.isEmpty
-                    ? ""
-                    : " You can retry any provider that still needs attention below."
-                actionMessage = "Found \(discoveredAccounts.count) \(noun).\(suffix)"
+            let providerAccounts = onboardingConnectedAccounts.filter {
+                $0.providerId == providerId
+            }
+            let providerResults = report.providerResults.filter { $0.providerId == providerId }
+            if providerResults.contains(where: { $0.status == .ok }), !providerAccounts.isEmpty {
+                providerConnections.clearOverride(for: providerId)
+                return
+            }
+
+            let result = providerResults.first
+            try await pauseProviderAfterFailedOnboardingConnection(providerId)
+            switch result?.status {
+            case .keychainAccessFailed:
+                setOnboardingProviderState(
+                    providerId,
+                    .needsPermission,
+                    "macOS did not allow credential access. You can try again."
+                )
+            case .credentialsMissing:
+                setOnboardingProviderState(
+                    providerId,
+                    .needsSignIn,
+                    "No signed-in account was found."
+                )
+            case .credentialsInvalid, .unauthorized:
+                setOnboardingProviderState(
+                    providerId,
+                    .needsSignIn,
+                    "The existing sign-in needs to be renewed."
+                )
+            case .network:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    "You appear to be offline. Check your connection and try again."
+                )
+            case .rateLimited:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    "The provider is temporarily rate limited. Try again shortly."
+                )
+            case .parse:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    "The provider returned data this version cannot read."
+                )
+            case .providerUnavailable:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    result?.message ?? "The provider is not available on this Mac."
+                )
+            case .storageError:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    "The account was found but could not be saved."
+                )
+            case .disabled:
+                providerConnections.clearOverride(for: providerId)
+            case .ok:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    "Usage was checked, but no account identity was returned."
+                )
+            case .other(_), nil:
+                setOnboardingProviderState(
+                    providerId,
+                    .needsSignIn,
+                    result?.message ?? "No signed-in account was found."
+                )
             }
         } catch {
-            actionError = "Account discovery failed: \(describe(error))"
+            try? await pauseProviderAfterFailedOnboardingConnection(providerId)
+            setOnboardingProviderState(providerId, .failed, describe(error))
         }
+    }
+
+    private func finishOnboardingUsageRefreshInBackground(_ job: RefreshJob) {
+        Task { [weak self] in
+            // Account discovery already succeeded. The state reload and
+            // provider health surface any later usage-refresh failure.
+            _ = try? await client.finishRefresh(job)
+            await self?.load()
+        }
+    }
+
+    func checkProviderAfterSignIn(_ providerId: String) async {
+        providerConnections.cancelMonitor(for: providerId)
+        await connectProviderForOnboarding(providerId)
+    }
+
+    private func pauseProviderAfterFailedOnboardingConnection(_ providerId: String) async throws {
+        config = try await client.updateConfig(
+            pollIntervalSeconds: nil,
+            providers: [providerId: false]
+        )
+        build()
+    }
+
+    private func setOnboardingProviderState(
+        _ providerId: String,
+        _ state: ProviderConnectionState,
+        _ message: String
+    ) {
+        providerConnections.set(state, message: message, for: providerId)
+    }
+
+    func onboardingProviderConnection(
+        _ providerId: String
+    ) -> ProviderConnectionPresentation {
+        providerConnections.presentation(
+            for: providerId,
+            descriptor: serverProviders[providerId],
+            accounts: onboardingConnectedAccounts.filter { $0.providerId == providerId },
+            health: health.filter { $0.providerId == providerId }
+        )
+    }
+
+    var onboardingConnectedAccounts: [Account] {
+        accounts.filter { !($0.hidden && !$0.collectionEnabled) }
+    }
+
+    var onboardingProviderOrder: [String] {
+        let serverRank = Dictionary(
+            uniqueKeysWithValues: serverProviderOrder.enumerated().map { ($0.element, $0.offset) }
+        )
+        return serverProviderOrder.sorted { left, right in
+            let leftRank = onboardingProviderRank(left)
+            let rightRank = onboardingProviderRank(right)
+            if leftRank != rightRank { return leftRank < rightRank }
+            return (serverRank[left] ?? Int.max) < (serverRank[right] ?? Int.max)
+        }
+    }
+
+    private func onboardingProviderRank(_ providerId: String) -> Int {
+        if onboardingConnectedAccounts.contains(where: { $0.providerId == providerId }) { return 0 }
+        if serverProviders[providerId]?.detected == true { return 1 }
+        return 2
+    }
+
+    var onboardingFoundProviderIDs: [String] {
+        onboardingProviderOrder.filter { providerId in
+            onboardingConnectedAccounts.contains(where: { $0.providerId == providerId })
+                || serverProviders[providerId]?.detected == true
+        }
+    }
+
+    var onboardingOtherProviderIDs: [String] {
+        let found = Set(onboardingFoundProviderIDs)
+        return onboardingProviderOrder.filter { !found.contains($0) }
+    }
+
+    var onboardingHasConnectedAccounts: Bool {
+        !onboardingConnectedAccounts.isEmpty
+    }
+
+    var onboardingHasSuccessfulUsage: Bool {
+        snapshots.contains { snapshot in
+            onboardingConnectedAccounts.contains { $0.id == snapshot.accountId }
+        }
+    }
+
+    var shouldOfferNotifications: Bool {
+        ui.onboardingCompleted
+            && !ui.notificationPromptCompleted
+            && onboardingHasSuccessfulUsage
+            && !notificationsEffectivelyEnabled
+            && notificationAuthorization == .notDetermined
+            && notificationAuthorizationAvailable
+    }
+
+    func continueFromOnboarding() async {
+        let connectedProviderIDs = Set(onboardingConnectedAccounts.map(\.providerId))
+        if !connectedProviderIDs.isEmpty {
+            do {
+                config = try await client.updateConfig(
+                    pollIntervalSeconds: nil,
+                    providers: Dictionary(
+                        uniqueKeysWithValues: connectedProviderIDs.map { ($0, true) }
+                    )
+                )
+                build()
+            } catch {
+                actionError = "Tracking could not be started: \(describe(error))"
+                return
+            }
+        }
+        if onboardingHasSuccessfulUsage,
+           !ui.notificationPromptCompleted,
+           notificationAuthorization == .notDetermined,
+           notificationAuthorizationAvailable {
+            onboardingShowsNotificationChoice = true
+        } else {
+            completeOnboarding()
+        }
+    }
+
+    func enableNotificationsAndCompleteOnboarding() async {
+        await setNotificationsEnabled(true)
+        ui.notificationPromptCompleted = true
+        onboardingShowsNotificationChoice = false
+        completeOnboarding()
+    }
+
+    func skipNotificationsAndCompleteOnboarding() {
+        ui.notificationPromptCompleted = true
+        onboardingShowsNotificationChoice = false
+        completeOnboarding()
+    }
+
+    func dismissNotificationOffer() {
+        ui.notificationPromptCompleted = true
+    }
+
+    func acceptNotificationOffer() async {
+        await setNotificationsEnabled(true)
+        ui.notificationPromptCompleted = true
+    }
+
+    private func completeOnboarding() {
+        // A clean installation has no "previous version," so its current
+        // release is not presented as something that was just updated.
+        if ui.lastSeenReleaseNotesVersion == nil {
+            ui.lastSeenReleaseNotesVersion = updater.currentVersion
+        }
+        ui.onboardingCompleted = true
+        ui.onboardingWelcomeCompleted = true
+        onboardingProviderDefaultsPending = false
+        actionError = nil
+        actionMessage = "Setup complete. Usage will update automatically."
+    }
+
+    func restartOnboarding() async {
+        // The daemon is already running for an existing installation, so rerunning
+        // setup can go straight to account discovery and provider controls.
+        providerConnections.reset()
+        onboardingDiscoveryStarted = true
+        onboardingProviderDefaultsPending = false
+        ui.onboardingWelcomeCompleted = true
+        ui.onboardingCompleted = false
+        await prepareOnboarding()
     }
 
     static func onboardingDefaultProviderToggles(providerIDs: [String]) -> [String: Bool] {
         Dictionary(
             uniqueKeysWithValues: Set(providerIDs)
-                .union(["codex"])
-                .map { ($0, $0 == "codex") }
+                .map { ($0, false) }
         )
     }
 
@@ -688,6 +988,13 @@ private enum ProviderSignInFollowUp {
     private static func defaultSocketPath() -> String {
         ProcessInfo.processInfo.environment["USAGE_TRACKER_SOCKET"] ?? UIPaths.socket.path
     }
+
+    private func observeProviderConnections() {
+        providerConnections.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+    }
+
     private static var isRunningFromAppBundle: Bool {
         Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
     }
@@ -854,6 +1161,7 @@ private enum ProviderSignInFollowUp {
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) account connected."
                     await load()
+                    providerConnections.clearOverride(for: providerId)
                     return
                 }
             } catch {
@@ -862,6 +1170,11 @@ private enum ProviderSignInFollowUp {
             try? await Task.sleep(for: .seconds(1))
         }
         actionMessage = "\(providerName(providerId)) sign-in is still pending. You can retry from Settings."
+        setOnboardingProviderState(
+            providerId,
+            .needsSignIn,
+            "Sign-in was not detected. You can check again or retry."
+        )
     }
     private func waitForProviderRepair(providerId: String, accountId: String?, startedAt: Date) async {
         for _ in 0..<600 {
@@ -879,6 +1192,7 @@ private enum ProviderSignInFollowUp {
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) login connected."
                     await load()
+                    providerConnections.clearOverride(for: providerId)
                     return
                 }
             } catch {
@@ -887,6 +1201,11 @@ private enum ProviderSignInFollowUp {
             try? await Task.sleep(for: .seconds(1))
         }
         actionMessage = "\(providerName(providerId)) sign-in is still pending. You can retry from Settings."
+        setOnboardingProviderState(
+            providerId,
+            .needsSignIn,
+            "Sign-in was not detected. You can check again or retry."
+        )
     }
 
     private func fail(_ error: Error) {

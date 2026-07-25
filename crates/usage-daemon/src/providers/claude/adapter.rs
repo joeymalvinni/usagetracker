@@ -37,7 +37,6 @@ impl ProviderAdapter for ClaudeAdapter {
             id: PROVIDER_ID,
             display_name: "Claude",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -124,6 +123,19 @@ impl ProviderAdapter for ClaudeAdapter {
         config: &ProviderConfig,
     ) -> anyhow::Result<Arc<dyn ProviderCollector>> {
         Ok(Arc::new(ClaudeCollector::new(config.clone())?))
+    }
+
+    fn detected_locally(&self) -> bool {
+        dirs::home_dir().is_some_and(|home| {
+            home.join(".claude").exists() || home.join(".config/claude").exists()
+        }) || std::path::Path::new("/Applications/Claude.app").exists()
+    }
+
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        Some(
+            "Claude stores its sign-in in macOS Keychain. After you continue, macOS may ask \
+             UsageTracker to access that Claude credential.",
+        )
     }
 
     fn migrate_config(

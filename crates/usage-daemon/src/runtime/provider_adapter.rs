@@ -42,7 +42,6 @@ pub(crate) struct ProviderManifest {
     pub(crate) id: &'static str,
     pub(crate) display_name: &'static str,
     pub(crate) minimum_refresh_interval_seconds: u64,
-    pub(crate) default_visible: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -341,6 +340,20 @@ pub(crate) trait ProviderAdapter: Send + Sync {
         config: &ProviderConfig,
     ) -> anyhow::Result<Arc<dyn ProviderCollector>>;
 
+    /// Performs a prompt-free local presence check for onboarding. Implementations
+    /// may test whether known apps, CLIs, or data directories exist, but must not
+    /// read credential contents, query Keychain, import browser cookies, launch a
+    /// provider process, or make network requests.
+    fn detected_locally(&self) -> bool {
+        false
+    }
+
+    /// Optional provider-owned consent copy shown before onboarding performs a
+    /// refresh that may ask macOS for access to credentials or browser storage.
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Applies provider-owned migrations after deserialization. Returning true
     /// asks the shared loader to persist the normalized configuration.
     fn migrate_config(
@@ -402,6 +415,8 @@ pub(crate) trait ProviderAdapter: Send + Sync {
             id: ProviderId::new(manifest.id),
             display_name: manifest.display_name.to_string(),
             minimum_refresh_interval_seconds: manifest.minimum_refresh_interval_seconds,
+            detected: self.detected_locally(),
+            credential_access_notice: self.credential_access_notice().map(str::to_owned),
             capabilities: ProviderCapabilities {
                 multiple_accounts: self.supports_multiple_accounts(),
                 add_account: self.add_account_handler().is_some(),

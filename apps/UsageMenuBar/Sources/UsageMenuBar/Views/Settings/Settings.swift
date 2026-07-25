@@ -78,6 +78,7 @@ struct Settings: View {
                         LabeledContent("Dark mode") {
                             Toggle("", isOn: darkModeBinding)
                                 .labelsHidden()
+                                .accessibilityLabel("Dark mode")
                         }
                         LabeledContent("Activity chart") {
                             Picker("", selection: activityChartStyleBinding) {
@@ -94,6 +95,7 @@ struct Settings: View {
                             } else {
                                 Toggle("", isOn: notificationsBinding)
                                     .labelsHidden()
+                                    .accessibilityLabel("Usage alerts")
                                     .disabled(state.daemon == .offline)
                             }
                         } label: {
@@ -126,7 +128,9 @@ struct Settings: View {
                         }
                         Divider()
                         HStack {
-                            Button("Run setup assistant") { state.restartOnboarding() }
+                            Button("Run setup assistant") {
+                                Task { await state.restartOnboarding() }
+                            }
                                 .buttonStyle(.link)
                             Spacer()
                             if !state.accounts.isEmpty {
@@ -211,7 +215,7 @@ struct Settings: View {
 
     private var notificationsBinding: Binding<Bool> {
         Binding(
-            get: { state.config?.notifications.enabled ?? true },
+            get: { state.notificationsEffectivelyEnabled },
             set: { enabled in Task { await state.setNotificationsEnabled(enabled) } }
         )
     }
@@ -282,7 +286,7 @@ private struct ProviderAccountCard: View {
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(provider.name).font(Theme.Typography.headline)
-                    Text(provider.visibleInMenu ? provider.healthText : "Hidden")
+                    Text(provider.visibleInMenu ? provider.healthText : "Not tracking")
                         .font(Theme.Typography.micro)
                         .foregroundStyle(provider.visibleInMenu ? provider.status.tint : .secondary)
                 }
@@ -293,8 +297,11 @@ private struct ProviderAccountCard: View {
                     Toggle("", isOn: visibilityBinding)
                         .labelsHidden()
                         .toggleStyle(.switch)
+                        .accessibilityLabel("Track \(provider.name)")
                         .disabled(state.daemon == .offline)
-                        .help(provider.visibleInMenu ? "Hide \(provider.name)" : "Show \(provider.name)")
+                        .help(provider.visibleInMenu
+                            ? "Stop tracking \(provider.name)"
+                            : "Track \(provider.name)")
                 }
             }
 
@@ -326,16 +333,27 @@ private struct ProviderAccountCard: View {
                     .buttonStyle(.chip)
                     .disabled(busy || state.daemon == .offline)
                     if busy { ProgressView().controlSize(.small) }
+                    if state.supportsSetup(provider.providerId) {
+                        Button(setup == nil ? "Find workspaces" : "Refresh workspaces") {
+                            Task { await state.loadProviderSetup(provider.providerId) }
+                        }
+                        .buttonStyle(.chip)
+                        .disabled(busy || state.daemon == .offline)
+                    }
+                    Spacer()
+                }
+            } else if state.supportsSetup(provider.providerId) {
+                HStack {
+                    Button(setup == nil ? "Find workspaces" : "Refresh workspaces") {
+                        Task { await state.loadProviderSetup(provider.providerId) }
+                    }
+                    .buttonStyle(.chip)
+                    .disabled(busy || state.daemon == .offline)
                     Spacer()
                 }
             }
         }
         .surfaceCard()
-        .task {
-            if state.supportsSetup(provider.providerId), setup == nil {
-                await state.loadProviderSetup(provider.providerId)
-            }
-        }
     }
 
     private var visibilityBinding: Binding<Bool> {
@@ -418,6 +436,7 @@ private struct AccountSettingsRow: View {
                 Toggle("", isOn: collectionBinding)
                     .labelsHidden()
                     .toggleStyle(.switch)
+                    .accessibilityLabel("Track \(title)")
                     .disabled(state.daemon == .offline)
                     .help(account.collectionEnabled ? "Pause tracking" : "Resume tracking")
                 accountMenu

@@ -50,7 +50,10 @@ pub(crate) fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
             (
                 manifest.id.to_string(),
                 ProviderConfig {
-                    enabled: manifest.default_visible,
+                    // Fresh installations must remain credential-inert until
+                    // the user explicitly connects a provider. In particular,
+                    // a LaunchAgent may start before the onboarding UI appears.
+                    enabled: false,
                     ..ProviderConfig::default()
                 },
             )
@@ -203,6 +206,10 @@ mod tests {
             assert_eq!(
                 descriptor.capabilities.setup,
                 provider.setup_handler().is_some()
+            );
+            assert_eq!(
+                descriptor.credential_access_notice.as_deref(),
+                provider.credential_access_notice()
             );
         }
     }

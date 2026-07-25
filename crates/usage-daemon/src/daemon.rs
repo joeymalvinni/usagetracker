@@ -49,7 +49,6 @@ pub struct DaemonRuntime {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PollSchedule {
-    initial: Vec<ProviderId>,
     groups: Vec<PollGroup>,
 }
 
@@ -65,13 +64,11 @@ impl PollSchedule {
     }
 
     fn from_descriptors(config: &Config, descriptors: &[usage_core::ProviderDescriptor]) -> Self {
-        let mut initial = Vec::new();
         let mut by_interval = BTreeMap::<u64, Vec<ProviderId>>::new();
         for descriptor in descriptors {
             if !config.provider_enabled(descriptor.id.as_str()) {
                 continue;
             }
-            initial.push(descriptor.id.clone());
             let effective_interval = config
                 .poll_interval_seconds
                 .max(descriptor.minimum_refresh_interval_seconds);
@@ -81,7 +78,6 @@ impl PollSchedule {
                 .push(descriptor.id.clone());
         }
         Self {
-            initial,
             groups: by_interval
                 .into_iter()
                 .map(|(interval_seconds, providers)| PollGroup {
@@ -649,13 +645,10 @@ fn spawn_polling_loop_with_delay(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut schedule = schedule_rx.borrow_and_update().clone();
-        if !schedule.initial.is_empty() {
-            let report = refresh.refresh(Some(&schedule.initial)).await;
-            info!(
-                results = report.provider_results.len(),
-                "initial visible refresh completed"
-            );
-        }
+        // Startup is deliberately passive. The foreground app performs explicit
+        // refreshes after onboarding or when its UI opens, while the daemon waits
+        // a full interval before background collection. This prevents a persisted
+        // provider configuration from racing first-run consent.
         let mut due = poll_deadlines(&schedule, poll_delay);
 
         loop {
@@ -915,12 +908,12 @@ mod tests {
                 ..ConfigUpdateChanges::default()
             }
         );
-        let disabled_notifications = NotificationConfig {
-            enabled: false,
+        let enabled_notifications = NotificationConfig {
+            enabled: true,
             ..NotificationConfig::default()
         };
         assert_eq!(
-            config_update_changes(&config, None, None, Some(&disabled_notifications),),
+            config_update_changes(&config, None, None, Some(&enabled_notifications),),
             ConfigUpdateChanges {
                 notifications: true,
                 ..ConfigUpdateChanges::default()
@@ -1037,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_poll_delay_begins_after_initial_refresh_finishes() {
+    async fn daemon_waits_a_full_interval_before_its_first_refresh() {
         let root =
             std::env::temp_dir().join(format!("usage-poll-schedule-test-{}", uuid::Uuid::new_v4()));
         let storage = test_storage_at(&root);
@@ -1047,7 +1040,6 @@ mod tests {
             vec![provider.clone()],
         ));
         let (_interval_tx, interval_rx) = watch::channel(PollSchedule {
-            initial: vec![ProviderId::new(CODEX_PROVIDER_ID)],
             groups: vec![PollGroup {
                 providers: vec![ProviderId::new(CODEX_PROVIDER_ID)],
                 interval_seconds: 30,
@@ -1055,12 +1047,12 @@ mod tests {
         });
         let poll_task =
             spawn_polling_loop_with_delay(interval_rx, refresh.clone(), Duration::from_millis);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 0);
         timeout(Duration::from_secs(1), provider.first_started.notified())
             .await
-            .expect("the initial refresh should start");
-
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+            .expect("the first periodic refresh should start after the delay");
 
         provider.release_first.notify_one();
         timeout(Duration::from_secs(1), provider.first_finished.notified())
@@ -1090,7 +1082,6 @@ mod tests {
         let config = test_config(&root);
         let schedule = PollSchedule::from_config(&config);
 
-        assert_eq!(schedule.initial, vec![ProviderId::new(CODEX_PROVIDER_ID)]);
         assert_eq!(
             schedule.groups,
             vec![PollGroup {
@@ -1117,12 +1108,13 @@ mod tests {
             id: ProviderId::new("future_provider"),
             display_name: "Future Provider".to_string(),
             minimum_refresh_interval_seconds: 900,
+            detected: false,
+            credential_access_notice: None,
             capabilities: usage_core::ProviderCapabilities::default(),
         }];
 
         let schedule = PollSchedule::from_descriptors(&config, &descriptors);
 
-        assert_eq!(schedule.initial, [ProviderId::new("future_provider")]);
         assert_eq!(schedule.groups[0].interval_seconds, 900);
     }
 

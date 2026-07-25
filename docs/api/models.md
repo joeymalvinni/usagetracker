@@ -15,7 +15,7 @@ The generated [request](schemas/v3/request.json) and [response](schemas/v3/respo
 
 `Account.id` is UsageTracker's own stable management ID. `external_account_id` is the provider's identity, and `profile_id` marks which local credentials the account is isolated to. `display_name` is a local, provider, or generated label — it never establishes identity. `hidden` controls visibility; `collection_enabled` controls collection.
 
-`ServerInfo` reports the protocol capabilities and an ordered list of `ProviderDescriptor` values. A provider's capabilities tell you whether the account-add, repair, launch, or workspace methods even apply to it. `minimum_refresh_interval_seconds` is the fastest cadence a provider will collect at — currently 60.
+`ServerInfo` reports the protocol capabilities and an ordered list of `ProviderDescriptor` values. A provider's capabilities tell you whether the account-add, repair, launch, or setup methods even apply to it. `minimum_refresh_interval_seconds` is the fastest cadence a provider will collect at — currently 60. `detected` is a prompt-free local-presence hint for onboarding. `credential_access_notice`, when present, is provider-owned consent copy shown before connecting may request Keychain or browser-storage access.
 
 ## Usage
 
@@ -45,7 +45,7 @@ The generated [request](schemas/v3/request.json) and [response](schemas/v3/respo
 
 `ProviderHealth` is the durable latest state, and it can hold both the last success and last failure times at once. `last_error_*` is sanitized operational text, not an API error object. Health statuses are `ok`, `credentials_missing`, `auth_failed`, `rate_limited`, `provider_error`, `parse_error`, `backing_off`, and `disabled`.
 
-`ProviderRefreshResult` is one provider/account outcome inside a completed job. Its statuses are `ok`, `credentials_missing`, `credentials_invalid`, `unauthorized`, `rate_limited`, `network`, `parse`, `provider_unavailable`, `storage_error`, and `disabled`. A job can be `completed` even when some of these are failures. `RefreshJob.skipped_offline` identifies jobs where remote collection was skipped because machine-wide reachability was definitively offline; clients should use this job-scoped value instead of sampling connectivity again when presenting the outcome.
+`ProviderRefreshResult` is one provider/account outcome inside a completed job. Its statuses are `ok`, `credentials_missing`, `credentials_invalid`, `unauthorized`, `rate_limited`, `network`, `parse`, `provider_unavailable`, `storage_error`, and `disabled`. A job can be `completed` even when some of these are failures. While a job is running, `RefreshJob.discovered_accounts` reports provider/account identities persisted by that job before usage collection completes. `RefreshJob.skipped_offline` identifies jobs where remote collection was skipped because machine-wide reachability was definitively offline; clients should use this job-scoped value instead of sampling connectivity again when presenting the outcome.
 
 ## Ordering
 

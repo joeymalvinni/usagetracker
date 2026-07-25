@@ -18,7 +18,7 @@ From highest priority to lowest:
 | --- | --- | --- |
 | `poll_interval_seconds` | `300` | A whole number, at least `60`. |
 | `notifications` | See below | Your notification policy. |
-| `providers` | Codex on, the rest off | A map keyed by `codex`, `claude`, `cursor`, `opencode_go`, or `grok`. Any supported provider you leave out is added at startup. |
+| `providers` | All off | A map keyed by `codex`, `claude`, `cursor`, `opencode_go`, or `grok`. Fresh installs keep every provider credential-inert until you explicitly connect it. Any supported provider you leave out is added at startup. |
 
 The old `debug_capture_raw_payloads` field is still accepted so old files load, but it does nothing and gets removed the next time the file is written.
 
