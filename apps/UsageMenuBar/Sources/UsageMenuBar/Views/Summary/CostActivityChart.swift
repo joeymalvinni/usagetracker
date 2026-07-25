@@ -47,6 +47,23 @@ struct CostActivityChart: View {
                             }
                             .frame(maxWidth: .infinity)
                             .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+                            .contentShape(Rectangle())
+                            .onHover { inside in
+                                if inside, hover?.dateKey != day.id {
+                                    hover = day.providers.max { value($0) < value($1) }
+                                }
+                            }
+                            .overlay {
+                                if hover?.dateKey == day.id {
+                                    Path {
+                                        $0.move(to: .zero)
+                                        $0.addLine(to: CGPoint(x: 0, y: chartHeight))
+                                    }
+                                        .stroke(.primary.opacity(0.15), style: StrokeStyle(dash: [3, 3]))
+                                        .frame(width: 1, height: chartHeight)
+                                        .allowsHitTesting(false)
+                                }
+                            }
                         }
                     }
                     baseline
