@@ -4,6 +4,23 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.9 — 2026-07-25
+
+### App
+
+- Reworked onboarding around explicit provider consent, with provider-by-provider connection flows, live account-discovery progress, and clearer tracking controls.
+- Added tabs to Settings so general preferences and provider accounts are easier to navigate.
+- Showed complete activity history and all-time totals in the activity grid, and added a hover indicator for the selected chart bar.
+
+### Usage tracking
+
+- Corrected Codex token totals to use the account's recorded activity instead of scaling local activity to an unrelated aggregate.
+
+### Reliability
+
+- Made first-run onboarding anchor to the menu bar item reliably after installation and added a local install test for the packaged app.
+- Prevented temporary Claude backoff health from being presented as low usage.
+
 ## 0.1.8 — 2026-07-23
 
 ### App
