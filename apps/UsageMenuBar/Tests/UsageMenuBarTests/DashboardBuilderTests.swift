@@ -257,6 +257,107 @@ final class DashboardBuilderTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(provider.credits.first).absolute, "4 / 10")
     }
 
+    func testClaudeBackoffDoesNotMasqueradeAsLowQuota() throws {
+        let account = account(id: "claude-account", providerId: "claude")
+        let snapshot = UsageSnapshot(
+            providerId: "claude",
+            accountId: account.id,
+            collectedAt: Date(),
+            windows: [
+                UsageWindow(
+                    windowId: "claude_usage_utilization_seven_day",
+                    label: "Claude seven day",
+                    kind: .weekly,
+                    used: UsageAmount(value: 5, unit: .percent),
+                    limit: UsageAmount(value: 100, unit: .percent),
+                    remaining: UsageAmount(value: 95, unit: .percent),
+                    percentUsed: 5,
+                    percentRemaining: 95,
+                    resetAt: nil
+                ),
+            ]
+        )
+        let health = ProviderHealth(
+            providerId: "claude",
+            accountId: account.id,
+            status: .backingOff,
+            collectionMode: nil,
+            lastSuccessAt: snapshot.collectedAt,
+            lastFailureAt: Date(),
+            lastErrorCode: "rate_limited",
+            lastErrorMessage: "retrying later",
+            updatedAt: Date()
+        )
+
+        let output = DashboardBuilder(
+            config: config(providers: ["claude": true]),
+            accounts: [account],
+            health: [health],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.percent, 95)
+        XCTAssertEqual(provider.status, .normal)
+        XCTAssertEqual(provider.healthText, "backing off")
+        XCTAssertNil(provider.alertSignature)
+    }
+
+    func testClaudeBackoffPreservesGenuineLowQuotaWarning() throws {
+        let account = account(id: "claude-account", providerId: "claude")
+        let snapshot = UsageSnapshot(
+            providerId: "claude",
+            accountId: account.id,
+            collectedAt: Date(),
+            windows: [
+                UsageWindow(
+                    windowId: "claude_usage_utilization_seven_day",
+                    label: "Claude seven day",
+                    kind: .weekly,
+                    used: UsageAmount(value: 80, unit: .percent),
+                    limit: UsageAmount(value: 100, unit: .percent),
+                    remaining: UsageAmount(value: 20, unit: .percent),
+                    percentUsed: 80,
+                    percentRemaining: 20,
+                    resetAt: nil
+                ),
+            ]
+        )
+        let health = ProviderHealth(
+            providerId: "claude",
+            accountId: account.id,
+            status: .backingOff,
+            collectionMode: nil,
+            lastSuccessAt: snapshot.collectedAt,
+            lastFailureAt: Date(),
+            lastErrorCode: "rate_limited",
+            lastErrorMessage: "retrying later",
+            updatedAt: Date()
+        )
+
+        let output = DashboardBuilder(
+            config: config(providers: ["claude": true]),
+            accounts: [account],
+            health: [health],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.percent, 20)
+        XCTAssertEqual(provider.status, .warning)
+        XCTAssertNotNil(provider.alertSignature)
+    }
+
     func testCountOnlyResetSummaryReachesProviderViewModel() throws {
         let snapshot = UsageSnapshot(
             providerId: "codex",
