@@ -821,16 +821,123 @@ final class DaemonLogRotatorTests: XCTestCase {
 }
 
 final class AppStateTests: XCTestCase {
-    @MainActor func testOnboardingDefaultsEnableOnlyCodex() {
+    @MainActor func testOnboardingStartsWithoutEnablingAnyProvider() {
         let toggles = AppState.onboardingDefaultProviderToggles(
             providerIDs: ["codex", "claude", "cursor", "opencode_go", "grok"]
         )
 
-        XCTAssertEqual(toggles["codex"], true)
+        XCTAssertEqual(toggles["codex"], false)
         XCTAssertEqual(toggles["claude"], false)
         XCTAssertEqual(toggles["cursor"], false)
         XCTAssertEqual(toggles["opencode_go"], false)
         XCTAssertEqual(toggles["grok"], false)
+    }
+}
+
+final class ProviderConnectionCoordinatorTests: XCTestCase {
+    @MainActor func testStableConnectionStateAlwaysReflectsCurrentAccounts() {
+        let coordinator = ProviderConnectionCoordinator()
+        let descriptor = providerDescriptor(detected: true)
+        let account = Account(
+            id: "account",
+            providerId: "future",
+            externalAccountId: "external",
+            profileId: nil,
+            displayName: nil,
+            email: nil,
+            hidden: false,
+            collectionEnabled: true,
+            createdAt: .now,
+            updatedAt: .now
+        )
+
+        XCTAssertEqual(
+            coordinator.presentation(
+                for: "future",
+                descriptor: descriptor,
+                accounts: [account],
+                health: []
+            ).state,
+            .connected
+        )
+        XCTAssertEqual(
+            coordinator.presentation(
+                for: "future",
+                descriptor: descriptor,
+                accounts: [],
+                health: []
+            ),
+            ProviderConnectionPresentation(
+                state: .idle,
+                message: "Found on this Mac"
+            )
+        )
+    }
+
+    @MainActor func testReplacingMonitorDoesNotLoseNewestTaskHandle() async {
+        let coordinator = ProviderConnectionCoordinator()
+        coordinator.monitor(providerId: "future") {
+            try? await Task.sleep(for: .seconds(60))
+        }
+        await Task.yield()
+
+        coordinator.monitor(providerId: "future") {
+            try? await Task.sleep(for: .seconds(60))
+        }
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(coordinator.isMonitoring("future"))
+        coordinator.cancelMonitor(for: "future")
+    }
+
+    func testProviderDescriptorDecodesProviderOwnedCredentialNotice() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let descriptor = try decoder.decode(
+            ServerProviderDescriptor.self,
+            from: Data(
+                """
+                {
+                  "id": "future",
+                  "display_name": "Future",
+                  "minimum_refresh_interval_seconds": 60,
+                  "detected": true,
+                  "credential_access_notice": "Future may request Keychain access.",
+                  "capabilities": {
+                    "multiple_accounts": false,
+                    "add_account": false,
+                    "repair": false,
+                    "launch_account": false,
+                    "setup": false,
+                    "workspace_setup": false
+                  }
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertEqual(
+            descriptor.credentialAccessNotice,
+            "Future may request Keychain access."
+        )
+    }
+
+    private func providerDescriptor(detected: Bool) -> ServerProviderDescriptor {
+        ServerProviderDescriptor(
+            id: "future",
+            displayName: "Future",
+            minimumRefreshIntervalSeconds: 60,
+            detected: detected,
+            capabilities: ProviderCapabilities(
+                multipleAccounts: false,
+                addAccount: false,
+                repair: false,
+                launchAccount: false,
+                workspaceSetup: false
+            )
+        )
     }
 }
 
@@ -945,13 +1052,20 @@ final class MenuBarPresentationTests: XCTestCase {
     }
 
     func testDarkModeIsEnabledByDefault() throws {
-        XCTAssertTrue(UIConfig().darkModeEnabled)
-        XCTAssertEqual(UIConfig().activityChartStyle, .bars)
+        let fresh = UIConfig()
+        XCTAssertTrue(fresh.darkModeEnabled)
+        XCTAssertEqual(fresh.activityChartStyle, .bars)
+        XCTAssertFalse(fresh.onboardingCompleted)
+        XCTAssertFalse(fresh.onboardingWelcomeCompleted)
+        XCTAssertFalse(fresh.notificationPromptCompleted)
 
         let decoded = try JSONDecoder().decode(UIConfig.self, from: Data("{}".utf8))
         XCTAssertTrue(decoded.darkModeEnabled)
         XCTAssertEqual(decoded.activityChartStyle, .bars)
         XCTAssertNil(decoded.lastSeenReleaseNotesVersion)
+        XCTAssertTrue(decoded.onboardingCompleted)
+        XCTAssertTrue(decoded.onboardingWelcomeCompleted)
+        XCTAssertTrue(decoded.notificationPromptCompleted)
     }
 
     func testActivityChartStyleRoundTrips() throws {
