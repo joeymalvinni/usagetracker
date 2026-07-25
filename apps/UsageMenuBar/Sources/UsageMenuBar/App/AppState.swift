@@ -653,7 +653,30 @@ private enum ProviderSignInFollowUp {
                 providers: [providerId: true]
             )
             build()
-            let report = try await client.refresh([providerId])
+            let started = try await client.startRefresh([providerId])
+            let discoveredProvider: (RefreshJob) -> Bool = { job in
+                job.discoveredAccounts.contains { $0.providerId == providerId }
+            }
+            let progress = try await client.waitForRefreshProgress(
+                started,
+                until: discoveredProvider
+            )
+            if discoveredProvider(progress) {
+                await load()
+                let discoveredAccountIDs = Set(
+                    progress.discoveredAccounts
+                        .filter { $0.providerId == providerId }
+                        .map(\.accountId)
+                )
+                if onboardingConnectedAccounts.contains(where: {
+                    discoveredAccountIDs.contains($0.id)
+                }) {
+                    providerConnections.clearOverride(for: providerId)
+                    finishOnboardingUsageRefreshInBackground(progress)
+                    return
+                }
+            }
+            let report = try await client.finishRefresh(progress)
             await load()
 
             let providerAccounts = onboardingConnectedAccounts.filter {
@@ -734,6 +757,15 @@ private enum ProviderSignInFollowUp {
         } catch {
             try? await pauseProviderAfterFailedOnboardingConnection(providerId)
             setOnboardingProviderState(providerId, .failed, describe(error))
+        }
+    }
+
+    private func finishOnboardingUsageRefreshInBackground(_ job: RefreshJob) {
+        Task { [weak self] in
+            // Account discovery already succeeded. The state reload and
+            // provider health surface any later usage-refresh failure.
+            _ = try? await client.finishRefresh(job)
+            await self?.load()
         }
     }
 

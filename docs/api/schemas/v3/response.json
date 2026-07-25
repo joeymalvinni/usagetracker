@@ -1048,11 +1048,33 @@
       ],
       "type": "object"
     },
+    "RefreshAccountDiscovery": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id"
+      ],
+      "type": "object"
+    },
     "RefreshJob": {
       "properties": {
         "created_at": {
           "format": "date-time",
           "type": "string"
+        },
+        "discovered_accounts": {
+          "description": "Accounts whose identities were discovered and persisted during this\nrefresh. This is populated while collection is still running so clients\ncan react to provider-scoped progress without polling global state.",
+          "items": {
+            "$ref": "#/$defs/RefreshAccountDiscovery"
+          },
+          "type": "array"
         },
         "failure_message": {
           "type": [

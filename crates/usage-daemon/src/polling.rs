@@ -14,8 +14,8 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use usage_core::{
-    AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus, RefreshJob, RefreshJobId,
-    RefreshJobStatus, RefreshScope, RefreshTrigger,
+    AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus, RefreshAccountDiscovery,
+    RefreshJob, RefreshJobId, RefreshJobStatus, RefreshScope, RefreshTrigger,
 };
 
 use crate::{
@@ -73,6 +73,12 @@ impl RefreshKey {
             }
         }
     }
+
+    fn includes_provider(&self, provider_id: &ProviderId) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|providers| providers.contains(provider_id))
+    }
 }
 
 struct RefreshJobEntry {
@@ -82,6 +88,7 @@ struct RefreshJobEntry {
 
 struct ProviderRefreshFlight {
     result: RwLock<Option<Vec<ProviderRefreshResult>>>,
+    discovered_accounts: RwLock<Vec<AccountId>>,
     finished: Notify,
 }
 
@@ -377,6 +384,7 @@ impl RefreshCoordinator {
             started_at: None,
             finished_at: None,
             skipped_offline: false,
+            discovered_accounts: Vec::new(),
             provider_results: Vec::new(),
             failure_message: None,
         };
@@ -386,7 +394,29 @@ impl RefreshCoordinator {
         });
         jobs.active.insert(key.clone(), entry.clone());
         jobs.by_id.insert(job.id, entry.clone());
+        drop(jobs);
+        self.seed_job_discoveries(&key, &entry).await;
         (key, entry, false)
+    }
+
+    async fn seed_job_discoveries(&self, key: &RefreshKey, entry: &RefreshJobEntry) {
+        let flights = self
+            .provider_flights
+            .lock()
+            .await
+            .iter()
+            .filter(|(provider_id, _)| key.includes_provider(provider_id))
+            .map(|(provider_id, flight)| (provider_id.clone(), flight.clone()))
+            .collect::<Vec<_>>();
+        if flights.is_empty() {
+            return;
+        }
+        let mut job = entry.job.write().await;
+        for (provider_id, flight) in flights {
+            for account_id in flight.discovered_accounts.read().await.iter() {
+                append_discovery(&mut job, &provider_id, account_id);
+            }
+        }
     }
 
     fn spawn_claimed_job(&self, key: RefreshKey, entry: Arc<RefreshJobEntry>) {
@@ -555,6 +585,7 @@ impl RefreshCoordinator {
             } else {
                 let flight = Arc::new(ProviderRefreshFlight {
                     result: RwLock::new(None),
+                    discovered_accounts: RwLock::new(Vec::new()),
                     finished: Notify::new(),
                 });
                 flights.insert(provider_id.clone(), flight.clone());
@@ -758,6 +789,8 @@ impl RefreshCoordinator {
                 );
             }
         };
+        self.record_account_discovery(&provider_id, &account.id)
+            .await;
 
         if !account.collection_enabled {
             self.clear_rate_limit_backoff(&provider_id, &account.id)
@@ -866,6 +899,29 @@ impl RefreshCoordinator {
                 self.record_failure(provider_id, Some(account.id), err)
                     .await
             }
+        }
+    }
+
+    async fn record_account_discovery(&self, provider_id: &ProviderId, account_id: &AccountId) {
+        if let Some(flight) = self.provider_flights.lock().await.get(provider_id).cloned() {
+            let mut discoveries = flight.discovered_accounts.write().await;
+            if !discoveries.contains(account_id) {
+                discoveries.push(account_id.clone());
+            }
+        }
+
+        let entries = self
+            .jobs
+            .lock()
+            .await
+            .active
+            .iter()
+            .filter(|(key, _)| key.includes_provider(provider_id))
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let mut job = entry.job.write().await;
+            append_discovery(&mut job, provider_id, account_id);
         }
     }
 
@@ -1417,6 +1473,16 @@ fn normalized_scope(filter: Option<Vec<ProviderId>>) -> RefreshScope {
     match filter {
         Some(providers) => RefreshScope::providers(providers),
         None => RefreshScope::all(),
+    }
+}
+
+fn append_discovery(job: &mut RefreshJob, provider_id: &ProviderId, account_id: &AccountId) {
+    let discovery = RefreshAccountDiscovery {
+        provider_id: provider_id.clone(),
+        account_id: account_id.clone(),
+    };
+    if !job.discovered_accounts.contains(&discovery) {
+        job.discovered_accounts.push(discovery);
     }
 }
 
@@ -2250,6 +2316,16 @@ mod tests {
         timeout(Duration::from_secs(1), first_started)
             .await
             .expect("background refresh should begin");
+        let collecting = coordinator
+            .get_refresh_job(&first.job.id)
+            .await
+            .expect("running job should remain queryable");
+        assert_eq!(collecting.status, RefreshJobStatus::Running);
+        assert_eq!(collecting.discovered_accounts.len(), 1);
+        assert_eq!(
+            collecting.discovered_accounts[0].provider_id,
+            ProviderId::new("codex")
+        );
 
         let second = coordinator
             .start_refresh(Some(vec![ProviderId::new("codex")]), RefreshTrigger::Manual)
@@ -2348,14 +2424,30 @@ mod tests {
         timeout(Duration::from_secs(1), provider_started)
             .await
             .unwrap();
-        let all = {
+
+        // The overlapping job joins the in-flight provider and is seeded with
+        // the accounts it has already discovered.
+        let all = coordinator
+            .start_refresh(None, RefreshTrigger::Manual)
+            .await;
+        assert!(!all.coalesced);
+        assert!(all
+            .job
+            .discovered_accounts
+            .iter()
+            .any(|discovery| discovery.provider_id == ProviderId::new("codex")));
+
+        let shared_waiter = {
             let coordinator = coordinator.clone();
             tokio::spawn(async move { coordinator.refresh(None).await })
         };
         tokio::task::yield_now().await;
         release.notify_waiters();
 
-        let report = timeout(Duration::from_secs(1), all).await.unwrap().unwrap();
+        let report = timeout(Duration::from_secs(1), shared_waiter)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(report.provider_results.len(), 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }

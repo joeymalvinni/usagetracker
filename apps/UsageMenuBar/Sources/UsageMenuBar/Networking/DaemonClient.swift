@@ -39,10 +39,44 @@ struct DaemonClient: Sendable {
         guard case let .notificationsAcknowledged(acknowledged) = try await send(.acknowledgeNotifications(ids)), acknowledged == ids else { throw DaemonError.badResponse }
     }
     func refresh(_ providers: [String]?) async throws -> RefreshResponse {
+        let job = try await startRefresh(providers)
+        return try await finishRefresh(job)
+    }
+    func startRefresh(_ providers: [String]?) async throws -> RefreshJob {
         guard case let .refreshStarted(job, _) = try await send(.refresh(providers)) else {
             throw DaemonError.badResponse
         }
-        let completed = try await waitForRefresh(job)
+        return job
+    }
+    func waitForRefreshProgress(
+        _ initialJob: RefreshJob,
+        pollInterval: Duration = .milliseconds(100),
+        until shouldStop: (RefreshJob) -> Bool
+    ) async throws -> RefreshJob {
+        var job = initialJob
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: refreshWaitTimeout)
+        while !job.status.isTerminal && !shouldStop(job) {
+            guard clock.now < deadline else { throw DaemonError.timeout }
+            try await Task.sleep(for: pollInterval)
+            job = try await refreshJob(job.id)
+        }
+        return job
+    }
+    func finishRefresh(_ initialJob: RefreshJob) async throws -> RefreshResponse {
+        let completed = try await waitForRefreshProgress(
+            initialJob,
+            pollInterval: refreshPollInterval
+        ) { _ in false }
+        return try completedRefresh(completed)
+    }
+    private func refreshJob(_ id: String) async throws -> RefreshJob {
+        guard case let .refreshJob(job) = try await send(.getRefreshJob(id)) else {
+            throw DaemonError.badResponse
+        }
+        return job
+    }
+    private func completedRefresh(_ completed: RefreshJob) throws -> RefreshResponse {
         guard completed.status != .failed else {
             throw DaemonError.refreshFailed(
                 jobId: completed.id,
@@ -119,21 +153,6 @@ struct DaemonClient: Sendable {
             throw DaemonError.api(code: error.code, message: error.message)
         }
         return decoded
-    }
-
-    private func waitForRefresh(_ initialJob: RefreshJob) async throws -> RefreshJob {
-        var job = initialJob
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: refreshWaitTimeout)
-        while !job.status.isTerminal {
-            guard clock.now < deadline else { throw DaemonError.timeout }
-            try await Task.sleep(for: refreshPollInterval)
-            guard case let .refreshJob(latest) = try await send(.getRefreshJob(job.id)) else {
-                throw DaemonError.badResponse
-            }
-            job = latest
-        }
-        return job
     }
 }
 

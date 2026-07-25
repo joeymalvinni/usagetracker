@@ -528,10 +528,21 @@ pub struct RefreshJob {
     /// because machine-wide reachability was definitively offline.
     #[serde(default, skip_serializing_if = "is_false")]
     pub skipped_offline: bool,
+    /// Accounts whose identities were discovered and persisted during this
+    /// refresh. This is populated while collection is still running so clients
+    /// can react to provider-scoped progress without polling global state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_accounts: Vec<RefreshAccountDiscovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_results: Vec<ProviderRefreshResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct RefreshAccountDiscovery {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -936,6 +947,13 @@ mod tests {
         };
         assert_eq!(job.status, RefreshJobStatus::Completed);
         assert!(!job.skipped_offline);
+        assert_eq!(
+            job.discovered_accounts,
+            vec![RefreshAccountDiscovery {
+                provider_id: ProviderId::new("codex"),
+                account_id: AccountId::new("account-1"),
+            }]
+        );
         assert_eq!(job.provider_results.len(), 1);
     }
 

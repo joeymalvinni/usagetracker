@@ -461,6 +461,18 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(openCode.workspaceSetup)
         XCTAssertTrue(openCode.setup)
 
+        let refreshJob = try JSONDecoder.usage.decode(
+            DaemonResponse.self,
+            from: Data(contentsOf: rustWireFixture("refresh_job_v3.json"))
+        )
+        guard case let .refreshJob(job) = refreshJob else {
+            return XCTFail("expected refresh job fixture")
+        }
+        XCTAssertEqual(
+            job.discoveredAccounts,
+            [RefreshAccountDiscovery(providerId: "codex", accountId: "account-1")]
+        )
+
         let stateURL = rustWireFixture("state_v3.json")
         let state = try JSONDecoder.usage.decode(
             DaemonResponse.self,
@@ -590,6 +602,104 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(start["method"] as? String, "refresh")
         XCTAssertEqual(poll["method"] as? String, "get_refresh_job")
         XCTAssertEqual(poll["job_id"] as? String, "job-1")
+    }
+
+    func testRefreshProgressReturnsAsSoonAsTheScopedJobPublishesDiscovery() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"refresh_started","coalesced":false,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null,"discovered_accounts":[{"provider_id":"codex","account_id":"account-1"}]}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.startRefresh(["codex"])
+        let progress = try await client.waitForRefreshProgress(
+            started,
+            pollInterval: .zero
+        ) { job in
+            job.discoveredAccounts.contains { $0.providerId == "codex" }
+        }
+        XCTAssertEqual(progress.discoveredAccounts.map(\.accountId), ["account-1"])
+
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 2)
+        let start = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(recorded[0].utf8)) as? [String: Any]
+        )
+        let progressLookup = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(recorded[1].utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(start["providers"] as? [String], ["codex"])
+        XCTAssertEqual(progressLookup["method"] as? String, "get_refresh_job")
+    }
+
+    func testRefreshProgressWaitsForTheProviderThatWasClicked() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"refresh_started","coalesced":false,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null,"discovered_accounts":[{"provider_id":"claude","account_id":"other-account"}]}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null,"discovered_accounts":[{"provider_id":"claude","account_id":"other-account"},{"provider_id":"codex","account_id":"account-1"}]}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.startRefresh(["codex"])
+        let progress = try await client.waitForRefreshProgress(
+            started,
+            pollInterval: .zero
+        ) { job in
+            job.discoveredAccounts.contains { $0.providerId == "codex" }
+        }
+        XCTAssertEqual(progress.discoveredAccounts.last?.providerId, "codex")
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 3)
+    }
+
+    func testRefreshProgressReturnsTerminalJobWhenDiscoveryNeverArrives() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"refresh_started","coalesced":false,"job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"running","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"refresh_job","job":{"id":"job-1","scope":{"providers":["codex"]},"trigger":"manual","status":"completed","created_at":"2026-07-11T12:00:00Z","started_at":"2026-07-11T12:00:00Z","finished_at":"2026-07-11T12:00:01Z","provider_results":[{"provider_id":"codex","account_id":null,"status":"credentials_missing","collection_mode":null,"collected_at":null,"message":"No signed-in account was found."}]}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.startRefresh(["codex"])
+        let progress = try await client.waitForRefreshProgress(
+            started,
+            pollInterval: .zero
+        ) { job in
+            job.discoveredAccounts.contains { $0.providerId == "codex" }
+        }
+        XCTAssertEqual(progress.status, .completed)
+        XCTAssertTrue(progress.discoveredAccounts.isEmpty)
+
+        // Finishing an already-terminal job must not poll again.
+        let report = try await client.finishRefresh(progress)
+        XCTAssertEqual(report.providerResults.first?.status, .credentialsMissing)
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 2)
     }
 }
 

@@ -21,6 +21,7 @@ struct RefreshJob: Decodable, Equatable, Sendable {
     let createdAt: Date
     let startedAt, finishedAt: Date?
     let skippedOffline: Bool
+    let discoveredAccounts: [RefreshAccountDiscovery]
     let providerResults: [ProviderRefreshResult]
     let failureMessage: String?
 
@@ -34,6 +35,10 @@ struct RefreshJob: Decodable, Equatable, Sendable {
         startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
         finishedAt = try container.decodeIfPresent(Date.self, forKey: .finishedAt)
         skippedOffline = try container.decodeIfPresent(Bool.self, forKey: .skippedOffline) ?? false
+        discoveredAccounts = try container.decodeIfPresent(
+            [RefreshAccountDiscovery].self,
+            forKey: .discoveredAccounts
+        ) ?? []
         providerResults = try container.decodeIfPresent(
             [ProviderRefreshResult].self,
             forKey: .providerResults
@@ -43,8 +48,13 @@ struct RefreshJob: Decodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, scope, trigger, status, createdAt, startedAt, finishedAt
-        case skippedOffline, providerResults, failureMessage
+        case skippedOffline, discoveredAccounts, providerResults, failureMessage
     }
+}
+
+struct RefreshAccountDiscovery: Decodable, Equatable, Sendable {
+    let providerId: String
+    let accountId: String
 }
 
 struct RefreshScope: Decodable, Equatable, Sendable {
