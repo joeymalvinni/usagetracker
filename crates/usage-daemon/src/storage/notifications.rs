@@ -12,7 +12,7 @@ impl Storage {
     ) -> anyhow::Result<Option<NotificationWindowState>> {
         let account_id = account_id.clone();
         let window_id = window_id.to_string();
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             let row = conn
                 .query_row(
                     "SELECT reset_at, notified_mask, last_attempt_at
@@ -96,7 +96,7 @@ impl Storage {
     }
 
     pub async fn pending_notifications(&self) -> anyhow::Result<Vec<PendingNotification>> {
-        self.with_connection(|conn| {
+        self.with_read_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, title, body, created_at FROM pending_notifications
                  ORDER BY id ASC LIMIT 100",

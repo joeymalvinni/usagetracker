@@ -143,318 +143,388 @@ impl SocketServer {
     }
 
     async fn handle_request(&self, request: ApiRequest) -> ApiResponse {
-        match request {
-            ApiRequest::GetServerInfo => ApiResponse::ServerInfo {
+        use ApiRequest as Req;
+        let result = match request {
+            Req::GetServerInfo => Ok(ApiResponse::ServerInfo {
                 server: ServerInfo::current(crate::runtime::provider_registry::descriptors()),
-            },
-            ApiRequest::GetState => self.state_response().await,
-            ApiRequest::GetUsage => {
-                let generated_at = chrono::Utc::now();
-                let today = generated_at.with_timezone(&chrono::Local).date_naive();
-                let recent_since = today
-                    .checked_sub_days(chrono::Days::new(DASHBOARD_HISTORY_DAYS - 1))
-                    .unwrap_or(today);
-                let since = generated_at - chrono::TimeDelta::days(FORECAST_HISTORY_DAYS);
-                match self
-                    .runtime
-                    .storage
-                    .usage_dashboard(recent_since, since, FORECAST_HISTORY_LIMIT)
-                    .await
-                {
-                    Ok(stored) => {
-                        let usage = build_usage_view(stored, generated_at);
-                        ApiResponse::Usage {
-                            snapshots: usage.snapshots,
-                            dashboard: usage.dashboard,
-                            forecasts: usage.forecasts,
-                            window_provenance: usage.window_provenance,
-                        }
-                    }
-                    Err(err) => storage_error(err),
-                }
-            }
-            ApiRequest::GetUsageEvents {
+            }),
+            Req::GetState => Ok(self.state_response().await),
+            Req::GetUsage => Ok(self.usage_response().await),
+            Req::GetUsageEvents {
                 account_id,
                 offset,
                 limit,
-            } => {
-                if let Some(error) = self.account_validation_error(&account_id).await {
-                    error
-                } else {
-                    let limit = limit.unwrap_or(100);
-                    if !(1..=200).contains(&limit) {
-                        ApiResponse::error(
-                            ApiErrorCode::InvalidArgument,
-                            "usage event limit must be between 1 and 200",
-                        )
-                    } else {
-                        match self
-                            .runtime
-                            .storage
-                            .usage_events(&account_id, offset, limit)
-                            .await
-                        {
-                            Ok(page) => ApiResponse::UsageEvents { page },
-                            Err(error) => storage_error(error),
-                        }
-                    }
-                }
+            } => self.usage_events_response(account_id, offset, limit).await,
+            Req::Refresh { providers } => self.refresh_response(providers).await,
+            Req::GetRefreshJob { job_id } => Ok(self.refresh_job_response(job_id).await),
+            Req::GetProviderHealth => Ok(self.provider_health_response().await),
+            Req::GetAccounts => Ok(self.accounts_response().await),
+            Req::GetConfig => Ok(self.config_response().await),
+            Req::GetPendingNotifications => Ok(self.pending_notifications_response().await),
+            Req::AcknowledgeNotifications { ids } => {
+                Ok(self.acknowledge_notifications_response(ids).await)
             }
-            ApiRequest::Refresh { providers } => match validated_refresh_scope(providers) {
-                Ok(providers) => {
-                    let started = self
-                        .runtime
-                        .refresh
-                        .start_refresh(providers, usage_core::RefreshTrigger::Manual)
-                        .await;
-                    ApiResponse::RefreshStarted {
-                        job: started.job,
-                        coalesced: started.coalesced,
-                    }
-                }
-                Err(error) => error,
-            },
-            ApiRequest::GetRefreshJob { job_id } => {
-                match self.runtime.refresh.get_refresh_job(&job_id).await {
-                    Some(job) => ApiResponse::RefreshJob { job },
-                    None => ApiResponse::error(
-                        ApiErrorCode::UnknownRefreshJob,
-                        format!("unknown refresh job: {job_id}"),
-                    ),
-                }
-            }
-            ApiRequest::GetProviderHealth => {
-                match (
-                    self.runtime.storage.provider_health().await,
-                    self.runtime.storage.accounts().await,
-                    self.runtime.visible_provider_ids().await,
-                ) {
-                    (Ok(health), Ok(accounts), Ok(visible_providers)) => {
-                        ApiResponse::ProviderHealth {
-                            health: visible_supported_provider_health(
-                                health,
-                                &accounts,
-                                &visible_providers,
-                            ),
-                        }
-                    }
-                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => storage_error(err),
-                }
-            }
-            ApiRequest::GetAccounts => match self.runtime.storage.accounts().await {
-                Ok(accounts) => ApiResponse::Accounts {
-                    accounts: supported_accounts(accounts),
-                },
-                Err(err) => storage_error(err),
-            },
-            ApiRequest::GetConfig => match self.runtime.config_response().await {
-                Ok(config) => ApiResponse::Config { config },
-                Err(err) => storage_error(err),
-            },
-            ApiRequest::GetPendingNotifications => {
-                match self.runtime.storage.pending_notifications().await {
-                    Ok(notifications) => ApiResponse::PendingNotifications { notifications },
-                    Err(err) => storage_error(err),
-                }
-            }
-            ApiRequest::AcknowledgeNotifications { ids } => {
-                match self.runtime.storage.acknowledge_notifications(&ids).await {
-                    Ok(()) => ApiResponse::NotificationsAcknowledged { ids },
-                    Err(err) => storage_error(err),
-                }
-            }
-            ApiRequest::UpdateConfig {
+            Req::UpdateConfig {
                 poll_interval_seconds,
                 providers,
                 notifications,
-            } => match self
-                .runtime
-                .update_config(poll_interval_seconds, providers, notifications)
-                .await
-            {
-                Ok(config) => ApiResponse::Config { config },
-                Err(err) => {
-                    warn!(error = %err, "config update failed");
-                    ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
-                }
-            },
-            ApiRequest::AddProviderAccount {
+            } => Ok(self
+                .update_config_response(poll_interval_seconds, providers, notifications)
+                .await),
+            Req::AddProviderAccount {
                 provider_id,
                 display_name,
                 sign_in_action,
             } => {
-                if let Some(error) = provider_validation_error(&provider_id) {
-                    error
-                } else if crate::runtime::provider_registry::find(provider_id.as_str())
-                    .is_none_or(|provider| provider.add_account_handler().is_none())
-                {
-                    ApiResponse::error(
-                        ApiErrorCode::UnsupportedOperation,
-                        format!("adding accounts is not supported for {provider_id}"),
-                    )
-                } else {
-                    match self
-                        .runtime
-                        .add_provider_account(provider_id, display_name, sign_in_action)
-                        .await
-                    {
-                        Ok(account) => ApiResponse::AddProviderAccount { account },
-                        Err(err) => {
-                            warn!(error = %err, "add provider account failed");
-                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
-                        }
-                    }
-                }
+                self.add_provider_account_response(provider_id, display_name, sign_in_action)
+                    .await
             }
-            ApiRequest::UpdateAccount {
+            Req::UpdateAccount {
                 account_id,
                 display_name,
                 hidden,
                 collection_enabled,
             } => {
-                if let Some(error) = self.account_validation_error(&account_id).await {
-                    error
-                } else {
-                    match self
-                        .runtime
-                        .update_account(account_id, display_name, hidden, collection_enabled)
-                        .await
-                    {
-                        Ok(account) => ApiResponse::Account { account },
-                        Err(err) => {
-                            warn!(error = %err, "account update failed");
-                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
-                        }
-                    }
-                }
+                self.update_account_response(account_id, display_name, hidden, collection_enabled)
+                    .await
             }
-            ApiRequest::RemoveAccount { account_id } => {
-                if let Some(error) = self.account_validation_error(&account_id).await {
-                    error
-                } else {
-                    match self.runtime.remove_account(account_id).await {
-                        Ok(account) => ApiResponse::Account { account },
-                        Err(err) => {
-                            warn!(error = %err, "account remove failed");
-                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
-                        }
-                    }
-                }
+            Req::RemoveAccount { account_id } => self.remove_account_response(account_id).await,
+            Req::DeleteAccount { account_id } => self.delete_account_response(account_id).await,
+            Req::GetProviderSetup { provider_id } => {
+                self.provider_setup_response(provider_id).await
             }
-            ApiRequest::DeleteAccount { account_id } => {
-                if let Some(error) = self.account_validation_error(&account_id).await {
-                    error
-                } else {
-                    match self.runtime.delete_account(account_id).await {
-                        Ok(account_id) => ApiResponse::AccountDeleted { account_id },
-                        Err(err) => {
-                            warn!(error = %err, "account delete failed");
-                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
-                        }
-                    }
-                }
-            }
-            ApiRequest::GetProviderSetup { provider_id } => {
-                if let Some(error) = provider_validation_error(&provider_id) {
-                    error
-                } else {
-                    match self.runtime.provider_setup(provider_id).await {
-                        Ok(setup) => ApiResponse::ProviderSetup { setup },
-                        Err(err) => {
-                            warn!(error = %err, "provider setup lookup failed");
-                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
-                        }
-                    }
-                }
-            }
-            ApiRequest::UpdateProviderSetup {
+            Req::UpdateProviderSetup {
                 provider_id,
-                mut settings,
+                settings,
                 workspace_id,
             } => {
-                if let Some(error) = provider_validation_error(&provider_id) {
-                    error
-                } else if crate::runtime::provider_registry::find(provider_id.as_str())
-                    .is_none_or(|provider| provider.setup_handler().is_none())
-                {
-                    ApiResponse::error(
-                        ApiErrorCode::UnsupportedOperation,
-                        format!("setup is not supported for {provider_id}"),
-                    )
-                } else {
-                    let supports_legacy_workspace_setup = crate::runtime::provider_registry::find(
-                        provider_id.as_str(),
-                    )
-                    .is_some_and(|provider| provider.descriptor().capabilities.workspace_setup);
-                    if supports_legacy_workspace_setup && settings.is_empty() {
-                        settings.insert("workspace_id".to_string(), workspace_id);
-                    } else if workspace_id.is_some() {
-                        return ApiResponse::error(
-                            ApiErrorCode::InvalidArgument,
-                            "workspace_id is only supported by workspace-based provider setup; otherwise send provider setup values through settings",
-                        );
-                    }
-                    match self
-                        .runtime
-                        .update_provider_setup(provider_id, settings)
-                        .await
-                    {
-                        Ok(setup) => ApiResponse::ProviderSetup { setup },
-                        Err(err) => {
-                            warn!(error = %err, "provider setup update failed");
-                            ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
-                        }
-                    }
-                }
+                self.update_provider_setup_response(provider_id, settings, workspace_id)
+                    .await
             }
-            ApiRequest::RepairProvider {
+            Req::RepairProvider {
                 provider_id,
                 account_id,
                 sign_in_action,
             } => {
-                let account_error = match account_id.as_ref() {
-                    Some(account_id) => self.account_validation_error(account_id).await,
-                    None => None,
-                };
-                if let Some(error) = provider_validation_error(&provider_id) {
-                    error
-                } else if crate::runtime::provider_registry::find(provider_id.as_str())
-                    .is_none_or(|provider| provider.repair_handler().is_none())
-                {
-                    ApiResponse::error(
-                        ApiErrorCode::UnsupportedOperation,
-                        format!("repair is not supported for {provider_id}"),
-                    )
-                } else if let Some(error) = account_error {
-                    error
-                } else {
-                    match self
-                        .runtime
-                        .repair_provider(provider_id, account_id, sign_in_action)
-                        .await
-                    {
-                        Ok(action) => ApiResponse::ProviderAction { action },
-                        Err(err) => {
-                            warn!(error = %err, "provider repair failed");
-                            ApiResponse::error(ApiErrorCode::Internal, err.to_string())
-                        }
-                    }
+                self.repair_provider_response(provider_id, account_id, sign_in_action)
+                    .await
+            }
+            Req::LaunchProviderAccount { account_id } => {
+                self.launch_provider_account_response(account_id).await
+            }
+        };
+        result.unwrap_or_else(|error| error)
+    }
+
+    async fn usage_response(&self) -> ApiResponse {
+        let generated_at = chrono::Utc::now();
+        let today = generated_at.with_timezone(&chrono::Local).date_naive();
+        let recent_since = today
+            .checked_sub_days(chrono::Days::new(DASHBOARD_HISTORY_DAYS - 1))
+            .unwrap_or(today);
+        let since = generated_at - chrono::TimeDelta::days(FORECAST_HISTORY_DAYS);
+        match self
+            .runtime
+            .storage
+            .usage_dashboard(recent_since, since, FORECAST_HISTORY_LIMIT)
+            .await
+        {
+            Ok(stored) => {
+                let usage = build_usage_view(stored, generated_at);
+                ApiResponse::Usage {
+                    snapshots: usage.snapshots,
+                    dashboard: usage.dashboard,
+                    forecasts: usage.forecasts,
+                    window_provenance: usage.window_provenance,
                 }
             }
-            ApiRequest::LaunchProviderAccount { account_id } => {
-                if let Some(error) = self.account_validation_error(&account_id).await {
-                    error
-                } else {
-                    match self.runtime.launch_provider_account(account_id).await {
-                        Ok(action) => ApiResponse::ProviderAction { action },
-                        Err(err) => {
-                            warn!(error = %err, "provider account launch failed");
-                            ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
-                        }
-                    }
-                }
+            Err(err) => storage_error(err),
+        }
+    }
+
+    async fn usage_events_response(
+        &self,
+        account_id: AccountId,
+        offset: u32,
+        limit: Option<u16>,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        let limit = limit.unwrap_or(100);
+        if !(1..=200).contains(&limit) {
+            return Err(ApiResponse::error(
+                ApiErrorCode::InvalidArgument,
+                "usage event limit must be between 1 and 200",
+            ));
+        }
+        Ok(
+            match self
+                .runtime
+                .storage
+                .usage_events(&account_id, offset, limit)
+                .await
+            {
+                Ok(page) => ApiResponse::UsageEvents { page },
+                Err(error) => storage_error(error),
+            },
+        )
+    }
+
+    async fn refresh_response(
+        &self,
+        providers: Option<Vec<usage_core::ProviderId>>,
+    ) -> Result<ApiResponse, ApiResponse> {
+        let providers = validated_refresh_scope(providers)?;
+        let started = self
+            .runtime
+            .refresh
+            .start_refresh(providers, usage_core::RefreshTrigger::Manual)
+            .await;
+        Ok(ApiResponse::RefreshStarted {
+            job: started.job,
+            coalesced: started.coalesced,
+        })
+    }
+
+    async fn refresh_job_response(&self, job_id: usage_core::RefreshJobId) -> ApiResponse {
+        match self.runtime.refresh.get_refresh_job(&job_id).await {
+            Some(job) => ApiResponse::RefreshJob { job },
+            None => ApiResponse::error(
+                ApiErrorCode::UnknownRefreshJob,
+                format!("unknown refresh job: {job_id}"),
+            ),
+        }
+    }
+
+    async fn provider_health_response(&self) -> ApiResponse {
+        match (
+            self.runtime.storage.provider_health().await,
+            self.runtime.storage.accounts().await,
+            self.runtime.visible_provider_ids().await,
+        ) {
+            (Ok(health), Ok(accounts), Ok(visible_providers)) => ApiResponse::ProviderHealth {
+                health: visible_supported_provider_health(health, &accounts, &visible_providers),
+            },
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => storage_error(err),
+        }
+    }
+
+    async fn accounts_response(&self) -> ApiResponse {
+        match self.runtime.storage.accounts().await {
+            Ok(accounts) => ApiResponse::Accounts {
+                accounts: supported_accounts(accounts),
+            },
+            Err(err) => storage_error(err),
+        }
+    }
+
+    async fn config_response(&self) -> ApiResponse {
+        match self.runtime.config_response().await {
+            Ok(config) => ApiResponse::Config { config },
+            Err(err) => storage_error(err),
+        }
+    }
+
+    async fn pending_notifications_response(&self) -> ApiResponse {
+        match self.runtime.storage.pending_notifications().await {
+            Ok(notifications) => ApiResponse::PendingNotifications { notifications },
+            Err(err) => storage_error(err),
+        }
+    }
+
+    async fn acknowledge_notifications_response(&self, ids: Vec<i64>) -> ApiResponse {
+        match self.runtime.storage.acknowledge_notifications(&ids).await {
+            Ok(()) => ApiResponse::NotificationsAcknowledged { ids },
+            Err(err) => storage_error(err),
+        }
+    }
+
+    async fn update_config_response(
+        &self,
+        poll_interval_seconds: Option<u64>,
+        providers: Option<std::collections::BTreeMap<String, usage_core::ProviderToggle>>,
+        notifications: Option<usage_core::NotificationConfig>,
+    ) -> ApiResponse {
+        match self
+            .runtime
+            .update_config(poll_interval_seconds, providers, notifications)
+            .await
+        {
+            Ok(config) => ApiResponse::Config { config },
+            Err(err) => {
+                warn!(error = %err, "config update failed");
+                ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
             }
         }
+    }
+
+    async fn add_provider_account_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+        display_name: Option<String>,
+        sign_in_action: usage_core::ProviderSignInAction,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        require_capability(&provider_id, "adding accounts", |provider| {
+            provider.add_account_handler().is_some()
+        })?;
+        Ok(
+            match self
+                .runtime
+                .add_provider_account(provider_id, display_name, sign_in_action)
+                .await
+            {
+                Ok(account) => ApiResponse::AddProviderAccount { account },
+                Err(err) => {
+                    warn!(error = %err, "add provider account failed");
+                    ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                }
+            },
+        )
+    }
+
+    async fn update_account_response(
+        &self,
+        account_id: AccountId,
+        display_name: Option<String>,
+        hidden: Option<bool>,
+        collection_enabled: Option<bool>,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(
+            match self
+                .runtime
+                .update_account(account_id, display_name, hidden, collection_enabled)
+                .await
+            {
+                Ok(account) => ApiResponse::Account { account },
+                Err(err) => {
+                    warn!(error = %err, "account update failed");
+                    ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                }
+            },
+        )
+    }
+
+    async fn remove_account_response(
+        &self,
+        account_id: AccountId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(match self.runtime.remove_account(account_id).await {
+            Ok(account) => ApiResponse::Account { account },
+            Err(err) => {
+                warn!(error = %err, "account remove failed");
+                ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+            }
+        })
+    }
+
+    async fn delete_account_response(
+        &self,
+        account_id: AccountId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(match self.runtime.delete_account(account_id).await {
+            Ok(account_id) => ApiResponse::AccountDeleted { account_id },
+            Err(err) => {
+                warn!(error = %err, "account delete failed");
+                ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+            }
+        })
+    }
+
+    async fn provider_setup_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        Ok(match self.runtime.provider_setup(provider_id).await {
+            Ok(setup) => ApiResponse::ProviderSetup { setup },
+            Err(err) => {
+                warn!(error = %err, "provider setup lookup failed");
+                ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+            }
+        })
+    }
+
+    async fn update_provider_setup_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+        mut settings: std::collections::BTreeMap<String, Option<String>>,
+        workspace_id: Option<String>,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        require_capability(&provider_id, "setup", |provider| {
+            provider.setup_handler().is_some()
+        })?;
+        let supports_legacy_workspace_setup =
+            crate::runtime::provider_registry::find(provider_id.as_str())
+                .is_some_and(|provider| provider.descriptor().capabilities.workspace_setup);
+        if supports_legacy_workspace_setup && settings.is_empty() {
+            settings.insert("workspace_id".to_string(), workspace_id);
+        } else if workspace_id.is_some() {
+            return Err(ApiResponse::error(
+                ApiErrorCode::InvalidArgument,
+                "workspace_id is only supported by workspace-based provider setup; otherwise send provider setup values through settings",
+            ));
+        }
+        Ok(
+            match self
+                .runtime
+                .update_provider_setup(provider_id, settings)
+                .await
+            {
+                Ok(setup) => ApiResponse::ProviderSetup { setup },
+                Err(err) => {
+                    warn!(error = %err, "provider setup update failed");
+                    ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
+                }
+            },
+        )
+    }
+
+    async fn repair_provider_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+        account_id: Option<AccountId>,
+        sign_in_action: usage_core::ProviderSignInAction,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        require_capability(&provider_id, "repair", |provider| {
+            provider.repair_handler().is_some()
+        })?;
+        if let Some(account_id) = account_id.as_ref() {
+            self.require_account(account_id).await?;
+        }
+        Ok(
+            match self
+                .runtime
+                .repair_provider(provider_id, account_id, sign_in_action)
+                .await
+            {
+                Ok(action) => ApiResponse::ProviderAction { action },
+                Err(err) => {
+                    warn!(error = %err, "provider repair failed");
+                    ApiResponse::error(ApiErrorCode::Internal, err.to_string())
+                }
+            },
+        )
+    }
+
+    async fn launch_provider_account_response(
+        &self,
+        account_id: AccountId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(
+            match self.runtime.launch_provider_account(account_id).await {
+                Ok(action) => ApiResponse::ProviderAction { action },
+                Err(err) => {
+                    warn!(error = %err, "provider account launch failed");
+                    ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+                }
+            },
+        )
     }
 
     async fn state_response(&self) -> ApiResponse {
@@ -528,6 +598,12 @@ impl SocketServer {
             )),
             Err(err) => Some(storage_error(err)),
         }
+    }
+
+    async fn require_account(&self, account_id: &AccountId) -> Result<(), ApiResponse> {
+        self.account_validation_error(account_id)
+            .await
+            .map_or(Ok(()), Err)
     }
 }
 
@@ -837,6 +913,28 @@ fn provider_validation_error(provider_id: &usage_core::ProviderId) -> Option<Api
             format!("unknown provider: {provider_id}"),
         )
     })
+}
+
+fn require_provider(provider_id: &usage_core::ProviderId) -> Result<(), ApiResponse> {
+    provider_validation_error(provider_id).map_or(Ok(()), Err)
+}
+
+/// Rejects a request whose provider exists but does not implement the handler an
+/// operation needs. `operation` names the operation for the error message, e.g.
+/// "repair is not supported for {provider_id}".
+fn require_capability(
+    provider_id: &usage_core::ProviderId,
+    operation: &str,
+    supported: impl FnOnce(&dyn crate::runtime::provider_adapter::ProviderAdapter) -> bool,
+) -> Result<(), ApiResponse> {
+    if crate::runtime::provider_registry::find(provider_id.as_str()).is_some_and(supported) {
+        Ok(())
+    } else {
+        Err(ApiResponse::error(
+            ApiErrorCode::UnsupportedOperation,
+            format!("{operation} is not supported for {provider_id}"),
+        ))
+    }
 }
 
 fn validated_refresh_scope(

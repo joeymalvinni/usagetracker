@@ -58,7 +58,7 @@ impl Storage {
         .await
     }
     pub async fn provider_health(&self) -> anyhow::Result<Vec<ProviderHealth>> {
-        self.with_connection(provider_health_from_conn).await
+        self.with_read_connection(provider_health_from_conn).await
     }
 }
 

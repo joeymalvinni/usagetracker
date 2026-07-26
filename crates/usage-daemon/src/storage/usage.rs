@@ -167,7 +167,7 @@ impl Storage {
 
     #[cfg(test)]
     pub async fn daily_usage_history(&self) -> anyhow::Result<Vec<StoredDailyUsage>> {
-        self.with_connection(|conn| {
+        self.with_read_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT provider_id, account_id, usage_date, tokens, cost_usd, source
                  FROM provider_daily_usage
@@ -211,7 +211,7 @@ impl Storage {
         &self,
         recent_since: chrono::NaiveDate,
     ) -> anyhow::Result<Vec<StoredDailyUsageHistory>> {
-        self.with_connection(move |conn| daily_usage_dashboard_from_conn(conn, recent_since))
+        self.with_read_connection(move |conn| daily_usage_dashboard_from_conn(conn, recent_since))
             .await
     }
 
@@ -222,7 +222,7 @@ impl Storage {
         forecast_limit: usize,
     ) -> anyhow::Result<StoredUsageDashboard> {
         let forecast_limit = forecast_limit.min(MAX_SNAPSHOTS_PER_ACCOUNT);
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             let transaction = conn.unchecked_transaction()?;
             let snapshots = latest_usage_from_conn(&transaction)?;
             let accounts = accounts_from_conn(&transaction)?;
@@ -254,7 +254,7 @@ impl Storage {
     ) -> anyhow::Result<StoredForecastHistory> {
         let snapshot = snapshot.clone();
         let limit = limit.min(MAX_SNAPSHOTS_PER_ACCOUNT);
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             let key = (snapshot.provider_id.clone(), snapshot.account_id.clone());
             Ok(
                 forecast_histories_from_conn(conn, &[snapshot], since, limit)?
@@ -412,7 +412,7 @@ impl Storage {
     }
 
     pub async fn latest_usage(&self) -> anyhow::Result<Vec<UsageSnapshot>> {
-        self.with_connection(latest_usage_from_conn).await
+        self.with_read_connection(latest_usage_from_conn).await
     }
 
     pub async fn usage_events(
@@ -422,7 +422,7 @@ impl Storage {
         limit: u16,
     ) -> anyhow::Result<UsageEventPage> {
         let account_id = account_id.clone();
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             let total_count = conn.query_row(
                 "SELECT COUNT(*) FROM provider_usage_events WHERE account_id = ?1",
                 params![account_id.as_str()],
@@ -468,7 +468,7 @@ impl Storage {
         let provider_id = provider_id.clone();
         let account_id = account_id.clone();
         let limit = limit.min(MAX_SNAPSHOTS_PER_ACCOUNT) as i64;
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT normalized_json FROM usage_snapshots
                  WHERE provider_id = ?1 AND account_id = ?2 AND collected_at >= ?3

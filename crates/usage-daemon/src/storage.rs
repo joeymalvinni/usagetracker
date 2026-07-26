@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use usage_core::{Account, AccountId, ProviderHealth, ProviderId, UsageSnapshot};
 
 use crate::providers::{DailyUsageBucket, ProviderUsageEventBatch};
@@ -137,10 +137,16 @@ pub(crate) struct CollectionRecord<'a> {
     pub clear_backoff: bool,
 }
 
+/// Read-only connections kept open alongside the single writer. WAL lets these
+/// run concurrently with each other and with an in-flight write, so dashboard
+/// reads (the hot path for GetState and GetUsage) never queue behind a
+/// collection write.
+const READ_POOL_SIZE: usize = 4;
+
 #[derive(Clone)]
 pub struct Storage {
-    conn: Arc<Mutex<Connection>>,
-    connection_gate: Arc<tokio::sync::Semaphore>,
+    writer: Arc<ConnectionPool>,
+    readers: Arc<ConnectionPool>,
 }
 
 impl Storage {
@@ -151,25 +157,28 @@ impl Storage {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut conn = Connection::open(path)?;
+        let mut writer = open_writer_connection(path)?;
         let mut permissions = std::fs::metadata(path)?.permissions();
         permissions.set_mode(0o600);
         std::fs::set_permissions(path, permissions)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "temp_store", "MEMORY")?;
-        conn.pragma_update(None, "cache_size", -8_192_i64)?;
-        conn.pragma_update(None, "journal_size_limit", 4_i64 * 1024 * 1024)?;
-        migrations::migrate(&mut conn)?;
+        migrations::migrate(&mut writer)?;
+
+        let readers = (0..READ_POOL_SIZE)
+            .map(|_| open_reader_connection(path))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            connection_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            writer: Arc::new(ConnectionPool::new(
+                path,
+                ConnectionRole::Writer,
+                vec![writer],
+            )),
+            readers: Arc::new(ConnectionPool::new(path, ConnectionRole::Reader, readers)),
         })
     }
+
     pub async fn provider_data_ids(&self) -> anyhow::Result<Vec<ProviderId>> {
-        self.with_connection(|conn| {
+        self.with_read_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT provider_id FROM accounts
                  UNION
@@ -184,6 +193,9 @@ impl Storage {
         .await
     }
 
+    /// Runs a statement on the single writer connection. SQLite allows only one
+    /// writer at a time, so funnelling every mutation through one connection
+    /// keeps concurrent writes from colliding on the WAL.
     async fn with_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
@@ -191,22 +203,135 @@ impl Storage {
     where
         T: Send + 'static,
     {
-        let permit = self
-            .connection_gate
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| anyhow::anyhow!("sqlite connection gate closed"))?;
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let conn = conn
-                .lock()
-                .map_err(|_| anyhow::anyhow!("sqlite connection mutex poisoned"))?;
-            operation(&conn)
-        })
-        .await?
+        self.writer.execute(operation).await
     }
+
+    /// Runs a read-only statement on the shared reader pool, concurrently with
+    /// writes and other reads. Only pure `SELECT` operations may use this path.
+    async fn with_read_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
+        self.readers.execute(operation).await
+    }
+}
+
+/// A fixed set of interchangeable SQLite connections guarded by a semaphore
+/// with one permit per connection. Because a permit is held for the whole
+/// borrow, checkout and checkin only need a short `Vec` push/pop lock. A
+/// poisoned bookkeeping lock is recovered instead of making a healthy SQLite
+/// connection permanently unavailable.
+struct ConnectionPool {
+    path: std::path::PathBuf,
+    role: ConnectionRole,
+    idle: Mutex<Vec<Connection>>,
+    permits: tokio::sync::Semaphore,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionRole {
+    Reader,
+    Writer,
+}
+
+impl ConnectionPool {
+    fn new(path: &Path, role: ConnectionRole, connections: Vec<Connection>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            role,
+            permits: tokio::sync::Semaphore::new(connections.len()),
+            idle: Mutex::new(connections),
+        }
+    }
+
+    async fn execute<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+    {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("sqlite connection pool closed"))?;
+        // The permit guarantees an idle connection; reopen only in the unlikely
+        // event a previous operation panicked and lost one.
+        let connection = match self.checkout() {
+            Some(connection) => connection,
+            None => self.open_connection()?,
+        };
+        let handle = tokio::task::spawn_blocking(move || {
+            let result = operation(&connection);
+            (connection, result)
+        });
+        match handle.await {
+            Ok((connection, result)) => {
+                self.checkin(connection);
+                result
+            }
+            Err(join_error) => {
+                // The blocking closure panicked and dropped its connection.
+                // Reopen one so the pool stays full for the next borrower.
+                if let Ok(connection) = self.open_connection() {
+                    self.checkin(connection);
+                }
+                Err(anyhow::anyhow!("sqlite operation panicked: {join_error}"))
+            }
+        }
+    }
+
+    fn checkout(&self) -> Option<Connection> {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop()
+    }
+
+    fn checkin(&self, connection: Connection) {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(connection);
+    }
+
+    fn open_connection(&self) -> anyhow::Result<Connection> {
+        match self.role {
+            ConnectionRole::Reader => open_reader_connection(&self.path),
+            ConnectionRole::Writer => open_writer_connection(&self.path),
+        }
+    }
+}
+
+fn open_writer_connection(path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(path)?;
+    configure_connection(&conn)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "journal_size_limit", 4_i64 * 1024 * 1024)?;
+    Ok(conn)
+}
+
+fn open_reader_connection(path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    configure_connection(&conn)?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
+}
+
+fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -8_192_i64)?;
+    Ok(())
 }
 
 fn parse_time_sql(value: &str) -> rusqlite::Result<DateTime<Utc>> {

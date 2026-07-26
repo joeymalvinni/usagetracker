@@ -573,6 +573,52 @@ fn creates_private_database_files() {
 }
 
 #[tokio::test]
+async fn dashboard_reads_do_not_queue_behind_the_writer() {
+    let storage = test_storage();
+    let writer_storage = storage.clone();
+    let (writer_started_tx, writer_started_rx) = tokio::sync::oneshot::channel();
+    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+    let writer = tokio::spawn(async move {
+        writer_storage
+            .with_connection(move |_| {
+                writer_started_tx
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("writer start receiver dropped"))?;
+                release_writer_rx.recv()?;
+                Ok(())
+            })
+            .await
+    });
+    writer_started_rx.await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), storage.latest_usage())
+        .await
+        .expect("a read should use the independent WAL reader pool")
+        .unwrap();
+
+    release_writer_tx.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn pooled_reader_connections_reject_writes() {
+    let storage = test_storage();
+
+    let error = storage
+        .with_read_connection(|conn| {
+            conn.execute("CREATE TABLE reader_must_not_write (id INTEGER)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("readonly"),
+        "unexpected SQLite error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn upserts_and_retains_daily_usage_by_account_and_date() {
     let storage = test_storage();
     let provider_id = ProviderId::new("codex");

@@ -11,7 +11,7 @@ impl Storage {
     ) -> anyhow::Result<Option<StoredProviderBackoff>> {
         let provider_id = provider_id.clone();
         let account_id = account_id.clone();
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT consecutive_failures, retry_at, last_failure_at, error_message
                  FROM provider_backoff WHERE provider_id = ?1 AND account_id = ?2",

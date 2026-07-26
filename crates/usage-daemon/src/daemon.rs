@@ -90,15 +90,24 @@ impl PollSchedule {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ConfigUpdateChanges {
-    poll_interval: bool,
+struct ConfigChangeSet {
+    poll_schedule: bool,
     providers: bool,
     notifications: bool,
 }
 
-impl ConfigUpdateChanges {
+impl ConfigChangeSet {
+    fn between(previous: &Config, updated: &Config) -> Self {
+        Self {
+            poll_schedule: previous.poll_interval_seconds != updated.poll_interval_seconds
+                || previous.providers != updated.providers,
+            providers: previous.providers != updated.providers,
+            notifications: previous.notifications != updated.notifications,
+        }
+    }
+
     fn any(self) -> bool {
-        self.poll_interval || self.providers || self.notifications
+        self.poll_schedule || self.providers || self.notifications
     }
 }
 
@@ -259,22 +268,166 @@ impl DaemonRuntime {
         self.config.read().await.clone()
     }
 
+    /// Applies `mutation` to the live configuration and republishes each
+    /// affected subscription. This is the single write path for configuration:
+    /// account edits, `update_config`, and `delete_account` all funnel through
+    /// it so persistence and derived runtime state cannot drift between callers.
     pub(crate) async fn mutate_config<T>(
         &self,
         mutation: impl FnOnce(&mut Config) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.commit_config_change(mutation, || std::future::ready(Ok(())))
+            .await
+    }
+
+    /// Like [`Self::mutate_config`], but runs `commit` once the new config is
+    /// live. If `commit` fails and the config file can be restored, the previous
+    /// in-memory copy and derived subscriptions are restored with it.
+    async fn commit_config_change<T, C, Fut>(
+        &self,
+        mutation: impl FnOnce(&mut Config) -> anyhow::Result<T>,
+        commit: C,
+    ) -> anyhow::Result<T>
+    where
+        C: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
         let guard = self.config_mutation.lock().await;
-        let mut updated = self.config.read().await.clone();
+        let previous = self.config.read().await.clone();
+        let mut updated = previous.clone();
         let result = mutation(&mut updated)?;
-        let collectors = self.collectors_for_config(&updated).await?;
+
+        let changes = ConfigChangeSet::between(&previous, &updated);
+        if !changes.any() {
+            commit().await?;
+            drop(guard);
+            return Ok(result);
+        }
+
+        // Build both provider sets before swapping so a rollback can restore
+        // the previous collectors without a second fallible build. Non-provider
+        // edits leave the active collectors untouched.
+        let (previous_collectors, updated_collectors) = if changes.providers {
+            (
+                Some(self.collectors_for_config(&previous).await?),
+                Some(self.collectors_for_config(&updated).await?),
+            )
+        } else {
+            (None, None)
+        };
+
         updated.persist()?;
-        self.publish_local_log_config(&updated);
-        *self.config.write().await = updated.clone();
-        self.refresh.set_providers(collectors).await;
-        self.poll_schedule_tx
-            .send_replace(PollSchedule::from_config(&updated));
+        self.install_config(&updated, updated_collectors, changes)
+            .await;
+        if let Err(error) = self
+            .apply_notification_effects(&previous.notifications, &updated.notifications)
+            .await
+        {
+            let error = self
+                .rollback_config_change(
+                    &previous,
+                    previous_collectors,
+                    changes,
+                    error,
+                    "notification state update failed; config change was rolled back",
+                )
+                .await;
+            drop(guard);
+            return Err(error);
+        }
+
+        if let Err(commit_error) = commit().await {
+            let error = self
+                .rollback_config_change(
+                    &previous,
+                    previous_collectors,
+                    changes,
+                    commit_error,
+                    "config change was rolled back",
+                )
+                .await;
+            drop(guard);
+            return Err(error);
+        }
+
         drop(guard);
         Ok(result)
+    }
+
+    async fn rollback_config_change(
+        &self,
+        previous: &Config,
+        previous_collectors: Option<Vec<Arc<dyn ProviderCollector>>>,
+        changes: ConfigChangeSet,
+        error: anyhow::Error,
+        context: &str,
+    ) -> anyhow::Error {
+        match previous.persist() {
+            Ok(()) => {
+                self.install_config(previous, previous_collectors, changes)
+                    .await;
+                if changes.notifications {
+                    self.notifications
+                        .set_config(previous.notifications.clone());
+                }
+                error.context(context.to_string())
+            }
+            Err(rollback_error) => error.context(format!(
+                "{context}; config file rollback also failed: {rollback_error}"
+            )),
+        }
+    }
+
+    /// Publishes a configuration to the affected live subscribers. The
+    /// schedule only fires when its derived value actually changes, so edits
+    /// that leave polling untouched don't reset poll deadlines.
+    async fn install_config(
+        &self,
+        config: &Config,
+        collectors: Option<Vec<Arc<dyn ProviderCollector>>>,
+        changes: ConfigChangeSet,
+    ) {
+        if changes.providers {
+            self.publish_local_log_config(config);
+        }
+        *self.config.write().await = config.clone();
+        if let Some(collectors) = collectors {
+            self.refresh.set_providers(collectors).await;
+        }
+        if changes.poll_schedule {
+            self.poll_schedule_tx.send_if_modified(|current| {
+                let next = PollSchedule::from_config(config);
+                let changed = *current != next;
+                if changed {
+                    *current = next;
+                }
+                changed
+            });
+        }
+    }
+
+    /// Reconciles notification state against a configuration change. All of the
+    /// effects are derived from the before/after notification config, so every
+    /// caller of [`Self::mutate_config`] gets them for free and none can forget
+    /// one.
+    async fn apply_notification_effects(
+        &self,
+        previous: &NotificationConfig,
+        updated: &NotificationConfig,
+    ) -> anyhow::Result<()> {
+        if previous == updated {
+            return Ok(());
+        }
+        let reenabled = !previous.enabled && updated.enabled;
+        let disabled = previous.enabled && !updated.enabled;
+        if reenabled || notification_threshold_policy_changed(previous, updated) {
+            self.storage.clear_notification_window_state().await?;
+        }
+        if disabled {
+            self.storage.clear_pending_notifications().await?;
+        }
+        self.notifications.set_config(updated.clone());
+        Ok(())
     }
 
     pub async fn config_response_for_provider_data(
@@ -328,71 +481,18 @@ impl DaemonRuntime {
             }
         }
 
-        let mutation = self.config_mutation.lock().await;
-        let config = self.config.read().await.clone();
-        let changes = config_update_changes(
-            &config,
-            poll_interval_seconds,
-            providers.as_ref(),
-            notifications.as_ref(),
-        );
-        if !changes.any() {
-            drop(mutation);
-            return self.config_response().await;
-        }
+        self.mutate_config(|config| {
+            config.apply_update(poll_interval_seconds, providers.as_ref(), notifications)
+        })
+        .await?;
 
-        let mut updated_config = config.clone();
-        updated_config.apply_update(poll_interval_seconds, providers.as_ref(), notifications)?;
-
-        let collectors = if changes.providers {
-            Some(self.collectors_for_config(&updated_config).await?)
-        } else {
-            None
-        };
-        let notifications_reenabled =
-            !config.notifications.enabled && updated_config.notifications.enabled;
-        let notifications_disabled =
-            config.notifications.enabled && !updated_config.notifications.enabled;
-        let threshold_policy_changed = notification_threshold_policy_changed(
-            &config.notifications,
-            &updated_config.notifications,
-        );
-        updated_config.persist()?;
-        *self.config.write().await = updated_config.clone();
-        self.publish_local_log_config(&updated_config);
-        if let Some(collectors) = collectors {
-            self.refresh.set_providers(collectors).await;
-        }
-        if notifications_reenabled || threshold_policy_changed {
-            self.storage.clear_notification_window_state().await?;
-        }
-        if notifications_disabled {
-            self.storage.clear_pending_notifications().await?;
-        }
-        if changes.notifications {
-            self.notifications
-                .set_config(updated_config.notifications.clone());
-        }
-        if changes.poll_interval || changes.providers {
-            let schedule = PollSchedule::from_config(&updated_config);
-            self.poll_schedule_tx.send_if_modified(|current| {
-                if *current == schedule {
-                    false
-                } else {
-                    *current = schedule;
-                    true
-                }
-            });
-        }
-
-        let poll_interval_seconds = updated_config.poll_interval_seconds;
-        let enabled_providers = updated_config.enabled_provider_ids();
+        let config = self.config.read().await;
         info!(
-            poll_interval_seconds,
-            enabled_providers = ?enabled_providers,
+            poll_interval_seconds = config.poll_interval_seconds,
+            enabled_providers = ?config.enabled_provider_ids(),
             "daemon config updated"
         );
-        drop(mutation);
+        drop(config);
         self.config_response().await
     }
 
@@ -454,38 +554,31 @@ impl DaemonRuntime {
             handler.cleanup_before_delete(&account).await?;
         }
 
-        let mutation = self.config_mutation.lock().await;
-        let previous_config = self.config.read().await.clone();
-        let plan = match adapter.delete_handler() {
-            Some(handler) => handler.plan_deletion(&previous_config, &account)?,
-            None => {
-                crate::runtime::provider_adapter::AccountDeletionPlan::unchanged(&previous_config)
-            }
-        };
-        let previous_collectors = self.collectors_for_config(&previous_config).await?;
-        let next_collectors = self.collectors_for_config(&plan.config).await?;
+        // The database row is deleted as the guarded commit so a failure there
+        // rolls the tombstoned config back to exactly what is still on disk.
+        let managed_profile_path = self
+            .commit_config_change(
+                |config| {
+                    let plan = match adapter.delete_handler() {
+                        Some(handler) => handler.plan_deletion(config, &account)?,
+                        None => {
+                            crate::runtime::provider_adapter::AccountDeletionPlan::unchanged(config)
+                        }
+                    };
+                    *config = plan.config;
+                    Ok(plan.managed_profile_path)
+                },
+                || async {
+                    self.storage
+                        .delete_account(&account_id)
+                        .await
+                        .map(|_| ())
+                        .context("database deletion failed")
+                },
+            )
+            .await?;
 
-        plan.config.persist()?;
-        *self.config.write().await = plan.config.clone();
-        self.publish_local_log_config(&plan.config);
-        self.refresh.set_providers(next_collectors).await;
-
-        if let Err(delete_error) = self.storage.delete_account(&account_id).await {
-            let rollback_result = previous_config.persist();
-            self.publish_local_log_config(&previous_config);
-            *self.config.write().await = previous_config;
-            self.refresh.set_providers(previous_collectors).await;
-            drop(mutation);
-            if let Err(rollback_error) = rollback_result {
-                return Err(delete_error.context(format!(
-                    "database deletion failed and config rollback also failed: {rollback_error}"
-                )));
-            }
-            return Err(delete_error.context("database deletion failed; config was rolled back"));
-        }
-        drop(mutation);
-
-        if let Some(path) = plan.managed_profile_path {
+        if let Some(path) = managed_profile_path {
             managed_profiles::quarantine_and_remove(&path)?;
         }
         Ok(account_id)
@@ -583,23 +676,26 @@ impl DaemonRuntime {
     }
 }
 
-fn config_update_changes(
-    config: &Config,
-    poll_interval_seconds: Option<u64>,
-    providers: Option<&BTreeMap<String, ProviderToggle>>,
-    notifications: Option<&NotificationConfig>,
-) -> ConfigUpdateChanges {
-    ConfigUpdateChanges {
-        poll_interval: poll_interval_seconds
-            .is_some_and(|seconds| seconds != config.poll_interval_seconds),
-        providers: providers.is_some_and(|providers| {
-            providers
-                .iter()
-                .any(|(id, toggle)| config.provider_enabled(id) != toggle.enabled)
-        }),
-        notifications: notifications
-            .is_some_and(|notifications| notifications != &config.notifications),
-    }
+/// A single rule's positional-notification identity: the account and window it
+/// targets and the threshold ladder it overrides.
+type ThresholdRule<'a> = (Option<&'a AccountId>, Option<&'a str>, Option<&'a [u8]>);
+
+/// The per-rule threshold overrides that steer positional notification state.
+/// Only rules that actually set thresholds participate, so unrelated rule edits
+/// don't force the stored notification window state to be cleared.
+fn threshold_rules(config: &NotificationConfig) -> Vec<ThresholdRule<'_>> {
+    config
+        .rules
+        .iter()
+        .filter(|rule| rule.thresholds_percent_remaining.is_some())
+        .map(|rule| {
+            (
+                rule.account_id.as_ref(),
+                rule.window_id.as_deref(),
+                rule.thresholds_percent_remaining.as_deref(),
+            )
+        })
+        .collect()
 }
 
 fn notification_threshold_policy_changed(
@@ -607,28 +703,7 @@ fn notification_threshold_policy_changed(
     updated: &NotificationConfig,
 ) -> bool {
     previous.thresholds_percent_remaining != updated.thresholds_percent_remaining
-        || previous
-            .rules
-            .iter()
-            .filter(|rule| rule.thresholds_percent_remaining.is_some())
-            .map(|rule| {
-                (
-                    rule.account_id.as_ref(),
-                    rule.window_id.as_deref(),
-                    rule.thresholds_percent_remaining.as_deref(),
-                )
-            })
-            .ne(updated
-                .rules
-                .iter()
-                .filter(|rule| rule.thresholds_percent_remaining.is_some())
-                .map(|rule| {
-                    (
-                        rule.account_id.as_ref(),
-                        rule.window_id.as_deref(),
-                        rule.thresholds_percent_remaining.as_deref(),
-                    )
-                }))
+        || threshold_rules(previous) != threshold_rules(updated)
 }
 
 fn spawn_polling_loop(
@@ -762,7 +837,7 @@ mod tests {
         },
     };
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::{sync::Notify, time::timeout};
 
     #[derive(Default)]
@@ -884,52 +959,35 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn classifies_config_updates_by_actual_side_effects() {
-        let config = test_config(Path::new("/tmp/unused-usage-config"));
-        let unchanged_providers = BTreeMap::from([(
-            CODEX_PROVIDER_ID.to_string(),
-            ProviderToggle { enabled: true },
-        )]);
+    #[tokio::test]
+    async fn config_commit_runs_when_the_mutation_is_a_noop() {
+        let root = std::env::temp_dir().join(format!(
+            "usage-runtime-noop-commit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = test_storage_at(&root);
+        let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), Vec::new()));
+        let (runtime, _schedule_rx) =
+            DaemonRuntime::new(test_config(&root), storage.clone(), refresh.clone());
+        let committed = Arc::new(AtomicBool::new(false));
+        let commit_flag = committed.clone();
 
-        assert_eq!(
-            config_update_changes(
-                &config,
-                Some(config.poll_interval_seconds),
-                Some(&unchanged_providers),
-                Some(&config.notifications),
-            ),
-            ConfigUpdateChanges::default()
-        );
-        assert_eq!(
-            config_update_changes(&config, Some(60), None, None),
-            ConfigUpdateChanges {
-                poll_interval: true,
-                ..ConfigUpdateChanges::default()
-            }
-        );
-        let enabled_notifications = NotificationConfig {
-            enabled: true,
-            ..NotificationConfig::default()
-        };
-        assert_eq!(
-            config_update_changes(&config, None, None, Some(&enabled_notifications),),
-            ConfigUpdateChanges {
-                notifications: true,
-                ..ConfigUpdateChanges::default()
-            }
-        );
-        let changed_providers = BTreeMap::from([(
-            CLAUDE_PROVIDER_ID.to_string(),
-            ProviderToggle { enabled: true },
-        )]);
-        assert_eq!(
-            config_update_changes(&config, None, Some(&changed_providers), None),
-            ConfigUpdateChanges {
-                providers: true,
-                ..ConfigUpdateChanges::default()
-            }
-        );
+        runtime
+            .commit_config_change(
+                |_| Ok(()),
+                || async move {
+                    commit_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(committed.load(Ordering::SeqCst));
+        drop(runtime);
+        drop(refresh);
+        drop(storage);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

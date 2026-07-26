@@ -47,7 +47,7 @@ pub struct FileConfig {
     pub providers: BTreeMap<String, ProviderConfig>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -59,7 +59,7 @@ pub struct ProviderConfig {
     pub(crate) settings: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProviderProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
