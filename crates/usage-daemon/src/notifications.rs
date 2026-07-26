@@ -733,10 +733,8 @@ mod tests {
         let mut snapshot = test_snapshot(0.0, Utc::now() + TimeDelta::hours(2));
         snapshot.provider_id = ProviderId::new("opencode_go");
         snapshot.account_id = account.id.clone();
-        snapshot.metadata = serde_json::json!({
-            "estimate": true,
-            "web_authoritative": false,
-        });
+        snapshot.detail.estimate = Some(true);
+        snapshot.detail.web_authoritative = Some(false);
 
         manager.process_snapshot(&account, &snapshot).await;
 
@@ -810,7 +808,7 @@ mod tests {
                 percent_remaining: Some(percent),
                 reset_at: Some(reset_at),
             }],
-            metadata: serde_json::json!({}),
+            detail: usage_core::SnapshotDetail::default(),
         }
     }
 

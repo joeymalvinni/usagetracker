@@ -14,9 +14,12 @@ use std::{
 use chrono::{Days, Local, NaiveDate};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
+use usage_core::{ActivityDetail, DailyUsagePoint};
 use wait_timeout::ChildExt;
 
-use crate::providers::{DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{
+    json_map, DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsage,
+};
 
 use super::{
     cost::u64_from_json_value, rate_limits::normalize_app_server_usage, CodexCollectedUsage,
@@ -547,26 +550,30 @@ impl CodexAccountActivityExt for ProviderUsage {
         let by_day = activity
             .daily_usage
             .iter()
-            .map(|bucket| {
-                json!({
-                    "date": bucket.date.to_string(),
-                    "tokens": bucket.tokens,
-                })
+            .map(|bucket| DailyUsagePoint {
+                date: bucket.date,
+                tokens: bucket.tokens,
+                cost_usd: None,
+                priced_tokens: 0,
+                unpriced_tokens: 0,
             })
             .collect::<Vec<_>>();
-        self.metadata["codex_activity"] = json!({
-            "source": "codex_account_usage",
-            "server_authoritative": true,
-            "daily_bucket_count": activity.daily_usage.len(),
-            "today_tokens": today_tokens,
-            "lookback_days": COST_LOOKBACK_DAYS,
-            "lookback_tokens": lookback_tokens,
-            "lifetime_tokens": lifetime_tokens,
-            "peak_daily_tokens": activity.peak_daily_tokens,
-            "longest_running_turn_sec": activity.longest_running_turn_sec,
-            "current_streak_days": activity.current_streak_days,
-            "longest_streak_days": activity.longest_streak_days,
-            "by_day": by_day,
+        self.detail.activity = Some(ActivityDetail {
+            source: Some("codex_account_usage".to_string()),
+            today_tokens: Some(today_tokens),
+            lookback_tokens: Some(lookback_tokens),
+            lifetime_tokens: Some(lifetime_tokens),
+            by_day,
+            extra: json_map(json!({
+                "server_authoritative": true,
+                "daily_bucket_count": activity.daily_usage.len(),
+                "lookback_days": COST_LOOKBACK_DAYS,
+                "peak_daily_tokens": activity.peak_daily_tokens,
+                "longest_running_turn_sec": activity.longest_running_turn_sec,
+                "current_streak_days": activity.current_streak_days,
+                "longest_streak_days": activity.longest_streak_days,
+            })),
+            ..ActivityDetail::default()
         });
     }
 }
@@ -671,8 +678,15 @@ mod tests {
             1785266625
         );
         assert_eq!(
-            snapshot.metadata["rate_limit_reset_credits"]["next_expires_at"],
-            1785430594.0
+            snapshot
+                .detail
+                .reset_credits
+                .as_ref()
+                .unwrap()
+                .next_expires_at
+                .unwrap()
+                .timestamp(),
+            1785430594
         );
     }
 

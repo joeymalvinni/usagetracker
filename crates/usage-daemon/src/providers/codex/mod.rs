@@ -8,13 +8,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 use usage_core::{
-    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
-    UsageSnapshot,
+    Account, ProviderId, SnapshotDetail, UsageDataCompleteness, UsageDataQuality, UsageDataScope,
+    UsageDataSource, UsageSnapshot,
 };
 
 use crate::{
@@ -196,7 +197,7 @@ impl CodexCollector {
             provider_id: ProviderId::new(PROVIDER_ID),
             collected_at: chrono::Utc::now(),
             windows: Vec::new(),
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         };
         usage.merge_cost_report(scan.report, true);
         Ok(UsageDataset::supplemental_named(
@@ -509,9 +510,10 @@ impl ProviderCollector for CodexCollector {
                     elapsed_ms = app_server_started.elapsed().as_millis(),
                     windows = collected.usage.windows.len(),
                     reset_credits_available =
-                        reset_credits_available_count(&collected.usage.metadata),
+                        reset_credits_available_count(&collected.usage.detail),
                     reset_credits_next_expires_at =
-                        reset_credits_next_expires_at(&collected.usage.metadata),
+                        reset_credits_next_expires_at(&collected.usage.detail)
+                            .map(|value| value.timestamp()),
                     "codex app-server usage collection completed"
                 );
                 collected
@@ -542,9 +544,13 @@ impl ProviderCollector for CodexCollector {
                 fallback
             }
         };
-        collected.usage.metadata["credential_profile"] = json!(profile.id.as_str());
+        collected.usage.detail.credential_profile = Some(profile.id.as_str().to_string());
         if let Some(display_name) = profile.display_name.as_deref() {
-            collected.usage.metadata["profile_display_name"] = json!(display_name);
+            collected
+                .usage
+                .detail
+                .extra
+                .insert("profile_display_name".to_string(), json!(display_name));
         }
 
         let mut supplemental = Vec::new();
@@ -600,23 +606,18 @@ struct CodexCollectedUsage {
     warnings: Vec<String>,
 }
 
-fn reset_credits_available_count(metadata: &Value) -> Option<f64> {
-    metadata
-        .get("rate_limit_reset_credits")
-        .and_then(|value| value.get("available_count"))
-        .and_then(number_from_json_value)
-        .or_else(|| {
-            metadata
-                .get("rate_limit_reset_credits_available_count")
-                .and_then(number_from_json_value)
-        })
+fn reset_credits_available_count(detail: &SnapshotDetail) -> Option<u64> {
+    detail
+        .reset_credits
+        .as_ref()
+        .map(|credits| credits.available_count)
 }
 
-fn reset_credits_next_expires_at(metadata: &Value) -> Option<f64> {
-    metadata
-        .get("rate_limit_reset_credits")
-        .and_then(|value| value.get("next_expires_at"))
-        .and_then(number_from_json_value)
+fn reset_credits_next_expires_at(detail: &SnapshotDetail) -> Option<DateTime<Utc>> {
+    detail
+        .reset_credits
+        .as_ref()
+        .and_then(|credits| credits.next_expires_at)
 }
 
 #[derive(Debug, Deserialize)]

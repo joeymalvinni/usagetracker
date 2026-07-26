@@ -5,9 +5,11 @@ use std::sync::LazyLock;
 use chrono::{DateTime, TimeDelta, Utc};
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{
+    ProviderId, SnapshotDetail, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+};
 
-use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{json_map, ProviderError, ProviderErrorKind, ProviderUsage};
 
 use super::{
     history::{usage_history_windows, UsageHistoryReport},
@@ -132,29 +134,25 @@ impl ParsedUsage {
             windows.extend(usage_history_windows(provider_id, report, Utc::now()));
         }
 
-        let mut metadata = json!({
-            "collection_mode": collection_mode,
-            "workspace_id": workspace_id,
-            "email": account_email,
-            "account_email": account_email,
-            "zen_balance_usd": zen_balance_usd,
-            "web_authoritative": true,
-            "cookie_source": cookie_source,
-        });
-        if let Some(usage_history) = history.as_ref() {
-            if let Some(object) = metadata.as_object_mut() {
-                object.insert(
-                    format!("{provider_id}_cost"),
-                    usage_history.metadata_value(),
-                );
-            }
-        }
+        let detail = SnapshotDetail {
+            collection_mode: Some(collection_mode.to_string()),
+            email: account_email.map(str::to_string),
+            account_email: account_email.map(str::to_string),
+            web_authoritative: Some(true),
+            cost: history.as_ref().map(UsageHistoryReport::cost_detail),
+            extra: json_map(json!({
+                "workspace_id": workspace_id,
+                "zen_balance_usd": zen_balance_usd,
+                "cookie_source": cookie_source,
+            })),
+            ..SnapshotDetail::default()
+        };
 
         ProviderUsage {
             provider_id: ProviderId::new(provider_id),
             collected_at: Utc::now(),
             windows,
-            metadata,
+            detail,
         }
     }
 }

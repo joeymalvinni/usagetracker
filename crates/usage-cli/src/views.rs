@@ -595,7 +595,7 @@ mod tests {
                     percent_remaining: Some(remaining),
                     reset_at: None,
                 }],
-                metadata: serde_json::Value::Null,
+                detail: usage_core::SnapshotDetail::default(),
             })
             .collect();
         let selected = SelectedState::from_state(state, SelectionRequest::default()).unwrap();

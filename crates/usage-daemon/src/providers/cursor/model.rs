@@ -2,13 +2,13 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 use usage_core::{
-    ProviderId, UsageAmount, UsageDataCompleteness, UsageDataQuality, UsageDataScope,
-    UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
+    ProviderId, SnapshotDetail, UsageAmount, UsageDataCompleteness, UsageDataQuality,
+    UsageDataScope, UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
 };
 
 use crate::providers::{
-    DailyUsageBucket, ProviderCollectionResult, ProviderError, ProviderErrorKind, ProviderUsage,
-    UsageDataset,
+    json_map, DailyUsageBucket, ProviderCollectionResult, ProviderError, ProviderErrorKind,
+    ProviderUsage, UsageDataset,
 };
 
 use super::{auth::SessionSource, client::CursorFetch, number::NumberLike, CURSOR_PROVIDER_ID};
@@ -300,20 +300,23 @@ pub(super) fn normalize_cursor_fetch(
     } else {
         headline_source.map(HeadlineSource::as_str)
     };
-    let metadata = json!({
-        "collection_mode": "cursor_web",
-        "credential_source": source.as_str(),
-        "membership_type": summary.membership_type.clone(),
-        "limit_type": summary.limit_type.clone(),
-        "is_unlimited": summary.is_unlimited,
-        "billing_cycle_start": summary.billing_cycle_start.clone(),
-        "billing_cycle_end": summary.billing_cycle_end.clone(),
-        "headline_source": headline_source_label,
-        "account_external_id": account_id,
-        "web_authoritative": true,
-        "team_pooled_scope": legacy_requests.is_none()
-            && headline_source.is_some_and(HeadlineSource::is_organization),
-    });
+    let detail = SnapshotDetail {
+        collection_mode: Some("cursor_web".to_string()),
+        web_authoritative: Some(true),
+        extra: json_map(json!({
+            "credential_source": source.as_str(),
+            "membership_type": summary.membership_type.clone(),
+            "limit_type": summary.limit_type.clone(),
+            "is_unlimited": summary.is_unlimited,
+            "billing_cycle_start": summary.billing_cycle_start.clone(),
+            "billing_cycle_end": summary.billing_cycle_end.clone(),
+            "headline_source": headline_source_label,
+            "account_external_id": account_id,
+            "team_pooled_scope": legacy_requests.is_none()
+                && headline_source.is_some_and(HeadlineSource::is_organization),
+        })),
+        ..SnapshotDetail::default()
+    };
 
     if windows.is_empty() && team_on_demand.is_none() {
         return Err(ProviderError::new(
@@ -323,9 +326,14 @@ pub(super) fn normalize_cursor_fetch(
     }
 
     let mut supplemental = Vec::new();
-    let mut primary_collection = collection(windows, metadata, account_email.clone());
-    let mut organization_personal_collection = (scope == UsageDataScope::Organization)
-        .then(|| collection(personal_windows, json!({}), account_email.clone()));
+    let mut primary_collection = collection(windows, detail, account_email.clone());
+    let mut organization_personal_collection = (scope == UsageDataScope::Organization).then(|| {
+        collection(
+            personal_windows,
+            SnapshotDetail::default(),
+            account_email.clone(),
+        )
+    });
     if let Some(warning) = event_warning {
         primary_collection.warnings.push(warning);
     }
@@ -341,11 +349,11 @@ pub(super) fn normalize_cursor_fetch(
                 if let Some(personal_collection) = organization_personal_collection.as_mut() {
                     personal_collection.daily_usage = report.daily_usage;
                     personal_collection.usage_events = Some(report.batch);
-                    personal_collection.usage.metadata["cursor_cost"] = report.metadata;
+                    personal_collection.usage.detail.cost = Some(report.cost);
                 } else {
                     primary_collection.daily_usage = report.daily_usage;
                     primary_collection.usage_events = Some(report.batch);
-                    primary_collection.usage.metadata["cursor_cost"] = report.metadata;
+                    primary_collection.usage.detail.cost = Some(report.cost);
                 }
             }
             Err(error) => primary_collection.warnings.push(format!(
@@ -380,15 +388,18 @@ pub(super) fn normalize_cursor_fetch(
                 return Ok(NormalizedCursorUsage {
                     collection: collection(
                         vec![team_window],
-                        json!({
-                            "collection_mode": "cursor_web",
-                            "credential_source": source.as_str(),
-                            "membership_type": summary.membership_type,
-                            "limit_type": summary.limit_type,
-                            "billing_cycle_end": summary.billing_cycle_end,
-                            "team_budget_scope": true,
-                            "web_authoritative": true,
-                        }),
+                        SnapshotDetail {
+                            collection_mode: Some("cursor_web".to_string()),
+                            web_authoritative: Some(true),
+                            extra: json_map(json!({
+                                "credential_source": source.as_str(),
+                                "membership_type": summary.membership_type,
+                                "limit_type": summary.limit_type,
+                                "billing_cycle_end": summary.billing_cycle_end,
+                                "team_budget_scope": true,
+                            })),
+                            ..SnapshotDetail::default()
+                        },
                         account_email,
                     ),
                     scope,
@@ -399,10 +410,13 @@ pub(super) fn normalize_cursor_fetch(
                 "cursor_team_budget",
                 collection(
                     vec![team_window],
-                    json!({
-                        "cursor_team_budget": true,
-                        "team_budget_scope": true,
-                    }),
+                    SnapshotDetail {
+                        extra: json_map(json!({
+                            "cursor_team_budget": true,
+                            "team_budget_scope": true,
+                        })),
+                        ..SnapshotDetail::default()
+                    },
                     account_email,
                 ),
                 UsageDataSource::ProviderReported,
@@ -421,7 +435,7 @@ pub(super) fn normalize_cursor_fetch(
 
 fn collection(
     windows: Vec<UsageWindow>,
-    metadata: serde_json::Value,
+    detail: SnapshotDetail,
     account_email: Option<String>,
 ) -> ProviderCollectionResult {
     ProviderCollectionResult {
@@ -429,7 +443,7 @@ fn collection(
             provider_id: ProviderId::new(CURSOR_PROVIDER_ID),
             collected_at: Utc::now(),
             windows,
-            metadata,
+            detail,
         },
         daily_usage: Vec::<DailyUsageBucket>::new(),
         usage_events: None,

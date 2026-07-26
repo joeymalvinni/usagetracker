@@ -5,7 +5,7 @@ use std::{
 
 use chrono::{Days, FixedOffset, Local, NaiveDate, Utc};
 use serde_json::json;
-use usage_core::{AccountId, ProviderId, UsageWindow, UsageWindowKind};
+use usage_core::{AccountId, ProviderId, SnapshotDetail, UsageWindow, UsageWindowKind};
 
 use crate::{
     config::{ProviderConfig, ProviderProfileConfig},
@@ -71,7 +71,7 @@ fn account_activity_and_local_cost_metadata_remain_separate() {
         provider_id: ProviderId::new(PROVIDER_ID),
         collected_at: Utc::now(),
         windows: Vec::new(),
-        metadata: json!({}),
+        detail: SnapshotDetail::default(),
     };
     usage.merge_account_activity(activity);
 
@@ -103,14 +103,13 @@ fn account_activity_and_local_cost_metadata_remain_separate() {
         true,
     );
 
-    assert_eq!(usage.metadata["codex_activity"]["lifetime_tokens"], 300);
-    assert_eq!(usage.metadata["codex_activity"]["by_day"][1]["tokens"], 100);
-    assert_eq!(usage.metadata["codex_cost"]["partial"], true);
-    assert_eq!(usage.metadata["codex_cost"]["today_activity_tokens"], 100);
-    assert_eq!(
-        usage.metadata["codex_cost"]["today_cached_input_tokens"],
-        80
-    );
+    let activity_detail = usage.detail.activity.as_ref().unwrap();
+    assert_eq!(activity_detail.lifetime_tokens, Some(300));
+    assert_eq!(activity_detail.by_day[1].tokens, 100);
+    let cost_detail = usage.detail.cost.as_ref().unwrap();
+    assert!(cost_detail.partial);
+    assert_eq!(cost_detail.extra["today_activity_tokens"], 100);
+    assert_eq!(cost_detail.extra["today_cached_input_tokens"], 80);
     let token_window = usage
         .windows
         .iter()
@@ -438,21 +437,12 @@ fn normalizes_codex_rate_limits() {
     assert_eq!(credits.remaining.as_ref().unwrap().value, 0.0);
     assert!(credits.limit.is_none());
 
-    assert_eq!(snapshot.metadata["plan_type"], "prolite");
-    assert_eq!(snapshot.metadata["email"], "user@example.com");
-    assert_eq!(snapshot.metadata["credits_has_credits"], false);
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits_available_count"],
-        1.0
-    );
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["available_count"],
-        1.0
-    );
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["credits"],
-        json!([])
-    );
+    assert_eq!(snapshot.detail.plan_type.as_deref(), Some("prolite"));
+    assert_eq!(snapshot.detail.email.as_deref(), Some("user@example.com"));
+    assert_eq!(snapshot.detail.extra["credits_has_credits"], false);
+    let reset_credits = snapshot.detail.reset_credits.as_ref().unwrap();
+    assert_eq!(reset_credits.available_count, 1);
+    assert!(reset_credits.credits.is_empty());
 }
 
 #[test]
@@ -575,34 +565,24 @@ fn normalizes_app_server_rate_limits_with_reset_credit_expiry() {
     assert_eq!(credits.remaining.as_ref().unwrap().value, 0.0);
 
     assert_eq!(
-        snapshot.metadata["collection_mode"],
-        "codex_app_server_rate_limits"
+        snapshot.detail.collection_mode.as_deref(),
+        Some("codex_app_server_rate_limits")
+    );
+    let reset_credits = snapshot.detail.reset_credits.as_ref().unwrap();
+    assert_eq!(reset_credits.available_count, 4);
+    assert_eq!(
+        reset_credits.next_expires_at.unwrap().timestamp(),
+        1783822493
     );
     assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits_available_count"],
-        4.0
+        reset_credits.credits[0].expires_at.unwrap().timestamp(),
+        1783822493
     );
     assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["next_expires_at"],
-        1783822493.0
+        reset_credits.credits[0].id.as_deref(),
+        Some("RateLimitResetCredit_old")
     );
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["next_expires_at_iso"],
-        "2026-07-12T02:14:53+00:00"
-    );
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["credits"][0]["expires_at"],
-        1783822493.0
-    );
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["credits"][0]["expires_at_iso"],
-        "2026-07-12T02:14:53+00:00"
-    );
-    assert_eq!(
-        snapshot.metadata["rate_limit_reset_credits"]["credits"][0]["id"],
-        "RateLimitResetCredit_old"
-    );
-    assert_eq!(snapshot.metadata["plan_type"], "prolite");
+    assert_eq!(snapshot.detail.plan_type.as_deref(), Some("prolite"));
 }
 
 #[test]

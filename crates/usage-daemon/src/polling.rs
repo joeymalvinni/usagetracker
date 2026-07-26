@@ -1372,7 +1372,7 @@ fn validate_discovery(
 fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResult> {
     let mut datasets = datasets.into_iter();
     let first = datasets.next()?;
-    let mut provenance = vec![dataset_provenance(&first)];
+    let mut provenance = vec![first.provenance_record()];
     let mut result = first.collection;
     let mut modes = BTreeSet::from([result.collection_mode.clone()]);
     let mut window_ids = result
@@ -1384,7 +1384,6 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
 
     for dataset in datasets {
         let mut contributed_window_ids = Vec::new();
-        let mut contributed_metadata_keys = Vec::new();
         let mut provenance_record = dataset.provenance_record();
         let incoming = dataset.collection;
         result.usage.collected_at = result.usage.collected_at.max(incoming.usage.collected_at);
@@ -1394,22 +1393,14 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
                 result.usage.windows.push(window);
             }
         }
-        if let (Some(target), Some(source)) = (
-            result.usage.metadata.as_object_mut(),
-            incoming.usage.metadata.as_object(),
-        ) {
-            for (key, value) in source {
-                if let serde_json::map::Entry::Vacant(entry) = target.entry(key.clone()) {
-                    contributed_metadata_keys.push(key.clone());
-                    entry.insert(value.clone());
-                }
-            }
-        }
+        // First writer wins for each typed field and diagnostic key.
+        let contributed_metadata_keys = result
+            .usage
+            .detail
+            .fill_missing_from(&incoming.usage.detail);
         provenance_record.window_ids = contributed_window_ids;
         provenance_record.metadata_keys = contributed_metadata_keys;
-        provenance.push(
-            serde_json::to_value(provenance_record).expect("dataset provenance is serializable"),
-        );
+        provenance.push(provenance_record);
         result.daily_usage.extend(incoming.daily_usage);
         if result.usage_events.is_none() {
             result.usage_events = incoming.usage_events;
@@ -1422,17 +1413,8 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
     }
 
     result.collection_mode = modes.into_iter().collect::<Vec<_>>().join("+");
-    if let Some(metadata) = result.usage.metadata.as_object_mut() {
-        metadata.insert(
-            "dataset_provenance".to_string(),
-            serde_json::Value::Array(provenance),
-        );
-    }
+    result.usage.detail.dataset_provenance = provenance;
     Some(result)
-}
-
-fn dataset_provenance(dataset: &UsageDataset) -> serde_json::Value {
-    serde_json::to_value(dataset.provenance_record()).expect("dataset provenance is serializable")
 }
 
 fn jittered_backoff_seconds(
@@ -1558,7 +1540,7 @@ mod tests {
         time::timeout,
     };
     use usage_core::{
-        DatasetProvenance, ProviderHealth, ProviderHealthStatus, UsageAmount,
+        CostDetail, ProviderHealth, ProviderHealthStatus, SnapshotDetail, UsageAmount,
         UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource, UsageUnit,
         UsageWindow, UsageWindowKind,
     };
@@ -1622,7 +1604,13 @@ mod tests {
                         provider_id: ProviderId::new("claude"),
                         collected_at: Utc::now(),
                         windows: Vec::new(),
-                        metadata: json!({"claude_cost": {"tokens": 42}}),
+                        detail: SnapshotDetail {
+                            cost: Some(CostDetail {
+                                total_tokens: Some(42),
+                                ..CostDetail::default()
+                            }),
+                            ..SnapshotDetail::default()
+                        },
                     },
                     daily_usage: Vec::new(),
                     usage_events: None,
@@ -1686,7 +1674,7 @@ mod tests {
                         percent_remaining: Some(75.0),
                         reset_at: None,
                     }],
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -1726,7 +1714,7 @@ mod tests {
                     provider_id: ProviderId::new("grok"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -1778,7 +1766,7 @@ mod tests {
                     provider_id: ProviderId::new("grok"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -1826,9 +1814,10 @@ mod tests {
                     provider_id: ProviderId::new("codex"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({
-                        "credential_profile": account.profile_id.as_deref(),
-                    }),
+                    detail: SnapshotDetail {
+                        credential_profile: account.profile_id.clone(),
+                        ..SnapshotDetail::default()
+                    },
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -1875,7 +1864,7 @@ mod tests {
                     provider_id: ProviderId::new("codex"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -1938,7 +1927,7 @@ mod tests {
                     provider_id: ProviderId::new(self.provider_id),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -2023,7 +2012,7 @@ mod tests {
                             percent_remaining: None,
                             reset_at: None,
                         }],
-                        metadata: json!({}),
+                        detail: SnapshotDetail::default(),
                     },
                     daily_usage: Vec::new(),
                     usage_events: None,
@@ -2073,7 +2062,7 @@ mod tests {
                     provider_id: ProviderId::new(self.provider_id),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -2108,7 +2097,10 @@ mod tests {
                     percent_remaining: Some(90.0),
                     reset_at: None,
                 }],
-                metadata: json!({"remote": true}),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(json!({"remote": true})),
+                    ..SnapshotDetail::default()
+                },
             })
             .await
             .unwrap();
@@ -2129,8 +2121,11 @@ mod tests {
             .windows
             .iter()
             .any(|window| window.window_id == "remote_quota"));
-        assert_eq!(snapshot.metadata["remote"], true);
-        assert_eq!(snapshot.metadata["claude_cost"]["tokens"], 42);
+        assert_eq!(snapshot.detail.extra["remote"], true);
+        assert_eq!(
+            snapshot.detail.cost.as_ref().unwrap().total_tokens,
+            Some(42)
+        );
     }
 
     #[tokio::test]
@@ -2147,7 +2142,10 @@ mod tests {
                 account_id: account.id,
                 collected_at: Utc::now() - chrono::TimeDelta::minutes(2),
                 windows: Vec::new(),
-                metadata: json!({"remote": true}),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(json!({"remote": true})),
+                    ..SnapshotDetail::default()
+                },
             })
             .await
             .unwrap();
@@ -2187,8 +2185,11 @@ mod tests {
         assert_eq!(health[0].last_success_at, existing.last_success_at);
         assert!(health[0].last_error_code.is_none());
         let snapshot = storage.latest_usage().await.unwrap().remove(0);
-        assert_eq!(snapshot.metadata["remote"], true);
-        assert_eq!(snapshot.metadata["claude_cost"]["tokens"], 42);
+        assert_eq!(snapshot.detail.extra["remote"], true);
+        assert_eq!(
+            snapshot.detail.cost.as_ref().unwrap().total_tokens,
+            Some(42)
+        );
     }
 
     #[test]
@@ -2213,10 +2214,11 @@ mod tests {
                 provider_id: provider_id.clone(),
                 collected_at: Utc::now(),
                 windows: vec![window("shared_history", 10.0)],
-                metadata: json!({
-                    "collection_mode": "opencode_go_web_console",
-                    "web_authoritative": true,
-                }),
+                detail: SnapshotDetail {
+                    collection_mode: Some("opencode_go_web_console".to_string()),
+                    web_authoritative: Some(true),
+                    ..SnapshotDetail::default()
+                },
             },
             daily_usage: Vec::new(),
             usage_events: None,
@@ -2234,11 +2236,12 @@ mod tests {
                         window("shared_history", 99.0),
                         window("local_history", 25.0),
                     ],
-                    metadata: json!({
-                        "collection_mode": "opencode_go_local_sqlite",
-                        "web_authoritative": false,
-                        "database": "opencode.db",
-                    }),
+                    detail: SnapshotDetail {
+                        collection_mode: Some("opencode_go_local_sqlite".to_string()),
+                        web_authoritative: Some(false),
+                        extra: crate::providers::json_map(json!({ "database": "opencode.db" })),
+                        ..SnapshotDetail::default()
+                    },
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -2255,11 +2258,11 @@ mod tests {
         let merged = merge_datasets(vec![authoritative, local]).unwrap();
 
         assert_eq!(
-            merged.usage.metadata["collection_mode"],
-            "opencode_go_web_console"
+            merged.usage.detail.collection_mode.as_deref(),
+            Some("opencode_go_web_console")
         );
-        assert_eq!(merged.usage.metadata["web_authoritative"], true);
-        assert_eq!(merged.usage.metadata["database"], "opencode.db");
+        assert_eq!(merged.usage.detail.web_authoritative, Some(true));
+        assert_eq!(merged.usage.detail.extra["database"], "opencode.db");
         assert_eq!(
             merged
                 .usage
@@ -2282,10 +2285,7 @@ mod tests {
                 .value,
             10.0
         );
-        let provenance = serde_json::from_value::<Vec<DatasetProvenance>>(
-            merged.usage.metadata["dataset_provenance"].clone(),
-        )
-        .unwrap();
+        let provenance = merged.usage.detail.dataset_provenance.clone();
         let local = provenance
             .iter()
             .find(|dataset| dataset.source_id == "opencode_local_database")

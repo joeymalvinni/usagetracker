@@ -4,10 +4,10 @@ use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use usage_core::UsageEvent;
+use usage_core::{CostDetail, DailyUsagePoint, ModelCostSummary, UsageEvent};
 
 use crate::providers::{
-    DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsageEventBatch,
+    json_map, DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsageEventBatch,
 };
 
 use super::number::NumberLike;
@@ -62,7 +62,7 @@ struct CursorTokenUsage {
 pub(super) struct CursorEventReport {
     pub(super) batch: ProviderUsageEventBatch,
     pub(super) daily_usage: Vec<DailyUsageBucket>,
-    pub(super) metadata: serde_json::Value,
+    pub(super) cost: CostDetail,
 }
 
 #[derive(Default)]
@@ -113,6 +113,18 @@ impl Aggregate {
             "chargeable_cost_usd": nanos_to_usd(self.chargeable_nanos),
             "provider_fee_usd": nanos_to_usd(self.fee_nanos),
         })
+    }
+
+    fn model_cost(&self, model: String) -> ModelCostSummary {
+        ModelCostSummary {
+            model,
+            event_count: self.events,
+            tokens: self.tokens,
+            vendor_cost_usd: nanos_to_usd(self.vendor_nanos),
+            metered_cost_usd: nanos_to_usd(self.metered_nanos),
+            chargeable_cost_usd: nanos_to_usd(self.chargeable_nanos),
+            provider_fee_usd: nanos_to_usd(self.fee_nanos),
+        }
     }
 }
 
@@ -211,21 +223,20 @@ pub(super) fn normalize_usage_events(
             source: "cursor_usage_events".to_string(),
         })
         .collect();
-    let by_day_json = by_day
+    let by_day = by_day
         .iter()
-        .map(|(date, aggregate)| {
-            let mut value = aggregate.json();
-            value["date"] = json!(date.to_string());
-            value
+        .map(|(date, aggregate)| DailyUsagePoint {
+            date: *date,
+            tokens: aggregate.tokens,
+            cost_usd: Some(nanos_to_usd(aggregate.metered_nanos)),
+            // Cursor usage events are all metered, so every token is priced.
+            priced_tokens: aggregate.tokens,
+            unpriced_tokens: 0,
         })
         .collect::<Vec<_>>();
-    let by_model_json = by_model
+    let by_model = by_model
         .iter()
-        .map(|(model, aggregate)| {
-            let mut value = aggregate.json();
-            value["model"] = json!(model);
-            value
-        })
+        .map(|(model, aggregate)| aggregate.model_cost(model.clone()))
         .collect::<Vec<_>>();
 
     Ok(CursorEventReport {
@@ -236,16 +247,19 @@ pub(super) fn normalize_usage_events(
             events,
         },
         daily_usage,
-        metadata: json!({
-            "source": "cursor_usage_events",
-            "estimate": false,
-            "partial": false,
-            "period_start": period_start,
-            "period_end": period_end,
-            "total": total.json(),
-            "by_day": by_day_json,
-            "by_model": by_model_json,
-        }),
+        cost: CostDetail {
+            source: Some("cursor_usage_events".to_string()),
+            estimate: false,
+            partial: false,
+            by_day,
+            by_model,
+            extra: json_map(json!({
+                "period_start": period_start,
+                "period_end": period_end,
+                "total": total.json(),
+            })),
+            ..CostDetail::default()
+        },
     })
 }
 

@@ -90,22 +90,11 @@ fn normalizes_complete_event_history_once_by_day_and_model() {
     assert_eq!(batch.events.len(), 2);
     assert_ne!(batch.events[0].event_id, batch.events[1].event_id);
     assert_eq!(normalized.collection.daily_usage.len(), 2);
-    assert_eq!(
-        normalized.collection.usage.metadata["cursor_cost"]["total"]["tokens"],
-        40
-    );
-    assert_eq!(
-        normalized.collection.usage.metadata["cursor_cost"]["total"]["metered_cost_usd"],
-        0.45
-    );
-    assert_eq!(
-        normalized.collection.usage.metadata["cursor_cost"]["total"]["chargeable_cost_usd"],
-        0.3
-    );
-    assert_eq!(
-        normalized.collection.usage.metadata["cursor_cost"]["by_model"][0]["model"],
-        "claude-sonnet"
-    );
+    let cost = normalized.collection.usage.detail.cost.as_ref().unwrap();
+    assert_eq!(cost.extra["total"]["tokens"], 40);
+    assert_eq!(cost.extra["total"]["metered_cost_usd"], 0.45);
+    assert_eq!(cost.extra["total"]["chargeable_cost_usd"], 0.3);
+    assert_eq!(cost.by_model[0].model, "claude-sonnet");
 }
 
 #[test]
@@ -210,7 +199,7 @@ fn enterprise_personal_overall_precedes_team_pool() {
     assert!((total.percent_used.unwrap() - 73.84).abs() < 0.000_001);
     assert_eq!(total.used.as_ref().unwrap().value, 73.84);
     assert_eq!(
-        normalized.collection.usage.metadata["headline_source"],
+        normalized.collection.usage.detail.extra["headline_source"],
         "overall"
     );
 }
@@ -276,12 +265,7 @@ fn pooled_quota_keeps_personal_event_history_account_scoped() {
     );
     assert!(normalized.collection.daily_usage.is_empty());
     assert!(normalized.collection.usage_events.is_none());
-    assert!(normalized
-        .collection
-        .usage
-        .metadata
-        .get("cursor_cost")
-        .is_none());
+    assert!(normalized.collection.usage.detail.cost.is_none());
     assert_eq!(normalized.supplemental.len(), 1);
     assert_eq!(
         normalized.supplemental[0].source_id,

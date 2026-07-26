@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use usage_core::{
-    Account, DataProvenance, DatasetProvenance, ProviderFailureCode, ProviderId,
+    Account, DataProvenance, DatasetProvenance, ProviderFailureCode, ProviderId, SnapshotDetail,
     UsageDataCompleteness, UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource,
     UsageEvent, UsageSnapshot, UsageWindow,
 };
@@ -309,13 +309,7 @@ impl UsageDataset {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            metadata_keys: self
-                .collection
-                .usage
-                .metadata
-                .as_object()
-                .map(|metadata| metadata.keys().cloned().collect())
-                .unwrap_or_default(),
+            metadata_keys: self.collection.usage.detail.present_keys(),
         }
     }
 
@@ -382,12 +376,22 @@ pub struct DailyUsageBucket {
     pub source: String,
 }
 
+/// Converts a `json!` object literal into the `serde_json::Map` used for the
+/// diagnostic-only `extra` fields of [`SnapshotDetail`] and its sub-details.
+/// A non-object value yields an empty map.
+pub(crate) fn json_map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
     pub provider_id: ProviderId,
     pub collected_at: DateTime<Utc>,
     pub windows: Vec<UsageWindow>,
-    pub metadata: serde_json::Value,
+    pub detail: SnapshotDetail,
 }
 
 impl ProviderUsage {
@@ -397,7 +401,7 @@ impl ProviderUsage {
             account_id,
             collected_at: self.collected_at,
             windows: self.windows,
-            metadata: self.metadata,
+            detail: self.detail,
         }
     }
 }

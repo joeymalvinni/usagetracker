@@ -9,11 +9,11 @@ use std::{
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde_json::{json, Value};
-use usage_core::UsageWindowKind;
+use usage_core::{CostDetail, ModelCostSummary, UsageWindowKind};
 
 use crate::providers::{
     local_usage::{
-        cost_window, daily_cost_rows, lookback_start, merge_daily_summary, scan_cached_files,
+        cost_window, daily_usage_points, lookback_start, merge_daily_summary, scan_cached_files,
         token_window, CachedFile, DailyCostSummary, DailyRollup, LocalFileCache, LocalFileScan,
     },
     ProviderUsage,
@@ -32,16 +32,15 @@ use crate::providers::local_usage::CacheStatus;
 
 pub(super) fn merge_local_cost_report(usage: &mut ProviderUsage, report: ClaudeCostReport) {
     if report.total_tokens == 0 {
-        usage.metadata["claude_cost"] = json!({
-            "source": "local_project_logs",
-            "estimate": true,
-            "project_roots": report.project_roots,
-            "files_scanned": report.files_scanned,
-            "assistant_messages": report.assistant_messages,
-            "unpriced_tokens": report.unpriced_tokens,
-            "pricing_source": CLAUDE_PRICING_SOURCE,
-            "pricing_version": CLAUDE_PRICING_VERSION,
-            "pricing_effective_from": CLAUDE_PRICING_EFFECTIVE_FROM,
+        usage.detail.cost = Some(CostDetail {
+            source: Some("local_project_logs".to_string()),
+            estimate: true,
+            unpriced_tokens: report.unpriced_tokens,
+            pricing_source: Some(CLAUDE_PRICING_SOURCE.to_string()),
+            pricing_version: Some(CLAUDE_PRICING_VERSION.to_string()),
+            pricing_effective_from: claude_pricing_effective_from(),
+            extra: claude_cost_extra(&report, false),
+            ..CostDetail::default()
         });
         return;
     }
@@ -74,27 +73,77 @@ pub(super) fn merge_local_cost_report(usage: &mut ProviderUsage, report: ClaudeC
         ));
     }
 
-    usage.metadata["claude_cost"] = json!({
-        "source": "local_project_logs",
-        "estimate": true,
-        "hint": "Estimated from local Claude logs at API rates.",
-        "project_roots": report.project_roots,
-        "files_scanned": report.files_scanned,
-        "assistant_messages": report.assistant_messages,
-        "today_cost_usd": report.today_cost_usd,
-        "today_tokens": report.today_tokens,
-        "lookback_days": COST_LOOKBACK_DAYS,
-        "lookback_cost_usd": report.lookback_cost_usd,
-        "lookback_tokens": report.lookback_tokens,
-        "total_cost_usd": report.total_cost_usd,
-        "total_tokens": report.total_tokens,
-        "unpriced_tokens": report.unpriced_tokens,
-        "pricing_source": CLAUDE_PRICING_SOURCE,
-        "pricing_version": CLAUDE_PRICING_VERSION,
-        "pricing_effective_from": CLAUDE_PRICING_EFFECTIVE_FROM,
-        "by_day": daily_cost_rows(&report.by_day),
-        "by_model": report.by_model,
+    usage.detail.cost = Some(CostDetail {
+        source: Some("local_project_logs".to_string()),
+        estimate: true,
+        today_cost_usd: Some(report.today_cost_usd),
+        today_tokens: Some(report.today_tokens),
+        lookback_cost_usd: Some(report.lookback_cost_usd),
+        lookback_tokens: Some(report.lookback_tokens),
+        total_cost_usd: Some(report.total_cost_usd),
+        total_tokens: Some(report.total_tokens),
+        unpriced_tokens: report.unpriced_tokens,
+        pricing_source: Some(CLAUDE_PRICING_SOURCE.to_string()),
+        pricing_version: Some(CLAUDE_PRICING_VERSION.to_string()),
+        pricing_effective_from: claude_pricing_effective_from(),
+        by_day: daily_usage_points(&report.by_day),
+        by_model: model_cost_summaries(&report.by_model),
+        extra: claude_cost_extra(&report, true),
+        ..CostDetail::default()
     });
+}
+
+fn claude_pricing_effective_from() -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(CLAUDE_PRICING_EFFECTIVE_FROM, "%Y-%m-%d").ok()
+}
+
+/// Diagnostic-only fields preserved under the cost detail's `extra` map. No
+/// consumer reads them; they aid debugging of the local log scan.
+fn claude_cost_extra(report: &ClaudeCostReport, full: bool) -> serde_json::Map<String, Value> {
+    let mut extra = serde_json::Map::new();
+    if full {
+        extra.insert(
+            "hint".to_string(),
+            json!("Estimated from local Claude logs at API rates."),
+        );
+        extra.insert("lookback_days".to_string(), json!(COST_LOOKBACK_DAYS));
+    }
+    extra.insert("project_roots".to_string(), json!(report.project_roots));
+    extra.insert("files_scanned".to_string(), json!(report.files_scanned));
+    extra.insert(
+        "assistant_messages".to_string(),
+        json!(report.assistant_messages),
+    );
+    extra
+}
+
+/// Maps Claude's per-model token/cost rollup into the canonical
+/// [`ModelCostSummary`] the dashboard renders. Claude estimates cost locally,
+/// so the vendor/metered/chargeable figures collapse to the single estimate and
+/// there is no per-model event count.
+fn model_cost_summaries(
+    by_model: &BTreeMap<String, ClaudeModelCostSummary>,
+) -> Vec<ModelCostSummary> {
+    by_model
+        .iter()
+        .map(|(model, summary)| {
+            let tokens = summary
+                .input_tokens
+                .saturating_add(summary.cache_creation_input_tokens)
+                .saturating_add(summary.cache_creation_1h_input_tokens)
+                .saturating_add(summary.cache_read_input_tokens)
+                .saturating_add(summary.output_tokens);
+            ModelCostSummary {
+                model: model.clone(),
+                event_count: 0,
+                tokens,
+                vendor_cost_usd: summary.cost_usd,
+                metered_cost_usd: summary.cost_usd,
+                chargeable_cost_usd: summary.cost_usd,
+                provider_fee_usd: 0.0,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default)]

@@ -2,9 +2,12 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
-use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{
+    ProviderId, ResetCreditEntry, ResetCreditsDetail, SnapshotDetail, UsageAmount, UsageUnit,
+    UsageWindow, UsageWindowKind,
+};
 
-use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{json_map, ProviderError, ProviderErrorKind, ProviderUsage};
 
 use super::{MAX_PERCENT, PROVIDER_ID};
 
@@ -40,40 +43,42 @@ pub(super) fn normalize_usage(
         provider_id: ProviderId::new(PROVIDER_ID),
         collected_at: Utc::now(),
         windows,
-        metadata: json!({
-            "account_display_name": display_name,
-            "email": object.get("email").and_then(Value::as_str),
-            "collection_mode": "wham_usage_api",
-            "credits_has_credits": object.get("credits").and_then(|value| value.get("has_credits")).and_then(Value::as_bool),
-            "credits_overage_limit_reached": object.get("credits").and_then(|value| value.get("overage_limit_reached")).and_then(Value::as_bool),
-            "credits_unlimited": object.get("credits").and_then(|value| value.get("unlimited")).and_then(Value::as_bool),
-            "plan_type": object.get("plan_type").and_then(Value::as_str),
-            "rate_limit_reached_type": object.get("rate_limit_reached_type").and_then(Value::as_str),
-            "rate_limit_reset_credits_available_count": reset_credits
-                .and_then(|value| value.get("available_count"))
-                .and_then(number_from_json_value),
-            "rate_limit_reset_credits": wham_reset_credits_metadata(reset_credits),
-            "spend_control_reached": object.get("spend_control").and_then(|value| value.get("reached")).and_then(Value::as_bool),
-            "top_level_keys": top_level_keys,
-        }),
+        detail: SnapshotDetail {
+            account_display_name: display_name.map(str::to_string),
+            email: object
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            collection_mode: Some("wham_usage_api".to_string()),
+            plan_type: object
+                .get("plan_type")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            reset_credits: wham_reset_credits(reset_credits),
+            extra: json_map(json!({
+                "credits_has_credits": object.get("credits").and_then(|value| value.get("has_credits")).and_then(Value::as_bool),
+                "credits_overage_limit_reached": object.get("credits").and_then(|value| value.get("overage_limit_reached")).and_then(Value::as_bool),
+                "credits_unlimited": object.get("credits").and_then(|value| value.get("unlimited")).and_then(Value::as_bool),
+                "rate_limit_reached_type": object.get("rate_limit_reached_type").and_then(Value::as_str),
+                "spend_control_reached": object.get("spend_control").and_then(|value| value.get("reached")).and_then(Value::as_bool),
+                "top_level_keys": top_level_keys,
+            })),
+            ..SnapshotDetail::default()
+        },
     })
 }
 
-fn wham_reset_credits_metadata(reset_credits: Option<&Value>) -> Value {
-    let Some(reset_credits) = reset_credits.and_then(Value::as_object) else {
-        return Value::Null;
-    };
-
-    // WHAM currently exposes only the available count. Keep the normalized
-    // shape aligned with app-server output so downstream consumers can render
-    // the useful partial result without needing access to raw diagnostics.
-    json!({
-        "available_count": reset_credits
+fn wham_reset_credits(reset_credits: Option<&Value>) -> Option<ResetCreditsDetail> {
+    let reset_credits = reset_credits.and_then(Value::as_object)?;
+    // WHAM currently exposes only the available count.
+    Some(ResetCreditsDetail {
+        available_count: reset_credits
             .get("available_count")
-            .and_then(number_from_json_value),
-        "credits": [],
-        "next_expires_at": Value::Null,
-        "next_expires_at_iso": Value::Null,
+            .and_then(number_from_json_value)
+            .map(|count| count.max(0.0) as u64)
+            .unwrap_or(0),
+        next_expires_at: None,
+        credits: Vec::new(),
     })
 }
 
@@ -116,33 +121,41 @@ pub(super) fn normalize_app_server_usage(
         provider_id: ProviderId::new(PROVIDER_ID),
         collected_at: Utc::now(),
         windows,
-        metadata: json!({
-            "account_display_name": display_name,
-            "email": account.and_then(|value| value.get("email")).and_then(Value::as_str),
-            "collection_mode": "codex_app_server_rate_limits",
-            "credits_has_credits": main_rate_limit
-                .and_then(|value| value.get("credits"))
-                .and_then(|value| value.get("hasCredits"))
-                .and_then(Value::as_bool),
-            "credits_overage_limit_reached": Value::Null,
-            "credits_unlimited": main_rate_limit
-                .and_then(|value| value.get("credits"))
-                .and_then(|value| value.get("unlimited"))
-                .and_then(Value::as_bool),
-            "plan_type": account
+        detail: SnapshotDetail {
+            account_display_name: display_name.map(str::to_string),
+            email: account
+                .and_then(|value| value.get("email"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            collection_mode: Some("codex_app_server_rate_limits".to_string()),
+            plan_type: account
                 .and_then(|value| value.get("planType"))
                 .and_then(Value::as_str)
-                .or_else(|| main_rate_limit.and_then(|value| value.get("planType")).and_then(Value::as_str)),
-            "rate_limit_reached_type": main_rate_limit
-                .and_then(|value| value.get("rateLimitReachedType"))
-                .and_then(Value::as_str),
-            "rate_limit_reset_credits_available_count": reset_credits
-                .and_then(|value| value.get("availableCount"))
-                .and_then(number_from_json_value),
-            "rate_limit_reset_credits": app_server_reset_credits_metadata(reset_credits),
-            "spend_control_reached": Value::Null,
-            "top_level_keys": top_level_keys,
-        }),
+                .or_else(|| {
+                    main_rate_limit
+                        .and_then(|value| value.get("planType"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::to_string),
+            reset_credits: app_server_reset_credits(reset_credits),
+            extra: json_map(json!({
+                "credits_has_credits": main_rate_limit
+                    .and_then(|value| value.get("credits"))
+                    .and_then(|value| value.get("hasCredits"))
+                    .and_then(Value::as_bool),
+                "credits_overage_limit_reached": Value::Null,
+                "credits_unlimited": main_rate_limit
+                    .and_then(|value| value.get("credits"))
+                    .and_then(|value| value.get("unlimited"))
+                    .and_then(Value::as_bool),
+                "rate_limit_reached_type": main_rate_limit
+                    .and_then(|value| value.get("rateLimitReachedType"))
+                    .and_then(Value::as_str),
+                "spend_control_reached": Value::Null,
+                "top_level_keys": top_level_keys,
+            })),
+            ..SnapshotDetail::default()
+        },
     })
 }
 
@@ -373,18 +386,15 @@ fn app_server_rate_limit_window(spec: AppServerRateLimitWindowSpec<'_>) -> Optio
     })
 }
 
-fn app_server_reset_credits_metadata(reset_credits: Option<&Value>) -> Value {
-    let Some(reset_credits) = reset_credits.and_then(Value::as_object) else {
-        return Value::Null;
-    };
-
+fn app_server_reset_credits(reset_credits: Option<&Value>) -> Option<ResetCreditsDetail> {
+    let reset_credits = reset_credits.and_then(Value::as_object)?;
     let credits = reset_credits
         .get("credits")
         .and_then(Value::as_array)
         .map(|credits| {
             credits
                 .iter()
-                .filter_map(app_server_reset_credit_metadata)
+                .filter_map(app_server_reset_credit)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -392,43 +402,40 @@ fn app_server_reset_credits_metadata(reset_credits: Option<&Value>) -> Value {
         .iter()
         .filter(|credit| {
             credit
-                .get("status")
-                .and_then(Value::as_str)
+                .status
+                .as_deref()
                 .is_none_or(|status| status == "available")
         })
-        .filter_map(|credit| credit.get("expires_at").and_then(number_from_json_value))
-        .min_by(|left, right| left.total_cmp(right));
-    let next_expires_at_iso = next_expires_at.and_then(unix_seconds_iso);
-
-    json!({
-        "available_count": reset_credits
+        .filter_map(|credit| credit.expires_at)
+        .min();
+    Some(ResetCreditsDetail {
+        available_count: reset_credits
             .get("availableCount")
-            .and_then(number_from_json_value),
-        "credits": credits,
-        "next_expires_at": next_expires_at,
-        "next_expires_at_iso": next_expires_at_iso,
+            .and_then(number_from_json_value)
+            .map(|count| count.max(0.0) as u64)
+            .unwrap_or(0),
+        next_expires_at,
+        credits,
     })
 }
 
-fn app_server_reset_credit_metadata(credit: &Value) -> Option<Value> {
+fn app_server_reset_credit(credit: &Value) -> Option<ResetCreditEntry> {
     let credit = credit.as_object()?;
-    let granted_at = credit.get("grantedAt").and_then(number_from_json_value);
-    let expires_at = credit.get("expiresAt").and_then(number_from_json_value);
-    Some(json!({
-        "id": credit.get("id").and_then(Value::as_str),
-        "status": credit.get("status").and_then(Value::as_str),
-        "reset_type": credit.get("resetType").and_then(Value::as_str),
-        "granted_at": granted_at,
-        "granted_at_iso": granted_at.and_then(unix_seconds_iso),
-        "expires_at": expires_at,
-        "expires_at_iso": expires_at.and_then(unix_seconds_iso),
-        "title": credit.get("title").and_then(Value::as_str),
-        "description": credit.get("description").and_then(Value::as_str),
-    }))
-}
-
-fn unix_seconds_iso(seconds: f64) -> Option<String> {
-    DateTime::from_timestamp(seconds.round() as i64, 0).map(|time| time.to_rfc3339())
+    Some(ResetCreditEntry {
+        id: credit.get("id").and_then(Value::as_str).map(str::to_string),
+        title: credit
+            .get("title")
+            .and_then(Value::as_str)
+            .or_else(|| credit.get("resetType").and_then(Value::as_str))
+            .map(str::to_string),
+        status: credit
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        expires_at: credit
+            .get("expiresAt")
+            .and_then(unix_timestamp_from_json_value),
+    })
 }
 
 pub(super) fn number_from_json_value(value: &Value) -> Option<f64> {

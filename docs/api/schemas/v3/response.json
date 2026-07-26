@@ -112,6 +112,57 @@
       ],
       "type": "object"
     },
+    "ActivityDetail": {
+      "additionalProperties": true,
+      "description": "Normalized token-activity summary for one account.",
+      "properties": {
+        "by_day": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "lifetime_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lookback_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "today_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ActivitySummary": {
       "properties": {
         "days": {
@@ -341,6 +392,123 @@
       ],
       "type": "string"
     },
+    "CostDetail": {
+      "additionalProperties": true,
+      "description": "Normalized cost/spend summary for one account. Shared by every provider's\ncost collector and by the dashboard builder.",
+      "properties": {
+        "by_day": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "by_model": {
+          "items": {
+            "$ref": "#/$defs/ModelCostSummary"
+          },
+          "type": "array"
+        },
+        "complete_lookback": {
+          "description": "Some providers report whether the lookback window was fully scanned.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "estimate": {
+          "default": false,
+          "type": "boolean"
+        },
+        "lookback_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lookback_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "partial": {
+          "default": false,
+          "type": "boolean"
+        },
+        "pricing_effective_from": {
+          "format": "date",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "today_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "today_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unpriced_models": {
+          "items": {
+            "$ref": "#/$defs/UnpricedModel"
+          },
+          "type": "array"
+        },
+        "unpriced_tokens": {
+          "default": 0,
+          "description": "Unpriced token count for the synthesized \"today\" point when no daily\nbreakdown is present.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "CostSummary": {
       "properties": {
         "days": {
@@ -443,6 +611,49 @@
       ],
       "type": "object"
     },
+    "DatasetProvenance": {
+      "description": "Persisted mapping from normalized data to its typed origin. It lives in the\ndiagnostics object for wire compatibility, but consumers deserialize this\ntype instead of inferring correctness from provider-specific strings.",
+      "properties": {
+        "authoritative": {
+          "type": "boolean"
+        },
+        "daily_sources": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "metadata_keys": {
+          "default": [],
+          "description": "Top-level diagnostic keys contributed by this dataset. This permits a\nnewer source-scoped observation to replace its own metadata without\nknowing provider-specific key names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "$ref": "#/$defs/DataProvenance"
+        },
+        "source_id": {
+          "default": "",
+          "description": "Stable provider-owned identity for replacing one independently\nrefreshable dataset without conflating sources with the same kind.",
+          "type": "string"
+        },
+        "window_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "authoritative",
+        "provenance"
+      ],
+      "type": "object"
+    },
     "ForecastConfidence": {
       "enum": [
         "low",
@@ -464,15 +675,18 @@
     "ModelCostSummary": {
       "properties": {
         "chargeable_cost_usd": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         },
         "event_count": {
+          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "metered_cost_usd": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         },
@@ -480,27 +694,24 @@
           "type": "string"
         },
         "provider_fee_usd": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         },
         "tokens": {
+          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "vendor_cost_usd": {
+          "default": 0.0,
           "format": "double",
           "type": "number"
         }
       },
       "required": [
-        "model",
-        "event_count",
-        "tokens",
-        "vendor_cost_usd",
-        "metered_cost_usd",
-        "chargeable_cost_usd",
-        "provider_fee_usd"
+        "model"
       ],
       "type": "object"
     },
@@ -1184,6 +1395,37 @@
       ],
       "type": "object"
     },
+    "ResetCreditEntry": {
+      "description": "A single reset credit entry.",
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ResetCreditSummary": {
       "properties": {
         "available_count": {
@@ -1211,6 +1453,31 @@
       ],
       "type": "object"
     },
+    "ResetCreditsDetail": {
+      "description": "Rate-limit reset credits (Codex). Timestamps are normalized to UTC by the\ncollector so consumers never re-parse epoch seconds or ISO strings.",
+      "properties": {
+        "available_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "credits": {
+          "items": {
+            "$ref": "#/$defs/ResetCreditEntry"
+          },
+          "type": "array"
+        },
+        "next_expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ServerInfo": {
       "properties": {
         "api_version": {
@@ -1235,6 +1502,112 @@
         "capabilities",
         "providers"
       ],
+      "type": "object"
+    },
+    "SnapshotDetail": {
+      "additionalProperties": true,
+      "description": "Typed contents of a snapshot's `diagnostics` blob.",
+      "properties": {
+        "account_display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "activity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActivityDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collection_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CostDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credential_profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dataset_provenance": {
+          "description": "Typed origin of each contributed dataset. Written by the merge layer.",
+          "items": {
+            "$ref": "#/$defs/DatasetProvenance"
+          },
+          "type": "array"
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "description": "Top-level estimate flag consulted when no dataset provenance matches.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "keychain_account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reset_credits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResetCreditsDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subscription_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "web_authoritative": {
+          "description": "Set to `false` by collectors that produce a synthetic local estimate\nrather than a web-authoritative reading.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "StateSnapshot": {
@@ -1297,6 +1670,23 @@
         "health",
         "snapshots",
         "dashboard"
+      ],
+      "type": "object"
+    },
+    "UnpricedModel": {
+      "description": "A model whose tokens could not be priced. Deserializes from either a bare\nmodel-name string or a `{ \"model\", \"tokens\" }` object.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model"
       ],
       "type": "object"
     },
@@ -1607,7 +1997,9 @@
           "format": "date-time",
           "type": "string"
         },
-        "diagnostics": true,
+        "diagnostics": {
+          "$ref": "#/$defs/SnapshotDetail"
+        },
         "provider_id": {
           "type": "string"
         },

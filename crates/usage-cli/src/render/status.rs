@@ -414,8 +414,9 @@ fn is_enabled_provider(provider_id: &str, config: &ConfigResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use usage_core::{AccountId, ProviderHealthStatus, ProviderId, ProviderToggle, UsageWindow};
+    use usage_core::{
+        AccountId, ProviderHealthStatus, ProviderId, ProviderToggle, SnapshotDetail, UsageWindow,
+    };
 
     fn benchmark(name: &str, iterations: u32, mut operation: impl FnMut() -> usize) {
         for _ in 0..iterations.min(100) {
@@ -464,7 +465,10 @@ mod tests {
                     account_id: account.id.clone(),
                     collected_at: now - TimeDelta::seconds(history_index),
                     windows: Vec::new(),
-                    metadata: json!({"subscription_type": "team"}),
+                    detail: SnapshotDetail {
+                        subscription_type: Some("team".to_string()),
+                        ..SnapshotDetail::default()
+                    },
                 })
             })
             .collect::<Vec<_>>();
@@ -607,7 +611,7 @@ mod tests {
             account_id,
             collected_at: Utc::now(),
             windows: Vec::<UsageWindow>::new(),
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         };
         let mut providers = std::collections::BTreeMap::new();
         providers.insert("codex".to_string(), ProviderToggle { enabled: false });
@@ -729,21 +733,30 @@ mod tests {
                 account_id: AccountId::new("a"),
                 collected_at,
                 windows: Vec::new(),
-                metadata: json!({"email": "first@example.com"}),
+                detail: SnapshotDetail {
+                    email: Some("first@example.com".to_string()),
+                    ..SnapshotDetail::default()
+                },
             },
             UsageSnapshot {
                 provider_id: ProviderId::new("codex"),
                 account_id: AccountId::new("a"),
                 collected_at,
                 windows: Vec::new(),
-                metadata: json!({"email": "second@example.com"}),
+                detail: SnapshotDetail {
+                    email: Some("second@example.com".to_string()),
+                    ..SnapshotDetail::default()
+                },
             },
             UsageSnapshot {
                 provider_id: ProviderId::new("codex"),
                 account_id: AccountId::new("b"),
                 collected_at,
                 windows: Vec::new(),
-                metadata: json!({"email": "b@example.com"}),
+                detail: SnapshotDetail {
+                    email: Some("b@example.com".to_string()),
+                    ..SnapshotDetail::default()
+                },
             },
         ];
         let health = vec![
@@ -836,11 +849,12 @@ mod tests {
             account_id: account_id.clone(),
             collected_at,
             windows: Vec::<UsageWindow>::new(),
-            metadata: json!({
-                "collection_mode": "claude_cli_usage",
-                "credential_profile": "joey",
-                "subscription_type": "team",
-            }),
+            detail: SnapshotDetail {
+                collection_mode: Some("claude_cli_usage".to_string()),
+                credential_profile: Some("joey".to_string()),
+                subscription_type: Some("team".to_string()),
+                ..SnapshotDetail::default()
+            },
         };
         let health = ProviderHealth {
             provider_id: ProviderId::new("claude"),

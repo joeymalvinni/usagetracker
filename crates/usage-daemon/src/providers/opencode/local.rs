@@ -5,12 +5,14 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
-use usage_core::ProviderId;
+use usage_core::{ProviderId, SnapshotDetail};
 
-use crate::providers::{ProviderCollectionResult, ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{
+    json_map, ProviderCollectionResult, ProviderError, ProviderErrorKind, ProviderUsage,
+};
 
 use super::{
-    history::{local_usage_history_report, usage_history_windows},
+    history::{local_usage_history_report, usage_history_windows, UsageHistoryReport},
     utils::{local_db_error, table_exists},
     OPENCODE_GO_PROVIDER_ID,
 };
@@ -41,26 +43,25 @@ pub(super) fn collect_go_local_usage() -> Result<Option<ProviderCollectionResult
     if let Some(report) = &history_report {
         windows.extend(usage_history_windows(OPENCODE_GO_PROVIDER_ID, report, now));
     }
-    let mut metadata = json!({
-        "collection_mode": "opencode_go_local_sqlite",
-        "estimate": true,
-        "database": db_path.display().to_string(),
-        "rows": rows.len(),
-        "web_authoritative": false,
-        "quota_authoritative": false,
-        "scope": "observed_local_activity",
-    });
-    if let Some(report) = history_report {
-        if let Some(object) = metadata.as_object_mut() {
-            object.insert("opencode_go_cost".to_string(), report.metadata_value());
-        }
-    }
+    let detail = SnapshotDetail {
+        collection_mode: Some("opencode_go_local_sqlite".to_string()),
+        estimate: Some(true),
+        web_authoritative: Some(false),
+        cost: history_report.as_ref().map(UsageHistoryReport::cost_detail),
+        extra: json_map(json!({
+            "database": db_path.display().to_string(),
+            "rows": rows.len(),
+            "quota_authoritative": false,
+            "scope": "observed_local_activity",
+        })),
+        ..SnapshotDetail::default()
+    };
     Ok(Some(ProviderCollectionResult {
         usage: ProviderUsage {
             provider_id: ProviderId::new(OPENCODE_GO_PROVIDER_ID),
             collected_at: now,
             windows,
-            metadata,
+            detail,
         },
         daily_usage: Vec::new(),
         usage_events: None,

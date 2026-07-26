@@ -1,8 +1,10 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
-use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{
+    ProviderId, SnapshotDetail, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+};
 
-use crate::providers::{ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{json_map, ProviderError, ProviderErrorKind, ProviderUsage};
 
 use super::PROVIDER_ID;
 
@@ -108,10 +110,11 @@ pub(super) fn to_provider_usage(data: &BillingData, source: BillingSource) -> Pr
         provider_id: ProviderId::new(PROVIDER_ID),
         collected_at,
         windows,
-        metadata: json!({
-            "source": source.collection_mode(),
-            "web_authoritative": true,
-        }),
+        detail: SnapshotDetail {
+            web_authoritative: Some(true),
+            extra: json_map(json!({ "source": source.collection_mode() })),
+            ..SnapshotDetail::default()
+        },
     }
 }
 

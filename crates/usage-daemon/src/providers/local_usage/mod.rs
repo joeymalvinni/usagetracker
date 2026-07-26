@@ -3,7 +3,7 @@ mod files;
 mod windows;
 
 pub(crate) use daily::{
-    daily_cost_rows, lookback_start, merge_daily_summary, DailyCostSummary, DailyRollup,
+    daily_usage_points, lookback_start, merge_daily_summary, DailyCostSummary, DailyRollup,
 };
 #[cfg(test)]
 pub(crate) use files::CacheStatus;

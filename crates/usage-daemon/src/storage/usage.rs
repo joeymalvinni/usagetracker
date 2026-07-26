@@ -2,7 +2,6 @@ use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Local, Utc};
 use rusqlite::{params, Connection, Row};
-use serde::Deserialize;
 use usage_core::{
     AccountId, DatasetProvenance, ProviderId, UsageEvent, UsageEventPage, UsageSnapshot,
     UsageWindowKind,
@@ -688,11 +687,7 @@ fn local_usage_overlays_from_conn(
 }
 
 fn apply_local_usage_overlays(snapshot: &mut UsageSnapshot, overlays: &[UsageDataset]) {
-    let mut provenance = snapshot
-        .metadata
-        .get("dataset_provenance")
-        .and_then(|value| Vec::<DatasetProvenance>::deserialize(value).ok())
-        .unwrap_or_default();
+    let mut provenance = std::mem::take(&mut snapshot.detail.dataset_provenance);
 
     for overlay in overlays {
         let existing_for_source = provenance
@@ -721,40 +716,25 @@ fn apply_local_usage_overlays(snapshot: &mut UsageSnapshot, overlays: &[UsageDat
             .map(|window| window.window_id.clone())
             .collect::<BTreeSet<_>>();
 
-        if !snapshot.metadata.is_object() {
-            snapshot.metadata = serde_json::json!({});
-        }
-        let metadata = snapshot
-            .metadata
-            .as_object_mut()
-            .expect("metadata was normalized to an object");
-        for key in replaced_metadata_keys {
-            metadata.remove(&key);
-        }
+        snapshot.detail.remove_keys(&replaced_metadata_keys);
         let claimed_metadata_keys = provenance
             .iter()
             .flat_map(|dataset| dataset.metadata_keys.iter().cloned())
             .collect::<BTreeSet<_>>();
+        // A fresh local-logs overlay owns its whole key set: drop any stale
+        // key it would otherwise leave behind that no surviving dataset claims.
         if !existing_for_source
             && overlay.provenance.source == usage_core::UsageDataSource::LocalLogs
         {
-            if let Some(incoming) = overlay.collection.usage.metadata.as_object() {
-                for key in incoming.keys() {
-                    if !claimed_metadata_keys.contains(key) {
-                        metadata.remove(key);
-                    }
+            for key in overlay.collection.usage.detail.present_keys() {
+                if !claimed_metadata_keys.contains(&key) {
+                    snapshot.detail.remove_keys([key]);
                 }
             }
         }
-        let mut contributed_metadata_keys = Vec::new();
-        if let Some(incoming) = overlay.collection.usage.metadata.as_object() {
-            for (key, value) in incoming {
-                if let serde_json::map::Entry::Vacant(entry) = metadata.entry(key.clone()) {
-                    contributed_metadata_keys.push(key.clone());
-                    entry.insert(value.clone());
-                }
-            }
-        }
+        let contributed_metadata_keys = snapshot
+            .detail
+            .fill_missing_from(&overlay.collection.usage.detail);
         let mut contributed_window_ids = Vec::new();
         for window in &overlay.collection.usage.windows {
             if window_ids.insert(window.window_id.clone()) {
@@ -771,12 +751,7 @@ fn apply_local_usage_overlays(snapshot: &mut UsageSnapshot, overlays: &[UsageDat
         provenance.push(provenance_record);
     }
 
-    if let Some(metadata) = snapshot.metadata.as_object_mut() {
-        metadata.insert(
-            "dataset_provenance".to_string(),
-            serde_json::to_value(provenance).expect("dataset provenance is serializable"),
-        );
-    }
+    snapshot.detail.dataset_provenance = provenance;
 }
 
 fn local_provenance_matches(dataset: &DatasetProvenance, overlay: &UsageDataset) -> bool {

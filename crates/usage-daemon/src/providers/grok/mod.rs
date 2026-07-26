@@ -20,14 +20,14 @@ use async_trait::async_trait;
 use reqwest::redirect::Policy;
 use serde_json::json;
 use usage_core::{
-    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
-    UsageSnapshot,
+    Account, ProviderId, SnapshotDetail, UsageDataCompleteness, UsageDataQuality, UsageDataScope,
+    UsageDataSource, UsageSnapshot,
 };
 
 use crate::{
     config::ProviderConfig,
     providers::{
-        AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome, DiscoveredAccount,
+        json_map, AccountDiscovery, AccountDiscoveryFailure, CollectionOutcome, DiscoveredAccount,
         ProviderCollectionResult, ProviderCollector, ProviderError, ProviderErrorKind,
         ProviderUsage, UsageDataset, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
@@ -280,14 +280,26 @@ impl GrokCollector {
         let collection_mode = source.collection_mode();
         let mut usage = billing::to_provider_usage(&data, source);
         if let Some(source) = credential_source {
-            usage.metadata["credential_source"] = json!(source);
+            usage
+                .detail
+                .extra
+                .insert("credential_source".to_string(), json!(source));
         }
         if let Some(credentials) = credentials {
-            usage.metadata["identity"] = credentials.metadata();
+            usage
+                .detail
+                .extra
+                .insert("identity".to_string(), credentials.metadata());
         }
-        usage.metadata["profile_id"] = json!(profile.id.as_str());
+        usage
+            .detail
+            .extra
+            .insert("profile_id".to_string(), json!(profile.id.as_str()));
         if let Some(display_name) = profile.display_name.as_deref() {
-            usage.metadata["profile_display_name"] = json!(display_name);
+            usage
+                .detail
+                .extra
+                .insert("profile_display_name".to_string(), json!(display_name));
         }
         ProviderCollectionResult {
             usage,
@@ -319,7 +331,10 @@ impl GrokCollector {
                     provider_id: ProviderId::new(PROVIDER_ID),
                     collected_at: chrono::Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({"local_sessions": summary.metadata()}),
+                    detail: SnapshotDetail {
+                        extra: json_map(json!({"local_sessions": summary.metadata()})),
+                        ..SnapshotDetail::default()
+                    },
                 },
                 daily_usage: Vec::new(),
                 usage_events: None,
@@ -692,7 +707,10 @@ mod tests {
                         provider_id: ProviderId::new(PROVIDER_ID),
                         collected_at: chrono::Utc::now(),
                         windows: Vec::new(),
-                        metadata: json!({"remote": true}),
+                        detail: SnapshotDetail {
+                            extra: json_map(json!({"remote": true})),
+                            ..SnapshotDetail::default()
+                        },
                     },
                     daily_usage: Vec::new(),
                     usage_events: None,
@@ -707,13 +725,13 @@ mod tests {
         let AuthoritativeOutcome::Collected(authoritative) = outcome.authoritative else {
             panic!("full collection should remain authoritative");
         };
-        assert_eq!(authoritative.collection.usage.metadata["remote"], true);
-        assert!(authoritative
+        assert_eq!(authoritative.collection.usage.detail.extra["remote"], true);
+        assert!(!authoritative
             .collection
             .usage
-            .metadata
-            .get("local_sessions")
-            .is_none());
+            .detail
+            .extra
+            .contains_key("local_sessions"));
         assert_eq!(outcome.supplemental.len(), 1);
         assert_eq!(outcome.supplemental[0].source_id, "grok_local_sessions");
         assert!(!outcome.supplemental[0].authoritative);
