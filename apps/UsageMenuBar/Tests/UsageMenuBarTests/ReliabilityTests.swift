@@ -346,6 +346,24 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertEqual(object["sign_in_action"] as? String, "copy_link")
     }
 
+    func testClaudeAuthenticationCodeIsSubmittedOnTheWire() throws {
+        let request = DaemonRequest.submitProviderSignInCode(
+            providerId: "claude",
+            authenticationCode: "code#with-special-characters"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(request))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["method"] as? String, "submit_provider_sign_in_code")
+        XCTAssertEqual(object["provider_id"] as? String, "claude")
+        XCTAssertEqual(
+            object["authentication_code"] as? String,
+            "code#with-special-characters"
+        )
+    }
+
     func testDecodesProviderAuthenticationURL() throws {
         let response = try JSONDecoder.usage.decode(
             DaemonResponse.self,

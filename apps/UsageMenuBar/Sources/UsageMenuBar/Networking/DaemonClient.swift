@@ -132,6 +132,22 @@ struct DaemonClient: Sendable {
         )) else { throw DaemonError.badResponse }
         return v
     }
+    func submitProviderSignInCode(
+        providerId: String,
+        authenticationCode: String
+    ) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(.submitProviderSignInCode(
+            providerId: providerId,
+            authenticationCode: authenticationCode
+        )) else { throw DaemonError.badResponse }
+        return v
+    }
+    func cancelProviderSignIn(providerId: String) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(
+            .cancelProviderSignIn(providerId: providerId)
+        ) else { throw DaemonError.badResponse }
+        return v
+    }
     func launchProviderAccount(accountId: String) async throws -> ProviderActionResponse {
         guard case let .providerAction(v) = try await send(.launchProviderAccount(accountId: accountId)) else { throw DaemonError.badResponse }
         return v
@@ -163,7 +179,8 @@ private enum DaemonRequestTimeout {
              .getAccounts, .getConfig, .getPendingNotifications,
              .acknowledgeNotifications:
             3
-        case .updateConfig, .updateAccount, .removeAccount:
+        case .updateConfig, .updateAccount, .removeAccount, .submitProviderSignInCode,
+             .cancelProviderSignIn:
             5
         case .addProviderAccount, .deleteAccount, .repairProvider,
              .launchProviderAccount:

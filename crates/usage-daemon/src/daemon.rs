@@ -199,6 +199,7 @@ impl Daemon {
         if let Some(task) = local_log_task {
             let _ = task.await;
         }
+        crate::providers::launchers::cancel_all_logins();
         if let Err(err) = std::fs::remove_file(&socket_path) {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(error = %err, "failed to remove socket file");

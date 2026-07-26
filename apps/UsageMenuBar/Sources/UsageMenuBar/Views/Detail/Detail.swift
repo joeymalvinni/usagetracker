@@ -47,11 +47,14 @@ struct Detail: View {
                 }
                 if state.showsAlertBanner(activeProvider) {
                     let canRepair = activeProvider.repairRecommended && state.supportsRepair(providerId)
+                    let signInActive = state.isProviderSignInActive(providerId)
                     AlertBanner(
                         provider: activeProvider,
-                        actionLabel: canRepair ? "Sign in again" : "Refresh",
+                        actionLabel: signInActive ? "Cancel sign-in" : (canRepair ? "Sign in again" : "Refresh"),
                         onAction: {
-                            if canRepair {
+                            if signInActive {
+                                state.cancelProviderSignIn(providerId)
+                            } else if canRepair {
                                 Task { await state.repairProvider(providerId, accountId: activeProvider.accountId) }
                             } else {
                                 Task { await state.refreshProvider(providerId) }
@@ -59,6 +62,9 @@ struct Detail: View {
                         },
                         onDismiss: { state.dismissAlert(activeProvider) }
                     )
+                }
+                if state.providersAwaitingAuthenticationCode.contains(providerId) {
+                    ProviderAuthenticationCodeEntry(providerId: providerId)
                 }
                 if accounts.count > 1 {
                     accountPicker

@@ -130,6 +130,10 @@
       },
       "type": "object"
     },
+    "ProviderAuthenticationCode": {
+      "description": "A short-lived provider sign-in secret.\n\nThe transparent wire representation remains a JSON string, while `Debug`\ndeliberately redacts the value so request tracing cannot disclose it.",
+      "type": "string"
+    },
     "ProviderSignInAction": {
       "enum": [
         "open",
@@ -519,6 +523,42 @@
         },
         "sign_in_action": {
           "$ref": "#/$defs/ProviderSignInAction"
+        }
+      },
+      "required": [
+        "method",
+        "provider_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "authentication_code": {
+          "$ref": "#/$defs/ProviderAuthenticationCode"
+        },
+        "method": {
+          "const": "submit_provider_sign_in_code",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "provider_id",
+        "authentication_code"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "const": "cancel_provider_sign_in",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
         }
       },
       "required": [

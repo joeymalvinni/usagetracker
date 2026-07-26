@@ -128,9 +128,41 @@ pub enum ApiRequest {
         #[serde(default, skip_serializing_if = "ProviderSignInAction::is_open")]
         sign_in_action: ProviderSignInAction,
     },
+    SubmitProviderSignInCode {
+        provider_id: ProviderId,
+        authentication_code: ProviderAuthenticationCode,
+    },
+    CancelProviderSignIn {
+        provider_id: ProviderId,
+    },
     LaunchProviderAccount {
         account_id: AccountId,
     },
+}
+
+/// A short-lived provider sign-in secret.
+///
+/// The transparent wire representation remains a JSON string, while `Debug`
+/// deliberately redacts the value so request tracing cannot disclose it.
+#[derive(Clone, Deserialize, JsonSchema, Serialize)]
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ProviderAuthenticationCode(String);
+
+impl ProviderAuthenticationCode {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProviderAuthenticationCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -170,6 +202,8 @@ impl ApiRequest {
                 | "get_provider_setup"
                 | "update_provider_setup"
                 | "repair_provider"
+                | "submit_provider_sign_in_code"
+                | "cancel_provider_sign_in"
                 | "launch_provider_account"
         )
     }
@@ -825,6 +859,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn provider_authentication_code_is_serialized_but_redacted_from_debug_output() {
+        let request = RequestEnvelope::new(ApiRequest::SubmitProviderSignInCode {
+            provider_id: ProviderId::new("claude"),
+            authentication_code: ProviderAuthenticationCode::new("secret-code"),
+        });
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["authentication_code"], "secret-code");
+
+        let debug = format!("{:?}", request.request);
+        assert!(!debug.contains("secret-code"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

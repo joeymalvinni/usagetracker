@@ -14,9 +14,10 @@ use tokio::{
 };
 use tracing::{debug, trace, warn};
 use usage_core::{
-    Account, AccountId, ApiErrorCode, ApiRequest, ApiResponse, ProviderHealth, RequestEnvelope,
-    ResponseEnvelope, ServerInfo, StateSnapshot, UsageDashboardSummary, UsageForecast,
-    UsageSnapshot, UsageWindowProvenance, API_VERSION, MAX_RESPONSE_BYTES,
+    Account, AccountId, ApiErrorCode, ApiRequest, ApiResponse, ProviderActionResponse,
+    ProviderHealth, RequestEnvelope, ResponseEnvelope, ServerInfo, StateSnapshot,
+    UsageDashboardSummary, UsageForecast, UsageSnapshot, UsageWindowProvenance, API_VERSION,
+    MAX_RESPONSE_BYTES,
 };
 
 use crate::{daemon::DaemonRuntime, dashboard, forecast};
@@ -208,6 +209,13 @@ impl SocketServer {
             } => {
                 self.repair_provider_response(provider_id, account_id, sign_in_action)
                     .await
+            }
+            Req::SubmitProviderSignInCode {
+                provider_id,
+                authentication_code,
+            } => self.submit_provider_sign_in_code_response(provider_id, authentication_code),
+            Req::CancelProviderSignIn { provider_id } => {
+                self.cancel_provider_sign_in_response(provider_id)
             }
             Req::LaunchProviderAccount { account_id } => {
                 self.launch_provider_account_response(account_id).await
@@ -509,6 +517,57 @@ impl SocketServer {
                 }
             },
         )
+    }
+
+    fn submit_provider_sign_in_code_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+        authentication_code: usage_core::ProviderAuthenticationCode,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        Ok(
+            match crate::providers::launchers::submit_provider_sign_in_code(
+                provider_id.as_str(),
+                authentication_code.expose_secret(),
+            ) {
+                Ok(()) => ApiResponse::ProviderAction {
+                    action: ProviderActionResponse {
+                        provider_id,
+                        message: "Authentication code submitted. Waiting for sign-in to finish."
+                            .to_string(),
+                        authentication_url: None,
+                    },
+                },
+                Err(error) => {
+                    warn!(
+                        provider_id = provider_id.as_str(),
+                        error = %error,
+                        "provider authentication code submission failed"
+                    );
+                    ApiResponse::error(ApiErrorCode::InvalidArgument, error.to_string())
+                }
+            },
+        )
+    }
+
+    fn cancel_provider_sign_in_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        let cancelled = crate::providers::launchers::cancel_provider_sign_in(provider_id.as_str());
+        Ok(ApiResponse::ProviderAction {
+            action: ProviderActionResponse {
+                provider_id,
+                message: if cancelled {
+                    "Provider sign-in cancelled."
+                } else {
+                    "No provider sign-in was active."
+                }
+                .to_string(),
+                authentication_url: None,
+            },
+        })
     }
 
     async fn launch_provider_account_response(

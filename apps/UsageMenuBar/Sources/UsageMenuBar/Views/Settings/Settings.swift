@@ -318,6 +318,7 @@ private struct ProviderAccountCard: View {
     private var busy: Bool {
         state.pendingProviders.contains(provider.providerId)
             || state.pendingAccountProviders.contains(provider.providerId)
+            || state.isProviderSignInActive(provider.providerId)
     }
 
     var body: some View {
@@ -363,6 +364,10 @@ private struct ProviderAccountCard: View {
                 ProviderSetupFields(providerId: provider.providerId, setup: setup, disabled: busy)
             }
 
+            if state.providersAwaitingAuthenticationCode.contains(provider.providerId) {
+                ProviderAuthenticationCodeEntry(providerId: provider.providerId)
+            }
+
             if hasPrimaryAction {
                 HStack(spacing: Theme.Spacing.sm) {
                     Button("Open sign-in") { Task { await primaryAction() } }
@@ -374,6 +379,10 @@ private struct ProviderAccountCard: View {
                     .buttonStyle(.chip)
                     .disabled(busy || state.daemon == .offline)
                     if busy { ProgressView().controlSize(.small) }
+                    if state.isProviderSignInActive(provider.providerId) {
+                        Button("Cancel") { state.cancelProviderSignIn(provider.providerId) }
+                            .buttonStyle(.chip)
+                    }
                     if state.supportsSetup(provider.providerId) {
                         Button(setup == nil ? "Find workspaces" : "Refresh workspaces") {
                             Task { await state.loadProviderSetup(provider.providerId) }
@@ -567,7 +576,7 @@ private struct AccountSettingsRow: View {
 
     private var needsSignIn: Bool {
         switch accountHealth?.status {
-        case .credentialsMissing, .authFailed: true
+        case .credentialsMissing, .authFailed, .keychainAccessFailed: true
         default: false
         }
     }
