@@ -31,6 +31,7 @@ mod cli;
 mod client;
 mod cost;
 mod credentials;
+pub(crate) mod local_import;
 mod normalize;
 mod pricing;
 pub(crate) mod settings;
