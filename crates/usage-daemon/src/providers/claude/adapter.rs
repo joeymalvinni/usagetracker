@@ -61,6 +61,7 @@ impl ProviderAdapter for ClaudeAdapter {
             "owns_default_claude_activity",
             "working_directory",
             "launch",
+            "local_import",
         ]
     }
 
@@ -794,6 +795,16 @@ mod tests {
                 model: Some("fable".to_string()),
                 effort: Some(usage_core::LaunchEffort::Xhigh),
                 dangerously_skip_permissions: true,
+            }),
+            local_import: Some(settings::ClaudeLocalImportSettings {
+                last_imported_at: Some(chrono::Utc::now()),
+                source: Some("~/.claude".to_string()),
+                source_identity: Some("user@example.com".to_string()),
+                options: Some(usage_core::ImportOptions::comfort_defaults()),
+                manifest: Some(settings::ClaudeImportManifest {
+                    paths: vec!["settings.json".to_string()],
+                    imported_at: chrono::Utc::now(),
+                }),
             }),
         };
         let value = serde_json::to_value(&settings).unwrap();

@@ -1,10 +1,34 @@
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use anyhow::Context;
+use usage_core::ImportOptions;
 
 use crate::{config::ProviderConfig, providers::settings_accessors};
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaudeLocalImportSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_imported_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) options: Option<ImportOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest: Option<ClaudeImportManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaudeImportManifest {
+    pub(crate) paths: Vec<String>,
+    pub(crate) imported_at: DateTime<Utc>,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +51,8 @@ pub(crate) struct ClaudeProfileSettings {
     pub(crate) working_directory: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launch: Option<usage_core::LaunchFlags>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_import: Option<ClaudeLocalImportSettings>,
 }
 
 pub(crate) fn validate(config: &ProviderConfig) -> anyhow::Result<()> {
@@ -67,7 +93,27 @@ settings_accessors!(profile: ClaudeProfileSettings);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use usage_core::LaunchFlags;
+    use usage_core::{ImportOptions, LaunchFlags};
+
+    #[test]
+    fn local_import_settings_round_trip_in_profile() {
+        let settings = ClaudeProfileSettings {
+            local_import: Some(ClaudeLocalImportSettings {
+                last_imported_at: Some(chrono::Utc::now()),
+                source: Some("~/.claude".into()),
+                source_identity: Some("user@example.com".into()),
+                options: Some(ImportOptions::comfort_defaults()),
+                manifest: Some(ClaudeImportManifest {
+                    paths: vec!["settings.json".into()],
+                    imported_at: chrono::Utc::now(),
+                }),
+            }),
+            ..ClaudeProfileSettings::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        let back: ClaudeProfileSettings = serde_json::from_value(value).unwrap();
+        assert!(back.local_import.is_some());
+    }
 
     #[test]
     fn launch_flag_validation_constrains_the_model_string() {
