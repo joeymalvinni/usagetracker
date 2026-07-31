@@ -25,7 +25,8 @@ use crate::{
             create_managed_claude_profile, ensure_claude_login_profile, pending_claude_profile,
             ClaudeLoginTarget,
         },
-        ProviderCollector,
+        ProviderCollector, ProviderError, ProviderErrorKind, HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
     },
     runtime::{
         managed_profiles,
@@ -38,7 +39,10 @@ use crate::{
     },
 };
 
-use super::{local_import, settings, ClaudeCollector, PROVIDER_ID};
+use super::{
+    client::ClaudeApiClient, credentials, keychain_service_for_config_dir, local_import, settings,
+    ClaudeCollector, PROVIDER_ID,
+};
 
 pub(crate) static ADAPTER: ClaudeAdapter = ClaudeAdapter;
 
@@ -338,6 +342,13 @@ pub(crate) fn resolve_launch_plan(
     })
 }
 
+fn reconnect_after_sync_failure(err: &ProviderError) -> String {
+    format!(
+        "Claude credentials need reconnect before opening a session ({}). Finish signing in in your browser.",
+        err.kind().as_str()
+    )
+}
+
 pub(crate) fn account_launch_settings_response(
     account: &Account,
     settings: &settings::ClaudeProfileSettings,
@@ -422,6 +433,47 @@ impl LaunchHandler for ClaudeAdapter {
             }
             None => None,
         };
+
+        if let Some(config_dir) = config_dir.as_ref() {
+            let service = saved
+                .keychain_service
+                .clone()
+                .unwrap_or_else(|| keychain_service_for_config_dir(config_dir));
+            let keychain_account = saved
+                .keychain_account
+                .clone()
+                .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "default".to_string()));
+            let credentials_file = saved
+                .credentials_file
+                .clone()
+                .map(expand_home_path)
+                .unwrap_or_else(|| config_dir.join(".credentials.json"));
+
+            let api = ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?;
+            if let Err(err) = credentials::sync_for_launch(
+                service,
+                keychain_account,
+                credentials_file,
+                |creds| api.refresh_credentials(creds),
+            )
+            .await
+            {
+                let target = prepare_login_profile(runtime, Some(&account.id)).await?;
+                let login = launchers::launch_claude_login(target.config_dir.as_deref())?;
+                let authentication_url = login.authentication_url.clone();
+                launchers::monitor_login(
+                    login.child,
+                    runtime.refresh(),
+                    PROVIDER_ID,
+                    Some(target.profile_id),
+                );
+                return Ok(ProviderActionResponse {
+                    provider_id: account.provider_id,
+                    message: reconnect_after_sync_failure(&err),
+                    authentication_url,
+                });
+            }
+        }
 
         let launcher = launchers::write_claude_profile_launcher(
             &account.id,
@@ -1065,6 +1117,17 @@ mod tests {
             account_launch_settings_response(&account, &settings::ClaudeProfileSettings::default());
         assert!(!unmanaged.has_managed_config_dir);
         assert_eq!(unmanaged.working_directory, None);
+    }
+
+    #[test]
+    fn launch_credential_sync_failure_message_mentions_reconnect_not_tokens() {
+        let msg = reconnect_after_sync_failure(&ProviderError::new(
+            ProviderErrorKind::CredentialsMissing,
+            "missing",
+        ));
+        assert!(msg.to_lowercase().contains("reconnect"));
+        assert!(!msg.contains("sk-"));
+        assert!(!msg.contains("accessToken"));
     }
 
     #[test]
