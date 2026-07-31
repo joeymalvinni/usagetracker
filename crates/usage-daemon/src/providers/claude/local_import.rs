@@ -14,6 +14,11 @@ use super::client;
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const HISTORY_FILE_NAME: &str = "history.jsonl";
 const CLAUDE_JSON_FILE_NAME: &str = ".claude.json";
+/// Internal bookkeeping only (not part of the public `ImportManifest`), so
+/// `Replace` mode knows which previously-imported paths to clean up. Task 3/5
+/// also plan to record the manifest in profile settings; keeping this sidecar
+/// too is intentional dual bookkeeping until that lands, since this module
+/// must stay self-contained and side-effect-free beyond `dest_config_dir`.
 const MANIFEST_STATE_FILE_NAME: &str = ".claude-comfort-import-manifest.json";
 const FREE_SPACE_HEADROOM_BYTES: u64 = 1024 * 1024;
 
@@ -295,6 +300,9 @@ fn import_history(source_home: &Path, dest_config_dir: &Path) -> anyhow::Result<
     }
 
     let dest_path = dest_config_dir.join(HISTORY_FILE_NAME);
+    // Fixed `.importing` suffix per the brief (unlike the uuid-suffixed
+    // staging names `write_staged_json` uses for settings/trust) — history is
+    // copied, not read-then-rewritten, so a stable name is fine here.
     let staging_path = dest_config_dir.join(format!("{HISTORY_FILE_NAME}.importing"));
     let copy_result = std::fs::copy(&source_path, &staging_path);
     match copy_result {
@@ -327,6 +335,7 @@ fn read_source_json(path: &Path) -> anyhow::Result<Option<Value>> {
 }
 
 fn write_staged_json(dest_path: &Path, value: &Value) -> anyhow::Result<()> {
+    reject_symlink(dest_path)?;
     let contents = serde_json::to_vec_pretty(value)?;
     let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = dest_path
@@ -441,9 +450,8 @@ fn read_manifest_state(dest_config_dir: &Path) -> Vec<String> {
 }
 
 fn persist_manifest_state(dest_config_dir: &Path, paths: &[String]) -> anyhow::Result<()> {
-    let contents = serde_json::to_vec(paths)?;
-    std::fs::write(dest_config_dir.join(MANIFEST_STATE_FILE_NAME), contents)?;
-    Ok(())
+    let value = serde_json::to_value(paths)?;
+    write_staged_json(&dest_config_dir.join(MANIFEST_STATE_FILE_NAME), &value)
 }
 
 #[cfg(test)]
@@ -601,6 +609,33 @@ mod tests {
             );
             assert!(err.is_err());
         }
+    }
+
+    #[test]
+    fn estimate_toggle_bytes_reports_missing_and_present_sizes_per_toggle() {
+        let dir = ScratchDir::new("claude-local-import-estimate");
+        let home = dir.path.join("home");
+        let json = dir.path.join("claude.json");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("settings.json"), "12345").unwrap();
+        fs::write(&json, "1234567890").unwrap();
+        // history.jsonl intentionally left missing.
+
+        let options = ImportOptions {
+            prefs: true,
+            prompt_history: true,
+            project_trust: false,
+            ..ImportOptions::comfort_defaults()
+        };
+        let estimates = estimate_toggle_bytes(&home, &json, &options);
+
+        assert_eq!(
+            estimates,
+            vec![
+                ("prefs".to_string(), Some(5)),
+                ("prompt_history".to_string(), None),
+            ]
+        );
     }
 
     #[test]
