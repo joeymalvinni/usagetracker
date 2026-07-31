@@ -280,6 +280,13 @@ pub(crate) struct LaunchOverrides {
 #[error("{0}")]
 pub(crate) struct InvalidLaunchRequest(pub(crate) String);
 
+/// Sibling of `InvalidLaunchRequest` for the import path: the daemon accepted
+/// the request shape but the options themselves are caller error (e.g.
+/// requesting a PR3+ toggle). Mapped to `invalid_argument`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct InvalidImportRequest(pub(crate) String);
+
 #[async_trait]
 pub(crate) trait LaunchHandler: Send + Sync {
     async fn launch(
@@ -315,9 +322,12 @@ pub(crate) trait ImportHandler: Send + Sync {
         account: Account,
     ) -> anyhow::Result<usage_core::AccountImportPreview>;
 
+    /// Takes an owned `Arc<DaemonRuntime>` so the spawned import job can
+    /// persist `local_import` settings after the copy finishes, without
+    /// borrowing a request-scoped runtime reference.
     async fn start_import(
         &self,
-        runtime: ProviderRuntime<'_>,
+        runtime: Arc<DaemonRuntime>,
         account: Account,
         options: usage_core::ImportOptions,
         mode: usage_core::ImportMode,

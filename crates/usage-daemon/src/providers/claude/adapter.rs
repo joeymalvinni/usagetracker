@@ -1,15 +1,23 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use chrono::Utc;
 use tracing::info;
 use usage_core::{
-    Account, AccountId, AccountLaunchSettingsResponse, AddProviderAccountResponse,
-    ProviderActionResponse, ProviderId,
+    Account, AccountId, AccountImportPreview, AccountLaunchSettingsResponse,
+    AddProviderAccountResponse, ImportJob, ImportJobId, ImportJobStatus, ImportMode, ImportOptions,
+    ImportToggleSize, ProviderActionResponse, ProviderId,
 };
 
 use crate::{
     config::ProviderConfig,
+    daemon::DaemonRuntime,
     providers::{
         launchers,
         paths::expand_home_path,
@@ -23,14 +31,14 @@ use crate::{
         managed_profiles,
         provider_adapter::{
             plan_profile_deletion, AccountDeletionPlan, AddAccountHandler, DeleteHandler,
-            ExecutionPolicy, InvalidLaunchRequest, LaunchHandler, LaunchOverrides,
-            LocalUsagePathMatcher, LocalUsageWatch, ProviderAdapter, ProviderManifest,
-            ProviderRuntime, RepairHandler,
+            ExecutionPolicy, ImportHandler, InvalidImportRequest, InvalidLaunchRequest,
+            LaunchHandler, LaunchOverrides, LocalUsagePathMatcher, LocalUsageWatch,
+            ProviderAdapter, ProviderManifest, ProviderRuntime, RepairHandler,
         },
     },
 };
 
-use super::{settings, ClaudeCollector, PROVIDER_ID};
+use super::{local_import, settings, ClaudeCollector, PROVIDER_ID};
 
 pub(crate) static ADAPTER: ClaudeAdapter = ClaudeAdapter;
 
@@ -155,6 +163,10 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn launch_handler(&self) -> Option<&dyn LaunchHandler> {
+        Some(self)
+    }
+
+    fn import_handler(&self) -> Option<&dyn ImportHandler> {
         Some(self)
     }
 
@@ -504,6 +516,271 @@ impl DeleteHandler for ClaudeAdapter {
             |profile| Ok(settings::profile(profile)?.claude_config_dir),
         )
     }
+}
+
+/// Full toggle catalog for the import preview. Order matches the design table
+/// (comfort defaults first, stretch toggles last) so the Swift sheet can render
+/// the list without additional sorting.
+const IMPORT_TOGGLE_KEYS: &[&str] = &[
+    "prefs",
+    "project_trust",
+    "prompt_history",
+    "plugins",
+    "project_transcripts",
+    "file_history",
+    "tasks_teams",
+    "sessions",
+];
+
+fn source_paths() -> anyhow::Result<(PathBuf, PathBuf)> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory could not be resolved"))?;
+    Ok((home.join(".claude"), home.join(".claude.json")))
+}
+
+/// Loads the (managed or manual) profile settings for `profile_id`, falling
+/// back to defaults for the legacy pre-managed-profile Claude account.
+fn load_profile_settings(
+    config: &crate::config::Config,
+    profile_id: &str,
+) -> anyhow::Result<settings::ClaudeProfileSettings> {
+    let provider = match config.providers.get(PROVIDER_ID) {
+        Some(provider) => provider,
+        None => return Ok(settings::ClaudeProfileSettings::default()),
+    };
+    if provider.profiles.is_empty() && profile_id == "default" {
+        return Ok(settings::ClaudeProfileSettings::default());
+    }
+    provider
+        .profiles
+        .iter()
+        .find(|profile| is_active_profile(profile, profile_id))
+        .map(settings::profile)
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("Claude profile {profile_id} is no longer configured"))
+}
+
+fn build_toggle_list(
+    default_options: &ImportOptions,
+    estimates: &HashMap<String, Option<u64>>,
+) -> Vec<ImportToggleSize> {
+    IMPORT_TOGGLE_KEYS
+        .iter()
+        .map(|key| toggle_entry(key, default_options, estimates))
+        .collect()
+}
+
+fn toggle_entry(
+    key: &str,
+    default_options: &ImportOptions,
+    estimates: &HashMap<String, Option<u64>>,
+) -> ImportToggleSize {
+    let (enabled_by_default, supported, note) = match key {
+        "prefs" => (default_options.prefs, true, None),
+        "project_trust" => (default_options.project_trust, true, None),
+        "prompt_history" => (default_options.prompt_history, true, None),
+        "plugins" => (
+            false,
+            false,
+            Some("plugins require a path rewrite and are not imported yet".to_string()),
+        ),
+        "project_transcripts" => (
+            false,
+            false,
+            Some("transcripts are excluded to preserve usage attribution".to_string()),
+        ),
+        "file_history" => (
+            false,
+            false,
+            Some("file-history import is not supported yet".to_string()),
+        ),
+        "tasks_teams" => (
+            false,
+            false,
+            Some("tasks/teams import is not supported yet".to_string()),
+        ),
+        "sessions" => (
+            false,
+            false,
+            Some("sessions import is not supported yet".to_string()),
+        ),
+        other => (false, false, Some(format!("unknown toggle {other}"))),
+    };
+    ImportToggleSize {
+        key: key.to_string(),
+        enabled_by_default,
+        supported,
+        bytes: estimates.get(key).and_then(|value| *value),
+        note,
+    }
+}
+
+#[async_trait]
+impl ImportHandler for ClaudeAdapter {
+    async fn preview(
+        &self,
+        runtime: ProviderRuntime<'_>,
+        account: Account,
+    ) -> anyhow::Result<AccountImportPreview> {
+        let profile_id = account
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?;
+        let config = runtime.config().await;
+        let saved = load_profile_settings(&config, profile_id)?;
+
+        let destination_path = saved.claude_config_dir.as_deref().map(expand_home_path);
+        let has_managed_config_dir = destination_path
+            .as_ref()
+            .is_some_and(|dir| managed_profiles::is_managed_profile(dir, PROVIDER_ID));
+
+        let (source_home, source_claude_json) = source_paths()?;
+        let default_options = ImportOptions::comfort_defaults();
+        // estimate_toggle_bytes only reports currently-selectable toggles; the
+        // stretch entries fall through `toggle_entry` with `bytes = None`.
+        let estimates: HashMap<String, Option<u64>> = local_import::estimate_toggle_bytes(
+            &source_home,
+            &source_claude_json,
+            &default_options,
+        )
+        .into_iter()
+        .collect();
+        let toggles = build_toggle_list(&default_options, &estimates);
+        let source_identity = local_import::read_source_identity(&source_claude_json);
+
+        Ok(AccountImportPreview {
+            provider_id: account.provider_id,
+            account_id: account.id,
+            source_home: source_home.display().to_string(),
+            source_claude_json: source_claude_json.display().to_string(),
+            destination: destination_path
+                .as_ref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+            has_managed_config_dir,
+            source_identity,
+            default_mode: ImportMode::PrefsOnly,
+            default_options,
+            toggles,
+        })
+    }
+
+    async fn start_import(
+        &self,
+        runtime: Arc<DaemonRuntime>,
+        account: Account,
+        options: ImportOptions,
+        mode: ImportMode,
+    ) -> anyhow::Result<ImportJob> {
+        options
+            .ensure_pr2_supported()
+            .map_err(|reason| anyhow::Error::new(InvalidImportRequest(reason)))?;
+
+        let profile_id = account
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?
+            .to_string();
+
+        let config = runtime.config_snapshot().await;
+        let saved = load_profile_settings(&config, &profile_id)?;
+        let destination = saved
+            .claude_config_dir
+            .as_deref()
+            .map(expand_home_path)
+            .ok_or_else(|| {
+                anyhow::Error::new(InvalidImportRequest(
+                    "importing requires a managed Claude config directory".to_string(),
+                ))
+            })?;
+        if !managed_profiles::is_managed_profile(&destination, PROVIDER_ID) {
+            return Err(anyhow::Error::new(InvalidImportRequest(
+                "importing is only supported for managed Claude profiles".to_string(),
+            )));
+        }
+
+        let (source_home, source_claude_json) = source_paths()?;
+        let plan = local_import::plan(&source_home, &source_claude_json, &options)?;
+        let source_identity = plan.source_identity.clone();
+
+        let job = ImportJob {
+            id: ImportJobId::new(uuid::Uuid::new_v4().to_string()),
+            account_id: account.id.clone(),
+            provider_id: account.provider_id.clone(),
+            status: ImportJobStatus::Queued,
+            mode,
+            options: options.clone(),
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            progress_message: None,
+            failure_message: None,
+        };
+
+        let import_jobs = runtime.import_jobs.clone();
+        let runtime_for_persist = runtime.clone();
+        let source_home_display = source_home.display().to_string();
+
+        import_jobs
+            .start(job, move || async move {
+                // GB-scale filesystem work never runs on the async worker
+                // pool — even prefs-only imports go through spawn_blocking so
+                // one long stat/copy cannot stall the daemon socket.
+                let manifest = tokio::task::spawn_blocking(move || {
+                    local_import::run(&plan, &destination, mode)
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("import worker task failed: {err}"))??;
+                persist_local_import(
+                    runtime_for_persist,
+                    profile_id,
+                    options,
+                    manifest,
+                    source_home_display,
+                    source_identity,
+                )
+                .await
+            })
+            .await
+    }
+}
+
+async fn persist_local_import(
+    runtime: Arc<DaemonRuntime>,
+    profile_id: String,
+    options: ImportOptions,
+    manifest: local_import::ImportManifest,
+    source: String,
+    source_identity: Option<String>,
+) -> anyhow::Result<()> {
+    runtime
+        .mutate_config(|config| {
+            let Some(provider) = config.providers.get_mut(PROVIDER_ID) else {
+                return Ok(());
+            };
+            let Some(profile) = provider
+                .profiles
+                .iter_mut()
+                .find(|profile| is_active_profile(profile, &profile_id))
+            else {
+                return Ok(());
+            };
+            settings::update_profile(profile, |profile_settings| {
+                profile_settings.local_import = Some(settings::ClaudeLocalImportSettings {
+                    last_imported_at: Some(manifest.imported_at),
+                    source: Some(source.clone()),
+                    source_identity: source_identity.clone(),
+                    options: Some(options.clone()),
+                    manifest: Some(settings::ClaudeImportManifest {
+                        paths: manifest.paths.clone(),
+                        imported_at: manifest.imported_at,
+                    }),
+                });
+            })?;
+            Ok(())
+        })
+        .await
+        .context("the Claude import completed, but saving import bookkeeping failed")
 }
 
 async fn prepare_login_profile(

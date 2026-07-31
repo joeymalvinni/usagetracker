@@ -449,23 +449,33 @@ impl SocketServer {
                 }
             }
             ApiRequest::PreviewAccountImport { account_id } => {
-                match self.runtime.preview_account_import(account_id).await {
-                    Ok(preview) => ApiResponse::AccountImportPreview { preview },
-                    Err(err) => map_import_error(err),
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    match self.runtime.preview_account_import(account_id).await {
+                        Ok(preview) => ApiResponse::AccountImportPreview { preview },
+                        Err(err) => map_import_error(err),
+                    }
                 }
             }
             ApiRequest::ImportAccountData {
                 account_id,
                 options,
                 mode,
-            } => match self
-                .runtime
-                .import_account_data(account_id, options, mode)
-                .await
-            {
-                Ok(job) => ApiResponse::ImportStarted { job },
-                Err(err) => map_import_error(err),
-            },
+            } => {
+                if let Some(error) = self.account_validation_error(&account_id).await {
+                    error
+                } else {
+                    match self
+                        .runtime
+                        .import_account_data(account_id, options, mode)
+                        .await
+                    {
+                        Ok(job) => ApiResponse::ImportStarted { job },
+                        Err(err) => map_import_error(err),
+                    }
+                }
+            }
             ApiRequest::GetImportJob { job_id } => {
                 match self.runtime.get_import_job(&job_id).await {
                     Ok(Some(job)) => ApiResponse::ImportJob { job },
@@ -473,10 +483,9 @@ impl SocketServer {
                         ApiErrorCode::UnknownImportJob,
                         format!("unknown import job: {}", job_id.as_str()),
                     ),
-                    Err(err) => ApiResponse::error(
-                        ApiErrorCode::StorageUnavailable,
-                        err.to_string(),
-                    ),
+                    Err(err) => {
+                        ApiResponse::error(ApiErrorCode::StorageUnavailable, err.to_string())
+                    }
                 }
             }
         }
@@ -911,7 +920,14 @@ fn launch_failure_response(err: anyhow::Error) -> ApiResponse {
 
 fn map_import_error(err: anyhow::Error) -> ApiResponse {
     warn!(error = %err, "import request failed");
-    ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+    if err
+        .downcast_ref::<crate::runtime::provider_adapter::InvalidImportRequest>()
+        .is_some()
+    {
+        ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
+    } else {
+        ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1208,6 +1224,137 @@ mod tests {
             panic!("expected error response")
         };
         assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+    }
+
+    #[test]
+    fn import_failures_split_invalid_requests_from_unsupported() {
+        let invalid = map_import_error(anyhow::Error::new(
+            crate::runtime::provider_adapter::InvalidImportRequest(
+                "plugin import is not supported yet".to_string(),
+            ),
+        ));
+        let ApiResponse::Error { error } = invalid else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+
+        let other = map_import_error(anyhow::anyhow!(
+            "importing account data is not supported for codex"
+        ));
+        let ApiResponse::Error { error } = other else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+    }
+
+    #[tokio::test]
+    async fn fixture_mode_rejects_import_but_allows_preview() {
+        let root = std::env::temp_dir().join(format!("usage-import-fixture-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("usage.sqlite3");
+        let storage = crate::storage::Storage::open(&db_path).unwrap();
+        crate::fixtures::seed(&storage, crate::fixtures::FixtureScenario::Notifications)
+            .await
+            .unwrap();
+        let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), Vec::new()));
+        let config = crate::config::Config {
+            poll_interval_seconds: 30,
+            notifications: Default::default(),
+            providers: BTreeMap::new(),
+            paths: crate::config::Paths {
+                config: root.join("config.json"),
+                db: db_path,
+                socket: root.join("usage.sock"),
+            },
+        };
+        let (runtime, _rx) = DaemonRuntime::new_with_fixture_mode(config, storage, refresh, true);
+        let server = SocketServer::new(runtime);
+
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+
+        let preview = server
+            .handle_request(ApiRequest::PreviewAccountImport {
+                account_id: claude.id.clone(),
+            })
+            .await;
+        let ApiResponse::AccountImportPreview { preview } = preview else {
+            panic!("unexpected preview response: {preview:?}")
+        };
+        assert_eq!(preview.provider_id.as_str(), "claude");
+
+        let started = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude.id.clone(),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = started else {
+            panic!("fixture-mode import must not succeed: {started:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+        assert!(error.message.contains("fixture"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_pr3_toggles_as_invalid_argument() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+
+        let response = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude.id.clone(),
+                options: usage_core::ImportOptions {
+                    plugins: true,
+                    ..usage_core::ImportOptions::comfort_defaults()
+                },
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = response else {
+            panic!("expected invalid-argument error, got {response:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+        assert!(error.message.contains("plugin"));
+
+        let unknown = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: AccountId::new("definitely-unknown"),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = unknown else {
+            panic!("expected unknown-account error")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnknownAccount);
+
+        let _ = std::fs::remove_dir_all(env.root);
     }
 
     #[tokio::test]

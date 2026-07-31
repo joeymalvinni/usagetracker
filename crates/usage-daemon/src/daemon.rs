@@ -225,7 +225,7 @@ impl DaemonRuntime {
         Self::new_with_fixture_mode(config, storage, refresh, false)
     }
 
-    fn new_with_fixture_mode(
+    pub(crate) fn new_with_fixture_mode(
         config: Config,
         storage: Storage,
         refresh: Arc<RefreshCoordinator>,
@@ -624,27 +624,63 @@ impl DaemonRuntime {
             .await
     }
 
+    /// Read-only: fixture mode is allowed so `just fixture` can demo the
+    /// Import sheet against real `~/.claude` sizes (never mutating anything).
     pub async fn preview_account_import(
         &self,
-        _account_id: usage_core::AccountId,
+        account_id: usage_core::AccountId,
     ) -> anyhow::Result<usage_core::AccountImportPreview> {
-        anyhow::bail!("not implemented")
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.import_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "importing account data is not supported for {}",
+                account.provider_id
+            )
+        })?;
+        handler
+            .preview(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                account,
+            )
+            .await
     }
 
     pub async fn import_account_data(
-        &self,
-        _account_id: usage_core::AccountId,
-        _options: usage_core::ImportOptions,
-        _mode: usage_core::ImportMode,
+        self: &Arc<Self>,
+        account_id: usage_core::AccountId,
+        options: usage_core::ImportOptions,
+        mode: usage_core::ImportMode,
     ) -> anyhow::Result<usage_core::ImportJob> {
-        anyhow::bail!("not implemented")
+        if self.fixture_mode {
+            anyhow::bail!("account import is unavailable in development fixture mode");
+        }
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.import_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "importing account data is not supported for {}",
+                account.provider_id
+            )
+        })?;
+        handler
+            .start_import(self.clone(), account, options, mode)
+            .await
     }
 
     pub async fn get_import_job(
         &self,
-        _job_id: &usage_core::ImportJobId,
+        job_id: &usage_core::ImportJobId,
     ) -> anyhow::Result<Option<usage_core::ImportJob>> {
-        anyhow::bail!("not implemented")
+        Ok(self.import_jobs.get(job_id).await)
     }
 
     fn publish_local_log_config(&self, config: &Config) {
@@ -1403,5 +1439,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(with_options, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
+    }
+
+    #[test]
+    fn import_capability_is_claude_only() {
+        let with_import = provider_registry::descriptors()
+            .into_iter()
+            .filter(|provider| provider.capabilities.import_account_data)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(with_import, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
     }
 }

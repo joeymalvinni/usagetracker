@@ -388,7 +388,7 @@ fn reject_symlink(path: &Path) -> anyhow::Result<()> {
 /// Best-effort only: the source `.claude.json` rarely carries an OAuth
 /// identity block, and any failure here (missing file, unexpected shape)
 /// simply means the import preview shows no source identity.
-fn read_source_identity(source_claude_json: &Path) -> Option<String> {
+pub(crate) fn read_source_identity(source_claude_json: &Path) -> Option<String> {
     let bytes = std::fs::read(source_claude_json).ok()?;
     let identity = client::parse_cached_profile_identity(&bytes).ok()?;
     identity.email.or(Some(identity.account_id))
