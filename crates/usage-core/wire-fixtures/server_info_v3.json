@@ -15,7 +15,7 @@
         "id": "claude",
         "display_name": "Claude",
         "minimum_refresh_interval_seconds": 60,
-        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "launch_options": true, "workspace_setup": false}
+        "capabilities": {"multiple_accounts": true, "add_account": true, "repair": true, "launch_account": true, "launch_options": true, "import_account_data": true, "workspace_setup": false}
       },
       {
         "id": "opencode_go",

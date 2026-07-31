@@ -1,0 +1,19 @@
+{
+  "api_version": 3,
+  "type": "import_job",
+  "job": {
+    "id": "fixture-import-1",
+    "account_id": "account-1",
+    "provider_id": "claude",
+    "status": "completed",
+    "mode": "prefs_only",
+    "options": {
+      "prefs": true,
+      "project_trust": true,
+      "prompt_history": true
+    },
+    "created_at": "2026-07-22T00:00:00Z",
+    "started_at": "2026-07-22T00:00:01Z",
+    "finished_at": "2026-07-22T00:00:02Z"
+  }
+}

@@ -1002,6 +1002,8 @@ mod tests {
             include_str!("../wire-fixtures/error_v3.json"),
             include_str!("../wire-fixtures/usage_v3.json"),
             include_str!("../wire-fixtures/account_launch_settings_v3.json"),
+            include_str!("../wire-fixtures/account_import_preview_v3.json"),
+            include_str!("../wire-fixtures/import_job_v3.json"),
         ] {
             let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
             let response: ResponseEnvelope = serde_json::from_value(expected.clone()).unwrap();

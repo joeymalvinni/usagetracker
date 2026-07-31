@@ -53,6 +53,12 @@ Diagnostics can note things like the collection mode, profile ID, Keychain servi
 
 Reading or refreshing credentials in the Keychain can prompt macOS for permission. UsageTracker distinguishes a rejected Keychain password from Claude rejecting an OAuth token, and successful Keychain reads are cached in memory for the daemon's lifetime so discovery and collection do not repeat an accepted prompt. Writes made through UsageTracker update that cache; changes made by another process are picked up after the daemon restarts. Managed login and launch commands only ever see their own profile directory — use the app's per-profile launch action so activity gets attributed correctly. Managed accounts can also save a per-account working directory and structured launch flags (model, effort, dangerously-skip-permissions). The generated launcher refuses to run if the working directory no longer exists, and the dangerous flag is use-once unless you explicitly remember it. The launcher file on disk keeps the most recent session's flags until the next open, so re-running it from Finder repeats them. Your local history may contain project paths and model names, but UsageTracker doesn't copy whole records into its own storage.
 
+## Comfort-pack import
+
+Managed Claude accounts can import a scrubbed comfort pack from your default Claude home (`~/.claude` and `~/.claude.json`) into the account's isolated config directory. The import sheet calls `preview_account_import` for paths, default toggles, and size hints, then `import_account_data` to start a background job you poll with `get_import_job`.
+
+v1 imports only the comfort toggles: scrubbed `settings.json` prefs, project trust flags from `.claude.json`, and prompt history. Stretch toggles such as plugins, transcripts, file history, tasks/teams, and sessions are listed in the preview but rejected if requested. `prefs_only` overwrites only the selected scrubbed files; `replace` also removes paths recorded in the previous import manifest before copying again. Import never touches credentials, Keychain state, or project transcripts (which would confuse local usage attribution).
+
 ## Tests and fixtures
 
 Inline tests cover the Keychain/file rules, token refresh, identity, OAuth and CLI parsing, reset times, local cost, project roots, and duplicate profiles. `just fixture` runs normalized Claude data all the way through the socket and UI.
