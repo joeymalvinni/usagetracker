@@ -1,7 +1,7 @@
 # Claude launch credential sync
 
 Date: 2026-07-31  
-Status: draft for review  
+Status: approved  
 Related: `docs/superpowers/specs/2026-07-22-claude-launch-import-design.md` (launch prefs; import does **not** copy OAuth)
 
 ## Goal
