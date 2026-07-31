@@ -52,6 +52,8 @@ private enum PendingAction {
     /// Non-nil while the confirm-on-open sheet should be shown; cleared on
     /// successful open, or by the view on cancel/window close.
     @Published var openSession: OpenSessionModel?
+    /// Non-nil while the import-from-local-Claude sheet should be shown.
+    @Published var importLocalClaude: ImportLocalClaudeModel?
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
     @Published private(set) var derived = DerivedState.empty
@@ -481,6 +483,48 @@ private enum PendingAction {
             )
             actionMessage = response.message
             openSession = nil
+        }
+    }
+
+    func prepareImportLocalClaude(_ accountId: String) async {
+        importLocalClaude = nil
+        guard let account = accounts.first(where: { $0.id == accountId }) else {
+            actionError = "The selected account is no longer available."
+            return
+        }
+        guard supportsImportAccountData(account.providerId) else {
+            actionError = "\(providerName(account.providerId)) does not support importing local account data."
+            return
+        }
+        await perform(.account(accountId)) {
+            let preview = try await client.previewAccountImport(accountId: accountId)
+            let title = account.displayName?.isEmpty == false ? account.displayName! : account.externalAccountId
+            importLocalClaude = ImportLocalClaudeModel(
+                accountId: account.id,
+                accountTitle: title,
+                providerId: account.providerId,
+                preview: preview
+            )
+        }
+    }
+
+    func confirmImportLocalClaude(_ model: ImportLocalClaudeModel) async {
+        importLocalClaude = model
+        guard model.canImport else { return }
+        await perform(.account(model.accountId)) {
+            let started = try await client.importAccountData(
+                accountId: model.accountId,
+                options: model.wireOptions,
+                mode: model.mode
+            )
+            let completed = try await client.waitForImport(started)
+            guard completed.status == .completed else {
+                throw ImportLocalClaudeFailure(
+                    message: completed.failureMessage ?? "Import failed."
+                )
+            }
+            actionMessage = "Imported local Claude settings for \(model.accountTitle)."
+            importLocalClaude = nil
         }
     }
 
@@ -929,6 +973,10 @@ private enum PendingAction {
 
     func supportsLaunchOptions(_ providerId: String) -> Bool {
         providerSupports(providerId, capability: \.launchOptions, in: serverProviders)
+    }
+
+    func supportsImportAccountData(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.importAccountData, in: serverProviders)
     }
 
     func supportsSetup(_ providerId: String) -> Bool {

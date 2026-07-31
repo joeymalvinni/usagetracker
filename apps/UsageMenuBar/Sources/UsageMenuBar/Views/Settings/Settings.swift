@@ -432,7 +432,7 @@ private struct AccountSettingsRow: View {
 
     private var accountMenu: some View {
         Menu {
-            if state.supportsLaunchAccount(account.providerId), !isRemoved {
+            if !isRemoved, state.supportsLaunchAccount(account.providerId) {
                 Button("Open \(ProviderCatalog.name(for: account.providerId)) session") {
                     if state.supportsLaunchOptions(account.providerId) {
                         Task { @MainActor in
@@ -445,6 +445,20 @@ private struct AccountSettingsRow: View {
                         Task { await state.launchProviderAccount(account.id) }
                     }
                 }
+            }
+            if !isRemoved, state.supportsImportAccountData(account.providerId) {
+                Button("Import from local Claude…") {
+                    Task { @MainActor in
+                        await state.prepareImportLocalClaude(account.id)
+                        if let model = state.importLocalClaude {
+                            ImportLocalClaudeWindow.shared.present(state: state, model: model)
+                        }
+                    }
+                }
+            }
+            if !isRemoved,
+               state.supportsLaunchAccount(account.providerId)
+                   || state.supportsImportAccountData(account.providerId) {
                 Divider()
             }
             Button("Rename") {
