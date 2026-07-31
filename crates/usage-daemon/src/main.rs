@@ -4,6 +4,7 @@ mod dashboard;
 mod fixtures;
 mod forecast;
 mod health;
+mod import_jobs;
 mod instance;
 mod keychain;
 mod local_logs;

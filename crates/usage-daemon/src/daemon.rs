@@ -20,6 +20,7 @@ use usage_core::default_app_dir;
 use crate::{
     config::Config,
     fixtures::{self, FixtureScenario},
+    import_jobs::ImportJobs,
     local_logs,
     notifications::NotificationManager,
     polling::RefreshCoordinator,
@@ -39,6 +40,7 @@ pub struct DaemonRuntime {
     config_mutation: Mutex<()>,
     pub storage: Storage,
     pub refresh: Arc<RefreshCoordinator>,
+    pub import_jobs: Arc<ImportJobs>,
     notifications: Arc<NotificationManager>,
     poll_schedule_tx: watch::Sender<PollSchedule>,
     local_log_config_tx: watch::Sender<local_logs::LocalLogConfig>,
@@ -240,6 +242,7 @@ impl DaemonRuntime {
             config_mutation: Mutex::new(()),
             storage,
             refresh,
+            import_jobs: Arc::new(ImportJobs::new()),
             notifications,
             poll_schedule_tx,
             local_log_config_tx,
