@@ -67,6 +67,58 @@
       ],
       "type": "string"
     },
+    "AccountImportPreview": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "default_mode": {
+          "$ref": "#/$defs/ImportMode"
+        },
+        "default_options": {
+          "$ref": "#/$defs/ImportOptions"
+        },
+        "destination": {
+          "type": "string"
+        },
+        "has_managed_config_dir": {
+          "type": "boolean"
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "source_claude_json": {
+          "type": "string"
+        },
+        "source_home": {
+          "type": "string"
+        },
+        "source_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toggles": {
+          "items": {
+            "$ref": "#/$defs/ImportToggleSize"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id",
+        "source_home",
+        "source_claude_json",
+        "destination",
+        "has_managed_config_dir",
+        "default_mode",
+        "default_options",
+        "toggles"
+      ],
+      "type": "object"
+    },
     "AccountLaunchSettingsResponse": {
       "properties": {
         "account_id": {
@@ -274,6 +326,7 @@
         "unknown_provider",
         "unknown_account",
         "unknown_refresh_job",
+        "unknown_import_job",
         "unsupported_operation",
         "conflict",
         "storage_unavailable",
@@ -461,6 +514,149 @@
         "exhausted"
       ],
       "type": "string"
+    },
+    "ImportJob": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "failure_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ImportMode"
+        },
+        "options": {
+          "$ref": "#/$defs/ImportOptions"
+        },
+        "progress_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ImportJobStatus"
+        }
+      },
+      "required": [
+        "id",
+        "account_id",
+        "provider_id",
+        "status",
+        "mode",
+        "options",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "ImportJobStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "ImportMode": {
+      "enum": [
+        "prefs_only",
+        "replace"
+      ],
+      "type": "string"
+    },
+    "ImportOptions": {
+      "properties": {
+        "file_history": {
+          "type": "boolean"
+        },
+        "plugins": {
+          "type": "boolean"
+        },
+        "prefs": {
+          "default": true,
+          "type": "boolean"
+        },
+        "project_transcripts": {
+          "type": "boolean"
+        },
+        "project_trust": {
+          "default": true,
+          "type": "boolean"
+        },
+        "prompt_history": {
+          "default": true,
+          "type": "boolean"
+        },
+        "sessions": {
+          "type": "boolean"
+        },
+        "tasks_teams": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ImportToggleSize": {
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "enabled_by_default": {
+          "type": "boolean"
+        },
+        "key": {
+          "type": "string"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supported": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "enabled_by_default",
+        "supported"
+      ],
+      "type": "object"
     },
     "LaunchEffort": {
       "enum": [
@@ -725,6 +921,9 @@
     "ProviderCapabilities": {
       "properties": {
         "add_account": {
+          "type": "boolean"
+        },
+        "import_account_data": {
           "type": "boolean"
         },
         "launch_account": {
@@ -1908,6 +2107,54 @@
       "required": [
         "type",
         "settings"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "preview": {
+          "$ref": "#/$defs/AccountImportPreview"
+        },
+        "type": {
+          "const": "account_import_preview",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "preview"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/ImportJob"
+        },
+        "type": {
+          "const": "import_started",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job": {
+          "$ref": "#/$defs/ImportJob"
+        },
+        "type": {
+          "const": "import_job",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "job"
       ],
       "type": "object"
     },

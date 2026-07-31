@@ -621,6 +621,29 @@ impl DaemonRuntime {
             .await
     }
 
+    pub async fn preview_account_import(
+        &self,
+        _account_id: usage_core::AccountId,
+    ) -> anyhow::Result<usage_core::AccountImportPreview> {
+        anyhow::bail!("not implemented")
+    }
+
+    pub async fn import_account_data(
+        &self,
+        _account_id: usage_core::AccountId,
+        _options: usage_core::ImportOptions,
+        _mode: usage_core::ImportMode,
+    ) -> anyhow::Result<usage_core::ImportJob> {
+        anyhow::bail!("not implemented")
+    }
+
+    pub async fn get_import_job(
+        &self,
+        _job_id: &usage_core::ImportJobId,
+    ) -> anyhow::Result<Option<usage_core::ImportJob>> {
+        anyhow::bail!("not implemented")
+    }
+
     fn publish_local_log_config(&self, config: &Config) {
         self.local_log_config_tx
             .send_replace(local_logs::LocalLogConfig::from_config(config));

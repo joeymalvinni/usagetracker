@@ -1,5 +1,44 @@
 {
   "$defs": {
+    "ImportMode": {
+      "enum": [
+        "prefs_only",
+        "replace"
+      ],
+      "type": "string"
+    },
+    "ImportOptions": {
+      "properties": {
+        "file_history": {
+          "type": "boolean"
+        },
+        "plugins": {
+          "type": "boolean"
+        },
+        "prefs": {
+          "default": true,
+          "type": "boolean"
+        },
+        "project_transcripts": {
+          "type": "boolean"
+        },
+        "project_trust": {
+          "default": true,
+          "type": "boolean"
+        },
+        "prompt_history": {
+          "default": true,
+          "type": "boolean"
+        },
+        "sessions": {
+          "type": "boolean"
+        },
+        "tasks_teams": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "LaunchEffort": {
       "enum": [
         "low",
@@ -566,6 +605,66 @@
       "required": [
         "method",
         "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "preview_account_import",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "import_account_data",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ImportMode",
+          "default": "prefs_only"
+        },
+        "options": {
+          "$ref": "#/$defs/ImportOptions",
+          "default": {
+            "prefs": true,
+            "project_trust": true,
+            "prompt_history": true
+          }
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "get_import_job",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "job_id"
       ],
       "type": "object"
     }

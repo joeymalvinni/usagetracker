@@ -448,6 +448,37 @@ impl SocketServer {
                     }
                 }
             }
+            ApiRequest::PreviewAccountImport { account_id } => {
+                match self.runtime.preview_account_import(account_id).await {
+                    Ok(preview) => ApiResponse::AccountImportPreview { preview },
+                    Err(err) => map_import_error(err),
+                }
+            }
+            ApiRequest::ImportAccountData {
+                account_id,
+                options,
+                mode,
+            } => match self
+                .runtime
+                .import_account_data(account_id, options, mode)
+                .await
+            {
+                Ok(job) => ApiResponse::ImportStarted { job },
+                Err(err) => map_import_error(err),
+            },
+            ApiRequest::GetImportJob { job_id } => {
+                match self.runtime.get_import_job(&job_id).await {
+                    Ok(Some(job)) => ApiResponse::ImportJob { job },
+                    Ok(None) => ApiResponse::error(
+                        ApiErrorCode::UnknownImportJob,
+                        format!("unknown import job: {}", job_id.as_str()),
+                    ),
+                    Err(err) => ApiResponse::error(
+                        ApiErrorCode::StorageUnavailable,
+                        err.to_string(),
+                    ),
+                }
+            }
         }
     }
 
@@ -876,6 +907,11 @@ fn launch_failure_response(err: anyhow::Error) -> ApiResponse {
     } else {
         ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
     }
+}
+
+fn map_import_error(err: anyhow::Error) -> ApiResponse {
+    warn!(error = %err, "import request failed");
+    ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
 }
 
 #[cfg(test)]

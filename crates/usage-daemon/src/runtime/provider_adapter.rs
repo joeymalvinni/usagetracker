@@ -308,6 +308,23 @@ pub(crate) trait LaunchHandler: Send + Sync {
 }
 
 #[async_trait]
+pub(crate) trait ImportHandler: Send + Sync {
+    async fn preview(
+        &self,
+        runtime: ProviderRuntime<'_>,
+        account: Account,
+    ) -> anyhow::Result<usage_core::AccountImportPreview>;
+
+    async fn start_import(
+        &self,
+        runtime: ProviderRuntime<'_>,
+        account: Account,
+        options: usage_core::ImportOptions,
+        mode: usage_core::ImportMode,
+    ) -> anyhow::Result<usage_core::ImportJob>;
+}
+
+#[async_trait]
 pub(crate) trait SetupHandler: Send + Sync {
     async fn get_setup(
         &self,
@@ -391,6 +408,10 @@ pub(crate) trait ProviderAdapter: Send + Sync {
         None
     }
 
+    fn import_handler(&self) -> Option<&dyn ImportHandler> {
+        None
+    }
+
     fn setup_handler(&self) -> Option<&dyn SetupHandler> {
         None
     }
@@ -442,6 +463,7 @@ pub(crate) trait ProviderAdapter: Send + Sync {
                 // intentionally derive from the same generic setup handler.
                 setup: self.setup_handler().is_some(),
                 workspace_setup: self.setup_handler().is_some(),
+                import_account_data: self.import_handler().is_some(),
             },
         }
     }

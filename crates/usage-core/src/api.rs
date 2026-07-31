@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Account, AccountId, ProviderHealth, ProviderId, RefreshJobId, UsageDashboardSummary,
-    UsageForecast, UsageSnapshot, UsageWindowProvenance,
+    Account, AccountId, ImportJobId, ProviderHealth, ProviderId, RefreshJobId,
+    UsageDashboardSummary, UsageForecast, UsageSnapshot, UsageWindowProvenance,
 };
 
 pub const API_VERSION: u16 = 3;
@@ -129,6 +129,19 @@ pub enum ApiRequest {
     GetAccountLaunchSettings {
         account_id: AccountId,
     },
+    PreviewAccountImport {
+        account_id: AccountId,
+    },
+    ImportAccountData {
+        account_id: AccountId,
+        #[serde(default)]
+        options: ImportOptions,
+        #[serde(default)]
+        mode: ImportMode,
+    },
+    GetImportJob {
+        job_id: ImportJobId,
+    },
 }
 
 impl ApiRequest {
@@ -155,6 +168,9 @@ impl ApiRequest {
                 | "repair_provider"
                 | "launch_provider_account"
                 | "get_account_launch_settings"
+                | "preview_account_import"
+                | "import_account_data"
+                | "get_import_job"
         )
     }
 }
@@ -196,6 +212,133 @@ pub struct LaunchFlags {
     pub effort: Option<LaunchEffort>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub dangerously_skip_permissions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportMode {
+    #[default]
+    PrefsOnly,
+    Replace,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct ImportOptions {
+    #[serde(default = "default_true")]
+    pub prefs: bool,
+    #[serde(default = "default_true")]
+    pub project_trust: bool,
+    #[serde(default = "default_true")]
+    pub prompt_history: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plugins: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub project_transcripts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub file_history: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tasks_teams: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sessions: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self::comfort_defaults()
+    }
+}
+
+impl ImportOptions {
+    pub fn comfort_defaults() -> Self {
+        Self {
+            prefs: true,
+            project_trust: true,
+            prompt_history: true,
+            plugins: false,
+            project_transcripts: false,
+            file_history: false,
+            tasks_teams: false,
+            sessions: false,
+        }
+    }
+
+    /// PR2 rejects any stretch toggle that would import plugins/transcripts/etc.
+    pub fn ensure_pr2_supported(&self) -> Result<(), String> {
+        if self.plugins {
+            return Err("plugin import is not supported yet".into());
+        }
+        if self.project_transcripts {
+            return Err("project transcript import is not supported yet".into());
+        }
+        if self.file_history {
+            return Err("file-history import is not supported yet".into());
+        }
+        if self.tasks_teams {
+            return Err("tasks/teams import is not supported yet".into());
+        }
+        if self.sessions {
+            return Err("sessions import is not supported yet".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl ImportJobStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct ImportJob {
+    pub id: ImportJobId,
+    pub account_id: AccountId,
+    pub provider_id: ProviderId,
+    pub status: ImportJobStatus,
+    pub mode: ImportMode,
+    pub options: ImportOptions,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct ImportToggleSize {
+    pub key: String,
+    pub enabled_by_default: bool,
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AccountImportPreview {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    pub source_home: String,
+    pub source_claude_json: String,
+    pub destination: String,
+    pub has_managed_config_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
+    pub default_mode: ImportMode,
+    pub default_options: ImportOptions,
+    pub toggles: Vec<ImportToggleSize>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -396,6 +539,15 @@ pub enum ApiResponse {
     AccountLaunchSettings {
         settings: AccountLaunchSettingsResponse,
     },
+    AccountImportPreview {
+        preview: AccountImportPreview,
+    },
+    ImportStarted {
+        job: ImportJob,
+    },
+    ImportJob {
+        job: ImportJob,
+    },
     Error {
         error: ApiErrorResponse,
     },
@@ -473,6 +625,8 @@ pub struct ProviderCapabilities {
     pub setup: bool,
     /// Deprecated alias retained for v3 clients.
     pub workspace_setup: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub import_account_data: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -692,6 +846,7 @@ pub enum ApiErrorCode {
     UnknownProvider,
     UnknownAccount,
     UnknownRefreshJob,
+    UnknownImportJob,
     UnsupportedOperation,
     Conflict,
     StorageUnavailable,
@@ -710,6 +865,7 @@ impl ApiErrorCode {
             Self::UnknownProvider => "unknown_provider",
             Self::UnknownAccount => "unknown_account",
             Self::UnknownRefreshJob => "unknown_refresh_job",
+            Self::UnknownImportJob => "unknown_import_job",
             Self::UnsupportedOperation => "unsupported_operation",
             Self::Conflict => "conflict",
             Self::StorageUnavailable => "storage_unavailable",
@@ -1006,6 +1162,55 @@ mod tests {
         let settings = bare_value["settings"].as_object().unwrap();
         assert!(settings.get("working_directory").is_none());
         assert!(settings.get("launch").is_none());
+    }
+
+    #[test]
+    fn import_methods_are_supported_and_round_trip() {
+        assert!(ApiRequest::supports_method("preview_account_import"));
+        assert!(ApiRequest::supports_method("import_account_data"));
+        assert!(ApiRequest::supports_method("get_import_job"));
+
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"import_account_data","account_id":"account-1","options":{"prefs":true,"project_trust":true,"prompt_history":true},"mode":"prefs_only"}"#,
+        )
+        .unwrap();
+        let ApiRequest::ImportAccountData {
+            account_id,
+            options,
+            mode,
+        } = request.request
+        else {
+            panic!("unexpected request");
+        };
+        assert_eq!(account_id.as_str(), "account-1");
+        assert!(options.prefs);
+        assert!(options.project_trust);
+        assert!(options.prompt_history);
+        assert!(!options.plugins);
+        assert!(!options.project_transcripts);
+        assert_eq!(mode, ImportMode::PrefsOnly);
+
+        let response = ResponseEnvelope::new(ApiResponse::ImportStarted {
+            job: ImportJob {
+                id: ImportJobId::new("import-1"),
+                account_id: AccountId::new("account-1"),
+                provider_id: ProviderId::new("claude"),
+                status: ImportJobStatus::Queued,
+                mode: ImportMode::PrefsOnly,
+                options: ImportOptions::comfort_defaults(),
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                started_at: None,
+                finished_at: None,
+                progress_message: None,
+                failure_message: None,
+            },
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "import_started");
+        assert_eq!(value["job"]["status"], "queued");
+        assert_eq!(value["job"]["mode"], "prefs_only");
     }
 
     #[test]
