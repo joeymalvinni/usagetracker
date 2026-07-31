@@ -1358,6 +1358,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_rejects_missing_or_unmanaged_config_dir_as_invalid_argument() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+
+        let missing = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude.id.clone(),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = missing else {
+            panic!("expected invalid-argument error for missing config dir, got {missing:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+        assert!(error.message.contains("managed Claude config directory"));
+
+        let home = dirs::home_dir().expect("home directory");
+        let mut profile = crate::config::ProviderProfileConfig {
+            id: Some("joeymalvinni".to_string()),
+            ..Default::default()
+        };
+        crate::providers::claude::settings::update_profile(&mut profile, |settings| {
+            settings.claude_config_dir = Some(home.join(".claude"));
+        })
+        .unwrap();
+        let env2 = test_env(BTreeMap::from([(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: true,
+                profiles: vec![profile],
+                ..Default::default()
+            },
+        )]));
+        crate::fixtures::seed(
+            &env2.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server2 = SocketServer::new(env2.runtime.clone());
+        let ApiResponse::Accounts { accounts } =
+            server2.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude2 = accounts
+            .iter()
+            .find(|account| {
+                account.provider_id.as_str() == "claude"
+                    && account.profile_id.as_deref() == Some("joeymalvinni")
+            })
+            .expect("fixture claude account with joeymalvinni profile");
+
+        let unmanaged = server2
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude2.id.clone(),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = unmanaged else {
+            panic!("expected invalid-argument error for unmanaged config dir, got {unmanaged:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+        assert!(error.message.contains("managed Claude profiles"));
+
+        let _ = std::fs::remove_dir_all(env.root);
+        let _ = std::fs::remove_dir_all(env2.root);
+    }
+
+    #[tokio::test]
     async fn serves_fixture_accounts_usage_and_notifications_over_socket() {
         let env = test_env(BTreeMap::new());
         crate::fixtures::seed(

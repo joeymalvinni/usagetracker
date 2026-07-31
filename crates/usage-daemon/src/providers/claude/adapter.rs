@@ -731,6 +731,9 @@ impl ImportHandler for ClaudeAdapter {
                 })
                 .await
                 .map_err(|err| anyhow::anyhow!("import worker task failed: {err}"))??;
+                // The managed dir may already contain copied files if persist
+                // fails below; we still mark the job Failed (not Completed) so
+                // bookkeeping stays honest. A retry re-runs replace/prefs_only.
                 persist_local_import(
                     runtime_for_persist,
                     profile_id,
@@ -756,14 +759,18 @@ async fn persist_local_import(
     runtime
         .mutate_config(|config| {
             let Some(provider) = config.providers.get_mut(PROVIDER_ID) else {
-                return Ok(());
+                anyhow::bail!(
+                    "Claude profile {profile_id} is no longer available to save import state"
+                );
             };
             let Some(profile) = provider
                 .profiles
                 .iter_mut()
                 .find(|profile| is_active_profile(profile, &profile_id))
             else {
-                return Ok(());
+                anyhow::bail!(
+                    "Claude profile {profile_id} is no longer available to save import state"
+                );
             };
             settings::update_profile(profile, |profile_settings| {
                 profile_settings.local_import = Some(settings::ClaudeLocalImportSettings {
@@ -780,7 +787,12 @@ async fn persist_local_import(
             Ok(())
         })
         .await
-        .context("the Claude import completed, but saving import bookkeeping failed")
+        .with_context(|| {
+            format!(
+                "the Claude import copy already applied, but saving import bookkeeping failed \
+                 for profile {profile_id}"
+            )
+        })
 }
 
 async fn prepare_login_profile(
