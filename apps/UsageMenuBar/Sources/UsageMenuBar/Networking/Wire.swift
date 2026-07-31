@@ -23,6 +23,9 @@ enum DaemonRequest: Encodable {
         rememberDangerouslySkipPermissions: Bool
     )
     case getAccountLaunchSettings(accountId: String)
+    case previewAccountImport(accountId: String)
+    case importAccountData(accountId: String, options: ImportOptions, mode: ImportMode)
+    case getImportJob(String)
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: K.self)
         try c.encode(DaemonWireProtocol.currentVersion, forKey: .apiVersion)
@@ -82,11 +85,22 @@ enum DaemonRequest: Encodable {
         case .getAccountLaunchSettings(let accountId):
             try c.encode("get_account_launch_settings", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
+        case .previewAccountImport(let accountId):
+            try c.encode("preview_account_import", forKey: .method)
+            try c.encode(accountId, forKey: .accountId)
+        case .importAccountData(let accountId, let options, let mode):
+            try c.encode("import_account_data", forKey: .method)
+            try c.encode(accountId, forKey: .accountId)
+            try c.encode(options, forKey: .options)
+            try c.encode(mode, forKey: .mode)
+        case .getImportJob(let jobId):
+            try c.encode("get_import_job", forKey: .method)
+            try c.encode(jobId, forKey: .jobId)
         }
     }
     enum K: String, CodingKey {
         case apiVersion = "api_version"
-        case method, providers, notifications, hidden, ids, settings, launch
+        case method, providers, notifications, hidden, ids, settings, launch, options, mode
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
@@ -174,6 +188,7 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
     let repair: Bool
     let launchAccount: Bool
     let launchOptions: Bool
+    let importAccountData: Bool
     let setup: Bool
     let workspaceSetup: Bool
 
@@ -183,6 +198,7 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
         repair: Bool,
         launchAccount: Bool,
         launchOptions: Bool = false,
+        importAccountData: Bool = false,
         workspaceSetup: Bool,
         setup: Bool? = nil
     ) {
@@ -191,6 +207,7 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
         self.repair = repair
         self.launchAccount = launchAccount
         self.launchOptions = launchOptions
+        self.importAccountData = importAccountData
         self.workspaceSetup = workspaceSetup
         self.setup = setup ?? workspaceSetup
     }
@@ -202,12 +219,14 @@ struct ProviderCapabilities: Decodable, Equatable, Sendable {
         repair = try c.decode(Bool.self, forKey: .repair)
         launchAccount = try c.decode(Bool.self, forKey: .launchAccount)
         launchOptions = try c.decodeIfPresent(Bool.self, forKey: .launchOptions) ?? false
+        importAccountData = try c.decodeIfPresent(Bool.self, forKey: .importAccountData) ?? false
         workspaceSetup = try c.decode(Bool.self, forKey: .workspaceSetup)
         setup = try c.decodeIfPresent(Bool.self, forKey: .setup) ?? workspaceSetup
     }
 
     private enum CodingKeys: String, CodingKey {
-        case multipleAccounts, addAccount, repair, launchAccount, launchOptions, setup, workspaceSetup
+        case multipleAccounts, addAccount, repair, launchAccount, launchOptions
+        case importAccountData, setup, workspaceSetup
     }
 }
 
@@ -227,6 +246,9 @@ enum DaemonResponse: Decodable {
     case addProviderAccount(AddProviderAccountResponse), account(Account), accountDeleted(String)
     case providerSetup(ProviderSetupResponse), providerAction(ProviderActionResponse), error(ApiError)
     case accountLaunchSettings(AccountLaunchSettingsResponse)
+    case accountImportPreview(AccountImportPreview)
+    case importStarted(ImportJob)
+    case importJob(ImportJob)
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         let version = try c.decodeIfPresent(Int.self, forKey: .apiVersion)
@@ -261,12 +283,18 @@ enum DaemonResponse: Decodable {
             self = .accountLaunchSettings(
                 try c.decode(AccountLaunchSettingsResponse.self, forKey: .settings)
             )
+        case "account_import_preview":
+            self = .accountImportPreview(try c.decode(AccountImportPreview.self, forKey: .preview))
+        case "import_started":
+            self = .importStarted(try c.decode(ImportJob.self, forKey: .job))
+        case "import_job":
+            self = .importJob(try c.decode(ImportJob.self, forKey: .job))
         default: throw DecodingError.dataCorrupted(.init(codingPath: c.codingPath, debugDescription: "unknown response"))
         }
     }
     enum K: String, CodingKey {
         case apiVersion, type, snapshots, health, accounts, config, notifications, ids
-        case server, state, job, coalesced, account, setup, action, error, accountId, settings
+        case server, state, job, coalesced, account, setup, action, error, accountId, settings, preview
     }
 }
 

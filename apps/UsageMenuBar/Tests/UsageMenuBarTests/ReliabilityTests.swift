@@ -371,6 +371,115 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertTrue(settings.hasManagedConfigDir)
     }
 
+    func testDecodesAccountImportPreviewFixture() throws {
+        let url = rustWireFixture("account_import_preview_v3.json")
+        let response = try JSONDecoder.usage.decode(DaemonResponse.self, from: Data(contentsOf: url))
+        guard case let .accountImportPreview(preview) = response else {
+            return XCTFail("expected account import preview")
+        }
+        XCTAssertEqual(preview.providerId, "claude")
+        XCTAssertEqual(preview.accountId, "account-1")
+        XCTAssertEqual(preview.sourceHome, "/Users/demo/.claude")
+        XCTAssertEqual(preview.sourceClaudeJson, "/Users/demo/.claude.json")
+        XCTAssertEqual(preview.destination, "/Users/demo/.usagetracker/profiles/claude/account-1")
+        XCTAssertTrue(preview.hasManagedConfigDir)
+        XCTAssertEqual(preview.sourceIdentity, "550e8400-e29b-41d4-a716-446655440000")
+        XCTAssertEqual(preview.defaultMode, .prefsOnly)
+        XCTAssertTrue(preview.defaultOptions.prefs)
+        XCTAssertTrue(preview.defaultOptions.projectTrust)
+        XCTAssertTrue(preview.defaultOptions.promptHistory)
+        XCTAssertEqual(preview.toggles.count, 8)
+        XCTAssertEqual(preview.toggles[0].key, "prefs")
+        XCTAssertTrue(preview.toggles[0].enabledByDefault)
+        XCTAssertTrue(preview.toggles[0].supported)
+        XCTAssertEqual(preview.toggles[3].key, "plugins")
+        XCTAssertFalse(preview.toggles[3].supported)
+        XCTAssertEqual(
+            preview.toggles[3].note,
+            "plugins require a path rewrite and are not imported yet"
+        )
+    }
+
+    func testDecodesImportJobFixture() throws {
+        let url = rustWireFixture("import_job_v3.json")
+        let response = try JSONDecoder.usage.decode(DaemonResponse.self, from: Data(contentsOf: url))
+        guard case let .importJob(job) = response else {
+            return XCTFail("expected import job")
+        }
+        XCTAssertEqual(job.id, "fixture-import-1")
+        XCTAssertEqual(job.accountId, "account-1")
+        XCTAssertEqual(job.providerId, "claude")
+        XCTAssertEqual(job.status, .completed)
+        XCTAssertEqual(job.mode, .prefsOnly)
+        XCTAssertTrue(job.options.prefs)
+        XCTAssertTrue(job.options.projectTrust)
+        XCTAssertTrue(job.options.promptHistory)
+        XCTAssertTrue(job.status.isTerminal)
+    }
+
+    func testEncodesImportAccountDataRequest() throws {
+        let request = DaemonRequest.importAccountData(
+            accountId: "account-1",
+            options: ImportOptions(),
+            mode: .prefsOnly
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(request)) as? [String: Any]
+        )
+        XCTAssertEqual(object["method"] as? String, "import_account_data")
+        XCTAssertEqual(object["account_id"] as? String, "account-1")
+        XCTAssertEqual(object["mode"] as? String, "prefs_only")
+        let options = try XCTUnwrap(object["options"] as? [String: Any])
+        XCTAssertEqual(options["prefs"] as? Bool, true)
+        XCTAssertEqual(options["project_trust"] as? Bool, true)
+        XCTAssertEqual(options["prompt_history"] as? Bool, true)
+        XCTAssertNil(options["plugins"])
+
+        let preview = DaemonRequest.previewAccountImport(accountId: "account-1")
+        let previewObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(preview)) as? [String: Any]
+        )
+        XCTAssertEqual(previewObject["method"] as? String, "preview_account_import")
+        XCTAssertEqual(previewObject["account_id"] as? String, "account-1")
+    }
+
+    func testPollsImportJobWithoutHoldingTheImportSocketOpen() async throws {
+        let transport = RecordingTransport(responses: [
+            """
+            {"api_version":3,"type":"import_started","job":{"id":"import-1","account_id":"account-1","provider_id":"claude","status":"running","mode":"prefs_only","options":{"prefs":true,"project_trust":true,"prompt_history":true},"created_at":"2026-07-22T00:00:00Z","started_at":"2026-07-22T00:00:01Z","finished_at":null}}
+            """,
+            """
+            {"api_version":3,"type":"import_job","job":{"id":"import-1","account_id":"account-1","provider_id":"claude","status":"completed","mode":"prefs_only","options":{"prefs":true,"project_trust":true,"prompt_history":true},"created_at":"2026-07-22T00:00:00Z","started_at":"2026-07-22T00:00:01Z","finished_at":"2026-07-22T00:00:02Z"}}
+            """,
+        ])
+        let client = DaemonClient(
+            socketPath: "/tmp/usage.sock",
+            transport: transport,
+            refreshPollInterval: .zero,
+            refreshWaitTimeout: .seconds(1)
+        )
+
+        let started = try await client.importAccountData(
+            accountId: "account-1",
+            options: ImportOptions(),
+            mode: .prefsOnly
+        )
+        let completed = try await client.waitForImport(started)
+        XCTAssertEqual(completed.status, .completed)
+
+        let recorded = await transport.allRequests()
+        XCTAssertEqual(recorded.count, 2)
+        let start = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(recorded[0].utf8)) as? [String: Any]
+        )
+        let poll = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(recorded[1].utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(start["method"] as? String, "import_account_data")
+        XCTAssertEqual(poll["method"] as? String, "get_import_job")
+        XCTAssertEqual(poll["job_id"] as? String, "import-1")
+    }
+
     func testGenericProviderSetupCanExplicitlyClearAValue() throws {
         let request = DaemonRequest.updateProviderSetup(
             providerId: "future_provider",
@@ -468,6 +577,7 @@ final class DaemonClientTests: XCTestCase {
         let claude = try XCTUnwrap(providers["claude"]?.capabilities)
         XCTAssertTrue(claude.launchAccount)
         XCTAssertTrue(claude.launchOptions)
+        XCTAssertTrue(claude.importAccountData)
         XCTAssertFalse(try XCTUnwrap(providers["grok"]?.capabilities).launchAccount)
 
         let openCode = try XCTUnwrap(providers["opencode_go"]?.capabilities)
