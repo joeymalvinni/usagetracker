@@ -25,8 +25,7 @@ use crate::{
             create_managed_claude_profile, ensure_claude_login_profile, pending_claude_profile,
             ClaudeLoginTarget,
         },
-        ProviderCollector, ProviderError, ProviderErrorKind, HTTP_CONNECT_TIMEOUT,
-        HTTP_REQUEST_TIMEOUT,
+        ProviderCollector, ProviderError, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
     },
     runtime::{
         managed_profiles,
@@ -450,13 +449,11 @@ impl LaunchHandler for ClaudeAdapter {
                 .unwrap_or_else(|| config_dir.join(".credentials.json"));
 
             let api = ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?;
-            if let Err(err) = credentials::sync_for_launch(
-                service,
-                keychain_account,
-                credentials_file,
-                |creds| api.refresh_credentials(creds),
-            )
-            .await
+            if let Err(err) =
+                credentials::sync_for_launch(service, keychain_account, credentials_file, |creds| {
+                    api.refresh_credentials(creds)
+                })
+                .await
             {
                 let target = prepare_login_profile(runtime, Some(&account.id)).await?;
                 let login = launchers::launch_claude_login(target.config_dir.as_deref())?;
@@ -872,6 +869,7 @@ async fn prepare_login_profile(
 mod tests {
     use super::*;
     use crate::config::ProviderProfileConfig;
+    use crate::providers::ProviderErrorKind;
 
     fn saved_settings(
         working_directory: Option<&str>,

@@ -118,30 +118,27 @@ fn invalidate_keychain_cache_for_launch(
 }
 
 #[cfg(test)]
-fn test_keychain_sync_hook(
-) -> Option<
-    fn(
-        &str,
-        &str,
-        &str,
-    ) -> Result<(), ProviderError>,
-> {
+type KeychainSyncHook = fn(&str, &str, &str) -> Result<(), ProviderError>;
+
+#[cfg(test)]
+type KeychainInvalidateHook = fn(&str, &str) -> Result<(), ProviderError>;
+
+#[cfg(test)]
+fn test_keychain_sync_hook() -> Option<KeychainSyncHook> {
     TEST_KEYCHAIN_SYNC_FN.with(|hook| *hook.borrow())
 }
 
 #[cfg(test)]
-fn test_keychain_invalidate_hook() -> Option<fn(&str, &str) -> Result<(), ProviderError>> {
+fn test_keychain_invalidate_hook() -> Option<KeychainInvalidateHook> {
     TEST_KEYCHAIN_INVALIDATE_FN.with(|hook| *hook.borrow())
 }
 
 #[cfg(test)]
 thread_local! {
-    static TEST_KEYCHAIN_SYNC_FN: std::cell::RefCell<
-        Option<fn(&str, &str, &str) -> Result<(), ProviderError>>,
-    > = const { std::cell::RefCell::new(None) };
-    static TEST_KEYCHAIN_INVALIDATE_FN: std::cell::RefCell<
-        Option<fn(&str, &str) -> Result<(), ProviderError>>,
-    > = const { std::cell::RefCell::new(None) };
+    static TEST_KEYCHAIN_SYNC_FN: std::cell::RefCell<Option<KeychainSyncHook>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_KEYCHAIN_INVALIDATE_FN: std::cell::RefCell<Option<KeychainInvalidateHook>> =
+        const { std::cell::RefCell::new(None) };
     static TEST_KEYCHAIN_WRITES: std::cell::RefCell<Vec<(String, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static TEST_KEYCHAIN_INVALIDATED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
@@ -204,16 +201,14 @@ where
 
     let service = keychain_service.clone();
     let account = keychain_account.clone();
-    tokio::task::spawn_blocking(move || {
-        sync_keychain_for_launch(&service, &account, &contents)
-    })
-    .await
-    .map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::CredentialsInvalid,
-            "Claude credential sync task failed",
-        )
-    })??;
+    tokio::task::spawn_blocking(move || sync_keychain_for_launch(&service, &account, &contents))
+        .await
+        .map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Claude credential sync task failed",
+            )
+        })??;
 
     tokio::task::spawn_blocking(move || {
         invalidate_keychain_cache_for_launch(&keychain_service, &keychain_account)
