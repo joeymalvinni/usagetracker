@@ -671,6 +671,16 @@ impl DaemonRuntime {
                 account.provider_id
             )
         })?;
+        if self
+            .import_jobs
+            .account_has_active_import(&account_id)
+            .await
+        {
+            anyhow::bail!(
+                "an import is already running for account {}",
+                account_id.as_str()
+            );
+        }
         handler
             .start_import(self.clone(), account, options, mode)
             .await
