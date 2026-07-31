@@ -90,6 +90,155 @@ pub(super) async fn save_credentials(
     Ok(credentials)
 }
 
+fn sync_keychain_for_launch(
+    keychain_service: &str,
+    keychain_account: &str,
+    contents: &str,
+) -> Result<(), ProviderError> {
+    #[cfg(test)]
+    if let Some(hook) = test_keychain_sync_hook() {
+        return hook(keychain_service, keychain_account, contents);
+    }
+
+    keychain::set_password_if_changed(keychain_service, keychain_account, contents)
+        .map_err(keychain_save_error)
+}
+
+fn invalidate_keychain_cache_for_launch(
+    keychain_service: &str,
+    keychain_account: &str,
+) -> Result<(), ProviderError> {
+    #[cfg(test)]
+    if let Some(hook) = test_keychain_invalidate_hook() {
+        return hook(keychain_service, keychain_account);
+    }
+
+    keychain::invalidate_password_cache(keychain_service, keychain_account)
+        .map_err(keychain_save_error)
+}
+
+#[cfg(test)]
+fn test_keychain_sync_hook(
+) -> Option<
+    fn(
+        &str,
+        &str,
+        &str,
+    ) -> Result<(), ProviderError>,
+> {
+    TEST_KEYCHAIN_SYNC_FN.with(|hook| *hook.borrow())
+}
+
+#[cfg(test)]
+fn test_keychain_invalidate_hook() -> Option<fn(&str, &str) -> Result<(), ProviderError>> {
+    TEST_KEYCHAIN_INVALIDATE_FN.with(|hook| *hook.borrow())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_KEYCHAIN_SYNC_FN: std::cell::RefCell<
+        Option<fn(&str, &str, &str) -> Result<(), ProviderError>>,
+    > = const { std::cell::RefCell::new(None) };
+    static TEST_KEYCHAIN_INVALIDATE_FN: std::cell::RefCell<
+        Option<fn(&str, &str) -> Result<(), ProviderError>>,
+    > = const { std::cell::RefCell::new(None) };
+    static TEST_KEYCHAIN_WRITES: std::cell::RefCell<Vec<(String, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_KEYCHAIN_INVALIDATED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
+}
+
+#[cfg(test)]
+fn test_record_keychain_sync(
+    service: &str,
+    account: &str,
+    contents: &str,
+) -> Result<(), ProviderError> {
+    TEST_KEYCHAIN_WRITES.with(|writes| {
+        writes.borrow_mut().push((
+            service.to_string(),
+            account.to_string(),
+            contents.to_string(),
+        ));
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_record_keychain_invalidate(_service: &str, _account: &str) -> Result<(), ProviderError> {
+    TEST_KEYCHAIN_INVALIDATED.with(|flag| *flag.borrow_mut() = true);
+    Ok(())
+}
+
+async fn sync_loaded_credentials_to_keychain<F, Fut>(
+    keychain_service: String,
+    keychain_account: String,
+    mut credentials: ClaudeCredentials,
+    refresh: F,
+) -> Result<(), ProviderError>
+where
+    F: FnOnce(ClaudeCredentials) -> Fut,
+    Fut: std::future::Future<Output = Result<ClaudeCredentials, ProviderError>>,
+{
+    if credentials.is_expired() {
+        credentials = refresh(credentials).await?;
+    }
+
+    let contents = credentials.raw.to_string();
+    #[cfg(test)]
+    if test_keychain_sync_hook().is_some() {
+        sync_keychain_for_launch(&keychain_service, &keychain_account, &contents)?;
+        invalidate_keychain_cache_for_launch(&keychain_service, &keychain_account)?;
+        return Ok(());
+    }
+
+    let service = keychain_service.clone();
+    let account = keychain_account.clone();
+    tokio::task::spawn_blocking(move || {
+        sync_keychain_for_launch(&service, &account, &contents)
+    })
+    .await
+    .map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Claude credential sync task failed",
+        )
+    })??;
+
+    tokio::task::spawn_blocking(move || {
+        invalidate_keychain_cache_for_launch(&keychain_service, &keychain_account)
+    })
+    .await
+    .map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Claude credential cache invalidation task failed",
+        )
+    })??;
+
+    Ok(())
+}
+
+pub(super) async fn sync_for_launch<F, Fut>(
+    keychain_service: String,
+    keychain_account: String,
+    credentials_file_path: PathBuf,
+    refresh: F,
+) -> Result<(), ProviderError>
+where
+    F: FnOnce(ClaudeCredentials) -> Fut,
+    Fut: std::future::Future<Output = Result<ClaudeCredentials, ProviderError>>,
+{
+    let credentials = load_credentials(
+        keychain_service.clone(),
+        keychain_account.clone(),
+        credentials_file_path,
+    )
+    .await?;
+
+    sync_loaded_credentials_to_keychain(keychain_service, keychain_account, credentials, refresh)
+        .await
+}
+
 fn save_file_credentials(
     path: &Path,
     expected_contents: &str,
@@ -534,5 +683,184 @@ mod tests {
         assert!(save_file_credentials(&path, "old", br#"{"token":"stale"}"#).is_err());
         save_file_credentials(&path, "{\"token\":\"secret\"}\n", br#"{"token":"new"}"#).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expired_credentials_are_detected_with_skew() {
+        let mut credentials = parse_credentials(
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}"#,
+            "svc",
+            "acct",
+            CredentialSource::Keychain,
+        )
+        .unwrap();
+        assert!(credentials.is_expired());
+        credentials = parse_credentials(
+            &format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{}}}}}"#,
+                chrono::Utc::now().timestamp_millis() + 3_600_000
+            ),
+            "svc",
+            "acct",
+            CredentialSource::Keychain,
+        )
+        .unwrap();
+        assert!(!credentials.is_expired());
+    }
+
+    fn valid_oauth_json(access_token: &str, refresh_token: &str, expires_at_ms: i64) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access_token}","refreshToken":"{refresh_token}","expiresAt":{expires_at_ms},"scopes":[]}}}}"#
+        )
+    }
+
+    struct TestKeychainHooksGuard;
+
+    impl TestKeychainHooksGuard {
+        fn install() -> Self {
+            TEST_KEYCHAIN_WRITES.with(|writes| writes.borrow_mut().clear());
+            TEST_KEYCHAIN_INVALIDATED.with(|flag| *flag.borrow_mut() = false);
+            TEST_KEYCHAIN_SYNC_FN.with(|hook| *hook.borrow_mut() = Some(test_record_keychain_sync));
+            TEST_KEYCHAIN_INVALIDATE_FN
+                .with(|hook| *hook.borrow_mut() = Some(test_record_keychain_invalidate));
+            Self
+        }
+    }
+
+    impl Drop for TestKeychainHooksGuard {
+        fn drop(&mut self) {
+            TEST_KEYCHAIN_SYNC_FN.with(|hook| *hook.borrow_mut() = None);
+            TEST_KEYCHAIN_INVALIDATE_FN.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    mod sync_for_launch_tests {
+        use super::*;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        fn parse_test_credentials(json: &str) -> ClaudeCredentials {
+            parse_credentials(json, "svc", "acct", CredentialSource::Keychain).unwrap()
+        }
+
+        #[tokio::test]
+        async fn sync_for_launch_writes_valid_credentials_without_refresh() {
+            let expires_at = Utc::now().timestamp_millis() + 3_600_000;
+            let json = valid_oauth_json("access", "refresh", expires_at);
+            let credentials = parse_test_credentials(&json);
+            let _guard = TestKeychainHooksGuard::install();
+
+            sync_loaded_credentials_to_keychain(
+                "svc".to_string(),
+                "acct".to_string(),
+                credentials,
+                |_| async {
+                    panic!("refresh should not be called for valid credentials");
+                    #[allow(unreachable_code)]
+                    Ok(parse_test_credentials(""))
+                },
+            )
+            .await
+            .unwrap();
+
+            let recorded = TEST_KEYCHAIN_WRITES.with(|writes| writes.borrow().clone());
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].0, "svc");
+            assert_eq!(recorded[0].1, "acct");
+            assert!(recorded[0].2.contains("\"accessToken\":\"access\""));
+            assert!(recorded[0].2.contains("\"refreshToken\":\"refresh\""));
+            assert!(TEST_KEYCHAIN_INVALIDATED.with(|flag| *flag.borrow()));
+        }
+
+        #[tokio::test]
+        async fn sync_for_launch_refreshes_expired_credentials_before_write() {
+            let json = valid_oauth_json("old-access", "old-refresh", 1);
+            let credentials = parse_test_credentials(&json);
+            let refresh_called = Arc::new(AtomicBool::new(false));
+            let refresh_called_clone = Arc::clone(&refresh_called);
+            let _guard = TestKeychainHooksGuard::install();
+
+            sync_loaded_credentials_to_keychain(
+                "svc".to_string(),
+                "acct".to_string(),
+                credentials,
+                move |credentials| {
+                    let refresh_called = Arc::clone(&refresh_called_clone);
+                    async move {
+                        refresh_called.store(true, Ordering::SeqCst);
+                        credentials.with_refreshed_tokens(TokenRefreshResponse {
+                            access_token: "new-access".to_string(),
+                            refresh_token: Some("new-refresh".to_string()),
+                            expires_in: 3600,
+                            token_type: None,
+                        })
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(refresh_called.load(Ordering::SeqCst));
+            let recorded = TEST_KEYCHAIN_WRITES.with(|writes| writes.borrow().clone());
+            assert_eq!(recorded.len(), 1);
+            assert!(recorded[0].2.contains("\"accessToken\":\"new-access\""));
+            assert!(recorded[0].2.contains("\"refreshToken\":\"new-refresh\""));
+        }
+
+        #[cfg(target_os = "macos")]
+        fn live_keychain_helper_available() -> bool {
+            let service = format!("usage-tracker-test-sync-probe-{}", uuid::Uuid::new_v4());
+            let available = keychain::set_password_if_changed(&service, "probe", "probe").is_ok();
+            if available {
+                let _ = keychain::delete_password(&service, "probe");
+            }
+            available
+        }
+
+        #[cfg(target_os = "macos")]
+        fn test_service_account() -> (String, String) {
+            (
+                format!("usage-tracker-test-sync-{}", uuid::Uuid::new_v4()),
+                "test-account".to_string(),
+            )
+        }
+
+        #[cfg(target_os = "macos")]
+        fn cleanup_keychain(service: &str, account: &str) {
+            let _ = keychain::delete_password(service, account);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn sync_for_launch_round_trips_through_live_keychain() {
+            if !live_keychain_helper_available() {
+                eprintln!("skipping live Keychain sync test: helper unavailable in test binary");
+                return;
+            }
+
+            let (service, account) = test_service_account();
+            let expires_at = Utc::now().timestamp_millis() + 3_600_000;
+            let json = valid_oauth_json("access", "refresh", expires_at);
+            keychain::set_password_if_changed(&service, &account, &json).unwrap();
+
+            sync_for_launch(
+                service.clone(),
+                account.clone(),
+                PathBuf::from("/nonexistent/.credentials.json"),
+                |_| async {
+                    panic!("refresh should not be called for valid credentials");
+                    #[allow(unreachable_code)]
+                    Ok(parse_test_credentials(""))
+                },
+            )
+            .await
+            .unwrap();
+
+            let stored = keychain::get_password(&service, &account).unwrap();
+            assert_eq!(stored, json);
+            cleanup_keychain(&service, &account);
+        }
     }
 }
