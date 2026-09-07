@@ -386,6 +386,9 @@ async fn run_accounts(
             let response = client
                 .request(ApiRequest::LaunchProviderAccount {
                     account_id: AccountId::new(account),
+                    working_directory: None,
+                    launch: None,
+                    remember_dangerously_skip_permissions: false,
                 })
                 .await?;
             print_action_response(response, style, color)

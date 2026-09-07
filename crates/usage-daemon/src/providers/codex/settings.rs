@@ -17,6 +17,22 @@ pub(crate) struct CodexProfileSettings {
     pub(crate) owns_default_codex_activity: bool,
 }
 
+impl CodexProfileSettings {
+    pub(crate) fn resolved_home(&self, default_home: &std::path::Path) -> PathBuf {
+        use crate::providers::paths::expand_home_path;
+        self.codex_home
+            .as_ref()
+            .map(expand_home_path)
+            .or_else(|| {
+                self.auth_path
+                    .as_ref()
+                    .map(expand_home_path)
+                    .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            })
+            .unwrap_or_else(|| default_home.to_path_buf())
+    }
+}
+
 pub(crate) fn validate(config: &ProviderConfig) -> anyhow::Result<()> {
     config.ensure_settings_empty("Codex provider")?;
     for (index, profile) in config.profiles.iter().enumerate() {

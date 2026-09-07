@@ -148,9 +148,61 @@ struct DaemonClient: Sendable {
         ) else { throw DaemonError.badResponse }
         return v
     }
-    func launchProviderAccount(accountId: String) async throws -> ProviderActionResponse {
-        guard case let .providerAction(v) = try await send(.launchProviderAccount(accountId: accountId)) else { throw DaemonError.badResponse }
+    func launchProviderAccount(
+        accountId: String,
+        workingDirectory: String? = nil,
+        launch: LaunchFlags? = nil,
+        rememberDangerouslySkipPermissions: Bool = false
+    ) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(.launchProviderAccount(
+            accountId: accountId,
+            workingDirectory: workingDirectory,
+            launch: launch,
+            rememberDangerouslySkipPermissions: rememberDangerouslySkipPermissions
+        )) else { throw DaemonError.badResponse }
         return v
+    }
+
+    func accountLaunchSettings(accountId: String) async throws -> AccountLaunchSettingsResponse {
+        guard case let .accountLaunchSettings(v) = try await send(.getAccountLaunchSettings(accountId: accountId)) else { throw DaemonError.badResponse }
+        return v
+    }
+
+    func previewAccountImport(accountId: String) async throws -> AccountImportPreview {
+        guard case let .accountImportPreview(v) = try await send(.previewAccountImport(accountId: accountId)) else {
+            throw DaemonError.badResponse
+        }
+        return v
+    }
+
+    func importAccountData(
+        accountId: String,
+        options: ImportOptions,
+        mode: ImportMode
+    ) async throws -> ImportJob {
+        guard case let .importStarted(job) = try await send(.importAccountData(
+            accountId: accountId,
+            options: options,
+            mode: mode
+        )) else {
+            throw DaemonError.badResponse
+        }
+        return job
+    }
+
+    func waitForImport(_ initialJob: ImportJob) async throws -> ImportJob {
+        var job = initialJob
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: refreshWaitTimeout)
+        while !job.status.isTerminal {
+            guard clock.now < deadline else { throw DaemonError.timeout }
+            try await Task.sleep(for: refreshPollInterval)
+            guard case let .importJob(latest) = try await send(.getImportJob(job.id)) else {
+                throw DaemonError.badResponse
+            }
+            job = latest
+        }
+        return job
     }
 
     private func send(_ request: DaemonRequest) async throws -> DaemonResponse {
@@ -175,15 +227,15 @@ struct DaemonClient: Sendable {
 private enum DaemonRequestTimeout {
     static func seconds(for request: DaemonRequest) -> TimeInterval {
         switch request {
-        case .getServerInfo, .getState, .getUsage, .getUsageEvents, .getRefreshJob, .getProviderHealth,
+        case .getServerInfo, .getState, .getUsage, .getUsageEvents, .getRefreshJob, .getImportJob, .getProviderHealth,
              .getAccounts, .getConfig, .getPendingNotifications,
-             .acknowledgeNotifications:
+             .acknowledgeNotifications, .getAccountLaunchSettings, .previewAccountImport:
             3
         case .updateConfig, .updateAccount, .removeAccount, .submitProviderSignInCode,
              .cancelProviderSignIn:
             5
         case .addProviderAccount, .deleteAccount, .repairProvider,
-             .launchProviderAccount:
+             .launchProviderAccount, .importAccountData:
             10
         case .getProviderSetup, .updateProviderSetup:
             20

@@ -543,18 +543,22 @@ fn kill_process_group(process_group: i32) {
 pub(crate) fn write_claude_profile_launcher(
     account_id: &AccountId,
     config_dir: Option<&Path>,
+    working_directory: Option<&Path>,
+    flags: Option<&usage_core::LaunchFlags>,
 ) -> anyhow::Result<PathBuf> {
     let app_dir = default_app_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve ~/.usagetracker directory"))?;
     let launcher_dir = app_dir.join("launchers");
     std::fs::create_dir_all(&launcher_dir)?;
+    // One launcher file per account: concurrent launches last-write-win, which
+    // is acceptable in the single-user local trust model.
     let launcher = launcher_dir.join(format!("claude-{}.command", account_id.as_str()));
     let temporary = launcher_dir.join(format!(
         ".claude-{}.{}.tmp",
         account_id.as_str(),
         uuid::Uuid::new_v4()
     ));
-    let contents = claude_launcher_contents(config_dir);
+    let contents = claude_launcher_contents(config_dir, working_directory, flags);
     let result = (|| -> anyhow::Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -573,7 +577,11 @@ pub(crate) fn write_claude_profile_launcher(
     Ok(launcher)
 }
 
-pub(crate) fn claude_launcher_contents(config_dir: Option<&Path>) -> String {
+pub(crate) fn claude_launcher_contents(
+    config_dir: Option<&Path>,
+    working_directory: Option<&Path>,
+    flags: Option<&usage_core::LaunchFlags>,
+) -> String {
     let profile_setup = match config_dir {
         Some(path) => format!(
             "export CLAUDE_CONFIG_DIR={}\n",
@@ -581,7 +589,33 @@ pub(crate) fn claude_launcher_contents(config_dir: Option<&Path>) -> String {
         ),
         None => "unset CLAUDE_CONFIG_DIR\n".to_string(),
     };
-    format!("#!/bin/zsh -l\nunset CLAUDE_SECURESTORAGE_CONFIG_DIR\n{profile_setup}exec claude\n")
+    let change_directory = match working_directory {
+        // A stale launcher re-run after the directory vanishes must stop,
+        // not exec claude in $HOME with these flags.
+        Some(path) => format!(
+            "cd -- {} || exit 1\n",
+            shell_single_quote(&path.display().to_string())
+        ),
+        None => String::new(),
+    };
+    let mut command = String::from("exec claude");
+    if let Some(flags) = flags {
+        if let Some(model) = &flags.model {
+            command.push_str(&format!(" --model {}", shell_single_quote(model)));
+        }
+        if let Some(effort) = flags.effort {
+            command.push_str(&format!(
+                " --effort {}",
+                shell_single_quote(effort.as_str())
+            ));
+        }
+        if flags.dangerously_skip_permissions {
+            command.push_str(" --dangerously-skip-permissions");
+        }
+    }
+    format!(
+        "#!/bin/zsh -l\nunset CLAUDE_SECURESTORAGE_CONFIG_DIR\n{profile_setup}{change_directory}{command}\n"
+    )
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -624,11 +658,11 @@ mod tests {
 
     #[test]
     fn launcher_quotes_profile_paths_and_clears_legacy_overrides() {
-        let contents = claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")));
+        let contents = claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")), None, None);
         assert!(contents.contains("CLAUDE_CONFIG_DIR='/tmp/Claude'\"'\"'s Work'"));
         assert!(contents.contains("unset CLAUDE_SECURESTORAGE_CONFIG_DIR"));
 
-        let legacy = claude_launcher_contents(None);
+        let legacy = claude_launcher_contents(None, None, None);
         assert!(legacy.contains("unset CLAUDE_CONFIG_DIR"));
     }
 
@@ -741,6 +775,45 @@ mod tests {
         submit_provider_sign_in_code(&provider_id, "replacement").unwrap();
         assert!(replacement.wait().unwrap().success());
         unregister_active_login(&provider_id, generation);
+    }
+
+    #[test]
+    fn launcher_adds_cd_guard_and_structured_flags() {
+        let flags = usage_core::LaunchFlags {
+            model: Some("fable".to_string()),
+            effort: Some(usage_core::LaunchEffort::Xhigh),
+            dangerously_skip_permissions: true,
+        };
+        let contents = claude_launcher_contents(
+            Some(Path::new("/tmp/profile")),
+            Some(Path::new("/tmp/My Project's Code")),
+            Some(&flags),
+        );
+        // cd failure must never fall through to $HOME with dangerous flags.
+        assert!(contents.contains("cd -- '/tmp/My Project'\"'\"'s Code' || exit 1"));
+        assert!(contents.ends_with(
+            "exec claude --model 'fable' --effort 'xhigh' --dangerously-skip-permissions\n"
+        ));
+    }
+
+    #[test]
+    fn launcher_omits_missing_working_directory_and_flags() {
+        let contents = claude_launcher_contents(Some(Path::new("/tmp/profile")), None, None);
+        assert!(!contents.contains("cd -- "));
+        assert!(contents.ends_with("exec claude\n"));
+
+        let default_flags = usage_core::LaunchFlags::default();
+        let bare = claude_launcher_contents(None, None, Some(&default_flags));
+        assert!(bare.ends_with("exec claude\n"));
+    }
+
+    #[test]
+    fn launcher_emits_cd_guard_without_requiring_flags() {
+        // Guards against a future refactor accidentally gating cd emission on
+        // flags being present.
+        let directory_only = claude_launcher_contents(None, Some(Path::new("/tmp/wd")), None);
+        assert!(directory_only.contains("cd -- '/tmp/wd' || exit 1"));
+        assert!(directory_only.ends_with("exec claude\n"));
     }
 
     #[test]

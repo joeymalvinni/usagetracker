@@ -3,6 +3,35 @@ import XCTest
 @testable import UsageMenuBar
 
 final class DashboardBuilderTests: XCTestCase {
+    func testCodexAccountActivityAndMissingLocalCostStayIsolated() throws {
+        let today = DateFormats.dayKey.string(from: Date())
+        let accounts = [account(id: "main", providerId: "codex"), account(id: "second", providerId: "codex")]
+        let snapshots = accounts.map {
+            UsageSnapshot(providerId: "codex", accountId: $0.id, collectedAt: Date(), windows: [])
+        }
+        let provenance = DataProvenance(source: .providerReported, scope: .accountWide,
+            quality: .authoritative, completeness: .complete, confidence: .high)
+        let summaries = zip(accounts, [UInt64(113_897_797), UInt64(8_245)]).map { account, tokens in
+            AccountUsageSummary(providerId: "codex", accountId: account.id,
+                activity: ActivitySummary(provenance: provenance,
+                    days: [DailyUsagePoint(dateKey: today, tokens: tokens, costUsd: nil, pricedTokens: 0, unpricedTokens: 0)],
+                    todayTokens: tokens, lookbackTokens: tokens, lifetimeTokens: tokens),
+                cost: nil, resetCredits: nil)
+        }
+        let output = DashboardBuilder(config: config(providers: ["codex": true]), accounts: accounts,
+            health: [], snapshots: snapshots, forecasts: [],
+            dashboard: UsageDashboardSummary(accounts: summaries, days: [], pricing: .empty, provenance: .empty),
+            windowProvenance: [], ui: UIConfig(), visible: { _ in true }).build()
+        let group = try XCTUnwrap(output.providers.first)
+        let main = try XCTUnwrap(group.subAccounts?.first { $0.accountId == "main" })
+        let second = try XCTUnwrap(group.subAccounts?.first { $0.accountId == "second" })
+        XCTAssertEqual(main.costDashboard.todayTokens, 113_897_797)
+        XCTAssertEqual(second.costDashboard.todayTokens, 8_245)
+        XCTAssertEqual(group.costDashboard.todayTokens, 113_906_042)
+        XCTAssertFalse(second.hasCostData)
+        XCTAssertEqual(second.activitySourceLabel, "Account activity reported by Codex; may include other devices.")
+    }
+
     func testOfflineProviderWithoutCachedUsageRemainsStale() throws {
         let output = DashboardBuilder(
             config: config(providers: ["codex": true]),
@@ -205,6 +234,61 @@ final class DashboardBuilderTests: XCTestCase {
         )
 
         XCTAssertEqual(stale, ["codex", "opencode_go"])
+    }
+
+    func testExpiredWindowTriggersRecoveryEvenWithFreshSnapshot() throws {
+        let now = Date()
+        let expiredWindow = UsageWindow(
+            windowId: "weekly", label: "Weekly", kind: .weekly,
+            used: nil, limit: nil, remaining: nil,
+            percentUsed: 50, percentRemaining: 50,
+            resetAt: now.addingTimeInterval(-14 * 3_600)
+        )
+        let snapshot = UsageSnapshot(
+            providerId: "codex", accountId: "codex-account",
+            collectedAt: now, windows: [expiredWindow]
+        )
+        XCTAssertEqual(AppState.staleProviderIDs(
+            config: config(providers: ["codex": true]), accounts: [],
+            snapshots: [snapshot], now: now
+        ), ["codex"])
+        let output = DashboardBuilder(
+            config: config(providers: ["codex": true]), accounts: [], health: [],
+            snapshots: [snapshot], forecasts: [], dashboard: .empty,
+            windowProvenance: [], ui: UIConfig(), visible: { _ in true }
+        ).build()
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.status, .stale)
+        let window = try XCTUnwrap(provider.windows.first)
+        XCTAssertEqual(window.status, .stale)
+        XCTAssertTrue(window.isMuted)
+        XCTAssertNil(window.forecast)
+        XCTAssertEqual(window.percent, 50) // Retain the last known value; never invent a reset.
+        XCTAssertEqual(window.reset, "Reset passed · awaiting update")
+    }
+
+    func testResetLabelHandlesPastExactAndFutureDeadlines() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        for reset in [now.addingTimeInterval(-50_400), now] {
+            XCTAssertEqual(DateFormats.resetLabel(for: reset, relativeTo: now),
+                           "Reset passed · awaiting update")
+        }
+        XCTAssertTrue(DateFormats.resetLabel(
+            for: now.addingTimeInterval(3_600), relativeTo: now
+        ).hasPrefix("Resets in "))
+        let fresh = UsageSnapshot(
+            providerId: "codex", accountId: "codex-account", collectedAt: now,
+            windows: [UsageWindow(
+                windowId: "weekly", label: "Weekly", kind: .weekly,
+                used: nil, limit: nil, remaining: nil,
+                percentUsed: 50, percentRemaining: 50,
+                resetAt: now.addingTimeInterval(3_600)
+            )]
+        )
+        XCTAssertEqual(AppState.staleProviderIDs(
+            config: config(providers: ["codex": true]), accounts: [],
+            snapshots: [fresh], now: now
+        ), [])
     }
 
     func testSingleAccountNameDoesNotReplaceProviderName() throws {

@@ -264,7 +264,10 @@ struct DashboardBuilder {
             lastSuccessAt: accountVMs.compactMap(\.lastSuccessAt).max(),
             errorDetail: worstAccount?.errorDetail,
             repairRecommended: worstAccount?.repairRecommended ?? false,
-            accountEmail: singleAccount?.accountEmail
+            accountEmail: singleAccount?.accountEmail,
+            activitySourceLabel: singleAccount?.activitySourceLabel,
+            hasCostData: accountVMs.contains(where: \.hasCostData),
+            unpricedModelNames: Array(Set(accountVMs.flatMap(\.unpricedModelNames))).sorted()
         )
     }
 
@@ -326,7 +329,23 @@ struct DashboardBuilder {
             lastSuccessAt: h?.lastSuccessAt,
             errorDetail: h?.lastErrorMessage,
             repairRecommended: h.map(needsCredentialRepair) ?? false,
-            accountEmail: account?.email
+            accountEmail: account?.email,
+            activitySourceLabel: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.activity.map {
+                $0.provenance.source == .providerReported
+                    ? "Account activity reported by \(pretty(providerId)); may include other devices."
+                    : "Activity observed on this Mac."
+            },
+            hasCostData: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.cost.map {
+                (!$0.days.isEmpty || !$0.models.isEmpty)
+                    && ($0.pricing.unpricedTokens == 0 || $0.pricing.pricedTokens > 0)
+            } ?? false,
+            unpricedModelNames: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.cost?.pricing.unpricedModels ?? []
         )
     }
 
@@ -681,6 +700,7 @@ struct DashboardBuilder {
     }
 
     private func window(_ w: UsageWindow, providerId: String, accountId: String) -> WindowVM {
+        let expired = w.resetAt.map { $0 <= Date() } ?? false
         let percent = (w.percentRemaining ?? computedPercent(w)).map { max(0, min(100, $0)) }
         let status: DisplayStatus = percent.map { $0 < 10 ? .critical : ($0 < 25 ? .warning : .normal) } ?? .normal
         let matchingForecast = forecastsByWindow[
@@ -690,15 +710,15 @@ struct DashboardBuilder {
             id: w.id,
             label: w.label,
             value: percent.map { "\(Int($0.rounded()))% left" } ?? amount(w.remaining ?? w.used),
-            reset: w.resetAt.map { "Resets \(DateFormats.expiry.string(from: $0))" } ?? "",
+            reset: expired ? "Reset passed · awaiting update" : w.resetAt.map { "Resets \(DateFormats.expiry.string(from: $0))" } ?? "",
             providerId: providerId,
             providerName: pretty(providerId),
             absolute: absoluteText(w),
             percent: percent,
-            status: status,
+            status: expired ? .stale : status,
             resetAt: w.resetAt,
-            forecast: matchingForecast.map(windowForecast),
-            isMuted: connectivity == .offline
+            forecast: expired ? nil : matchingForecast.map(windowForecast),
+            isMuted: connectivity == .offline || expired
         )
     }
 
@@ -762,7 +782,8 @@ struct DashboardBuilder {
         }
         if connectivity != .offline,
            let latest,
-           Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) {
+           (latest.hasExpiredWindow(at: Date()) ||
+            Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2)) {
             return refreshingProviderIDs.contains(id) ? .refreshing : .stale
         }
         if let percent { return percent < 10 ? .critical : (percent < 25 ? .warning : .normal) }

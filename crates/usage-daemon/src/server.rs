@@ -217,9 +217,42 @@ impl SocketServer {
             Req::CancelProviderSignIn { provider_id } => {
                 self.cancel_provider_sign_in_response(provider_id)
             }
-            Req::LaunchProviderAccount { account_id } => {
-                self.launch_provider_account_response(account_id).await
+            Req::LaunchProviderAccount {
+                account_id,
+                working_directory,
+                launch,
+                remember_dangerously_skip_permissions,
+            } => {
+                let overrides = crate::runtime::provider_adapter::LaunchOverrides {
+                    working_directory,
+                    launch,
+                    remember_dangerously_skip_permissions,
+                };
+                self.launch_provider_account_response(account_id, overrides)
+                    .await
             }
+            Req::GetAccountLaunchSettings { account_id } => {
+                self.account_launch_settings_response(account_id).await
+            }
+            Req::PreviewAccountImport { account_id } => {
+                self.preview_account_import_response(account_id).await
+            }
+            Req::ImportAccountData {
+                account_id,
+                options,
+                mode,
+            } => {
+                self.import_account_data_response(account_id, options, mode)
+                    .await
+            }
+            Req::GetImportJob { job_id } => Ok(match self.runtime.get_import_job(&job_id).await {
+                Ok(Some(job)) => ApiResponse::ImportJob { job },
+                Ok(None) => ApiResponse::error(
+                    ApiErrorCode::UnknownImportJob,
+                    format!("unknown import job: {}", job_id.as_str()),
+                ),
+                Err(err) => storage_error(err),
+            }),
         };
         result.unwrap_or_else(|error| error)
     }
@@ -573,15 +606,65 @@ impl SocketServer {
     async fn launch_provider_account_response(
         &self,
         account_id: AccountId,
+        overrides: crate::runtime::provider_adapter::LaunchOverrides,
     ) -> Result<ApiResponse, ApiResponse> {
         self.require_account(&account_id).await?;
         Ok(
-            match self.runtime.launch_provider_account(account_id).await {
+            match self
+                .runtime
+                .launch_provider_account(account_id, overrides)
+                .await
+            {
                 Ok(action) => ApiResponse::ProviderAction { action },
                 Err(err) => {
                     warn!(error = %err, "provider account launch failed");
-                    ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+                    launch_failure_response(err)
                 }
+            },
+        )
+    }
+
+    async fn account_launch_settings_response(
+        &self,
+        account_id: AccountId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(
+            match self.runtime.account_launch_settings(account_id).await {
+                Ok(settings) => ApiResponse::AccountLaunchSettings { settings },
+                Err(err) => ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string()),
+            },
+        )
+    }
+
+    async fn preview_account_import_response(
+        &self,
+        account_id: AccountId,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(
+            match self.runtime.preview_account_import(account_id).await {
+                Ok(preview) => ApiResponse::AccountImportPreview { preview },
+                Err(err) => map_import_error(err),
+            },
+        )
+    }
+
+    async fn import_account_data_response(
+        &self,
+        account_id: AccountId,
+        options: usage_core::ImportOptions,
+        mode: usage_core::ImportMode,
+    ) -> Result<ApiResponse, ApiResponse> {
+        self.require_account(&account_id).await?;
+        Ok(
+            match self
+                .runtime
+                .import_account_data(account_id, options, mode)
+                .await
+            {
+                Ok(job) => ApiResponse::ImportStarted { job },
+                Err(err) => map_import_error(err),
             },
         )
     }
@@ -1031,6 +1114,29 @@ fn storage_error(err: anyhow::Error) -> ApiResponse {
     ApiResponse::error(ApiErrorCode::StorageUnavailable, err.to_string())
 }
 
+fn launch_failure_response(err: anyhow::Error) -> ApiResponse {
+    if err
+        .downcast_ref::<crate::runtime::provider_adapter::InvalidLaunchRequest>()
+        .is_some()
+    {
+        ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
+    } else {
+        ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+    }
+}
+
+fn map_import_error(err: anyhow::Error) -> ApiResponse {
+    warn!(error = %err, "import request failed");
+    if err
+        .downcast_ref::<crate::runtime::provider_adapter::InvalidImportRequest>()
+        .is_some()
+    {
+        ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
+    } else {
+        ApiResponse::error(ApiErrorCode::UnsupportedOperation, err.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,6 +1414,259 @@ mod tests {
         let _ = std::fs::remove_dir_all(env.root);
     }
 
+    #[test]
+    fn launch_failures_map_invalid_requests_to_invalid_argument() {
+        let invalid = launch_failure_response(anyhow::Error::new(
+            crate::runtime::provider_adapter::InvalidLaunchRequest(
+                "working directory /nope does not exist".to_string(),
+            ),
+        ));
+        let ApiResponse::Error { error } = invalid else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+
+        let other = launch_failure_response(anyhow::anyhow!("Claude is not configured"));
+        let ApiResponse::Error { error } = other else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+    }
+
+    #[test]
+    fn import_failures_split_invalid_requests_from_unsupported() {
+        let invalid = map_import_error(anyhow::Error::new(
+            crate::runtime::provider_adapter::InvalidImportRequest(
+                "plugin import is not supported yet".to_string(),
+            ),
+        ));
+        let ApiResponse::Error { error } = invalid else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+
+        let other = map_import_error(anyhow::anyhow!(
+            "importing account data is not supported for codex"
+        ));
+        let ApiResponse::Error { error } = other else {
+            panic!("expected error response")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+    }
+
+    #[tokio::test]
+    async fn fixture_mode_rejects_import_but_allows_preview() {
+        let root = std::env::temp_dir().join(format!("usage-import-fixture-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("usage.sqlite3");
+        let storage = crate::storage::Storage::open(&db_path).unwrap();
+        crate::fixtures::seed(&storage, crate::fixtures::FixtureScenario::Notifications)
+            .await
+            .unwrap();
+        let refresh = Arc::new(RefreshCoordinator::new(storage.clone(), Vec::new()));
+        let config = crate::config::Config {
+            poll_interval_seconds: 30,
+            notifications: Default::default(),
+            providers: BTreeMap::from([(
+                "claude".to_string(),
+                crate::config::ProviderConfig::default(),
+            )]),
+            paths: crate::config::Paths {
+                config: root.join("config.json"),
+                db: db_path,
+                socket: root.join("usage.sock"),
+            },
+        };
+        let (runtime, _rx) = DaemonRuntime::new_with_fixture_mode(config, storage, refresh, true);
+        let server = SocketServer::new(runtime);
+
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+
+        let preview = server
+            .handle_request(ApiRequest::PreviewAccountImport {
+                account_id: claude.id.clone(),
+            })
+            .await;
+        let ApiResponse::AccountImportPreview { preview } = preview else {
+            panic!("unexpected preview response: {preview:?}")
+        };
+        assert_eq!(preview.provider_id.as_str(), "claude");
+        assert!(!preview.has_managed_config_dir);
+        let launch = server
+            .handle_request(ApiRequest::LaunchProviderAccount {
+                account_id: claude.id.clone(),
+                working_directory: None,
+                launch: None,
+                remember_dangerously_skip_permissions: false,
+            })
+            .await;
+        let ApiResponse::Error { error } = launch else {
+            panic!("fixture launch must fail")
+        };
+        assert!(error.message.contains("fixture"));
+
+        let started = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude.id.clone(),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = started else {
+            panic!("fixture-mode import must not succeed: {started:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+        assert!(error.message.contains("fixture"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_pr3_toggles_as_invalid_argument() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+
+        let response = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude.id.clone(),
+                options: usage_core::ImportOptions {
+                    plugins: true,
+                    ..usage_core::ImportOptions::comfort_defaults()
+                },
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = response else {
+            panic!("expected invalid-argument error, got {response:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+        assert!(error.message.contains("plugin"));
+
+        let unknown = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: AccountId::new("definitely-unknown"),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = unknown else {
+            panic!("expected unknown-account error")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnknownAccount);
+
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_missing_or_unmanaged_config_dir_as_invalid_argument() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+
+        let missing = server
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude.id.clone(),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = missing else {
+            panic!("expected invalid-argument error for missing config dir, got {missing:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+        assert!(error.message.contains("managed Claude config directory"));
+
+        let home = dirs::home_dir().expect("home directory");
+        let mut profile = crate::config::ProviderProfileConfig {
+            id: Some("joeymalvinni".to_string()),
+            ..Default::default()
+        };
+        crate::providers::claude::settings::update_profile(&mut profile, |settings| {
+            settings.claude_config_dir = Some(home.join(".claude"));
+        })
+        .unwrap();
+        let env2 = test_env(BTreeMap::from([(
+            "claude".to_string(),
+            ProviderConfig {
+                enabled: true,
+                profiles: vec![profile],
+                ..Default::default()
+            },
+        )]));
+        crate::fixtures::seed(
+            &env2.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server2 = SocketServer::new(env2.runtime.clone());
+        let ApiResponse::Accounts { accounts } =
+            server2.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let claude2 = accounts
+            .iter()
+            .find(|account| {
+                account.provider_id.as_str() == "claude"
+                    && account.profile_id.as_deref() == Some("joeymalvinni")
+            })
+            .expect("fixture claude account with joeymalvinni profile");
+
+        let unmanaged = server2
+            .handle_request(ApiRequest::ImportAccountData {
+                account_id: claude2.id.clone(),
+                options: usage_core::ImportOptions::comfort_defaults(),
+                mode: usage_core::ImportMode::PrefsOnly,
+            })
+            .await;
+        let ApiResponse::Error { error } = unmanaged else {
+            panic!("expected invalid-argument error for unmanaged config dir, got {unmanaged:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::InvalidArgument);
+        assert!(error.message.contains("managed Claude profiles"));
+
+        let _ = std::fs::remove_dir_all(env.root);
+        let _ = std::fs::remove_dir_all(env2.root);
+    }
+
     #[tokio::test]
     async fn serves_fixture_accounts_usage_and_notifications_over_socket() {
         let env = test_env(BTreeMap::new());
@@ -1386,6 +1745,67 @@ mod tests {
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn account_launch_settings_route_by_provider_capability() {
+        let env = test_env(BTreeMap::new());
+        crate::fixtures::seed(
+            &env.runtime.storage,
+            crate::fixtures::FixtureScenario::Notifications,
+        )
+        .await
+        .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+
+        let unknown = server
+            .handle_request(ApiRequest::GetAccountLaunchSettings {
+                account_id: usage_core::AccountId::new("definitely-unknown"),
+            })
+            .await;
+        let ApiResponse::Error { error } = unknown else {
+            panic!("unexpected response: {unknown:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnknownAccount);
+
+        let ApiResponse::Accounts { accounts } =
+            server.handle_request(ApiRequest::GetAccounts).await
+        else {
+            panic!("expected accounts")
+        };
+        let codex = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "codex")
+            .expect("fixture codex account");
+        let unsupported = server
+            .handle_request(ApiRequest::GetAccountLaunchSettings {
+                account_id: codex.id.clone(),
+            })
+            .await;
+        let ApiResponse::Error { error } = unsupported else {
+            panic!("unexpected response: {unsupported:?}")
+        };
+        assert_eq!(error.code, ApiErrorCode::UnsupportedOperation);
+
+        // test_env's config has no claude profiles, so the read serves defaults —
+        // the assertion below is about the config, not the fixture seed data.
+        let claude = accounts
+            .iter()
+            .find(|account| account.provider_id.as_str() == "claude")
+            .expect("fixture claude account");
+        let supported = server
+            .handle_request(ApiRequest::GetAccountLaunchSettings {
+                account_id: claude.id.clone(),
+            })
+            .await;
+        let ApiResponse::AccountLaunchSettings { settings } = supported else {
+            panic!("unexpected response: {supported:?}")
+        };
+        assert_eq!(settings.provider_id.as_str(), "claude");
+        assert_eq!(settings.working_directory, None);
+        assert!(!settings.has_managed_config_dir);
+
         let _ = std::fs::remove_dir_all(env.root);
     }
 

@@ -514,6 +514,11 @@ pub(super) fn codex_token_delta(
         .get("last_token_usage")
         .and_then(codex_totals_from_value);
     let (delta, baseline_seeded) = match (last, total, *previous_totals) {
+        // Rate-limit notifications can repeat the previous request's usage.
+        // An unchanged cumulative counter proves no new tokens were consumed.
+        (_, Some(current), Some(previous)) if current == previous => {
+            (CodexTokenTotals::default(), false)
+        }
         (Some(last), _, _) => (last, false),
         (None, Some(current), Some(previous)) => (current.saturating_delta(previous), false),
         (None, Some(_), None) => {
@@ -663,7 +668,8 @@ fn per_token(per_million: f64) -> f64 {
 }
 
 pub(super) fn normalize_codex_model(model: &str) -> String {
-    let model = model.strip_prefix("openai/").unwrap_or(model).trim();
+    let model = model.trim();
+    let model = model.strip_prefix("openai/").unwrap_or(model);
     if model.len() > 11 && model.as_bytes()[model.len() - 11] == b'-' {
         let suffix = &model[model.len() - 10..];
         if suffix.len() == 10

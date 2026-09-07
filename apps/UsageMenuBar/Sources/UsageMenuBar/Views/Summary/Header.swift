@@ -31,7 +31,7 @@ struct Header: View {
                 .help("Install UsageTracker \(updateAction.version)")
             }
             if showsRefresh {
-                RefreshRing(refreshing: state.refreshing) {
+                RefreshRing(refreshing: state.refreshing && state.connectivity.status != .offline) {
                     if let refreshAction {
                         refreshAction()
                     } else {
@@ -44,7 +44,7 @@ struct Header: View {
 
     @ViewBuilder
     private var statusPill: some View {
-        switch subtitleStyle {
+        switch state.connectivity.status == .offline ? .networkOffline : subtitleStyle {
         case .online: StatusPill(online: true)
         case .offline: StatusPill(online: false, detail: state.message)
         case .networkOffline:
@@ -148,7 +148,7 @@ struct RefreshRing: View {
         }
         .buttonStyle(.plain)
         .help("Refresh")
-        .onChange(of: refreshing) {
+        .onChange(of: refreshing, initial: true) {
             if refreshing {
                 withAnimation(.linear(duration: 0.9).repeatForever(autoreverses: false)) { rotation = 360 }
             } else {

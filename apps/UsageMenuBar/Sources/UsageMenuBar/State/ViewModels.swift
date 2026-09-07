@@ -110,6 +110,9 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     var errorDetail: String? = nil
     var repairRecommended: Bool = false
     var accountEmail: String? = nil
+    var activitySourceLabel: String? = nil
+    var hasCostData: Bool = true
+    var unpricedModelNames: [String] = []
 }
 
 struct MenuBarProviderVM: Identifiable, Equatable, Sendable {

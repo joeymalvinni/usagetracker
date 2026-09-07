@@ -4,6 +4,18 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+### App
+
+- Added per-account Claude launch preferences behind a new confirm-on-open sheet: a saved working directory and structured launch flags (model, effort, dangerously-skip-permissions) applied by the session launcher and persisted on successful open. The dangerous flag is use-once unless explicitly remembered.
+
+### Reliability
+
+- Preserved managed Claude account identity and MCP configuration when importing project trust. Serialized launch credential migration with token refresh and prevented stale credentials from replacing a newer Keychain item.
+
+### Protocol
+
+- Added v3 import methods (`preview_account_import`, `import_account_data`, `get_import_job`) with wire fixtures, schemas, and provider capability `import_account_data` for Claude managed profiles.
+
 ## 0.1.9 — 2026-07-25
 
 ### App

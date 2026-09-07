@@ -56,6 +56,11 @@ private enum ProviderSignInFollowUp {
     @Published var providerSetups = [String: ProviderSetupResponse]()
     @Published var serverProviders = [String: ServerProviderDescriptor]()
     @Published var serverProviderOrder = [String]()
+    /// Non-nil while the confirm-on-open sheet should be shown; cleared on
+    /// successful open, or by the view on cancel/window close.
+    @Published var openSession: OpenSessionModel?
+    /// Non-nil while the import-from-local-Claude sheet should be shown.
+    @Published var importLocalClaude: ImportLocalClaudeModel?
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
     @Published var onboardingShowsNotificationChoice = false
@@ -110,7 +115,8 @@ private enum ProviderSignInFollowUp {
     private var refreshActivityCount = 0
     private var refreshingProviderCounts = [String: Int]()
     private let automaticRecoveryCooldown: TimeInterval = 30
-    private let wakeRecoveryDelay: Duration = .seconds(2)
+    private var networkStatus: ConnectivityStatus?
+    private var recoveryPending = false
 
     init() {
         let socketPath = AppState.defaultSocketPath()
@@ -174,18 +180,41 @@ private enum ProviderSignInFollowUp {
     func refreshForPopoverOpen() async {
         guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         await load()
-        await requestStaleDataRecovery(delay: .zero, reloadBeforeChecking: false)
+        await requestStaleDataRecovery(reloadBeforeChecking: false)
     }
     func refreshAfterWake() async {
         guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
-        await requestStaleDataRecovery(delay: wakeRecoveryDelay, reloadBeforeChecking: true)
+        recoveryPending = true
+        lastAutomaticRecoveryAt = nil
+        await requestStaleDataRecovery(reloadBeforeChecking: true)
     }
+    func connectivityChanged(isOnline: Bool) async {
+        let status: ConnectivityStatus = isOnline ? .online : .offline
+        guard networkStatus != status else { return }
+        let previous = networkStatus ?? connectivity.status
+        networkStatus = status
+        connectivity = Connectivity(status: status, changedAt: Date())
+        build()
+        if status == .offline {
+            recoveryPending = true
+            return
+        }
+        guard previous == .offline || recoveryPending else { return }
+        guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
+        recoveryPending = true
+        lastAutomaticRecoveryAt = nil
+        await requestStaleDataRecovery(reloadBeforeChecking: true)
+    }
+
     func pollLoop() async {
         while !Task.isCancelled {
-            let seconds = max(15, Int(config?.pollIntervalSeconds ?? 60))
-            try? await Task.sleep(for: .seconds(seconds))
+            // Check cached state independently of the provider poll interval,
+            // including after wake recovery runs before networking is ready.
+            do { try await Task.sleep(for: .seconds(15)) }
+            catch { return }
             guard ui.onboardingCompleted || onboardingDiscoveryStarted else { continue }
             await load()
+            await requestStaleDataRecovery(reloadBeforeChecking: false)
         }
     }
     func refreshAll() async {
@@ -670,6 +699,89 @@ private enum ProviderSignInFollowUp {
         }
     }
 
+    func prepareOpenSession(_ accountId: String) async {
+        // Clear any stale sheet model up front: Settings.swift treats a non-nil
+        // `openSession` after this call as "prepare succeeded," so a leftover
+        // model from a different account must not survive a failed prepare.
+        openSession = nil
+        guard let account = accounts.first(where: { $0.id == accountId }) else {
+            actionError = "The selected account is no longer available."
+            return
+        }
+        guard supportsLaunchOptions(account.providerId) else {
+            await launchProviderAccount(accountId)
+            return
+        }
+        await perform(.account(accountId)) {
+            let settings = try await client.accountLaunchSettings(accountId: accountId)
+            let title = account.displayName?.isEmpty == false ? account.displayName! : account.externalAccountId
+            openSession = OpenSessionModel(
+                accountId: account.id,
+                accountTitle: title,
+                providerId: account.providerId,
+                settings: settings
+            )
+        }
+    }
+
+    func confirmOpenSession(_ model: OpenSessionModel) async {
+        // Sync the view's edited copy so a failed launch keeps the sheet
+        // (and its edits) alive.
+        openSession = model
+        await perform(.account(model.accountId)) {
+            let response = try await client.launchProviderAccount(
+                accountId: model.accountId,
+                workingDirectory: model.trimmedWorkingDirectory,
+                launch: model.wireFlags,
+                rememberDangerouslySkipPermissions: model.rememberDangerous
+            )
+            actionMessage = response.message
+            openSession = nil
+        }
+    }
+
+    func prepareImportLocalClaude(_ accountId: String) async {
+        importLocalClaude = nil
+        guard let account = accounts.first(where: { $0.id == accountId }) else {
+            actionError = "The selected account is no longer available."
+            return
+        }
+        guard supportsImportAccountData(account.providerId) else {
+            actionError = "\(providerName(account.providerId)) does not support importing local account data."
+            return
+        }
+        await perform(.account(accountId)) {
+            let preview = try await client.previewAccountImport(accountId: accountId)
+            let title = account.displayName?.isEmpty == false ? account.displayName! : account.externalAccountId
+            importLocalClaude = ImportLocalClaudeModel(
+                accountId: account.id,
+                accountTitle: title,
+                providerId: account.providerId,
+                preview: preview
+            )
+        }
+    }
+
+    func confirmImportLocalClaude(_ model: ImportLocalClaudeModel) async {
+        importLocalClaude = model
+        guard model.canImport else { return }
+        await perform(.account(model.accountId)) {
+            let started = try await client.importAccountData(
+                accountId: model.accountId,
+                options: model.wireOptions,
+                mode: model.mode
+            )
+            let completed = try await client.waitForImport(started)
+            guard completed.status == .completed else {
+                throw ImportLocalClaudeFailure(
+                    message: completed.failureMessage ?? "Import failed."
+                )
+            }
+            actionMessage = "Imported local Claude settings for \(model.accountTitle)."
+            importLocalClaude = nil
+        }
+    }
+
     func beginOnboarding() async {
         ui.onboardingWelcomeCompleted = true
         onboardingDiscoveryStarted = true
@@ -721,7 +833,7 @@ private enum ProviderSignInFollowUp {
             )
             build()
             let started = try await client.startRefresh([providerId])
-            let discoveredProvider: (RefreshJob) -> Bool = { job in
+            let discoveredProvider: @Sendable (RefreshJob) -> Bool = { job in
                 job.discoveredAccounts.contains { $0.providerId == providerId }
             }
             let progress = try await client.waitForRefreshProgress(
@@ -828,12 +940,11 @@ private enum ProviderSignInFollowUp {
     }
 
     private func finishOnboardingUsageRefreshInBackground(_ job: RefreshJob) {
-        Task { [weak self] in
-            guard let self else { return }
+        Task { [weak self, client] in
             // Account discovery already succeeded. The state reload and
             // provider health surface any later usage-refresh failure.
-            _ = try? await self.client.finishRefresh(job)
-            await self.load()
+            _ = try? await client.finishRefresh(job)
+            await self?.load()
         }
     }
 
@@ -1106,7 +1217,7 @@ private enum ProviderSignInFollowUp {
                 uniqueKeysWithValues: state.server.providers.map { ($0.id, $0) }
             )
             if config != state.config { config = state.config }
-            if connectivity != state.connectivity { connectivity = state.connectivity }
+            if networkStatus == nil, connectivity != state.connectivity { connectivity = state.connectivity }
             updateSocketPath(from: state.config)
             if accounts != state.accounts { accounts = state.accounts }
             if health != state.health { health = state.health }
@@ -1136,7 +1247,6 @@ private enum ProviderSignInFollowUp {
     }
 
     private func requestStaleDataRecovery(
-        delay: Duration,
         reloadBeforeChecking: Bool
     ) async {
         if let automaticRecoveryTask {
@@ -1146,18 +1256,15 @@ private enum ProviderSignInFollowUp {
 
         let task = Task { [weak self] in
             guard let self else { return }
-            if delay > .zero {
-                try? await Task.sleep(for: delay)
-                guard !Task.isCancelled else { return }
-            }
             if reloadBeforeChecking { await load() }
+            guard daemon == .online, connectivity.status != .offline else { return }
 
             let now = Date()
-            if let lastAutomaticRecoveryAt,
+            if !recoveryPending, let lastAutomaticRecoveryAt,
                now.timeIntervalSince(lastAutomaticRecoveryAt) < automaticRecoveryCooldown {
                 return
             }
-            let providerIDs = Set(Self.staleProviderIDs(
+            let providerIDs = recoveryPending ? enabledProviderIDs() : Set(Self.staleProviderIDs(
                 config: config,
                 accounts: accounts,
                 snapshots: snapshots,
@@ -1165,11 +1272,13 @@ private enum ProviderSignInFollowUp {
             ))
             guard !providerIDs.isEmpty else { return }
 
+            recoveryPending = false
             lastAutomaticRecoveryAt = now
             beginRefreshing(providerIDs)
             defer { endRefreshing(providerIDs) }
             do {
                 let report = try await client.refresh(Array(providerIDs).sorted())
+                if report.skippedOffline { recoveryPending = true }
                 await load()
                 applyRefreshOutcome(report)
             } catch {
@@ -1366,6 +1475,14 @@ private enum ProviderSignInFollowUp {
 
     func supportsLaunchAccount(_ providerId: String) -> Bool {
         providerSupports(providerId, capability: \.launchAccount, in: serverProviders)
+    }
+
+    func supportsLaunchOptions(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.launchOptions, in: serverProviders)
+    }
+
+    func supportsImportAccountData(_ providerId: String) -> Bool {
+        providerSupports(providerId, capability: \.importAccountData, in: serverProviders)
     }
 
     func supportsSetup(_ providerId: String) -> Bool {

@@ -742,9 +742,8 @@ fn apply_local_usage_overlays(snapshot: &mut UsageSnapshot, overlays: &[UsageDat
                 snapshot.windows.push(window.clone());
             }
         }
-        snapshot.collected_at = snapshot
-            .collected_at
-            .max(overlay.collection.usage.collected_at);
+        // Local activity does not refresh the provider's quota. Preserve the
+        // remote snapshot timestamp so clients can detect stale rate limits.
         let mut provenance_record = overlay.provenance_record();
         provenance_record.window_ids = contributed_window_ids;
         provenance_record.metadata_keys = contributed_metadata_keys;

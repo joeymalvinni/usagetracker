@@ -44,3 +44,4 @@ macro_rules! string_id {
 string_id!(ProviderId);
 string_id!(AccountId);
 string_id!(RefreshJobId);
+string_id!(ImportJobId);

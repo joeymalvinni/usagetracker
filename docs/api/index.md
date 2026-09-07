@@ -4,7 +4,7 @@ UsageTracker exposes a local API over a Unix socket — newline-delimited JSON, 
 
 - [Protocol](protocol.md) — the transport, framing, limits, timeouts, and a working example.
 - [Versioning](versioning.md) — exact-match compatibility and the capabilities on offer.
-- [Methods](methods.md) — all 19 request methods.
+- [Methods](methods.md) — all 20 request methods.
 - [Models](models.md) — identifiers, units, timestamps, ordering, and what the models mean.
 - [Errors](errors.md) — API errors and provider refresh failures.
 - [Refresh jobs](refresh-jobs.md) — background work, coalescing, retention, and what a restart does.

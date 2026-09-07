@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
     fs::OpenOptions,
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, Weak},
 };
 
 use chrono::Utc;
@@ -17,6 +19,59 @@ use crate::{
 pub(super) const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 const TOKEN_REFRESH_SKEW_MS: i64 = 60_000;
+
+type CredentialLocks = HashMap<(String, String), Weak<tokio::sync::Mutex<()>>>;
+static CREDENTIAL_LOCKS: LazyLock<Mutex<CredentialLocks>> = LazyLock::new(Mutex::default);
+
+/// Serializes refresh and file-to-Keychain migration for one credential item.
+/// Weak entries keep deleted profiles from accumulating in the registry.
+pub(super) async fn lock_credentials(
+    service: &str,
+    account: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = CREDENTIAL_LOCKS
+            .lock()
+            .expect("credential lock registry poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (service.to_string(), account.to_string());
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+/// A collector may have cached file credentials before launch seeded Keychain.
+/// Re-evaluate source priority while holding the shared credential lock.
+pub(super) async fn reload_for_refresh(
+    credentials: &ClaudeCredentials,
+) -> Result<ClaudeCredentials, ProviderError> {
+    let service = credentials.keychain_service.clone();
+    let account = credentials.keychain_account.clone();
+    let source = credentials.source.clone();
+    tokio::task::spawn_blocking(move || {
+        keychain::invalidate_password_cache(&service, &account).map_err(keychain_save_error)?;
+        match source {
+            CredentialSource::Keychain => load_keychain_credentials(&service, &account),
+            CredentialSource::File(path) => {
+                load_credentials_from_keychain_or_file(&service, &account, path)
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Claude credential reload task failed",
+        )
+    })?
+}
 
 pub(super) async fn load_credentials(
     keychain_service: String,
@@ -88,6 +143,96 @@ pub(super) async fn save_credentials(
         }
     }
     Ok(credentials)
+}
+
+/// Ensures Claude Code can read the selected profile's credentials. The refresh
+/// callback persists rotated tokens with the normal compare-and-set safeguards.
+pub(super) async fn sync_for_launch<F, Fut>(
+    keychain_service: String,
+    keychain_account: String,
+    credentials_file_path: PathBuf,
+    refresh: F,
+) -> Result<(), ProviderError>
+where
+    F: Fn(ClaudeCredentials) -> Fut,
+    Fut: std::future::Future<Output = Result<ClaudeCredentials, ProviderError>>,
+{
+    let _guard = lock_credentials(&keychain_service, &keychain_account).await;
+    let load = || {
+        let service = keychain_service.clone();
+        let account = keychain_account.clone();
+        let path = credentials_file_path.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                // Invalidate before reading: an external Claude process may
+                // have rotated the item since the broker last read it.
+                keychain::invalidate_password_cache(&service, &account)
+                    .map_err(keychain_save_error)?;
+                load_credentials_from_keychain_or_file(&service, &account, path)
+            })
+            .await
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::CredentialsInvalid,
+                    "Claude credential load task failed",
+                )
+            })?
+        }
+    };
+    let seed = |contents: String| {
+        let service = keychain_service.clone();
+        let account = keychain_account.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                keychain::create_password_if_missing(&service, &account, &contents)
+            })
+            .await
+            .map_err(|_| KeychainError::HelperUnavailable)?
+        }
+    };
+    sync_for_launch_with(load, refresh, seed).await
+}
+
+async fn sync_for_launch_with<L, LF, R, RF, S, SF>(
+    load: L,
+    refresh: R,
+    seed: S,
+) -> Result<(), ProviderError>
+where
+    L: Fn() -> LF,
+    LF: std::future::Future<Output = Result<ClaudeCredentials, ProviderError>>,
+    R: Fn(ClaudeCredentials) -> RF,
+    RF: std::future::Future<Output = Result<ClaudeCredentials, ProviderError>>,
+    S: Fn(String) -> SF,
+    SF: std::future::Future<Output = Result<(), KeychainError>>,
+{
+    for attempt in 0..3 {
+        let mut credentials = load().await?;
+        if credentials.is_expired() {
+            credentials = match refresh(credentials).await {
+                Ok(credentials) => credentials,
+                // A guarded refresh may lose to another writer. Re-read the
+                // source before retrying; never write our stale snapshot back.
+                Err(error)
+                    if error.kind() == ProviderErrorKind::CredentialsInvalid && attempt < 2 =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            };
+        }
+        if matches!(credentials.source, CredentialSource::Keychain) {
+            // Already in the right place. Refresh, if needed, persisted it.
+            // Rewriting here could undo a concurrent refresh or reconnect.
+            return Ok(());
+        }
+        match seed(credentials.raw.to_string()).await {
+            Ok(()) => return Ok(()),
+            Err(KeychainError::Conflict) => continue,
+            Err(error) => return Err(keychain_save_error(error)),
+        }
+    }
+    Err(credential_conflict())
 }
 
 fn save_file_credentials(
@@ -534,5 +679,233 @@ mod tests {
         assert!(save_file_credentials(&path, "old", br#"{"token":"stale"}"#).is_err());
         save_file_credentials(&path, "{\"token\":\"secret\"}\n", br#"{"token":"new"}"#).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn expired_credentials_are_detected_with_skew() {
+        let mut credentials = parse_credentials(
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}"#,
+            "svc",
+            "acct",
+            CredentialSource::Keychain,
+        )
+        .unwrap();
+        assert!(credentials.is_expired());
+        credentials = parse_credentials(
+            &format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"r","expiresAt":{}}}}}"#,
+                chrono::Utc::now().timestamp_millis() + 3_600_000
+            ),
+            "svc",
+            "acct",
+            CredentialSource::Keychain,
+        )
+        .unwrap();
+        assert!(!credentials.is_expired());
+    }
+
+    fn valid_oauth_json(access_token: &str, refresh_token: &str, expires_at_ms: i64) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access_token}","refreshToken":"{refresh_token}","expiresAt":{expires_at_ms},"scopes":[]}}}}"#
+        )
+    }
+
+    mod sync_for_launch_tests {
+        use super::*;
+        use std::{
+            cell::{Cell, RefCell},
+            future::ready,
+        };
+
+        fn credentials(access: &str, source: CredentialSource, expired: bool) -> ClaudeCredentials {
+            let expires_at = if expired {
+                1
+            } else {
+                Utc::now().timestamp_millis() + 3_600_000
+            };
+            parse_credentials(
+                &valid_oauth_json(access, "refresh", expires_at),
+                "svc",
+                "acct",
+                source,
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn credential_lock_serializes_same_item_but_not_other_accounts() {
+            let service = uuid::Uuid::new_v4().to_string();
+            let first = lock_credentials(&service, "account").await;
+            let mut competing = Box::pin(lock_credentials(&service, "account"));
+            assert!(futures_util::poll!(&mut competing).is_pending());
+            let mut other_account = Box::pin(lock_credentials(&service, "other"));
+            assert!(futures_util::poll!(&mut other_account).is_ready());
+            drop(first);
+            assert!(futures_util::poll!(&mut competing).is_ready());
+        }
+
+        #[tokio::test]
+        async fn launch_does_not_overwrite_a_concurrent_keychain_refresh() {
+            let stored = RefCell::new("A");
+            sync_for_launch_with(
+                || {
+                    let loaded = credentials(&stored.borrow(), CredentialSource::Keychain, false);
+                    // Polling writes B after launch has read A.
+                    *stored.borrow_mut() = "B";
+                    ready(Ok(loaded))
+                },
+                |_| async { panic!("unexpired credentials must not be refreshed") },
+                |_| async { panic!("existing Keychain credentials must never be re-seeded") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(*stored.borrow(), "B");
+        }
+
+        #[tokio::test]
+        async fn launch_reloads_after_a_guarded_refresh_conflict() {
+            let loads = Cell::new(0);
+            let refreshes = Cell::new(0);
+            sync_for_launch_with(
+                || {
+                    let first = loads.get() == 0;
+                    loads.set(loads.get() + 1);
+                    ready(Ok(credentials(
+                        if first { "A" } else { "B" },
+                        CredentialSource::Keychain,
+                        first,
+                    )))
+                },
+                |_| {
+                    refreshes.set(refreshes.get() + 1);
+                    ready(Err(credential_conflict()))
+                },
+                |_| async { panic!("must preserve the winner of the guarded refresh") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(loads.get(), 2);
+            assert_eq!(refreshes.get(), 1);
+        }
+
+        #[tokio::test]
+        async fn launch_seeds_a_missing_keychain_item_from_file() {
+            let stored = RefCell::new(None);
+            sync_for_launch_with(
+                || {
+                    ready(Ok(credentials(
+                        "file",
+                        CredentialSource::File(PathBuf::from("unused")),
+                        false,
+                    )))
+                },
+                |_| async { panic!("valid file credentials need no refresh") },
+                |contents| {
+                    *stored.borrow_mut() = Some(contents);
+                    ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+            let raw: Value = serde_json::from_str(stored.borrow().as_ref().unwrap()).unwrap();
+            assert_eq!(raw["claudeAiOauth"]["accessToken"], "file");
+        }
+
+        #[tokio::test]
+        async fn launch_reloads_keychain_if_another_writer_wins_file_seeding() {
+            let loads = Cell::new(0);
+            let seeds = Cell::new(0);
+            sync_for_launch_with(
+                || {
+                    let first = loads.get() == 0;
+                    loads.set(loads.get() + 1);
+                    ready(Ok(credentials(
+                        if first { "file-A" } else { "keychain-B" },
+                        if first {
+                            CredentialSource::File(PathBuf::from("unused"))
+                        } else {
+                            CredentialSource::Keychain
+                        },
+                        false,
+                    )))
+                },
+                |_| async { panic!("valid credentials need no refresh") },
+                |_| {
+                    seeds.set(seeds.get() + 1);
+                    ready(Err(KeychainError::Conflict))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(loads.get(), 2);
+            assert_eq!(seeds.get(), 1);
+        }
+
+        #[tokio::test]
+        async fn launch_seeds_refreshed_file_tokens_and_bounds_conflict_retries() {
+            let writes = Cell::new(0);
+            let error = sync_for_launch_with(
+                || {
+                    ready(Ok(credentials(
+                        "expired",
+                        CredentialSource::File(PathBuf::from("unused")),
+                        true,
+                    )))
+                },
+                |_| {
+                    ready(Ok(credentials(
+                        "refreshed",
+                        CredentialSource::File(PathBuf::from("unused")),
+                        false,
+                    )))
+                },
+                |contents| {
+                    let raw: Value = serde_json::from_str(&contents).unwrap();
+                    assert_eq!(raw["claudeAiOauth"]["accessToken"], "refreshed");
+                    writes.set(writes.get() + 1);
+                    ready(Err(KeychainError::Conflict))
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), ProviderErrorKind::CredentialsInvalid);
+            assert_eq!(writes.get(), 3);
+        }
+
+        #[tokio::test]
+        async fn launch_stops_on_keychain_and_refresh_failures() {
+            let error = sync_for_launch_with(
+                || {
+                    ready(Err(ProviderError::new(
+                        ProviderErrorKind::KeychainAccessFailed,
+                        "denied",
+                    )))
+                },
+                |_| async { panic!("must not refresh after a Keychain error") },
+                |_| async { panic!("must not seed after a Keychain error") },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), ProviderErrorKind::KeychainAccessFailed);
+            for kind in [
+                ProviderErrorKind::Network,
+                ProviderErrorKind::RateLimited,
+                ProviderErrorKind::Unauthorized,
+            ] {
+                let loads = Cell::new(0);
+                let error = sync_for_launch_with(
+                    || {
+                        loads.set(loads.get() + 1);
+                        ready(Ok(credentials("old", CredentialSource::Keychain, true)))
+                    },
+                    |_| ready(Err(ProviderError::new(kind, "refresh failed"))),
+                    |_| async { panic!("must not seed after failed refresh") },
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+                assert_eq!(loads.get(), 1);
+            }
+        }
     }
 }

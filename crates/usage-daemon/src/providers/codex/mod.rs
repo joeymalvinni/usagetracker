@@ -154,6 +154,8 @@ impl CodexCollector {
         &self,
         profile: &CodexProfile,
     ) -> Result<UsageDataset, ProviderError> {
+        let credentials = self.load_credentials(profile).await?;
+        app_server::validate_profile_home_identity(profile, &credentials.account_id)?;
         let pricing = CodexPricingCatalog::bundled();
         let cost_cache = profile.cost_cache.clone();
         let local_codex_home = self.local_codex_home.clone();
@@ -338,12 +340,7 @@ fn codex_profiles(
     let has_direct_default_owner = configured.iter().zip(&decoded).any(|(profile, settings)| {
         profile.enabled
             && !profile.deleted
-            && settings
-                .codex_home
-                .as_ref()
-                .map(|path| expand_home_path(path.clone()))
-                .unwrap_or_else(|| local_codex_home.to_path_buf())
-                == local_codex_home
+            && settings.resolved_home(local_codex_home) == local_codex_home
     });
     let default_activity_owner = (!has_direct_default_owner)
         .then(|| {
@@ -363,10 +360,7 @@ fn codex_profiles(
         .filter(|(_, (profile, _))| profile.enabled && !profile.deleted)
         .map(|(index, (profile, settings))| {
             let id = profile_id(profile.id.as_deref(), index);
-            let codex_home = settings
-                .codex_home
-                .map(expand_home_path)
-                .unwrap_or_else(|| local_codex_home.to_path_buf());
+            let codex_home = settings.resolved_home(local_codex_home);
             let auth_path = settings
                 .auth_path
                 .map(expand_home_path)
@@ -500,8 +494,9 @@ impl ProviderCollector for CodexCollector {
             "codex app-server usage collection started"
         );
         let app_server_profile = profile.clone();
+        let expected_account_id = credentials.account_id.clone();
         let mut collected = match tokio::task::spawn_blocking(move || {
-            collect_usage_from_app_server(&app_server_profile)
+            collect_usage_from_app_server(&app_server_profile, &expected_account_id)
         })
         .await
         {
@@ -519,6 +514,9 @@ impl ProviderCollector for CodexCollector {
                 collected
             }
             Ok(Err(app_server_err)) => {
+                if app_server_err.kind() == ProviderErrorKind::RateLimited {
+                    return Err(app_server_err);
+                }
                 warn!(
                     elapsed_ms = app_server_started.elapsed().as_millis(),
                     error = %app_server_err,
@@ -577,23 +575,15 @@ impl ProviderCollector for CodexCollector {
         account: &Account,
         _current: Option<&UsageSnapshot>,
     ) -> Result<Vec<UsageDataset>, ProviderError> {
-        let profile_id = account.profile_id.as_deref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "Codex account has no profile identity",
-            )
-        })?;
-        let profile = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::CredentialsInvalid,
-                    format!("Codex profile {profile_id} no longer exists"),
-                )
-            })?;
-        Ok(vec![self.collect_local_usage_dataset(profile).await?])
+        let (profile, _) = self
+            .profile_for_account(&DiscoveredAccount {
+                external_account_id: account.external_account_id.clone(),
+                profile_id: account.profile_id.clone(),
+                display_name: account.display_name.clone(),
+                email: account.email.clone(),
+            })
+            .await?;
+        Ok(vec![self.collect_local_usage_dataset(&profile).await?])
     }
 }
 
