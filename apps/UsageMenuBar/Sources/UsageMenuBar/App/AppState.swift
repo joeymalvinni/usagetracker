@@ -108,7 +108,8 @@ private enum ProviderSignInFollowUp {
     private var refreshActivityCount = 0
     private var refreshingProviderCounts = [String: Int]()
     private let automaticRecoveryCooldown: TimeInterval = 30
-    private let wakeRecoveryDelay: Duration = .seconds(2)
+    private var networkStatus: ConnectivityStatus?
+    private var recoveryPending = false
 
     init() {
         let socketPath = AppState.defaultSocketPath()
@@ -172,18 +173,41 @@ private enum ProviderSignInFollowUp {
     func refreshForPopoverOpen() async {
         guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
         await load()
-        await requestStaleDataRecovery(delay: .zero, reloadBeforeChecking: false)
+        await requestStaleDataRecovery(reloadBeforeChecking: false)
     }
     func refreshAfterWake() async {
         guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
-        await requestStaleDataRecovery(delay: wakeRecoveryDelay, reloadBeforeChecking: true)
+        recoveryPending = true
+        lastAutomaticRecoveryAt = nil
+        await requestStaleDataRecovery(reloadBeforeChecking: true)
     }
+    func connectivityChanged(isOnline: Bool) async {
+        let status: ConnectivityStatus = isOnline ? .online : .offline
+        guard networkStatus != status else { return }
+        let previous = networkStatus ?? connectivity.status
+        networkStatus = status
+        connectivity = Connectivity(status: status, changedAt: Date())
+        build()
+        if status == .offline {
+            recoveryPending = true
+            return
+        }
+        guard previous == .offline || recoveryPending else { return }
+        guard ui.onboardingCompleted || onboardingDiscoveryStarted else { return }
+        recoveryPending = true
+        lastAutomaticRecoveryAt = nil
+        await requestStaleDataRecovery(reloadBeforeChecking: true)
+    }
+
     func pollLoop() async {
         while !Task.isCancelled {
-            let seconds = max(15, Int(config?.pollIntervalSeconds ?? 60))
-            try? await Task.sleep(for: .seconds(seconds))
+            // Check cached state independently of the provider poll interval,
+            // including after wake recovery runs before networking is ready.
+            do { try await Task.sleep(for: .seconds(15)) }
+            catch { return }
             guard ui.onboardingCompleted || onboardingDiscoveryStarted else { continue }
             await load()
+            await requestStaleDataRecovery(reloadBeforeChecking: false)
         }
     }
     func refreshAll() async {
@@ -1035,7 +1059,7 @@ private enum ProviderSignInFollowUp {
                 uniqueKeysWithValues: state.server.providers.map { ($0.id, $0) }
             )
             if config != state.config { config = state.config }
-            if connectivity != state.connectivity { connectivity = state.connectivity }
+            if networkStatus == nil, connectivity != state.connectivity { connectivity = state.connectivity }
             updateSocketPath(from: state.config)
             if accounts != state.accounts { accounts = state.accounts }
             if health != state.health { health = state.health }
@@ -1065,7 +1089,6 @@ private enum ProviderSignInFollowUp {
     }
 
     private func requestStaleDataRecovery(
-        delay: Duration,
         reloadBeforeChecking: Bool
     ) async {
         if let automaticRecoveryTask {
@@ -1075,18 +1098,15 @@ private enum ProviderSignInFollowUp {
 
         let task = Task { [weak self] in
             guard let self else { return }
-            if delay > .zero {
-                try? await Task.sleep(for: delay)
-                guard !Task.isCancelled else { return }
-            }
             if reloadBeforeChecking { await load() }
+            guard daemon == .online, connectivity.status != .offline else { return }
 
             let now = Date()
-            if let lastAutomaticRecoveryAt,
+            if !recoveryPending, let lastAutomaticRecoveryAt,
                now.timeIntervalSince(lastAutomaticRecoveryAt) < automaticRecoveryCooldown {
                 return
             }
-            let providerIDs = Set(Self.staleProviderIDs(
+            let providerIDs = recoveryPending ? enabledProviderIDs() : Set(Self.staleProviderIDs(
                 config: config,
                 accounts: accounts,
                 snapshots: snapshots,
@@ -1094,11 +1114,13 @@ private enum ProviderSignInFollowUp {
             ))
             guard !providerIDs.isEmpty else { return }
 
+            recoveryPending = false
             lastAutomaticRecoveryAt = now
             beginRefreshing(providerIDs)
             defer { endRefreshing(providerIDs) }
             do {
                 let report = try await client.refresh(Array(providerIDs).sorted())
+                if report.skippedOffline { recoveryPending = true }
                 await load()
                 applyRefreshOutcome(report)
             } catch {

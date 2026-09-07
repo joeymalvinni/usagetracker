@@ -1,3 +1,4 @@
+import Network
 import AppKit
 import Combine
 import Darwin
@@ -85,6 +86,7 @@ struct StatusItemAnchorSnapshot: Equatable {
     private var providerMenuSignature = ""
     private var renderedMenuIcon: MenuIconPresentation?
     private var bag = Set<AnyCancellable>()
+    private let networkMonitor = NWPathMonitor()
     private let menuIconSize = NSSize(width: 16, height: 16)
     private let startupPopoverRetryDelay: TimeInterval = 0.05
     private let startupPopoverMaxAttempts = 120
@@ -119,6 +121,13 @@ struct StatusItemAnchorSnapshot: Equatable {
                 Task { await self?.state.refreshAfterWake() }
             }
             .store(in: &bag)
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            let isOnline = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                await self?.state.connectivityChanged(isOnline: isOnline)
+            }
+        }
+        networkMonitor.start(queue: DispatchQueue(label: "usage.network-monitor"))
         Task { await state.bootstrap(); await state.pollLoop() }
         Task { await state.updater.checkForUpdates() }
 

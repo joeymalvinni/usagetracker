@@ -413,6 +413,11 @@ enum DateFormats {
         $0.unitsStyle = .full
     }
 
+    static func resetLabel(for date: Date, relativeTo now: Date = Date()) -> String {
+        guard date > now else { return "Reset passed · awaiting update" }
+        return "Resets \(resetRelativeString(for: date, relativeTo: now))"
+    }
+
     /// Relative wording for future reset/expiry deadlines. Foundation truncates
     /// a 45-hour interval to "in 1 day", which conflicts with an explicit date
     /// two calendar days ahead (for example, Thursday to Saturday).
