@@ -9,7 +9,7 @@ use crate::providers::{
     read_response_body, retry_after_deadline, ProviderError, ProviderErrorKind,
 };
 
-use super::credentials::{save_credentials, ClaudeCredentials, TokenRefreshResponse};
+use super::credentials::{self, save_credentials, ClaudeCredentials, TokenRefreshResponse};
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -65,6 +65,26 @@ impl ClaudeApiClient {
     }
 
     pub(super) async fn refresh_credentials(
+        &self,
+        credentials: ClaudeCredentials,
+    ) -> Result<ClaudeCredentials, ProviderError> {
+        let _guard = credentials::lock_credentials(
+            &credentials.keychain_service,
+            &credentials.keychain_account,
+        )
+        .await;
+        let current = credentials::reload_for_refresh(&credentials).await?;
+        if (current.access_token != credentials.access_token
+            || current.refresh_token != credentials.refresh_token)
+            && !current.is_expired()
+        {
+            return Ok(current);
+        }
+        self.refresh_credentials_locked(current).await
+    }
+
+    /// Caller must hold the credential-item lock through load, refresh and seed.
+    pub(super) async fn refresh_credentials_locked(
         &self,
         credentials: ClaudeCredentials,
     ) -> Result<ClaudeCredentials, ProviderError> {

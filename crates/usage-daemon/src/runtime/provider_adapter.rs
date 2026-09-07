@@ -265,13 +265,75 @@ pub(crate) trait RepairHandler: Send + Sync {
     ) -> anyhow::Result<ProviderActionResponse>;
 }
 
+/// Per-open overrides from the confirm-on-open sheet. `None` fields fall back
+/// to the account's saved preferences; the sheet always sends the full
+/// `launch` object, so an override replaces the whole flag set.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LaunchOverrides {
+    pub(crate) working_directory: Option<String>,
+    pub(crate) launch: Option<usage_core::LaunchFlags>,
+    pub(crate) remember_dangerously_skip_permissions: bool,
+}
+
+/// A launch request the daemon understood but must reject as caller error
+/// (bad working directory, malformed flags). The server maps this to
+/// `invalid_argument`; everything else stays `unsupported_operation`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct InvalidLaunchRequest(pub(crate) String);
+
+/// Sibling of `InvalidLaunchRequest` for the import path: the daemon accepted
+/// the request shape but the options themselves are caller error (e.g.
+/// requesting a PR3+ toggle). Mapped to `invalid_argument`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct InvalidImportRequest(pub(crate) String);
+
 #[async_trait]
 pub(crate) trait LaunchHandler: Send + Sync {
     async fn launch(
         &self,
         runtime: ProviderRuntime<'_>,
         account: Account,
+        overrides: LaunchOverrides,
     ) -> anyhow::Result<ProviderActionResponse>;
+
+    /// Advertised as the `launch_options` capability: this handler honors
+    /// LaunchOverrides and serves per-account launch settings.
+    fn supports_launch_options(&self) -> bool {
+        false
+    }
+
+    async fn launch_settings(
+        &self,
+        _runtime: ProviderRuntime<'_>,
+        account: Account,
+    ) -> anyhow::Result<usage_core::AccountLaunchSettingsResponse> {
+        anyhow::bail!(
+            "launch settings are not supported for {}",
+            account.provider_id
+        )
+    }
+}
+
+#[async_trait]
+pub(crate) trait ImportHandler: Send + Sync {
+    async fn preview(
+        &self,
+        runtime: ProviderRuntime<'_>,
+        account: Account,
+    ) -> anyhow::Result<usage_core::AccountImportPreview>;
+
+    /// Takes an owned `Arc<DaemonRuntime>` so the spawned import job can
+    /// persist `local_import` settings after the copy finishes, without
+    /// borrowing a request-scoped runtime reference.
+    async fn start_import(
+        &self,
+        runtime: Arc<DaemonRuntime>,
+        account: Account,
+        options: usage_core::ImportOptions,
+        mode: usage_core::ImportMode,
+    ) -> anyhow::Result<usage_core::ImportJob>;
 }
 
 #[async_trait]
@@ -376,6 +438,10 @@ pub(crate) trait ProviderAdapter: Send + Sync {
         None
     }
 
+    fn import_handler(&self) -> Option<&dyn ImportHandler> {
+        None
+    }
+
     fn setup_handler(&self) -> Option<&dyn SetupHandler> {
         None
     }
@@ -422,10 +488,14 @@ pub(crate) trait ProviderAdapter: Send + Sync {
                 add_account: self.add_account_handler().is_some(),
                 repair: self.repair_handler().is_some(),
                 launch_account: self.launch_handler().is_some(),
+                launch_options: self
+                    .launch_handler()
+                    .is_some_and(|handler| handler.supports_launch_options()),
                 // `workspace_setup` is a deprecated v3 wire alias. Both fields
                 // intentionally derive from the same generic setup handler.
                 setup: self.setup_handler().is_some(),
                 workspace_setup: self.setup_handler().is_some(),
+                import_account_data: self.import_handler().is_some(),
             },
         }
     }

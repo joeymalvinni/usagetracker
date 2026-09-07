@@ -1,0 +1,29 @@
+{
+  "api_version": 3,
+  "type": "account_import_preview",
+  "preview": {
+    "provider_id": "claude",
+    "account_id": "account-1",
+    "source_home": "/Users/demo/.claude",
+    "source_claude_json": "/Users/demo/.claude.json",
+    "destination": "/Users/demo/.usagetracker/profiles/claude/account-1",
+    "has_managed_config_dir": true,
+    "source_identity": "550e8400-e29b-41d4-a716-446655440000",
+    "default_mode": "prefs_only",
+    "default_options": {
+      "prefs": true,
+      "project_trust": true,
+      "prompt_history": true
+    },
+    "toggles": [
+      {"key": "prefs", "enabled_by_default": true, "supported": true},
+      {"key": "project_trust", "enabled_by_default": true, "supported": true},
+      {"key": "prompt_history", "enabled_by_default": true, "supported": true},
+      {"key": "plugins", "enabled_by_default": false, "supported": false, "note": "plugins require a path rewrite and are not imported yet"},
+      {"key": "project_transcripts", "enabled_by_default": false, "supported": false, "note": "transcripts are excluded to preserve usage attribution"},
+      {"key": "file_history", "enabled_by_default": false, "supported": false, "note": "file-history import is not supported yet"},
+      {"key": "tasks_teams", "enabled_by_default": false, "supported": false, "note": "tasks/teams import is not supported yet"},
+      {"key": "sessions", "enabled_by_default": false, "supported": false, "note": "sessions import is not supported yet"}
+    ]
+  }
+}

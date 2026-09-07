@@ -32,6 +32,10 @@ A reminder on trust: read methods can surface account emails, local paths, usage
 | `update_provider_setup` | `{"method":"update_provider_setup","provider_id":"opencode_go","settings":{"workspace_id":"wrk_123"}}` | `provider_setup` |
 | `repair_provider` | `{"method":"repair_provider","provider_id":"codex"}` | `provider_action` |
 | `launch_provider_account` | `{"method":"launch_provider_account","account_id":"ACCOUNT"}` | `provider_action` |
+| `get_account_launch_settings` | `{"method":"get_account_launch_settings","account_id":"ACCOUNT"}` | `account_launch_settings` |
+| `preview_account_import` | `{"method":"preview_account_import","account_id":"ACCOUNT"}` | `account_import_preview` |
+| `import_account_data` | `{"method":"import_account_data","account_id":"ACCOUNT","options":{"prefs":true,"project_trust":true,"prompt_history":true},"mode":"prefs_only"}` | `import_started` |
+| `get_import_job` | `{"method":"get_import_job","job_id":"JOB"}` | `import_job` |
 
 A complete accounts exchange looks like this:
 
@@ -55,6 +59,9 @@ The exact shapes come from the [schemas](index.md) and [models](models.md).
 | `get_accounts` | Every supported account — including hidden, disabled, and removed — ordered by provider, profile, then external ID. | `storage_unavailable` | 3s |
 | `get_config` | Effective paths, polling, notifications, and visible provider toggles. Credential and profile details are deliberately left out. | `storage_unavailable` | 3s |
 | `get_provider_setup` | Safe profile summaries and provider-owned declarative setup fields. Discovery failures can ride along in `discovery_error` with an otherwise successful response. | `unknown_provider`, `internal` | 20s |
+| `get_account_launch_settings` | The account's saved launch preferences: working directory, structured launch flags, and whether the profile has a managed config directory. Providers must advertise `launch_options`. Allowed in fixture mode. | `unknown_account`, `unsupported_operation`, `storage_unavailable` | 3s |
+| `preview_account_import` | Source and destination paths, default import toggles and mode, per-toggle size hints, and whether the account has a managed config directory. Providers must advertise `import_account_data`. Read-only; allowed in fixture mode. | `unknown_account`, `unsupported_operation`, `storage_unavailable` | 3s |
+| `get_import_job` | The current retained import job. Jobs live in memory, so unknown or expired IDs fail. | `unknown_import_job` | 3s |
 
 Read results reflect storage at the moment each method reads it. They aren't subscriptions, and separate requests don't add up to one consistent snapshot.
 
@@ -66,6 +73,14 @@ Read results reflect storage at the moment each method reads it. They aren't sub
 | `acknowledge_notifications` | `ids` is required; `[]` is a valid no-op. Deletes matching queued rows in one transaction and echoes back every ID you sent, including ones already gone. Idempotent and persistent. | `storage_unavailable` |
 
 See [refresh jobs](refresh-jobs.md) for polling and failure details.
+
+## Import methods
+
+| Method | Parameters, effects, retry, persistence | Expected errors |
+| --- | --- | --- |
+| `import_account_data` | `options` selects comfort-pack toggles (`prefs`, `project_trust`, `prompt_history` in v1). `mode` is `prefs_only` or `replace`. The provider must advertise `import_account_data` and the account must have a managed config directory. Starts background copy/scrub work and returns immediately with `import_started`. Only one active import per account; stretch toggles in `options` fail with `invalid_argument`. Poll `get_import_job` until `status` is `completed` or `failed`. Job state isn't persistent, but a successful import writes a local manifest on the profile. | `invalid_argument`, `unknown_account`, `unsupported_operation`, `storage_unavailable` |
+
+Import jobs follow the same in-memory retention rules as refresh jobs: active jobs stay queryable, the newest 64 completed or failed jobs are kept, and older IDs return `unknown_import_job`. Fixture mode rejects import side effects but still allows preview.
 
 ## Configuration and account methods
 
@@ -83,6 +98,6 @@ See [refresh jobs](refresh-jobs.md) for polling and failure details.
 | Method | Effect | Retry and restart | Expected errors |
 | --- | --- | --- | --- |
 | `repair_provider` | Validates an optional `account_id`, then starts the provider's login/repair flow. The provider must advertise `repair`. `sign_in_action` defaults to `open`; `copy_link` suppresses automatic browser launch and requires the response to include `authentication_url`. | Not idempotent — it may start several login sessions. The configuration itself persists. | `unknown_provider`, `unknown_account`, `storage_unavailable`, `unsupported_operation`, `internal` |
-| `launch_provider_account` | Opens the provider with the account's isolated profile. The provider and account must support launch. | Not idempotent — it may open several sessions. No job persists. | `unknown_account`, `storage_unavailable`, `unsupported_operation` |
+| `launch_provider_account` | Opens the provider with the account's isolated profile. Optional `working_directory`, `launch` (structured flags: `model`, `effort`, `dangerously_skip_permissions`), and `remember_dangerously_skip_permissions` override and — on success — persist the account's saved preferences. `launch` replaces the saved flags as a whole rather than merging fields, and a blank `working_directory` clears the saved one. The saved dangerous flag changes only when explicitly remembered, and `remember_dangerously_skip_permissions` has no effect unless `launch` is also sent. Preferences persist only for accounts with managed profile entries; legacy default accounts launch but save nothing. Providers must advertise `launch_options` for overrides; a relative or nonexistent working directory fails with `invalid_argument`. | Not idempotent — it may open several sessions. No job persists. | `unknown_account`, `storage_unavailable`, `unsupported_operation`, `invalid_argument` |
 
 These action methods can expose local profile paths to the launched provider process and cause visible Terminal or app activity. Fixture mode rejects sign-in, repair, and launch operations.

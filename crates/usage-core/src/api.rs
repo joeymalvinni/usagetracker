@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Account, AccountId, ProviderHealth, ProviderId, RefreshJobId, UsageDashboardSummary,
-    UsageEventPage, UsageForecast, UsageSnapshot, UsageWindowProvenance,
+    Account, AccountId, ImportJobId, ProviderHealth, ProviderId, RefreshJobId,
+    UsageDashboardSummary, UsageEventPage, UsageForecast, UsageSnapshot, UsageWindowProvenance,
 };
 
 pub const API_VERSION: u16 = 3;
@@ -130,6 +130,28 @@ pub enum ApiRequest {
     },
     LaunchProviderAccount {
         account_id: AccountId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch: Option<LaunchFlags>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        remember_dangerously_skip_permissions: bool,
+    },
+    GetAccountLaunchSettings {
+        account_id: AccountId,
+    },
+    PreviewAccountImport {
+        account_id: AccountId,
+    },
+    ImportAccountData {
+        account_id: AccountId,
+        #[serde(default)]
+        options: ImportOptions,
+        #[serde(default)]
+        mode: ImportMode,
+    },
+    GetImportJob {
+        job_id: ImportJobId,
     },
 }
 
@@ -171,6 +193,10 @@ impl ApiRequest {
                 | "update_provider_setup"
                 | "repair_provider"
                 | "launch_provider_account"
+                | "get_account_launch_settings"
+                | "preview_account_import"
+                | "import_account_data"
+                | "get_import_job"
         )
     }
 }
@@ -178,6 +204,178 @@ impl ApiRequest {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProviderToggle {
     pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl LaunchEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Structured launch flags for provider sessions. Structured on purpose —
+/// values are validated and shell-quoted by the daemon; never free-form argv.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct LaunchFlags {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<LaunchEffort>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dangerously_skip_permissions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportMode {
+    #[default]
+    PrefsOnly,
+    Replace,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct ImportOptions {
+    #[serde(default = "default_true")]
+    pub prefs: bool,
+    #[serde(default = "default_true")]
+    pub project_trust: bool,
+    #[serde(default = "default_true")]
+    pub prompt_history: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plugins: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub project_transcripts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub file_history: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tasks_teams: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sessions: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self::comfort_defaults()
+    }
+}
+
+impl ImportOptions {
+    pub fn comfort_defaults() -> Self {
+        Self {
+            prefs: true,
+            project_trust: true,
+            prompt_history: true,
+            plugins: false,
+            project_transcripts: false,
+            file_history: false,
+            tasks_teams: false,
+            sessions: false,
+        }
+    }
+
+    /// PR2 rejects any stretch toggle that would import plugins/transcripts/etc.
+    pub fn ensure_pr2_supported(&self) -> Result<(), String> {
+        if self.plugins {
+            return Err("plugin import is not supported yet".into());
+        }
+        if self.project_transcripts {
+            return Err("project transcript import is not supported yet".into());
+        }
+        if self.file_history {
+            return Err("file-history import is not supported yet".into());
+        }
+        if self.tasks_teams {
+            return Err("tasks/teams import is not supported yet".into());
+        }
+        if self.sessions {
+            return Err("sessions import is not supported yet".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl ImportJobStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct ImportJob {
+    pub id: ImportJobId,
+    pub account_id: AccountId,
+    pub provider_id: ProviderId,
+    pub status: ImportJobStatus,
+    pub mode: ImportMode,
+    pub options: ImportOptions,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct ImportToggleSize {
+    pub key: String,
+    pub enabled_by_default: bool,
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AccountImportPreview {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    pub source_home: String,
+    pub source_claude_json: String,
+    pub destination: String,
+    pub has_managed_config_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
+    pub default_mode: ImportMode,
+    pub default_options: ImportOptions,
+    pub toggles: Vec<ImportToggleSize>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AccountLaunchSettingsResponse {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<LaunchFlags>,
+    pub has_managed_config_dir: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -365,6 +563,18 @@ pub enum ApiResponse {
     ProviderAction {
         action: ProviderActionResponse,
     },
+    AccountLaunchSettings {
+        settings: AccountLaunchSettingsResponse,
+    },
+    AccountImportPreview {
+        preview: AccountImportPreview,
+    },
+    ImportStarted {
+        job: ImportJob,
+    },
+    ImportJob {
+        job: ImportJob,
+    },
     Error {
         error: ApiErrorResponse,
     },
@@ -467,10 +677,16 @@ pub struct ProviderCapabilities {
     pub add_account: bool,
     pub repair: bool,
     pub launch_account: bool,
+    /// The launch handler accepts working-directory / flag overrides and
+    /// exposes per-account launch settings.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub launch_options: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub setup: bool,
     /// Deprecated alias retained for v3 clients.
     pub workspace_setup: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub import_account_data: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -705,6 +921,7 @@ pub enum ApiErrorCode {
     UnknownProvider,
     UnknownAccount,
     UnknownRefreshJob,
+    UnknownImportJob,
     UnsupportedOperation,
     Conflict,
     StorageUnavailable,
@@ -723,6 +940,7 @@ impl ApiErrorCode {
             Self::UnknownProvider => "unknown_provider",
             Self::UnknownAccount => "unknown_account",
             Self::UnknownRefreshJob => "unknown_refresh_job",
+            Self::UnknownImportJob => "unknown_import_job",
             Self::UnsupportedOperation => "unsupported_operation",
             Self::Conflict => "conflict",
             Self::StorageUnavailable => "storage_unavailable",
@@ -773,7 +991,7 @@ mod tests {
 
         assert_eq!(request.api_version, API_VERSION);
         match request.request {
-            ApiRequest::LaunchProviderAccount { account_id } => {
+            ApiRequest::LaunchProviderAccount { account_id, .. } => {
                 assert_eq!(account_id.as_str(), "account-1");
             }
             _ => panic!("unexpected request variant"),
@@ -930,6 +1148,9 @@ mod tests {
             include_str!("../wire-fixtures/refresh_job_v3.json"),
             include_str!("../wire-fixtures/error_v3.json"),
             include_str!("../wire-fixtures/usage_v3.json"),
+            include_str!("../wire-fixtures/account_launch_settings_v3.json"),
+            include_str!("../wire-fixtures/account_import_preview_v3.json"),
+            include_str!("../wire-fixtures/import_job_v3.json"),
         ] {
             let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
             let response: ResponseEnvelope = serde_json::from_value(expected.clone()).unwrap();
@@ -982,6 +1203,171 @@ mod tests {
         };
         assert_eq!(snapshots.len(), 1);
         assert!(window_provenance[0].authoritative);
+    }
+
+    #[test]
+    fn fixture_account_launch_settings_decodes() {
+        let response: ResponseEnvelope = serde_json::from_str(include_str!(
+            "../wire-fixtures/account_launch_settings_v3.json"
+        ))
+        .unwrap();
+        let ApiResponse::AccountLaunchSettings { settings } = response.response else {
+            panic!("unexpected fixture response");
+        };
+        assert_eq!(settings.provider_id.as_str(), "claude");
+        assert_eq!(settings.launch.unwrap().effort, Some(LaunchEffort::Xhigh));
+        assert!(settings.has_managed_config_dir);
+    }
+
+    #[test]
+    fn launch_request_decodes_optional_overrides_and_defaults() {
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1","working_directory":"~/Projects/demo","launch":{"model":"fable","effort":"xhigh","dangerously_skip_permissions":true},"remember_dangerously_skip_permissions":true}"#,
+        )
+        .unwrap();
+        let ApiRequest::LaunchProviderAccount {
+            account_id,
+            working_directory,
+            launch,
+            remember_dangerously_skip_permissions,
+        } = request.request
+        else {
+            panic!("unexpected request variant");
+        };
+        assert_eq!(account_id.as_str(), "account-1");
+        assert_eq!(working_directory.as_deref(), Some("~/Projects/demo"));
+        let launch = launch.unwrap();
+        assert_eq!(launch.model.as_deref(), Some("fable"));
+        assert_eq!(launch.effort, Some(LaunchEffort::Xhigh));
+        assert!(launch.dangerously_skip_permissions);
+        assert!(remember_dangerously_skip_permissions);
+
+        let bare: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1"}"#,
+        )
+        .unwrap();
+        let ApiRequest::LaunchProviderAccount {
+            working_directory,
+            launch,
+            remember_dangerously_skip_permissions,
+            ..
+        } = bare.request
+        else {
+            panic!("unexpected request variant");
+        };
+        assert_eq!(working_directory, None);
+        assert_eq!(launch, None);
+        assert!(!remember_dangerously_skip_permissions);
+
+        // A bare request must serialize to the exact legacy shape so old
+        // daemons see byte-identical launch requests from new clients.
+        let serialized =
+            serde_json::to_value(RequestEnvelope::new(ApiRequest::LaunchProviderAccount {
+                account_id: AccountId::new("account-1"),
+                working_directory: None,
+                launch: None,
+                remember_dangerously_skip_permissions: false,
+            }))
+            .unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::from_str::<serde_json::Value>(
+                r#"{"api_version":3,"method":"launch_provider_account","account_id":"account-1"}"#
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn account_launch_settings_are_supported_and_round_trip() {
+        assert!(ApiRequest::supports_method("get_account_launch_settings"));
+
+        let response = ResponseEnvelope::new(ApiResponse::AccountLaunchSettings {
+            settings: AccountLaunchSettingsResponse {
+                provider_id: ProviderId::new("claude"),
+                account_id: AccountId::new("account-1"),
+                working_directory: Some("~/Projects/demo".to_string()),
+                launch: Some(LaunchFlags {
+                    model: Some("fable".to_string()),
+                    effort: Some(LaunchEffort::Xhigh),
+                    dangerously_skip_permissions: false,
+                }),
+                has_managed_config_dir: true,
+            },
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "account_launch_settings");
+        assert_eq!(value["settings"]["launch"]["effort"], "xhigh");
+        // dangerously_skip_permissions is skipped when false.
+        assert!(value["settings"]["launch"]
+            .as_object()
+            .unwrap()
+            .get("dangerously_skip_permissions")
+            .is_none());
+
+        // working_directory and launch are both skipped when None.
+        let bare_response = ResponseEnvelope::new(ApiResponse::AccountLaunchSettings {
+            settings: AccountLaunchSettingsResponse {
+                provider_id: ProviderId::new("claude"),
+                account_id: AccountId::new("account-1"),
+                working_directory: None,
+                launch: None,
+                has_managed_config_dir: false,
+            },
+        });
+        let bare_value = serde_json::to_value(&bare_response).unwrap();
+        let settings = bare_value["settings"].as_object().unwrap();
+        assert!(settings.get("working_directory").is_none());
+        assert!(settings.get("launch").is_none());
+    }
+
+    #[test]
+    fn import_methods_are_supported_and_round_trip() {
+        assert!(ApiRequest::supports_method("preview_account_import"));
+        assert!(ApiRequest::supports_method("import_account_data"));
+        assert!(ApiRequest::supports_method("get_import_job"));
+
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"import_account_data","account_id":"account-1","options":{"prefs":true,"project_trust":true,"prompt_history":true},"mode":"prefs_only"}"#,
+        )
+        .unwrap();
+        let ApiRequest::ImportAccountData {
+            account_id,
+            options,
+            mode,
+        } = request.request
+        else {
+            panic!("unexpected request");
+        };
+        assert_eq!(account_id.as_str(), "account-1");
+        assert!(options.prefs);
+        assert!(options.project_trust);
+        assert!(options.prompt_history);
+        assert!(!options.plugins);
+        assert!(!options.project_transcripts);
+        assert_eq!(mode, ImportMode::PrefsOnly);
+
+        let response = ResponseEnvelope::new(ApiResponse::ImportStarted {
+            job: ImportJob {
+                id: ImportJobId::new("import-1"),
+                account_id: AccountId::new("account-1"),
+                provider_id: ProviderId::new("claude"),
+                status: ImportJobStatus::Queued,
+                mode: ImportMode::PrefsOnly,
+                options: ImportOptions::comfort_defaults(),
+                created_at: chrono::DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                started_at: None,
+                finished_at: None,
+                progress_message: None,
+                failure_message: None,
+            },
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], "import_started");
+        assert_eq!(value["job"]["status"], "queued");
+        assert_eq!(value["job"]["mode"], "prefs_only");
     }
 
     #[test]

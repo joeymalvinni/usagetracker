@@ -77,6 +77,27 @@ pub(crate) fn set_password_if_changed(
     result
 }
 
+/// Seeds a missing item without ever replacing credentials written by another process.
+pub(crate) fn create_password_if_missing(
+    service: &str,
+    account: &str,
+    password: &str,
+) -> Result<(), Error> {
+    let result = match invoke_with_auth_retry(Request::CreateIfMissing {
+        service: service.to_string(),
+        account: account.to_string(),
+        password: password.to_string(),
+    }) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Conflict) => Err(Error::Conflict),
+        Ok(Response::Failed) => Err(Error::BackendRejected),
+        Ok(_) => Err(Error::InvalidResponse),
+        Err(error) => Err(error),
+    };
+    observe_error("create_if_missing", &result);
+    result
+}
+
 pub(crate) fn compare_and_set_password(
     service: &str,
     account: &str,
@@ -276,7 +297,9 @@ fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor) {
                     .map(|_| Response::Ok)
             }),
             Request::Invalidate { .. } => Some(Response::Ok),
-            Request::CompareAndSet { .. } | Request::Delete { .. } => None,
+            Request::CompareAndSet { .. }
+            | Request::CreateIfMissing { .. }
+            | Request::Delete { .. } => None,
         };
         let result = if let Some(response) = cached {
             Ok(response)
@@ -325,6 +348,7 @@ fn update_read_cache(
     let value = match (request, result) {
         (Request::Get { .. }, Ok(Response::Value { value })) => Some(value.clone()),
         (Request::SetIfChanged { password, .. }, Ok(Response::Ok))
+        | (Request::CreateIfMissing { password, .. }, Ok(Response::Ok))
         | (Request::CompareAndSet { password, .. }, Ok(Response::Ok)) => Some(password.clone()),
         // A failed mutation leaves the actual Keychain state uncertain. Deletes
         // and missing reads must not preserve an older successful read.
@@ -332,6 +356,7 @@ fn update_read_cache(
         | (Request::Invalidate { .. }, Ok(Response::Ok))
         | (Request::Delete { .. }, Ok(_)) => None,
         (Request::SetIfChanged { .. }, _)
+        | (Request::CreateIfMissing { .. }, _)
         | (Request::CompareAndSet { .. }, _)
         | (Request::Invalidate { .. }, _)
         | (Request::Delete { .. }, _) => None,
@@ -459,6 +484,11 @@ fn perform(request: Request) -> Response {
             account,
             password,
         } => write_password(&service, &account, &password, true),
+        Request::CreateIfMissing {
+            service,
+            account,
+            password,
+        } => create_password(&service, &account, &password),
         Request::CompareAndSet {
             service,
             account,
@@ -489,6 +519,29 @@ fn perform(request: Request) -> Response {
         // the helper. Keep the protocol arm defensive if it is invoked directly.
         Request::Invalidate { .. } => Response::Ok,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn create_password(service: &str, account: &str, password: &str) -> Response {
+    use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+    // SecKeychainAddGenericPassword is insert-only. A competing login/refresh
+    // wins even if it happens after our initial missing-item read.
+    match SecKeychain::default_for_domain(SecPreferencesDomain::User)
+        .and_then(|keychain| keychain.add_generic_password(service, account, password.as_bytes()))
+    {
+        Ok(()) => Response::Ok,
+        Err(error) if error.code() == security_framework_sys::base::errSecDuplicateItem => {
+            Response::Conflict
+        }
+        Err(error) => keyring_failure_response(&KeyringError::PlatformFailure(Box::new(error))),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_password(_service: &str, _account: &str, _password: &str) -> Response {
+    // Managed Claude launches are macOS-only. Do not emulate insert-only with
+    // a read followed by an unconditional write on another backend.
+    Response::Failed
 }
 
 fn write_password(service: &str, account: &str, password: &str, only_if_changed: bool) -> Response {
@@ -588,6 +641,11 @@ enum Request {
         account: String,
         password: String,
     },
+    CreateIfMissing {
+        service: String,
+        account: String,
+        password: String,
+    },
     CompareAndSet {
         service: String,
         account: String,
@@ -609,6 +667,9 @@ impl Request {
         match self {
             Self::Get { service, account }
             | Self::SetIfChanged {
+                service, account, ..
+            }
+            | Self::CreateIfMissing {
                 service, account, ..
             }
             | Self::CompareAndSet {
@@ -880,6 +941,45 @@ mod tests {
             Ok(Response::Ok)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn insert_conflict_reloads_the_winning_credential_instead_of_using_cached_data() {
+        let value = Arc::new(Mutex::new("A".to_string()));
+        let executor_value = value.clone();
+        let broker = Broker::new(
+            1,
+            Arc::new(move |request, _| match request {
+                Request::Get { .. } => Ok(Response::Value {
+                    value: executor_value.lock().unwrap().clone(),
+                }),
+                Request::CreateIfMissing { .. } => Ok(Response::Conflict),
+                _ => panic!("unexpected request"),
+            }),
+        );
+        assert!(
+            matches!(broker.invoke(request(), Duration::from_secs(1)), Ok(Response::Value { value }) if value == "A")
+        );
+        // Another writer replaces the real item while the broker still caches A.
+        *value.lock().unwrap() = "B".to_string();
+        let Request::Get { service, account } = request() else {
+            unreachable!()
+        };
+        assert!(matches!(
+            broker.invoke(
+                Request::CreateIfMissing {
+                    service,
+                    account,
+                    password: "A".to_string()
+                },
+                Duration::from_secs(1)
+            ),
+            Ok(Response::Conflict)
+        ));
+        assert!(
+            matches!(broker.invoke(request(), Duration::from_secs(1)), Ok(Response::Value { value }) if value == "B")
+        );
+        assert_eq!(*value.lock().unwrap(), "B");
     }
 
     #[test]

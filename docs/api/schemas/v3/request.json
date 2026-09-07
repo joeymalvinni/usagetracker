@@ -1,5 +1,79 @@
 {
   "$defs": {
+    "ImportMode": {
+      "enum": [
+        "prefs_only",
+        "replace"
+      ],
+      "type": "string"
+    },
+    "ImportOptions": {
+      "properties": {
+        "file_history": {
+          "type": "boolean"
+        },
+        "plugins": {
+          "type": "boolean"
+        },
+        "prefs": {
+          "default": true,
+          "type": "boolean"
+        },
+        "project_transcripts": {
+          "type": "boolean"
+        },
+        "project_trust": {
+          "default": true,
+          "type": "boolean"
+        },
+        "prompt_history": {
+          "default": true,
+          "type": "boolean"
+        },
+        "sessions": {
+          "type": "boolean"
+        },
+        "tasks_teams": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "LaunchEffort": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "type": "string"
+    },
+    "LaunchFlags": {
+      "description": "Structured launch flags for provider sessions. Structured on purpose —\nvalues are validated and shell-quoted by the daemon; never free-form argv.",
+      "properties": {
+        "dangerously_skip_permissions": {
+          "type": "boolean"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "NotificationConfig": {
       "properties": {
         "cooldown_minutes": {
@@ -532,14 +606,109 @@
         "account_id": {
           "type": "string"
         },
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchFlags"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "method": {
           "const": "launch_provider_account",
+          "type": "string"
+        },
+        "remember_dangerously_skip_permissions": {
+          "type": "boolean"
+        },
+        "working_directory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "get_account_launch_settings",
           "type": "string"
         }
       },
       "required": [
         "method",
         "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "preview_account_import",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "import_account_data",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ImportMode",
+          "default": "prefs_only"
+        },
+        "options": {
+          "$ref": "#/$defs/ImportOptions",
+          "default": {
+            "prefs": true,
+            "project_trust": true,
+            "prompt_history": true
+          }
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "job_id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "get_import_job",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "job_id"
       ],
       "type": "object"
     }

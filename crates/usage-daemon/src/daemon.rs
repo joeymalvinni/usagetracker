@@ -22,6 +22,7 @@ use crate::{
     config::Config,
     connectivity::ConnectivityMonitor,
     fixtures::{self, FixtureScenario},
+    import_jobs::ImportJobs,
     local_logs,
     notifications::NotificationManager,
     polling::RefreshCoordinator,
@@ -41,6 +42,7 @@ pub struct DaemonRuntime {
     config_mutation: Mutex<()>,
     pub storage: Storage,
     pub refresh: Arc<RefreshCoordinator>,
+    pub import_jobs: Arc<ImportJobs>,
     notifications: Arc<NotificationManager>,
     poll_schedule_tx: watch::Sender<PollSchedule>,
     local_log_config_tx: watch::Sender<local_logs::LocalLogConfig>,
@@ -225,7 +227,7 @@ impl DaemonRuntime {
         Self::new_with_fixture_mode(config, storage, refresh, false)
     }
 
-    fn new_with_fixture_mode(
+    pub(crate) fn new_with_fixture_mode(
         config: Config,
         storage: Storage,
         refresh: Arc<RefreshCoordinator>,
@@ -242,6 +244,7 @@ impl DaemonRuntime {
             config_mutation: Mutex::new(()),
             storage,
             refresh,
+            import_jobs: Arc::new(ImportJobs::new()),
             notifications,
             poll_schedule_tx,
             local_log_config_tx,
@@ -646,6 +649,7 @@ impl DaemonRuntime {
     pub async fn launch_provider_account(
         &self,
         account_id: AccountId,
+        overrides: crate::runtime::provider_adapter::LaunchOverrides,
     ) -> anyhow::Result<ProviderActionResponse> {
         if self.fixture_mode {
             anyhow::bail!("provider launch is unavailable in development fixture mode");
@@ -662,12 +666,121 @@ impl DaemonRuntime {
                 account.provider_id
             )
         })?;
+        if !handler.supports_launch_options()
+            && (overrides.working_directory.is_some() || overrides.launch.is_some())
+        {
+            anyhow::bail!(
+                "launch overrides are not supported for {}",
+                account.provider_id
+            );
+        }
         handler
             .launch(
                 crate::runtime::provider_adapter::ProviderRuntime::new(self),
                 account,
+                overrides,
             )
             .await
+    }
+
+    /// Read-only, so fixture mode is allowed — the Open sheet stays demoable
+    /// via `just fixture` even though the launch itself is rejected there.
+    pub async fn account_launch_settings(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<usage_core::AccountLaunchSettingsResponse> {
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.launch_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "launch settings are not supported for {}",
+                account.provider_id
+            )
+        })?;
+        anyhow::ensure!(
+            handler.supports_launch_options(),
+            "launch settings are not supported for {}",
+            account.provider_id
+        );
+        handler
+            .launch_settings(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                account,
+            )
+            .await
+    }
+
+    /// Read-only: fixture mode is allowed so `just fixture` can demo the
+    /// Import sheet against real `~/.claude` sizes (never mutating anything).
+    pub async fn preview_account_import(
+        &self,
+        account_id: usage_core::AccountId,
+    ) -> anyhow::Result<usage_core::AccountImportPreview> {
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.import_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "importing account data is not supported for {}",
+                account.provider_id
+            )
+        })?;
+        handler
+            .preview(
+                crate::runtime::provider_adapter::ProviderRuntime::new(self),
+                account,
+            )
+            .await
+    }
+
+    pub async fn import_account_data(
+        self: &Arc<Self>,
+        account_id: usage_core::AccountId,
+        options: usage_core::ImportOptions,
+        mode: usage_core::ImportMode,
+    ) -> anyhow::Result<usage_core::ImportJob> {
+        if self.fixture_mode {
+            anyhow::bail!("account import is unavailable in development fixture mode");
+        }
+        let account = self
+            .storage
+            .account(&account_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown account: {}", account_id.as_str()))?;
+        let adapter = provider_registry::adapter(&account.provider_id)?;
+        let handler = adapter.import_handler().ok_or_else(|| {
+            anyhow::anyhow!(
+                "importing account data is not supported for {}",
+                account.provider_id
+            )
+        })?;
+        if self
+            .import_jobs
+            .account_has_active_import(&account_id)
+            .await
+        {
+            anyhow::bail!(
+                "an import is already running for account {}",
+                account_id.as_str()
+            );
+        }
+        handler
+            .start_import(self.clone(), account, options, mode)
+            .await
+    }
+
+    pub async fn get_import_job(
+        &self,
+        job_id: &usage_core::ImportJobId,
+    ) -> anyhow::Result<Option<usage_core::ImportJob>> {
+        Ok(self.import_jobs.get(job_id).await)
     }
 
     fn publish_local_log_config(&self, config: &Config) {
@@ -1368,7 +1481,8 @@ mod tests {
 
     #[test]
     fn claude_launcher_pins_activity_to_the_profile_config_directory() {
-        let contents = launchers::claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")));
+        let contents =
+            launchers::claude_launcher_contents(Some(Path::new("/tmp/Claude's Work")), None, None);
 
         assert!(contents.contains("unset CLAUDE_SECURESTORAGE_CONFIG_DIR"));
         assert!(contents.contains("export CLAUDE_CONFIG_DIR='/tmp/Claude'\"'\"'s Work'"));
@@ -1377,7 +1491,7 @@ mod tests {
 
     #[test]
     fn legacy_claude_launcher_clears_profile_overrides() {
-        let contents = launchers::claude_launcher_contents(None);
+        let contents = launchers::claude_launcher_contents(None, None, None);
 
         assert!(contents.contains("unset CLAUDE_CONFIG_DIR"));
         assert!(!contents.contains("export CLAUDE_CONFIG_DIR"));
@@ -1392,5 +1506,27 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(launchable, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
+    }
+
+    #[test]
+    fn launch_options_capability_is_claude_only() {
+        let with_options = provider_registry::descriptors()
+            .into_iter()
+            .filter(|provider| provider.capabilities.launch_options)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(with_options, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
+    }
+
+    #[test]
+    fn import_capability_is_claude_only() {
+        let with_import = provider_registry::descriptors()
+            .into_iter()
+            .filter(|provider| provider.capabilities.import_account_data)
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(with_import, vec![ProviderId::new(CLAUDE_PROVIDER_ID)]);
     }
 }
