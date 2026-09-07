@@ -31,6 +31,8 @@ OAuth's canonical `limits` list becomes windows clamped to `0..100`, including s
 
 Your local JSONL history is used only for token activity and estimated cost on *this* Mac — never for quota percentages. It's found via `project_roots`, `<claude_config_dir>/projects`, or whichever single profile owns the shared default Claude project roots.
 
+The September 5, 2026 bundled catalog includes Opus 5. Cache-write totals include the one-hour subset once; its separate rate affects estimated cost, not the token total. Unknown models are named in pricing coverage. Local logs are reconciled at startup as well as after file changes so upgrades can reprice existing history even when remote credential access is unavailable.
+
 ## Refresh timing and rate limits
 
 Refreshes happen at most once a minute. Changes to your local JSONL files are debounced for 30 seconds and can trigger at most one refresh per minute. Account-wide polling is always the source of truth. A 429 puts the provider into shared backoff and, again, never switches to the CLI.

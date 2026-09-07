@@ -654,7 +654,7 @@ private enum ProviderSignInFollowUp {
             )
             build()
             let started = try await client.startRefresh([providerId])
-            let discoveredProvider: (RefreshJob) -> Bool = { job in
+            let discoveredProvider: @Sendable (RefreshJob) -> Bool = { job in
                 job.discoveredAccounts.contains { $0.providerId == providerId }
             }
             let progress = try await client.waitForRefreshProgress(
@@ -761,7 +761,7 @@ private enum ProviderSignInFollowUp {
     }
 
     private func finishOnboardingUsageRefreshInBackground(_ job: RefreshJob) {
-        Task { [weak self] in
+        Task { [weak self, client] in
             // Account discovery already succeeded. The state reload and
             // provider health surface any later usage-refresh failure.
             _ = try? await client.finishRefresh(job)

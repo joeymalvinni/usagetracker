@@ -427,7 +427,7 @@ fn normalizes_codex_rate_limits() {
     assert_eq!(weekly.percent_remaining, Some(96.0));
     assert_eq!(weekly.reset_at.unwrap().timestamp(), 1781820574);
 
-    let additional_session = find_window(&snapshot.windows, "codex_additional_0_session");
+    let additional_session = find_window(&snapshot.windows, "codex_limit_codex_bengalfox_session");
     assert_eq!(additional_session.label, "GPT-5.3-Codex-Spark session");
     assert_eq!(additional_session.percent_used, Some(0.0));
 
@@ -558,7 +558,7 @@ fn normalizes_app_server_rate_limits_with_reset_credit_expiry() {
     assert_eq!(weekly.percent_used, Some(39.0));
     assert_eq!(weekly.reset_at.unwrap().timestamp(), 1784040385);
 
-    let additional_session = find_window(&snapshot.windows, "codex_additional_0_session");
+    let additional_session = find_window(&snapshot.windows, "codex_limit_codex_bengalfox_session");
     assert_eq!(additional_session.label, "GPT-5.3-Codex-Spark session");
 
     let credits = find_window(&snapshot.windows, "codex_credits");
@@ -589,6 +589,77 @@ fn normalizes_app_server_rate_limits_with_reset_credit_expiry() {
 fn rejects_non_object_payloads() {
     let err = normalize_usage(&json!([1, 2, 3]), None).unwrap_err();
     assert_eq!(err.kind(), ProviderErrorKind::Parse);
+}
+
+#[test]
+fn additional_limit_identity_survives_insertion_and_matches_wham() {
+    let limit =
+        json!({"limitName":"Astra", "primary":{"usedPercent":25,"windowDurationMins":10080}});
+    let first = normalize_app_server_usage(
+        &json!({"rate_limits_read": {
+            "rateLimitsByLimitId": {"astra":limit}
+        }}),
+        None,
+    )
+    .unwrap();
+    let inserted = normalize_app_server_usage(
+        &json!({"rate_limits_read": {
+            "rateLimitsByLimitId": {"aaa":limit,"astra":limit}
+        }}),
+        None,
+    )
+    .unwrap();
+    let expected = &first.windows[0];
+    let actual = inserted
+        .windows
+        .iter()
+        .find(|window| window.window_id == expected.window_id)
+        .unwrap();
+    assert_eq!(expected.window_id, "codex_limit_astra_session");
+    assert_eq!(actual.label, "Astra weekly");
+    assert!(matches!(actual.kind, UsageWindowKind::Weekly));
+    let wham = normalize_usage(
+        &json!({"additional_rate_limits":[{
+            "metered_feature":"astra", "limit_name":"Astra",
+            "rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":604800}}
+        }]}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(wham.windows[0].window_id, expected.window_id);
+    assert!(matches!(wham.windows[0].kind, UsageWindowKind::Weekly));
+}
+
+#[tokio::test]
+async fn custom_auth_does_not_inherit_another_accounts_home_usage() {
+    let root = std::env::temp_dir().join(format!(
+        "usagetracker-codex-isolation-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    write_codex_auth(&root.join("auth.json"), "main-account");
+    write_codex_auth(&root.join("second.json"), "second-account");
+    let collector = CodexCollector::new(ProviderConfig {
+        enabled: true,
+        profiles: vec![codex_test_profile(
+            "second",
+            "Second",
+            root.join("second.json"),
+        )],
+        ..ProviderConfig::default()
+    })
+    .unwrap();
+    let profile = &collector.profiles[0];
+    assert_eq!(profile.codex_home, root);
+    let error = collector
+        .collect_local_usage_dataset(profile)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ProviderErrorKind::CredentialsInvalid);
+    let error =
+        super::app_server::collect_usage_from_app_server(profile, "second-account").unwrap_err();
+    assert_eq!(error.kind(), ProviderErrorKind::CredentialsInvalid);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -788,7 +859,7 @@ fn prices_gpt_56_and_uses_distinct_long_context_rates() {
         },
     )
     .unwrap();
-    assert!((short - 0.4525).abs() < 1e-12);
+    assert!((short - 0.322).abs() < 1e-12);
 
     let long = codex_cost_usd(
         "gpt-5.6-sol",
@@ -800,7 +871,45 @@ fn prices_gpt_56_and_uses_distinct_long_context_rates() {
         },
     )
     .unwrap();
-    assert!((long - 2.55).abs() < 1e-12);
+    assert!((long - 1.98).abs() < 1e-12);
+}
+
+#[test]
+fn repeated_cumulative_notifications_do_not_charge_the_last_request_again() {
+    let mut previous = None;
+    let event = json!({
+        "last_token_usage": {"input_tokens": 1000, "output_tokens": 100},
+        "total_token_usage": {"input_tokens": 1000, "output_tokens": 100}
+    });
+    assert_eq!(codex_token_delta(&event, &mut previous).0.total(), 1100);
+    assert_eq!(codex_token_delta(&event, &mut previous).0.total(), 0);
+    let next = json!({
+        "last_token_usage": {"input_tokens": 1000, "output_tokens": 100},
+        "total_token_usage": {"input_tokens": 2000, "output_tokens": 200}
+    });
+    assert_eq!(codex_token_delta(&next, &mut previous).0.total(), 1100);
+}
+
+#[test]
+fn prices_astra_cache_writes_and_long_context_at_the_threshold() {
+    for (input, expected) in [(272_000, 2.095), (272_001, 4.06502)] {
+        let cost = codex_cost_usd(
+            " openai/gpt-6-astra-2026-09-01 ",
+            CodexTokenTotals {
+                input,
+                cached: 100_000,
+                cache_write: 10_000,
+                output: 5_000,
+            },
+        )
+        .unwrap();
+        assert!((cost - expected).abs() < 1e-10, "{input}: {cost}");
+    }
+    assert!(codex_cost_usd("gpt-5.1-codex-mini", CodexTokenTotals::default()).is_some());
+    assert_eq!(
+        codex_cost_usd("gpt-5.6", CodexTokenTotals::default()),
+        Some(0.0)
+    );
 }
 
 #[test]

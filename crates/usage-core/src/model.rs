@@ -48,6 +48,8 @@ pub struct UsageSnapshot {
     #[serde(
         default,
         rename = "diagnostics",
+        alias = "metadata",
+        alias = "detail",
         skip_serializing_if = "detail_is_empty"
     )]
     pub detail: SnapshotDetail,
@@ -644,6 +646,32 @@ pub struct ProviderHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_reads_historical_detail_names_without_dropping_cost_or_activity() {
+        for key in ["metadata", "detail", "diagnostics"] {
+            let mut value = serde_json::json!({
+                "provider_id": "codex", "account_id": "account",
+                "collected_at": "2026-09-05T00:00:00Z", "windows": []
+            });
+            value[key] = serde_json::json!({
+                "cost": {"today_cost_usd": 12.0},
+                "activity": {"lifetime_tokens": 1234}
+            });
+            let snapshot: UsageSnapshot = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                snapshot.detail.cost.as_ref().unwrap().today_cost_usd,
+                Some(12.0)
+            );
+            assert_eq!(
+                snapshot.detail.activity.as_ref().unwrap().lifetime_tokens,
+                Some(1234)
+            );
+            let serialized = serde_json::to_value(snapshot).unwrap();
+            assert!(serialized.get("diagnostics").is_some());
+            assert!(serialized.get("metadata").is_none());
+        }
+    }
 
     fn benchmark(name: &str, iterations: u32, mut operation: impl FnMut() -> usize) {
         for _ in 0..iterations.min(100) {

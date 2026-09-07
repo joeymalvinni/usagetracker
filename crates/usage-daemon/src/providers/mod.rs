@@ -391,6 +391,7 @@ pub struct ProviderUsage {
     pub provider_id: ProviderId,
     pub collected_at: DateTime<Utc>,
     pub windows: Vec<UsageWindow>,
+    #[serde(default, alias = "metadata")]
     pub detail: SnapshotDetail,
 }
 
@@ -493,5 +494,30 @@ mod retry_after_tests {
         let after = Utc::now() + chrono::TimeDelta::seconds(121);
         let deadline = retry_after_deadline(&headers).unwrap();
         assert!(deadline >= before && deadline <= after);
+    }
+
+    #[test]
+    fn provider_usage_accepts_legacy_metadata() {
+        let usage: ProviderUsage = serde_json::from_value(serde_json::json!({
+            "provider_id": "codex",
+            "collected_at": "2026-08-31T00:00:00Z",
+            "windows": [],
+            "metadata": { "collection_mode": "legacy" }
+        }))
+        .unwrap();
+
+        assert_eq!(usage.detail.collection_mode.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn provider_usage_defaults_missing_detail() {
+        let usage: ProviderUsage = serde_json::from_value(serde_json::json!({
+            "provider_id": "codex",
+            "collected_at": "2026-08-31T00:00:00Z",
+            "windows": []
+        }))
+        .unwrap();
+
+        assert_eq!(usage.detail, SnapshotDetail::default());
     }
 }

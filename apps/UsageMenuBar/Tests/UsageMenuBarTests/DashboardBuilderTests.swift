@@ -3,6 +3,35 @@ import XCTest
 @testable import UsageMenuBar
 
 final class DashboardBuilderTests: XCTestCase {
+    func testCodexAccountActivityAndMissingLocalCostStayIsolated() throws {
+        let today = DateFormats.dayKey.string(from: Date())
+        let accounts = [account(id: "main", providerId: "codex"), account(id: "second", providerId: "codex")]
+        let snapshots = accounts.map {
+            UsageSnapshot(providerId: "codex", accountId: $0.id, collectedAt: Date(), windows: [])
+        }
+        let provenance = DataProvenance(source: .providerReported, scope: .accountWide,
+            quality: .authoritative, completeness: .complete, confidence: .high)
+        let summaries = zip(accounts, [UInt64(113_897_797), UInt64(8_245)]).map { account, tokens in
+            AccountUsageSummary(providerId: "codex", accountId: account.id,
+                activity: ActivitySummary(provenance: provenance,
+                    days: [DailyUsagePoint(dateKey: today, tokens: tokens, costUsd: nil, pricedTokens: 0, unpricedTokens: 0)],
+                    todayTokens: tokens, lookbackTokens: tokens, lifetimeTokens: tokens),
+                cost: nil, resetCredits: nil)
+        }
+        let output = DashboardBuilder(config: config(providers: ["codex": true]), accounts: accounts,
+            health: [], snapshots: snapshots, forecasts: [],
+            dashboard: UsageDashboardSummary(accounts: summaries, days: [], pricing: .empty, provenance: .empty),
+            windowProvenance: [], ui: UIConfig(), visible: { _ in true }).build()
+        let group = try XCTUnwrap(output.providers.first)
+        let main = try XCTUnwrap(group.subAccounts?.first { $0.accountId == "main" })
+        let second = try XCTUnwrap(group.subAccounts?.first { $0.accountId == "second" })
+        XCTAssertEqual(main.costDashboard.todayTokens, 113_897_797)
+        XCTAssertEqual(second.costDashboard.todayTokens, 8_245)
+        XCTAssertEqual(group.costDashboard.todayTokens, 113_906_042)
+        XCTAssertFalse(second.hasCostData)
+        XCTAssertEqual(second.activitySourceLabel, "Account activity reported by Codex; may include other devices.")
+    }
+
     func testOfflineProviderWithoutCachedUsageRemainsStale() throws {
         let output = DashboardBuilder(
             config: config(providers: ["codex": true]),

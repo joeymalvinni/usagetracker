@@ -44,13 +44,23 @@ impl Drop for ChildGuard {
 
 pub(super) fn collect_usage_from_app_server(
     profile: &CodexProfile,
+    expected_account_id: &str,
 ) -> Result<CodexCollectedUsage, ProviderError> {
+    // app-server reads its home, not UsageTracker's auth_path override.
+    // Require the home credentials to match before accepting any remote data.
+    validate_profile_home_identity(profile, expected_account_id)?;
     let payload = run_codex_app_server_rate_limits(&profile.codex_home).map_err(|err| {
+        if let Some(provider_error) = err.downcast_ref::<ProviderError>() {
+            return ProviderError::new(provider_error.kind(), provider_error.short_message())
+                .with_retry_at(provider_error.retry_at());
+        }
         ProviderError::new(
             ProviderErrorKind::ProviderUnavailable,
             format!("Codex app-server rate limit request failed: {err}"),
         )
     })?;
+    // A login may change while the process is collecting.
+    validate_profile_home_identity(profile, expected_account_id)?;
     let account_display_name = payload
         .get("account_read")
         .and_then(|value| value.get("account"))
@@ -98,6 +108,26 @@ pub(super) fn collect_usage_from_app_server(
         account_display_name,
         warnings,
     })
+}
+
+pub(super) fn validate_profile_home_identity(
+    profile: &CodexProfile,
+    expected_account_id: &str,
+) -> Result<(), ProviderError> {
+    let contents = std::fs::read_to_string(profile.codex_home.join("auth.json")).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex profile home credentials are unavailable; cannot attribute its usage",
+        )
+    })?;
+    let credentials = super::codex_credentials_from_auth_json(&contents)?;
+    if credentials.account_id != expected_account_id {
+        return Err(ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex profile home belongs to a different account; its usage was not collected",
+        ));
+    }
+    Ok(())
 }
 
 fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> {
@@ -154,6 +184,20 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
             }
         }),
     )?;
+    let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("Codex initialization timed out"))?;
+        let line = line_rx
+            .recv_timeout(remaining)
+            .map_err(|_| anyhow::anyhow!("Codex initialization did not respond"))??;
+        let message: Value = serde_json::from_str(&line)?;
+        if message.get("id").and_then(Value::as_i64) == Some(1) {
+            json_rpc_result(message, "initialize")?;
+            break;
+        }
+    }
     write_json_rpc(
         &mut stdin,
         &json!({ "method": "initialized", "params": {} }),
@@ -175,7 +219,6 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
         &json!({ "method": "account/usage/read", "id": 4 }),
     )?;
 
-    let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
     let mut responses = AppServerResponses::default();
     let mut required_completed_at = None;
 
@@ -242,14 +285,10 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
     let payload = responses.into_payload().map_err(|err| {
         warn!(
             elapsed_ms = started.elapsed().as_millis(),
-            stderr = stderr.trim(),
+            stderr_bytes = stderr.len(),
             "codex app-server account/rateLimits/read timed out"
         );
-        anyhow::anyhow!(
-            "{err}; timed out after {:?}; stderr: {}",
-            CODEX_APP_SERVER_TIMEOUT,
-            stderr.trim()
-        )
+        anyhow::anyhow!("{err}; timed out after {:?}", CODEX_APP_SERVER_TIMEOUT,)
     })?;
 
     debug!(
@@ -291,7 +330,11 @@ impl AppServerResponses {
             Some(4) => {
                 self.account_usage_complete = true;
                 if let Some(error) = message.get("error") {
-                    self.account_usage_error = Some(error.to_string());
+                    self.account_usage_error = Some(
+                        safe_rpc_error(error, "account/usage/read")
+                            .short_message()
+                            .to_string(),
+                    );
                 } else {
                     self.account_usage_read = message.get("result").cloned();
                     if self.account_usage_read.is_none() {
@@ -328,6 +371,7 @@ impl AppServerResponses {
 fn spawn_codex_app_server(codex_home: &Path) -> std::io::Result<Child> {
     let configure = |command: &mut Command| {
         command
+            .args(["-c", "cli_auth_credentials_store=\"file\""])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -361,13 +405,37 @@ fn spawn_codex_app_server(codex_home: &Path) -> std::io::Result<Child> {
 
 fn resolve_codex_executable_with_login_shell() -> std::io::Result<std::path::PathBuf> {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-    let output = Command::new(shell)
-        .args(["-lic", "command -v codex"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    if output.status.success() {
-        if let Some(path) = executable_path_from_shell_output(&output.stdout) {
+    let mut child = ChildGuard(
+        Command::new(shell)
+            .args(["-lic", "command -v codex"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()?,
+    );
+    let stdout = child.0.stdout.take().expect("piped shell stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout
+            .take(MAX_APP_SERVER_STDERR_BYTES)
+            .read_to_end(&mut output);
+        let _ = tx.send(output);
+    });
+    let status = child
+        .0
+        .wait_timeout(Duration::from_secs(5))?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Codex login-shell executable lookup timed out",
+            )
+        })?;
+    if status.success() {
+        let output = rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        if let Some(path) = executable_path_from_shell_output(&output) {
             return Ok(path);
         }
     }
@@ -418,12 +486,36 @@ fn write_json_rpc(stdin: &mut impl Write, message: &Value) -> anyhow::Result<()>
 
 fn json_rpc_result(message: Value, method: &str) -> anyhow::Result<Value> {
     if let Some(error) = message.get("error") {
-        anyhow::bail!("{method} returned error: {error}");
+        return Err(safe_rpc_error(error, method).into());
     }
     message
         .get("result")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{method} response missing result"))
+}
+
+fn safe_rpc_error(error: &Value, method: &str) -> ProviderError {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let code = error.get("code").and_then(Value::as_i64);
+    let kind = if code == Some(429)
+        || message.contains("429")
+        || message.contains("rate limited")
+        || message.contains("rate-limited")
+        || message.contains("rate limit exceeded")
+        || message.contains("too many requests")
+    {
+        ProviderErrorKind::RateLimited
+    } else if matches!(code, Some(401 | 403)) || message.contains("401") || message.contains("403")
+    {
+        ProviderErrorKind::Unauthorized
+    } else {
+        ProviderErrorKind::ProviderUnavailable
+    };
+    ProviderError::new(kind, format!("Codex {method} failed ({})", kind.as_str()))
 }
 
 pub(super) struct CodexAccountActivity {
@@ -580,6 +672,29 @@ impl CodexAccountActivityExt for ProviderUsage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rpc_rate_limits_keep_their_error_kind_without_exposing_payloads() {
+        let error = super::json_rpc_result(
+            serde_json::json!({"error":{
+                "code":429,"message":"rate limited: private provider response"
+            }}),
+            "account/rateLimits/read",
+        )
+        .unwrap_err();
+        let error = error.downcast_ref::<super::ProviderError>().unwrap();
+        assert_eq!(error.kind(), super::ProviderErrorKind::RateLimited);
+        assert!(!error.short_message().contains("private"));
+        let unrelated = super::safe_rpc_error(
+            &json!({
+                "message":"Unable to read rate limits: connection failed"
+            }),
+            "account/rateLimits/read",
+        );
+        assert_eq!(
+            unrelated.kind(),
+            super::ProviderErrorKind::ProviderUnavailable
+        );
+    }
     use std::{ffi::OsStr, os::unix::fs::PermissionsExt, process::Command};
 
     use serde_json::json;

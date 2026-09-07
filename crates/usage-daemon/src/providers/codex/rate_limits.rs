@@ -252,7 +252,12 @@ fn collect_additional_rate_limit_windows(value: Option<&Value>) -> Vec<UsageWind
                 .or_else(|| rate_limit.get("metered_feature").and_then(Value::as_str))
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("Codex additional limit {}", index + 1));
-            let id_prefix = format!("codex_additional_{index}");
+            let id_prefix = additional_limit_prefix(
+                rate_limit
+                    .get("metered_feature")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&label),
+            );
             Some(collect_codex_rate_limit_windows(RateLimitGroupSpec {
                 id_prefix: &id_prefix,
                 label_prefix: &label,
@@ -271,15 +276,14 @@ fn collect_app_server_additional_rate_limit_windows(value: Option<&Value>) -> Ve
     rate_limits
         .iter()
         .filter(|(limit_id, _)| limit_id.as_str() != "codex")
-        .enumerate()
-        .flat_map(|(index, (limit_id, rate_limit))| {
+        .flat_map(|(limit_id, rate_limit)| {
             let label = rate_limit
                 .get("limitName")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(limit_id);
-            let id_prefix = format!("codex_additional_{index}");
+            let id_prefix = additional_limit_prefix(limit_id);
             collect_app_server_rate_limit_windows(AppServerRateLimitGroupSpec {
                 id_prefix: &id_prefix,
                 label_prefix: label,
@@ -287,6 +291,20 @@ fn collect_app_server_additional_rate_limit_windows(value: Option<&Value>) -> Ve
             })
         })
         .collect()
+}
+
+fn additional_limit_prefix(id: &str) -> String {
+    let encoded: String = id
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+                (byte as char).to_string()
+            } else {
+                format!("~{byte:02x}")
+            }
+        })
+        .collect();
+    format!("codex_limit_{encoded}")
 }
 
 fn collect_credits_window(credits: Option<&Value>) -> Option<UsageWindow> {
@@ -325,6 +343,13 @@ fn collect_credits_window(credits: Option<&Value>) -> Option<UsageWindow> {
 
 fn rate_limit_window(spec: RateLimitWindowSpec<'_>) -> Option<UsageWindow> {
     let object = spec.value?.as_object()?;
+    let (kind, label) = window_duration_label(
+        spec.kind,
+        spec.label,
+        object
+            .get("limit_window_seconds")
+            .and_then(number_from_json_value),
+    );
     let percent_used = object
         .get("used_percent")
         .and_then(number_from_json_value)
@@ -347,8 +372,8 @@ fn rate_limit_window(spec: RateLimitWindowSpec<'_>) -> Option<UsageWindow> {
 
     Some(UsageWindow {
         window_id: spec.window_id,
-        label: spec.label,
-        kind: spec.kind,
+        label,
+        kind,
         used: None,
         limit: None,
         remaining: None,
@@ -360,6 +385,14 @@ fn rate_limit_window(spec: RateLimitWindowSpec<'_>) -> Option<UsageWindow> {
 
 fn app_server_rate_limit_window(spec: AppServerRateLimitWindowSpec<'_>) -> Option<UsageWindow> {
     let object = spec.value?.as_object()?;
+    let (kind, label) = window_duration_label(
+        spec.kind,
+        spec.label,
+        object
+            .get("windowDurationMins")
+            .and_then(number_from_json_value)
+            .map(|mins| mins * 60.0),
+    );
     let percent_used = object
         .get("usedPercent")
         .and_then(number_from_json_value)
@@ -375,8 +408,8 @@ fn app_server_rate_limit_window(spec: AppServerRateLimitWindowSpec<'_>) -> Optio
 
     Some(UsageWindow {
         window_id: spec.window_id,
-        label: spec.label,
-        kind: spec.kind,
+        label,
+        kind,
         used: None,
         limit: None,
         remaining: None,
@@ -384,6 +417,23 @@ fn app_server_rate_limit_window(spec: AppServerRateLimitWindowSpec<'_>) -> Optio
         percent_remaining,
         reset_at,
     })
+}
+
+fn window_duration_label(
+    fallback: UsageWindowKind,
+    label: String,
+    seconds: Option<f64>,
+) -> (UsageWindowKind, String) {
+    let (kind, suffix) = match seconds {
+        Some(86_400.0) => (UsageWindowKind::Daily, "daily"),
+        Some(604_800.0) => (UsageWindowKind::Weekly, "weekly"),
+        Some(value) if value > 0.0 && value < 86_400.0 => (UsageWindowKind::Session, "session"),
+        _ => return (fallback, label),
+    };
+    let prefix = label
+        .rsplit_once(' ')
+        .map_or(label.as_str(), |(prefix, _)| prefix);
+    (kind, format!("{prefix} {suffix}"))
 }
 
 fn app_server_reset_credits(reset_credits: Option<&Value>) -> Option<ResetCreditsDetail> {

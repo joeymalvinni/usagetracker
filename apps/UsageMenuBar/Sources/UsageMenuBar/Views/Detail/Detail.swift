@@ -143,6 +143,7 @@ struct Detail: View {
     }
 
     private func loadUsageEvents(reset: Bool) async {
+        guard !Task.isCancelled else { return }
         guard let accountId = activeProvider.accountId else {
             usageEvents = []
             nextEventOffset = nil
@@ -157,15 +158,21 @@ struct Detail: View {
             return
         }
         loadingEvents = true
+        if reset {
+            usageEvents = []
+            nextEventOffset = nil
+        }
         eventError = nil
-        defer { loadingEvents = false }
+        defer {
+            if !Task.isCancelled && activeProvider.accountId == accountId { loadingEvents = false }
+        }
         do {
             let page = try await state.usageEvents(accountId: accountId, offset: offset, limit: 20)
-            guard activeProvider.accountId == accountId else { return }
+            guard !Task.isCancelled && activeProvider.accountId == accountId else { return }
             usageEvents = reset ? page.events : usageEvents + page.events
             nextEventOffset = page.nextOffset
         } catch {
-            guard activeProvider.accountId == accountId else { return }
+            guard !Task.isCancelled && activeProvider.accountId == accountId else { return }
             if reset { usageEvents = [] }
             nextEventOffset = nil
             eventError = "Usage events unavailable: \(error.localizedDescription)"
@@ -583,17 +590,30 @@ private struct ProviderActivityCard: View {
                 CostKPI(title: "Peak", value: peakValue)
             }
 
+            if metric == .tokens, let source = provider.activitySourceLabel {
+                Text(source)
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.secondary)
+            } else if metric == .cost && (provider.providerId == "codex" || provider.providerId == "claude") {
+                Text(provider.hasCostData
+                    ? "Estimated API-equivalent cost from logs on this Mac."
+                    : "No priced local usage is available for this account.")
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.secondary)
+            }
+
             if !provider.modelCosts.isEmpty {
                 Divider()
-                ForEach(provider.modelCosts.prefix(5), id: \.model) { model in
+                ForEach(provider.modelCosts, id: \.model) { model in
                     HStack(spacing: Theme.Spacing.sm) {
                         Text(model.model)
                             .lineLimit(1)
                         Spacer()
-                        Text(
-                            "\(formatUsd(model.meteredCostUsd)) metered · "
-                                + "\(formatUsd(model.vendorCostUsd)) vendor"
-                        )
+                        Text(provider.unpricedModelNames.contains(model.model)
+                            ? "Price unavailable"
+                            : provider.providerId == "codex" || provider.providerId == "claude"
+                            ? "\(formatUsd(model.vendorCostUsd)) estimated"
+                            : "\(formatUsd(model.meteredCostUsd)) metered · \(formatUsd(model.vendorCostUsd)) vendor")
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                     }
@@ -605,6 +625,7 @@ private struct ProviderActivityCard: View {
         .animation(.spring(duration: 0.3), value: range)
         .animation(.spring(duration: 0.3), value: metric)
         .animation(.spring(response: 0.4, dampingFraction: 0.82), value: provider.id)
+        .onChange(of: provider.id) { _, _ in hover = nil }
     }
 
     private var activitySubtitle: String {
@@ -614,11 +635,13 @@ private struct ProviderActivityCard: View {
     }
 
     private var todayValue: String {
+        if metric == .cost && !provider.hasCostData { return "Unavailable" }
         guard let today = providerDays.last else { return metric == .cost ? formatUsd(0) : formatTokens(0) }
         return formatted(today)
     }
 
     private var totalValue: String {
+        if metric == .cost && !provider.hasCostData { return "Unavailable" }
         if isActivityGrid {
             return metric == .cost
                 ? formatUsd(dashboard.allTimeCost)
@@ -631,6 +654,7 @@ private struct ProviderActivityCard: View {
     }
 
     private var peakValue: String {
+        if metric == .cost && !provider.hasCostData { return "Unavailable" }
         guard let peak = providerDays.max(by: { value($0) < value($1) }) else {
             return metric == .cost ? formatUsd(0) : formatTokens(0)
         }
