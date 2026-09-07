@@ -264,7 +264,10 @@ struct DashboardBuilder {
             lastSuccessAt: accountVMs.compactMap(\.lastSuccessAt).max(),
             errorDetail: worstAccount?.errorDetail,
             repairRecommended: worstAccount?.repairRecommended ?? false,
-            accountEmail: singleAccount?.accountEmail
+            accountEmail: singleAccount?.accountEmail,
+            activitySourceLabel: singleAccount?.activitySourceLabel,
+            hasCostData: accountVMs.contains(where: \.hasCostData),
+            unpricedModelNames: Array(Set(accountVMs.flatMap(\.unpricedModelNames))).sorted()
         )
     }
 
@@ -326,7 +329,23 @@ struct DashboardBuilder {
             lastSuccessAt: h?.lastSuccessAt,
             errorDetail: h?.lastErrorMessage,
             repairRecommended: h.map(needsCredentialRepair) ?? false,
-            accountEmail: account?.email
+            accountEmail: account?.email,
+            activitySourceLabel: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.activity.map {
+                $0.provenance.source == .providerReported
+                    ? "Account activity reported by \(pretty(providerId)); may include other devices."
+                    : "Activity observed on this Mac."
+            },
+            hasCostData: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.cost.map {
+                (!$0.days.isEmpty || !$0.models.isEmpty)
+                    && ($0.pricing.unpricedTokens == 0 || $0.pricing.pricedTokens > 0)
+            } ?? false,
+            unpricedModelNames: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.cost?.pricing.unpricedModels ?? []
         )
     }
 

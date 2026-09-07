@@ -67,8 +67,12 @@ impl ProviderAdapter for CodexAdapter {
             .iter()
             .filter(|profile| profile.enabled && !profile.deleted)
         {
-            if let Some(home) = settings::profile(profile)?.codex_home {
-                roots.push(expand_home_path(home).join("sessions"));
+            if let Some(default_home) = default_local_home() {
+                roots.push(
+                    settings::profile(profile)?
+                        .resolved_home(&default_home)
+                        .join("sessions"),
+                );
             }
         }
         roots.sort();

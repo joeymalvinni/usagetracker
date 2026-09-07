@@ -9,7 +9,7 @@ use std::{
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use serde_json::{json, Value};
-use usage_core::{CostDetail, ModelCostSummary, UsageWindowKind};
+use usage_core::{CostDetail, ModelCostSummary, UnpricedModel, UsageWindowKind};
 
 use crate::providers::{
     local_usage::{
@@ -88,6 +88,14 @@ pub(super) fn merge_local_cost_report(usage: &mut ProviderUsage, report: ClaudeC
         pricing_effective_from: claude_pricing_effective_from(),
         by_day: daily_usage_points(&report.by_day),
         by_model: model_cost_summaries(&report.by_model),
+        unpriced_models: model_cost_summaries(&report.by_model)
+            .into_iter()
+            .filter(|model| claude_cost_usd(&model.model, ClaudeTokenTotals::default()).is_none())
+            .map(|model| UnpricedModel {
+                model: model.model,
+                tokens: model.tokens,
+            })
+            .collect(),
         extra: claude_cost_extra(&report, true),
         ..CostDetail::default()
     });
@@ -130,7 +138,6 @@ fn model_cost_summaries(
             let tokens = summary
                 .input_tokens
                 .saturating_add(summary.cache_creation_input_tokens)
-                .saturating_add(summary.cache_creation_1h_input_tokens)
                 .saturating_add(summary.cache_read_input_tokens)
                 .saturating_add(summary.output_tokens);
             ModelCostSummary {
@@ -465,6 +472,22 @@ mod tests {
     use chrono::{Days, TimeZone};
 
     use super::*;
+
+    #[test]
+    fn model_totals_count_one_hour_cache_writes_only_once() {
+        let models = BTreeMap::from([(
+            "claude-opus-5".to_string(),
+            ClaudeModelCostSummary {
+                input_tokens: 100,
+                cache_creation_input_tokens: 200,
+                cache_creation_1h_input_tokens: 100,
+                cache_read_input_tokens: 300,
+                output_tokens: 50,
+                cost_usd: 0.003525,
+            },
+        )]);
+        assert_eq!(model_cost_summaries(&models)[0].tokens, 650);
+    }
 
     struct TestDir(PathBuf);
 
