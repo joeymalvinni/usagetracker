@@ -3,7 +3,7 @@ use std::{
     os::unix::{fs::FileTypeExt, net::UnixStream as StdUnixStream},
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
@@ -727,13 +727,14 @@ fn spawn_polling_loop_with_delay(
         let mut due = poll_deadlines(&schedule, poll_delay);
 
         loop {
-            let next_due =
-                due.iter().map(|(_, due)| *due).min().unwrap_or_else(|| {
-                    tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60)
-                });
+            let next_due = due
+                .iter()
+                .map(|(_, due)| *due)
+                .min()
+                .unwrap_or_else(|| SystemTime::now() + Duration::from_secs(24 * 60 * 60));
             tokio::select! {
-                _ = tokio::time::sleep_until(next_due), if !due.is_empty() => {
-                    let now = tokio::time::Instant::now();
+                _ = tokio::time::sleep(poll_wait(next_due, SystemTime::now())), if !due.is_empty() => {
+                    let now = SystemTime::now();
                     let mut providers = Vec::new();
                     let mut elapsed_groups = Vec::new();
                     for (index, (group, group_due)) in due.iter().enumerate() {
@@ -742,8 +743,9 @@ fn spawn_polling_loop_with_delay(
                             elapsed_groups.push(index);
                         }
                     }
+                    if providers.is_empty() { continue; }
                     let report = refresh.refresh(Some(&providers)).await;
-                    let completed_at = tokio::time::Instant::now();
+                    let completed_at = SystemTime::now();
                     for index in elapsed_groups {
                         let (group, group_due) = &mut due[index];
                         *group_due = completed_at + poll_delay(group.interval_seconds);
@@ -767,11 +769,20 @@ fn spawn_polling_loop_with_delay(
     })
 }
 
+// Recheck wall-clock deadlines regularly: elapsed sleep time must count toward
+// a provider's interval even on platforms whose async timer pauses in sleep.
+fn poll_wait(deadline: SystemTime, now: SystemTime) -> Duration {
+    deadline
+        .duration_since(now)
+        .unwrap_or_default()
+        .min(Duration::from_secs(15))
+}
+
 fn poll_deadlines(
     schedule: &PollSchedule,
     poll_delay: fn(u64) -> Duration,
-) -> Vec<(PollGroup, tokio::time::Instant)> {
-    let now = tokio::time::Instant::now();
+) -> Vec<(PollGroup, SystemTime)> {
+    let now = SystemTime::now();
     schedule
         .groups
         .iter()
@@ -1131,6 +1142,22 @@ mod tests {
         drop(refresh);
         drop(storage);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn poll_deadline_is_due_after_sleep_and_waits_are_bounded() {
+        let before_sleep = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let deadline = before_sleep + Duration::from_secs(300);
+        assert_eq!(poll_wait(deadline, before_sleep), Duration::from_secs(15));
+        assert_eq!(
+            poll_wait(deadline, deadline - Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(poll_wait(deadline, deadline), Duration::ZERO);
+        assert_eq!(
+            poll_wait(deadline, before_sleep + Duration::from_secs(14 * 3_600)),
+            Duration::ZERO
+        );
     }
 
     #[test]

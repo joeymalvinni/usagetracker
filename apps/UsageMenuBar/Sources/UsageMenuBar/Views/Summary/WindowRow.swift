@@ -135,8 +135,7 @@ struct WindowRow: View {
 
     private var relativeReset: String {
         guard let date = window.resetAt else { return window.reset }
-        let relative = DateFormats.resetRelativeString(for: date)
-        return "Resets \(relative)"
+        return DateFormats.resetLabel(for: date)
     }
 
     private var explicitReset: String {

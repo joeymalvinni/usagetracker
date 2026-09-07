@@ -208,6 +208,61 @@ final class DashboardBuilderTests: XCTestCase {
         XCTAssertEqual(stale, ["codex", "opencode_go"])
     }
 
+    func testExpiredWindowTriggersRecoveryEvenWithFreshSnapshot() throws {
+        let now = Date()
+        let expiredWindow = UsageWindow(
+            windowId: "weekly", label: "Weekly", kind: .weekly,
+            used: nil, limit: nil, remaining: nil,
+            percentUsed: 50, percentRemaining: 50,
+            resetAt: now.addingTimeInterval(-14 * 3_600)
+        )
+        let snapshot = UsageSnapshot(
+            providerId: "codex", accountId: "codex-account",
+            collectedAt: now, windows: [expiredWindow]
+        )
+        XCTAssertEqual(AppState.staleProviderIDs(
+            config: config(providers: ["codex": true]), accounts: [],
+            snapshots: [snapshot], now: now
+        ), ["codex"])
+        let output = DashboardBuilder(
+            config: config(providers: ["codex": true]), accounts: [], health: [],
+            snapshots: [snapshot], forecasts: [], dashboard: .empty,
+            windowProvenance: [], ui: UIConfig(), visible: { _ in true }
+        ).build()
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.status, .stale)
+        let window = try XCTUnwrap(provider.windows.first)
+        XCTAssertEqual(window.status, .stale)
+        XCTAssertTrue(window.isMuted)
+        XCTAssertNil(window.forecast)
+        XCTAssertEqual(window.percent, 50) // Retain the last known value; never invent a reset.
+        XCTAssertEqual(window.reset, "Reset passed · awaiting update")
+    }
+
+    func testResetLabelHandlesPastExactAndFutureDeadlines() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        for reset in [now.addingTimeInterval(-50_400), now] {
+            XCTAssertEqual(DateFormats.resetLabel(for: reset, relativeTo: now),
+                           "Reset passed · awaiting update")
+        }
+        XCTAssertTrue(DateFormats.resetLabel(
+            for: now.addingTimeInterval(3_600), relativeTo: now
+        ).hasPrefix("Resets in "))
+        let fresh = UsageSnapshot(
+            providerId: "codex", accountId: "codex-account", collectedAt: now,
+            windows: [UsageWindow(
+                windowId: "weekly", label: "Weekly", kind: .weekly,
+                used: nil, limit: nil, remaining: nil,
+                percentUsed: 50, percentRemaining: 50,
+                resetAt: now.addingTimeInterval(3_600)
+            )]
+        )
+        XCTAssertEqual(AppState.staleProviderIDs(
+            config: config(providers: ["codex": true]), accounts: [],
+            snapshots: [fresh], now: now
+        ), [])
+    }
+
     func testSingleAccountNameDoesNotReplaceProviderName() throws {
         let account = Account(
             id: "claude-account",

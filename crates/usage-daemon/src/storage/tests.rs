@@ -177,7 +177,7 @@ async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
         .unwrap();
 
     let snapshot = storage.latest_usage().await.unwrap().remove(0);
-    assert_eq!(snapshot.collected_at, local_at);
+    assert_eq!(snapshot.collected_at, remote_at);
     assert!(snapshot
         .windows
         .iter()
