@@ -1330,6 +1330,16 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.bars.first?.isMuted, true)
     }
 
+    func testOfflineMenuWithoutCachedUsageStillShowsOffline() {
+        let presentation = AppState.menuContent(
+            providers: [], daemon: .online, connectivity: .offline,
+            ui: UIConfig(), eligibleProviderIDs: []
+        )
+        XCTAssertEqual(presentation.status, .offline)
+        XCTAssertTrue(presentation.preview.hasPrefix("Offline"))
+        XCTAssertTrue(presentation.bars.isEmpty)
+    }
+
     func testDarkModeIsEnabledByDefault() throws {
         let fresh = UIConfig()
         XCTAssertTrue(fresh.darkModeEnabled)

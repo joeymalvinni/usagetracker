@@ -31,10 +31,10 @@ extension AppState {
                 isMuted: connectivity == .offline
             )
         }
-        guard !preview.isEmpty else { return ("Usage", .stale, []) }
         if connectivity == .offline {
             return ("Offline · showing last known usage", .offline, bars)
         }
+        guard !preview.isEmpty else { return ("Usage", .stale, []) }
         return (preview, shown.map(\.status).max { $0.severity < $1.severity } ?? .stale, bars)
     }
 

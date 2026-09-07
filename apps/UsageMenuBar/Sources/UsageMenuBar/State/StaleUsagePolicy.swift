@@ -21,6 +21,9 @@ extension AppState {
             let relevant = snapshots.filter {
                 $0.providerId == providerID && (accountIDs.isEmpty || accountIDs.contains($0.accountId))
             }
+            if relevant.contains(where: { $0.hasExpiredWindow(at: now) }) {
+                return providerID
+            }
             let latestByAccount = Dictionary(grouping: relevant, by: \.accountId)
                 .mapValues { $0.map(\.collectedAt).max() }
             if !enabledAccounts.isEmpty {
@@ -34,6 +37,12 @@ extension AppState {
                 $0.flatMap { $0 }.isNoneOrOlder(than: staleAfter, relativeTo: now)
             } ? providerID : nil
         }.sorted()
+    }
+}
+
+extension UsageSnapshot {
+    func hasExpiredWindow(at now: Date) -> Bool {
+        windows.contains { $0.resetAt.map { $0 <= now } ?? false }
     }
 }
 
