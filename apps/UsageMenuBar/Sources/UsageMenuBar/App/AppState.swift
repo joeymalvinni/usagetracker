@@ -304,6 +304,7 @@ private enum ProviderSignInFollowUp {
     }
 
     func addProviderAccount(_ providerId: String) async {
+        guard !pendingAccountProviders.contains(providerId) else { return }
         guard supportsAddAccount(providerId) else {
             actionError = "\(providerName(providerId)) does not support adding accounts."
             return
@@ -336,6 +337,7 @@ private enum ProviderSignInFollowUp {
         accountId: String? = nil,
         addAccount: Bool = false
     ) async -> String? {
+        guard !pendingAccountProviders.contains(providerId) else { return nil }
         pendingAccountProviders.insert(providerId)
         defer { pendingAccountProviders.remove(providerId) }
         do {
@@ -424,16 +426,26 @@ private enum ProviderSignInFollowUp {
     }
 
     func cancelProviderSignIn(_ providerId: String) {
-        providerConnections.cancelMonitor(for: providerId)
-        providersAwaitingAuthenticationCode.remove(providerId)
+        guard !pendingAccountProviders.contains(providerId) else { return }
+        // Keep retry actions locked until the daemon acknowledges cancellation;
+        // otherwise a delayed cancel request can terminate the next login.
+        pendingAccountProviders.insert(providerId)
         Task {
-            _ = try? await client.cancelProviderSignIn(providerId: providerId)
+            defer { pendingAccountProviders.remove(providerId) }
+            do {
+                _ = try await client.cancelProviderSignIn(providerId: providerId)
+                providerConnections.cancelMonitor(for: providerId)
+                providersAwaitingAuthenticationCode.remove(providerId)
+                actionError = nil
+                setOnboardingProviderState(
+                    providerId,
+                    .needsSignIn,
+                    "Sign-in cancelled. Continue whenever you’re ready."
+                )
+            } catch {
+                actionError = describe(error)
+            }
         }
-        setOnboardingProviderState(
-            providerId,
-            .needsSignIn,
-            "Sign-in paused. Continue whenever you’re ready."
-        )
     }
 
     func isProviderSignInActive(_ providerId: String) -> Bool {
@@ -442,6 +454,8 @@ private enum ProviderSignInFollowUp {
 
     @discardableResult
     func submitProviderAuthenticationCode(_ code: String, providerId: String) async -> Bool {
+        guard !pendingAccountProviders.contains(providerId),
+              isProviderSignInActive(providerId) else { return false }
         let code = code.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !code.isEmpty else {
             actionError = "Paste the authentication code from your browser."
@@ -455,6 +469,7 @@ private enum ProviderSignInFollowUp {
                 providerId: providerId,
                 authenticationCode: code
             )
+            guard isProviderSignInActive(providerId) else { return false }
             actionError = nil
             actionMessage = response.message
             setOnboardingProviderState(
@@ -618,6 +633,7 @@ private enum ProviderSignInFollowUp {
     }
 
     func repairProvider(_ providerId: String, accountId: String? = nil) async {
+        guard !pendingAccountProviders.contains(providerId) else { return }
         guard supportsRepair(providerId) else {
             actionError = "\(providerName(providerId)) does not support reconnecting accounts."
             return
@@ -1211,11 +1227,13 @@ private enum ProviderSignInFollowUp {
             guard !Task.isCancelled else { return }
             do {
                 let discovered = try await client.accounts()
+                guard !Task.isCancelled else { return }
                 if discovered.contains(where: { $0.providerId == providerId && $0.profileId == profileId }) {
                     accounts = discovered
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) account connected."
                     await load()
+                    guard !Task.isCancelled else { return }
                     providerConnections.clearOverride(for: providerId)
                     providersAwaitingAuthenticationCode.remove(providerId)
                     return
@@ -1238,6 +1256,7 @@ private enum ProviderSignInFollowUp {
             guard !Task.isCancelled else { return }
             do {
                 let latest = try await client.health()
+                guard !Task.isCancelled else { return }
                 let repaired = latest.first {
                     $0.providerId == providerId
                         && (accountId == nil || $0.accountId == accountId)
@@ -1248,6 +1267,7 @@ private enum ProviderSignInFollowUp {
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) login connected."
                     await load()
+                    guard !Task.isCancelled else { return }
                     providerConnections.clearOverride(for: providerId)
                     providersAwaitingAuthenticationCode.remove(providerId)
                     return

@@ -3,6 +3,7 @@ use std::{
     ffi::OsStr,
     fs::OpenOptions,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
@@ -353,7 +354,9 @@ pub(crate) fn monitor_login(
     let runtime = tokio::runtime::Handle::current();
     std::thread::spawn(move || match wait_for_login(&mut child) {
         Ok(status) if status.success() => {
-            unregister_active_login(provider_id, generation);
+            if !unregister_active_login(provider_id, generation) {
+                return;
+            }
             runtime.spawn(async move {
                 let provider = ProviderId::new(provider_id);
                 if let Err(error) = refresh
@@ -425,11 +428,10 @@ fn register_active_login(provider_id: &str, child: &mut std::process::Child) -> 
         process_group,
         stdin: child.stdin.take(),
     };
-    let replaced = ACTIVE_LOGINS
+    let mut logins = ACTIVE_LOGINS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(provider_id.to_string(), active);
-    if let Some(replaced) = replaced {
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(replaced) = logins.insert(provider_id.to_string(), active) {
         kill_process_group(replaced.process_group);
         warn!(
             provider_id,
@@ -439,7 +441,7 @@ fn register_active_login(provider_id: &str, child: &mut std::process::Child) -> 
     generation
 }
 
-fn unregister_active_login(provider_id: &str, generation: Uuid) {
+fn unregister_active_login(provider_id: &str, generation: Uuid) -> bool {
     let mut active = ACTIVE_LOGINS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -448,6 +450,9 @@ fn unregister_active_login(provider_id: &str, generation: Uuid) {
         .is_some_and(|login| login.generation == generation)
     {
         active.remove(provider_id);
+        true
+    } else {
+        false
     }
 }
 
@@ -479,10 +484,26 @@ pub(crate) fn submit_provider_sign_in_code(
         .stdin
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("{provider_id} does not accept an authentication code"))?;
-    stdin.write_all(authentication_code.as_bytes())?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    Ok(())
+    // A CLI may stop reading while it exchanges a code. Never block the socket
+    // worker (or hold the registry lock indefinitely) on a full input pipe.
+    let result = write_authentication_code(stdin, authentication_code);
+    if result.is_err() {
+        // A nonblocking write can be partial. End this attempt so a retry cannot
+        // append a second code to an incomplete first line.
+        let login = active.remove(provider_id).expect("active login exists");
+        kill_process_group(login.process_group);
+    }
+    result.map_err(|_| anyhow::anyhow!("could not deliver authentication code; restart sign-in"))
+}
+
+fn write_authentication_code(stdin: &mut ChildStdin, code: &str) -> std::io::Result<()> {
+    let fd = stdin.as_raw_fd();
+    // The owned ChildStdin keeps the descriptor valid throughout both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stdin.write_all(format!("{code}\n").as_bytes())
 }
 
 pub(crate) fn cancel_provider_sign_in(provider_id: &str) -> bool {
@@ -633,6 +654,56 @@ mod tests {
     }
 
     #[test]
+    fn full_login_pipe_fails_promptly_and_cancels_the_attempt() {
+        let provider_id = format!("test-{}", Uuid::new_v4());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        let code = "x".repeat(MAX_AUTHENTICATION_CODE_BYTES);
+        // Fill the pipe without relying on the platform's pipe capacity.
+        while write_authentication_code(stdin, &code).is_ok() {}
+        register_active_login(&provider_id, &mut child);
+        let (sender, receiver) = mpsc::channel();
+        let test_provider = provider_id.clone();
+        thread::spawn(move || {
+            sender
+                .send(submit_provider_sign_in_code(&test_provider, &code))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            let _ = terminate_login_process(&mut child);
+        }
+        assert!(result.expect("submission must not block").is_err());
+        assert!(!cancel_provider_sign_in(&provider_id));
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn cancellation_terminates_login_and_rejects_late_codes() {
+        let provider_id = format!("test-{}", Uuid::new_v4());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let generation = register_active_login(&provider_id, &mut child);
+        assert!(cancel_provider_sign_in(&provider_id));
+        assert!(!child
+            .wait_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .success());
+        assert!(!unregister_active_login(&provider_id, generation));
+        assert!(submit_provider_sign_in_code(&provider_id, "late-code").is_err());
+    }
+
+    #[test]
     fn rejects_multiline_authentication_codes() {
         let error = submit_provider_sign_in_code("claude", "first\nsecond").unwrap_err();
         assert!(error.to_string().contains("single line"));
@@ -649,7 +720,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        register_active_login(&provider_id, &mut first);
+        let first_generation = register_active_login(&provider_id, &mut first);
 
         let mut replacement = Command::new("/bin/sh")
             .args(["-c", "IFS= read -r code; test \"$code\" = replacement"])
@@ -666,6 +737,7 @@ mod tests {
             .unwrap()
             .expect("replaced login should terminate promptly");
         assert!(!replaced_status.success());
+        assert!(!unregister_active_login(&provider_id, first_generation));
         submit_provider_sign_in_code(&provider_id, "replacement").unwrap();
         assert!(replacement.wait().unwrap().success());
         unregister_active_login(&provider_id, generation);

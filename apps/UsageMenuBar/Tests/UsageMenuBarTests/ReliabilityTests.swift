@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CryptoKit
 import Foundation
 import XCTest
@@ -963,6 +964,22 @@ final class AppStateTests: XCTestCase {
 }
 
 final class ProviderConnectionCoordinatorTests: XCTestCase {
+    @MainActor func testMonitorLifecyclePublishesChangesForSignInControls() async {
+        let coordinator = ProviderConnectionCoordinator()
+        var changes = 0
+        let observation = coordinator.objectWillChange.sink { changes += 1 }
+        coordinator.monitor(providerId: "claude") {}
+        XCTAssertTrue(coordinator.isMonitoring("claude"))
+        XCTAssertGreaterThan(changes, 0)
+        let beforeCompletion = changes
+        for _ in 0..<100 where coordinator.isMonitoring("claude") {
+            await Task.yield()
+        }
+        XCTAssertFalse(coordinator.isMonitoring("claude"))
+        XCTAssertGreaterThan(changes, beforeCompletion)
+        withExtendedLifetime(observation) {}
+    }
+
     @MainActor func testStableConnectionStateAlwaysReflectsCurrentAccounts() {
         let coordinator = ProviderConnectionCoordinator()
         let descriptor = providerDescriptor(detected: true)
