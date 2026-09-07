@@ -417,8 +417,9 @@ fn account_state_plain(account: &Account) -> &'static str {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use serde_json::json;
-    use usage_core::{AccountId, ProviderId, ProviderRefreshStatus, ProviderToggle, UsageWindow};
+    use usage_core::{
+        AccountId, ProviderId, ProviderRefreshStatus, ProviderToggle, SnapshotDetail, UsageWindow,
+    };
 
     #[test]
     fn render_accounts_dashboard_lists_display_names() {
@@ -506,11 +507,12 @@ mod tests {
             account_id: AccountId::new("account"),
             collected_at: Utc.with_ymd_and_hms(2026, 7, 8, 17, 18, 55).unwrap(),
             windows: Vec::<UsageWindow>::new(),
-            metadata: json!({
-                "collection_mode": "claude_cli_usage",
-                "credential_profile": "joey",
-                "subscription_type": "team",
-            }),
+            detail: SnapshotDetail {
+                collection_mode: Some("claude_cli_usage".to_string()),
+                credential_profile: Some("joey".to_string()),
+                subscription_type: Some("team".to_string()),
+                ..SnapshotDetail::default()
+            },
         }
     }
 

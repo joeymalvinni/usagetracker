@@ -5,6 +5,10 @@ struct Detail: View {
     let providerId: String
     let initialAccountId: String?
     @State private var selectedAccountId: String?
+    @State private var usageEvents = [UsageEvent]()
+    @State private var nextEventOffset: UInt32?
+    @State private var loadingEvents = false
+    @State private var eventError: String?
 
     private var group: ProviderVM? {
         state.providers.first { $0.id == providerId || $0.providerId == providerId }
@@ -62,6 +66,30 @@ struct Detail: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                         ProviderActivityCard(provider: activeProvider, dashboard: activeProvider.costDashboard)
+                        if !usageEvents.isEmpty || loadingEvents || eventError != nil {
+                            ProviderSection(title: "Recent usage") {
+                                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                                    ForEach(usageEvents) { event in
+                                        UsageEventRow(event: event)
+                                    }
+                                    if let eventError {
+                                        Text(eventError)
+                                            .font(Theme.Typography.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if loadingEvents {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else if nextEventOffset != nil {
+                                        Button("Load more") {
+                                            Task { await loadUsageEvents(reset: false) }
+                                        }
+                                        .buttonStyle(.plain)
+                                        .font(Theme.Typography.caption.weight(.medium))
+                                    }
+                                }
+                            }
+                        }
                         if !limitWindows(activeProvider).isEmpty {
                             ProviderSection(title: "Limits") {
                                 ForEach(limitWindows(activeProvider)) { window in
@@ -108,6 +136,46 @@ struct Detail: View {
         }
         .onChange(of: selectedAccountId) { _, _ in
             state.markAlertSeen(activeProvider)
+        }
+        .task(id: activeProvider.accountId) {
+            await loadUsageEvents(reset: true)
+        }
+    }
+
+    private func loadUsageEvents(reset: Bool) async {
+        guard !Task.isCancelled else { return }
+        guard let accountId = activeProvider.accountId else {
+            usageEvents = []
+            nextEventOffset = nil
+            return
+        }
+        let offset: UInt32
+        if reset {
+            offset = 0
+        } else if let nextEventOffset {
+            offset = nextEventOffset
+        } else {
+            return
+        }
+        loadingEvents = true
+        if reset {
+            usageEvents = []
+            nextEventOffset = nil
+        }
+        eventError = nil
+        defer {
+            if !Task.isCancelled && activeProvider.accountId == accountId { loadingEvents = false }
+        }
+        do {
+            let page = try await state.usageEvents(accountId: accountId, offset: offset, limit: 20)
+            guard !Task.isCancelled && activeProvider.accountId == accountId else { return }
+            usageEvents = reset ? page.events : usageEvents + page.events
+            nextEventOffset = page.nextOffset
+        } catch {
+            guard !Task.isCancelled && activeProvider.accountId == accountId else { return }
+            if reset { usageEvents = [] }
+            nextEventOffset = nil
+            eventError = "Usage events unavailable: \(error.localizedDescription)"
         }
     }
 
@@ -438,6 +506,7 @@ private struct SpendLineRow: View {
 }
 
 private struct ProviderActivityCard: View {
+    @EnvironmentObject var state: AppState
     let provider: ProviderVM
     let dashboard: CostDashboardVM
 
@@ -445,8 +514,12 @@ private struct ProviderActivityCard: View {
     @State private var metric: CostMetric = .tokens
     @State private var hover: CostProviderDayVM?
 
+    private var isActivityGrid: Bool {
+        state.ui.activityChartStyle == .contributions
+    }
+
     private var days: [CostDayVM] {
-        dashboard.days.suffix(range.rawValue)
+        isActivityGrid ? dashboard.days : Array(dashboard.days.suffix(range.rawValue))
     }
 
     private var providerDays: [CostProviderDayVM] {
@@ -459,69 +532,121 @@ private struct ProviderActivityCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            VStack(spacing: Theme.Spacing.xs) {
-                HStack(alignment: .top, spacing: Theme.Spacing.sm) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Activity").font(Theme.Typography.headline)
-                        Text(hover.map(hoverText) ?? activitySubtitle)
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: Theme.Spacing.sm)
+            HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Activity").font(Theme.Typography.headline)
+                    Text(hover.map(hoverText) ?? activitySubtitle)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                HStack(spacing: Theme.Spacing.xs) {
-                    Spacer()
+                Spacer(minLength: Theme.Spacing.sm)
+                if !isActivityGrid {
                     Picker("", selection: $range) {
                         ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .frame(width: 82)
-                    Picker("", selection: $metric) {
-                        ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 110)
                 }
+                Picker("", selection: $metric) {
+                    ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 110)
             }
 
-            CostActivityChart(
-                days: days,
-                metric: metric,
-                hover: $hover,
-                providerColor: Theme.chartColor(provider.providerId),
-                onSelectProvider: nil
-            )
-                .frame(height: 126)
+            Group {
+                if state.ui.activityChartStyle == .contributions {
+                    ActivityHeatmap(
+                        days: days,
+                        metric: metric,
+                        color: Theme.chartColor(provider.providerId),
+                        hover: $hover,
+                        onSelectProvider: nil
+                    )
+                } else {
+                    CostActivityChart(
+                        days: days,
+                        metric: metric,
+                        hover: $hover,
+                        providerColor: Theme.chartColor(provider.providerId),
+                        onSelectProvider: nil
+                    )
+                }
+            }
+                .frame(height: state.ui.activityChartStyle == .contributions ? 110 : 126)
                 .opacity(hasData ? 1 : 0.55)
 
             HStack(spacing: Theme.Spacing.sm) {
                 CostKPI(title: "Today", value: todayValue)
                 Divider().frame(height: 24)
-                CostKPI(title: "\(range.label) total", value: totalValue)
+                CostKPI(
+                    title: isActivityGrid ? "All time" : "\(range.label) total",
+                    value: totalValue
+                )
                 Divider().frame(height: 24)
                 CostKPI(title: "Peak", value: peakValue)
+            }
+
+            if metric == .tokens, let source = provider.activitySourceLabel {
+                Text(source)
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.secondary)
+            } else if metric == .cost && (provider.providerId == "codex" || provider.providerId == "claude") {
+                Text(provider.hasCostData
+                    ? "Estimated API-equivalent cost from logs on this Mac."
+                    : "No priced local usage is available for this account.")
+                    .font(Theme.Typography.micro)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !provider.modelCosts.isEmpty {
+                Divider()
+                ForEach(provider.modelCosts, id: \.model) { model in
+                    HStack(spacing: Theme.Spacing.sm) {
+                        Text(model.model)
+                            .lineLimit(1)
+                        Spacer()
+                        Text(provider.unpricedModelNames.contains(model.model)
+                            ? "Price unavailable"
+                            : provider.providerId == "codex" || provider.providerId == "claude"
+                            ? "\(formatUsd(model.vendorCostUsd)) estimated"
+                            : "\(formatUsd(model.meteredCostUsd)) metered · \(formatUsd(model.vendorCostUsd)) vendor")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    }
+                    .font(Theme.Typography.caption)
+                }
             }
         }
         .surfaceCard()
         .animation(.spring(duration: 0.3), value: range)
         .animation(.spring(duration: 0.3), value: metric)
         .animation(.spring(response: 0.4, dampingFraction: 0.82), value: provider.id)
+        .onChange(of: provider.id) { _, _ in hover = nil }
     }
 
     private var activitySubtitle: String {
         guard hasData else { return "No recent cost or token activity" }
-        return "\(range.label) \(metric == .cost ? "cost" : "tokens")"
+        let period = isActivityGrid ? "All time" : range.label
+        return "\(period) \(metric == .cost ? "cost" : "tokens")"
     }
 
     private var todayValue: String {
+        if metric == .cost && !provider.hasCostData { return "Unavailable" }
         guard let today = providerDays.last else { return metric == .cost ? formatUsd(0) : formatTokens(0) }
         return formatted(today)
     }
 
     private var totalValue: String {
+        if metric == .cost && !provider.hasCostData { return "Unavailable" }
+        if isActivityGrid {
+            return metric == .cost
+                ? formatUsd(dashboard.allTimeCost)
+                : formatTokens(dashboard.allTimeTokens)
+        }
         if metric == .cost {
             return formatUsd(providerDays.reduce(0) { $0 + $1.cost })
         }
@@ -529,6 +654,7 @@ private struct ProviderActivityCard: View {
     }
 
     private var peakValue: String {
+        if metric == .cost && !provider.hasCostData { return "Unavailable" }
         guard let peak = providerDays.max(by: { value($0) < value($1) }) else {
             return metric == .cost ? formatUsd(0) : formatTokens(0)
         }
@@ -545,6 +671,40 @@ private struct ProviderActivityCard: View {
 
     private func hoverText(_ day: CostProviderDayVM) -> String {
         "\(shortDate(day.date)): \(formatted(day))"
+    }
+}
+
+private struct UsageEventRow: View {
+    let event: UsageEvent
+
+    var body: some View {
+        HStack(spacing: Theme.Spacing.sm) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.model)
+                    .lineLimit(1)
+                Text(event.occurredAt.formatted(date: .omitted, time: .shortened))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(formatUsd(event.meteredCostUsd))
+                    .monospacedDigit()
+                Text(formatTokens(totalTokens))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .font(Theme.Typography.caption)
+        .surfaceInset()
+    }
+
+    private var totalTokens: UInt64 {
+        [
+            event.inputTokens,
+            event.outputTokens,
+            event.cacheReadTokens,
+            event.cacheWriteTokens,
+        ].reduce(0) { $0.saturatingAdd($1) }
     }
 }
 

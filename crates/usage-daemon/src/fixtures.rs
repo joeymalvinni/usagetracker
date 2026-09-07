@@ -3,11 +3,16 @@ use std::path::Path;
 use chrono::{DateTime, Days, TimeDelta, Utc};
 use clap::ValueEnum;
 use usage_core::{
-    Account, AccountId, ProviderHealth, ProviderHealthStatus, ProviderId, UsageAmount,
-    UsageSnapshot, UsageUnit, UsageWindow, UsageWindowKind,
+    Account, AccountId, CostDetail, DailyUsagePoint, ProviderHealth, ProviderHealthStatus,
+    ProviderId, ResetCreditEntry, ResetCreditsDetail, SnapshotDetail, UsageAmount, UsageSnapshot,
+    UsageUnit, UsageWindow, UsageWindowKind,
 };
 
-use crate::{notifications::NotificationManager, providers::DailyUsageBucket, storage::Storage};
+use crate::{
+    notifications::NotificationManager,
+    providers::DailyUsageBucket,
+    storage::{CollectionRecord, Storage},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum FixtureScenario {
@@ -97,7 +102,7 @@ async fn seed_account(
         (scenario == FixtureScenario::Notifications).then_some(fixture.notification_remaining);
     let daily_usage = daily_usage(fixture.provider_id, account_index, now);
     let cost_usage = cost_usage(fixture.provider_id, now);
-    let metadata = fixture_metadata(fixture.provider_id, &cost_usage, now);
+    let detail = fixture_detail(fixture.provider_id, &cost_usage, now);
     let mut latest = None;
 
     for sample in 0..6 {
@@ -115,7 +120,7 @@ async fn seed_account(
                 notification_remaining,
                 now,
             ),
-            metadata: metadata.clone(),
+            detail: detail.clone(),
         };
         let health = fixture_health(fixture, &account.id, collected_at);
         let buckets = if sample == 5 {
@@ -124,7 +129,15 @@ async fn seed_account(
             &[]
         };
         storage
-            .record_collection(&snapshot, buckets, &health, fixture.email, None, true)
+            .record_collection(CollectionRecord {
+                snapshot: &snapshot,
+                daily_usage: buckets,
+                usage_events: None,
+                health: &health,
+                email: fixture.email,
+                backoff: None,
+                clear_backoff: true,
+            })
             .await?;
         latest = Some(snapshot);
     }
@@ -477,56 +490,40 @@ fn cost_usage(provider_id: &str, now: DateTime<Utc>) -> Vec<DailyUsageBucket> {
         .collect()
 }
 
-fn fixture_metadata(
+fn fixture_detail(
     provider_id: &str,
     daily_usage: &[DailyUsageBucket],
     now: DateTime<Utc>,
-) -> serde_json::Value {
-    let rows = daily_usage
+) -> SnapshotDetail {
+    let by_day = daily_usage
         .iter()
-        .map(|bucket| {
-            let cached_input_tokens = if provider_id == "codex" {
-                bucket.tokens.saturating_mul(19) / 20
-            } else {
-                0
-            };
-            serde_json::json!({
-                "date": bucket.date.to_string(),
-                "tokens": bucket.tokens,
-                "activity_tokens": bucket.tokens,
-                "cached_input_tokens": cached_input_tokens,
-                "priced_tokens": bucket.tokens,
-                "cost_usd": bucket.cost_usd,
-            })
+        .map(|bucket| DailyUsagePoint {
+            date: bucket.date,
+            tokens: bucket.tokens,
+            cost_usd: bucket.cost_usd,
+            priced_tokens: bucket.tokens,
+            unpriced_tokens: 0,
         })
         .collect::<Vec<_>>();
-    let mut metadata = serde_json::json!({ "fixture": true });
-    if !rows.is_empty() {
-        metadata.as_object_mut().unwrap().insert(
-            format!("{provider_id}_cost"),
-            serde_json::json!({
-                "source": "development_fixture",
-                "estimate": true,
-                "partial": false,
-                "complete_lookback": true,
-                "by_day": rows,
-            }),
-        );
+    let cost = (!by_day.is_empty()).then(|| CostDetail {
+        source: Some("development_fixture".to_string()),
+        estimate: true,
+        partial: false,
+        complete_lookback: Some(true),
+        by_day,
+        ..CostDetail::default()
+    });
+    SnapshotDetail {
+        cost,
+        // Codex is the only provider that exposes rate-limit reset credits, so
+        // seed a small pool here to exercise the "N resets" summary and detail.
+        reset_credits: (provider_id == "codex").then(|| fixture_reset_credits(now)),
+        extra: crate::providers::json_map(serde_json::json!({ "fixture": true })),
+        ..SnapshotDetail::default()
     }
-    // Codex is the only provider that exposes rate-limit reset credits, so seed
-    // a small pool here to exercise the "N resets" summary and Resets detail.
-    if provider_id == "codex" {
-        if let Some(object) = metadata.as_object_mut() {
-            object.insert(
-                "rate_limit_reset_credits".to_string(),
-                fixture_reset_credits(now),
-            );
-        }
-    }
-    metadata
 }
 
-fn fixture_reset_credits(now: DateTime<Utc>) -> serde_json::Value {
+fn fixture_reset_credits(now: DateTime<Utc>) -> ResetCreditsDetail {
     let credits = [
         ("Session reset", TimeDelta::hours(20)),
         ("Weekly reset", TimeDelta::days(2)),
@@ -535,20 +532,18 @@ fn fixture_reset_credits(now: DateTime<Utc>) -> serde_json::Value {
     let credit_rows = credits
         .iter()
         .enumerate()
-        .map(|(index, (title, delta))| {
-            serde_json::json!({
-                "id": format!("fixture-reset-{index}"),
-                "title": title,
-                "status": "available",
-                "expires_at": (now + *delta).timestamp(),
-            })
+        .map(|(index, (title, delta))| ResetCreditEntry {
+            id: Some(format!("fixture-reset-{index}")),
+            title: Some((*title).to_string()),
+            status: Some("available".to_string()),
+            expires_at: Some(now + *delta),
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
-        "available_count": credit_rows.len(),
-        "next_expires_at": (now + credits[0].1).timestamp(),
-        "credits": credit_rows,
-    })
+    ResetCreditsDetail {
+        available_count: credit_rows.len() as u64,
+        next_expires_at: Some(now + credits[0].1),
+        credits: credit_rows,
+    }
 }
 
 fn fixture_health(

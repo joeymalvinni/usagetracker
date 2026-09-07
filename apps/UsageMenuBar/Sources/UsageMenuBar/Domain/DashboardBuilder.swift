@@ -42,6 +42,7 @@ struct DashboardBuilder {
     let forecasts: [UsageForecast]
     let dashboard: UsageDashboardSummary
     let windowProvenance: [UsageWindowProvenance]
+    let connectivity: ConnectivityStatus
     let serverProviders: [String: ServerProviderDescriptor]
     let serverProviderOrder: [String]
     let ui: UIConfig
@@ -64,6 +65,7 @@ struct DashboardBuilder {
         forecasts: [UsageForecast],
         dashboard: UsageDashboardSummary,
         windowProvenance: [UsageWindowProvenance],
+        connectivity: ConnectivityStatus = .unknown,
         serverProviders: [String: ServerProviderDescriptor] = [:],
         serverProviderOrder: [String] = [],
         ui: UIConfig,
@@ -77,6 +79,7 @@ struct DashboardBuilder {
         self.forecasts = forecasts
         self.dashboard = dashboard
         self.windowProvenance = windowProvenance
+        self.connectivity = connectivity
         self.serverProviders = serverProviders
         self.serverProviderOrder = serverProviderOrder
         self.ui = ui
@@ -255,12 +258,16 @@ struct DashboardBuilder {
             sparkline: aggregatedSparkline,
             costDashboard: buildCostDashboard(filter: { snap in snap.providerId == providerId }),
             subAccounts: accountVMs.count > 1 ? accountVMs : nil,
+            modelCosts: modelCosts(providerId: providerId, accountId: nil),
             alertSignature: worstAccount?.alertSignature,
             hasUnseenAlert: accountVMs.contains(where: \.hasUnseenAlert),
             lastSuccessAt: accountVMs.compactMap(\.lastSuccessAt).max(),
             errorDetail: worstAccount?.errorDetail,
             repairRecommended: worstAccount?.repairRecommended ?? false,
-            accountEmail: singleAccount?.accountEmail
+            accountEmail: singleAccount?.accountEmail,
+            activitySourceLabel: singleAccount?.activitySourceLabel,
+            hasCostData: accountVMs.contains(where: \.hasCostData),
+            unpricedModelNames: Array(Set(accountVMs.flatMap(\.unpricedModelNames))).sorted()
         )
     }
 
@@ -316,12 +323,29 @@ struct DashboardBuilder {
             sparkline: sparkline,
             costDashboard: buildCostDashboard(filter: { snap in snap.providerId == providerId && snap.accountId == accountId }),
             subAccounts: nil,
+            modelCosts: modelCosts(providerId: providerId, accountId: accountId),
             alertSignature: signature,
             hasUnseenAlert: signature.map { !ui.seenAlerts.contains($0) } ?? false,
             lastSuccessAt: h?.lastSuccessAt,
             errorDetail: h?.lastErrorMessage,
             repairRecommended: h.map(needsCredentialRepair) ?? false,
-            accountEmail: account?.email
+            accountEmail: account?.email,
+            activitySourceLabel: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.activity.map {
+                $0.provenance.source == .providerReported
+                    ? "Account activity reported by \(pretty(providerId)); may include other devices."
+                    : "Activity observed on this Mac."
+            },
+            hasCostData: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.cost.map {
+                (!$0.days.isEmpty || !$0.models.isEmpty)
+                    && ($0.pricing.unpricedTokens == 0 || $0.pricing.pricedTokens > 0)
+            } ?? false,
+            unpricedModelNames: dashboardByAccount[
+                ProviderAccountKey(providerId: providerId, accountId: accountId)
+            ]?.cost?.pricing.unpricedModels ?? []
         )
     }
 
@@ -337,10 +361,6 @@ struct DashboardBuilder {
     private func buildCostDashboard(filter: ((UsageSnapshot) -> Bool)?) -> CostDashboardVM {
         let calendar = dayCalendar
         let today = calendar.startOfDay(for: Date())
-        let dayStarts = (0..<30).compactMap { offset in
-            calendar.date(byAdding: .day, value: offset - 29, to: today)
-        }
-        let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
         let allowedAccounts: Set<ProviderAccountKey>? = filter.map { predicate in
             Set(snapshots.filter(predicate).map {
                 ProviderAccountKey(providerId: $0.providerId, accountId: $0.accountId)
@@ -352,6 +372,25 @@ struct DashboardBuilder {
                 ProviderAccountKey(providerId: summary.providerId, accountId: summary.accountId)
             ) ?? true
         }
+        let availableDates = summaries.flatMap { summary in
+            (summary.activity?.days ?? []).compactMap(\.date)
+                + (summary.cost?.days ?? []).compactMap(\.date)
+        }
+        let defaultStart = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+        let firstAvailableDate = availableDates
+            .map { calendar.startOfDay(for: $0) }
+            .filter { $0 <= today }
+            .min()
+        let firstDay = min(firstAvailableDate ?? defaultStart, defaultStart)
+        let dayCount = max(
+            1,
+            (calendar.dateComponents([.day], from: firstDay, to: today).day ?? 0) + 1
+        )
+        let dayStarts = (0..<dayCount).compactMap { offset in
+            calendar.date(byAdding: .day, value: offset, to: firstDay)
+        }
+        let dayKeys = dayStarts.map { DateFormats.dayKey.string(from: $0) }
+        let includedDayKeys = Set(dayKeys)
 
         var rows = [String: [String: (cost: Double, tokens: UInt64)]]()
         var active = Set<String>()
@@ -361,7 +400,7 @@ struct DashboardBuilder {
                 ? summary.providerId
                 : "\(summary.providerId):\(summary.accountId)"
             if let activity = summary.activity {
-                for point in activity.days where dayKeys.contains(point.dateKey) {
+                for point in activity.days where includedDayKeys.contains(point.dateKey) {
                     let current = rows[rowId]?[point.dateKey] ?? (0, 0)
                     rows[rowId, default: [:]][point.dateKey] = (
                         current.cost,
@@ -371,7 +410,7 @@ struct DashboardBuilder {
                 }
             }
             if let cost = summary.cost {
-                for point in cost.days where dayKeys.contains(point.dateKey) {
+                for point in cost.days where includedDayKeys.contains(point.dateKey) {
                     let current = rows[rowId]?[point.dateKey] ?? (0, 0)
                     rows[rowId, default: [:]][point.dateKey] = (
                         current.cost + (point.costUsd ?? 0),
@@ -382,6 +421,25 @@ struct DashboardBuilder {
                     if point.costUsd ?? 0 > 0 { active.insert(rowId) }
                 }
             }
+        }
+        let allTimeCost = summaries
+            .compactMap(\.cost)
+            .flatMap(\.days)
+            .compactMap(\.costUsd)
+            .reduce(0, +)
+        let allTimeTokens = summaries.reduce(UInt64(0)) { total, summary in
+            let accountTotal: UInt64
+            if let activity = summary.activity {
+                accountTotal = activity.lifetimeTokens
+                    ?? activity.days.reduce(UInt64(0)) {
+                        $0.saturatingAdd($1.tokens)
+                    }
+            } else {
+                accountTotal = (summary.cost?.days ?? []).reduce(UInt64(0)) {
+                    $0.saturatingAdd($1.tokens)
+                }
+            }
+            return total.saturatingAdd(accountTotal)
         }
 
         let activeIds = filter == nil
@@ -424,7 +482,39 @@ struct DashboardBuilder {
                 }
             )
         }
-        return CostDashboardVM(days: days, providers: providers)
+        return CostDashboardVM(
+            days: days,
+            providers: providers,
+            allTimeCost: allTimeCost,
+            allTimeTokens: allTimeTokens
+        )
+    }
+
+    private func modelCosts(providerId: String, accountId: String?) -> [ModelCostSummary] {
+        let summaries = dashboard.accounts.filter {
+            $0.providerId == providerId
+                && (accountId == nil || $0.accountId == accountId)
+                && !hiddenAccountIdSet.contains($0.accountId)
+        }
+        var totals = [String: ModelCostSummary]()
+        for model in summaries.compactMap(\.cost).flatMap(\.models) {
+            let current = totals[model.model]
+            totals[model.model] = ModelCostSummary(
+                model: model.model,
+                eventCount: (current?.eventCount ?? 0).saturatingAdd(model.eventCount),
+                tokens: (current?.tokens ?? 0).saturatingAdd(model.tokens),
+                vendorCostUsd: (current?.vendorCostUsd ?? 0) + model.vendorCostUsd,
+                meteredCostUsd: (current?.meteredCostUsd ?? 0) + model.meteredCostUsd,
+                chargeableCostUsd: (current?.chargeableCostUsd ?? 0) + model.chargeableCostUsd,
+                providerFeeUsd: (current?.providerFeeUsd ?? 0) + model.providerFeeUsd
+            )
+        }
+        return totals.values.sorted {
+            if $0.meteredCostUsd != $1.meteredCostUsd {
+                return $0.meteredCostUsd > $1.meteredCostUsd
+            }
+            return $0.model < $1.model
+        }
     }
 
     private var knownProviderIds: [String] {
@@ -567,7 +657,7 @@ struct DashboardBuilder {
     }
 
     private func selectedHealth(providerId: String, accountId: String?) -> ProviderHealth? {
-        let providerHealth = healthByProvider[providerId] ?? []
+        let providerHealth = (healthByProvider[providerId] ?? []).filter { !suppressesHealth($0) }
         if let accountId, let accountHealth = providerHealth.first(where: { $0.accountId == accountId }) {
             return accountHealth
         }
@@ -575,7 +665,7 @@ struct DashboardBuilder {
     }
 
     private func worstHealthText(providerId: String) -> String {
-        let providerHealth = healthByProvider[providerId] ?? []
+        let providerHealth = (healthByProvider[providerId] ?? []).filter { !suppressesHealth($0) }
         let accountHealth = providerHealth.filter { $0.accountId != nil }
         let relevant = accountHealth.isEmpty ? providerHealth : accountHealth
         let worst = relevant.max {
@@ -605,6 +695,10 @@ struct DashboardBuilder {
         }
     }
 
+    private func suppressesHealth(_ health: ProviderHealth) -> Bool {
+        connectivity == .offline && health.lastErrorCode == "network"
+    }
+
     private func window(_ w: UsageWindow, providerId: String, accountId: String) -> WindowVM {
         let percent = (w.percentRemaining ?? computedPercent(w)).map { max(0, min(100, $0)) }
         let status: DisplayStatus = percent.map { $0 < 10 ? .critical : ($0 < 25 ? .warning : .normal) } ?? .normal
@@ -622,7 +716,8 @@ struct DashboardBuilder {
             percent: percent,
             status: status,
             resetAt: w.resetAt,
-            forecast: matchingForecast.map(windowForecast)
+            forecast: matchingForecast.map(windowForecast),
+            isMuted: connectivity == .offline
         )
     }
 
@@ -680,16 +775,19 @@ struct DashboardBuilder {
     private func statusValue(id: String, percent: Double?, latest: UsageSnapshot?, health h: ProviderHealth?, enabled: Bool) -> DisplayStatus {
         guard enabled else { return .disabled }
         switch h?.status {
-        case .ok, .none: break
+        case .ok, .backingOff, .none: break
         case .disabled?: return .disabled
-        case .backingOff?: return .warning
         default: return .error
         }
-        if let latest, Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) {
+        if connectivity != .offline,
+           let latest,
+           Date().timeIntervalSince(latest.collectedAt) > Double((config?.pollIntervalSeconds ?? 60) * 2) {
             return refreshingProviderIDs.contains(id) ? .refreshing : .stale
         }
         if let percent { return percent < 10 ? .critical : (percent < 25 ? .warning : .normal) }
-        if latest == nil { return refreshingProviderIDs.contains(id) ? .refreshing : .stale }
+        if latest == nil {
+            return refreshingProviderIDs.contains(id) ? .refreshing : .stale
+        }
         return .normal
     }
 

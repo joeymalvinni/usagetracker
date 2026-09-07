@@ -24,6 +24,10 @@ struct Summary: View {
                         }
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
+                    if state.shouldOfferNotifications {
+                        NotificationOfferCard()
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                     if state.providers.isEmpty {
                         EmptyState(
                             text: state.daemon == .offline ? "Daemon unavailable" : "No providers enabled",
@@ -67,7 +71,38 @@ struct Summary: View {
 
     private var summarySubtitle: HeaderSubtitleStyle {
         if state.daemon == .offline { return .offline }
+        if state.connectivity.status == .offline { return .networkOffline }
         guard let date = state.lastSuccessfulRefresh else { return .custom("waiting for first successful refresh") }
         return .custom("last refreshed \(DateFormats.relative.localizedString(for: date, relativeTo: Date()))")
+    }
+}
+
+private struct NotificationOfferCard: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+            HStack(alignment: .top, spacing: Theme.Spacing.sm) {
+                Image(systemName: "bell.badge")
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Get a heads-up before you run low")
+                        .font(Theme.Typography.headline)
+                    Text("Enable alerts for low limits and resets.")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack {
+                Button("Not now") { state.dismissNotificationOffer() }
+                    .buttonStyle(.chip)
+                Spacer()
+                Button("Enable alerts") {
+                    Task { await state.acceptNotificationOffer() }
+                }
+                .buttonStyle(.chipProminent)
+            }
+        }
+        .surfaceCard()
     }
 }

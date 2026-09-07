@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use unicode_normalization::UnicodeNormalization;
 use usage_core::{
-    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
-    UsageSnapshot,
+    Account, ProviderId, SnapshotDetail, UsageDataCompleteness, UsageDataQuality, UsageDataScope,
+    UsageDataSource, UsageSnapshot,
 };
 
 use crate::{
@@ -201,15 +201,19 @@ impl ClaudeCollector {
             provider_id: ProviderId::new(PROVIDER_ID),
             collected_at: chrono::Utc::now(),
             windows: Vec::new(),
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         };
         merge_local_cost_report(&mut usage, scan.report);
-        usage.metadata["claude_cost"]["scan_cache"] = json!(cache_status);
+        if let Some(cost) = usage.detail.cost.as_mut() {
+            cost.extra
+                .insert("scan_cache".to_string(), json!(cache_status));
+        }
         Ok(Some(UsageDataset::supplemental_named(
             "claude_local_logs",
             ProviderCollectionResult {
                 usage,
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "claude_local_logs".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -651,20 +655,24 @@ impl ProviderCollector for ClaudeCollector {
             Err(api_err) => return Err(api_err),
         };
 
-        usage.metadata["credential_profile"] = json!(account.external_account_id);
-        usage.metadata["profile_id"] = json!(profile.id.as_str());
+        usage.detail.credential_profile = Some(account.external_account_id.clone());
+        usage
+            .detail
+            .extra
+            .insert("profile_id".to_string(), json!(profile.id.as_str()));
         if let Some(display_name) = profile.display_name.as_deref() {
-            usage.metadata["profile_display_name"] = json!(display_name);
+            usage
+                .detail
+                .extra
+                .insert("profile_display_name".to_string(), json!(display_name));
         }
-        if usage
-            .metadata
-            .get("subscription_type")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
+        if usage.detail.subscription_type.is_none() {
             if let Ok(credentials) = self.load_credentials(&profile).await {
-                usage.metadata["subscription_type"] = json!(credentials.subscription_type);
-                usage.metadata["rate_limit_tier"] = json!(credentials.rate_limit_tier);
+                usage.detail.subscription_type = credentials.subscription_type.clone();
+                usage.detail.extra.insert(
+                    "rate_limit_tier".to_string(),
+                    json!(credentials.rate_limit_tier),
+                );
             }
         }
 
@@ -679,6 +687,7 @@ impl ProviderCollector for ClaudeCollector {
             ProviderCollectionResult {
                 usage,
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode,
                 account_email: account.email.clone(),
                 warnings,
@@ -934,10 +943,22 @@ mod tests {
         merge_local_cost_report(&mut personal_usage, personal_scan.report);
         merge_local_cost_report(&mut work_usage, work_scan.report);
 
-        assert_eq!(personal_usage.metadata["claude_cost"]["total_tokens"], 11);
-        assert_eq!(work_usage.metadata["claude_cost"]["total_tokens"], 22);
-        assert_eq!(personal_usage.metadata["claude_cost"]["files_scanned"], 1);
-        assert_eq!(work_usage.metadata["claude_cost"]["files_scanned"], 1);
+        assert_eq!(
+            personal_usage.detail.cost.as_ref().unwrap().total_tokens,
+            Some(11)
+        );
+        assert_eq!(
+            work_usage.detail.cost.as_ref().unwrap().total_tokens,
+            Some(22)
+        );
+        assert_eq!(
+            personal_usage.detail.cost.as_ref().unwrap().extra["files_scanned"],
+            1
+        );
+        assert_eq!(
+            work_usage.detail.cost.as_ref().unwrap().extra["files_scanned"],
+            1
+        );
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -974,7 +995,7 @@ mod tests {
             provider_id: ProviderId::new(PROVIDER_ID),
             collected_at: Utc::now(),
             windows: Vec::new(),
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         }
     }
 

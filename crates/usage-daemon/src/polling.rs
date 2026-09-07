@@ -14,11 +14,12 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 use usage_core::{
-    AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus, RefreshJob, RefreshJobId,
-    RefreshJobStatus, RefreshScope, RefreshTrigger,
+    AccountId, ProviderId, ProviderRefreshResult, ProviderRefreshStatus, RefreshAccountDiscovery,
+    RefreshJob, RefreshJobId, RefreshJobStatus, RefreshScope, RefreshTrigger,
 };
 
 use crate::{
+    connectivity::ConnectivityMonitor,
     health,
     notifications::NotificationManager,
     providers::{
@@ -27,7 +28,7 @@ use crate::{
         UsageDataset,
     },
     runtime::provider_registry,
-    storage::{Storage, StoredProviderBackoff},
+    storage::{CollectionRecord, Storage, StoredProviderBackoff},
 };
 
 const RATE_LIMIT_BACKOFF_SECONDS: [i64; 5] = [5 * 60, 10 * 60, 20 * 60, 40 * 60, 60 * 60];
@@ -51,6 +52,7 @@ struct CollectionState {
 #[derive(Clone)]
 pub struct RefreshCoordinator {
     storage: Storage,
+    connectivity: ConnectivityMonitor,
     notifications: Arc<NotificationManager>,
     providers: Arc<RwLock<Vec<Arc<dyn ProviderCollector>>>>,
     jobs: Arc<Mutex<RefreshJobs>>,
@@ -71,6 +73,12 @@ impl RefreshKey {
             }
         }
     }
+
+    fn includes_provider(&self, provider_id: &ProviderId) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|providers| providers.contains(provider_id))
+    }
 }
 
 struct RefreshJobEntry {
@@ -80,6 +88,7 @@ struct RefreshJobEntry {
 
 struct ProviderRefreshFlight {
     result: RwLock<Option<Vec<ProviderRefreshResult>>>,
+    discovered_accounts: RwLock<Vec<AccountId>>,
     finished: Notify,
 }
 
@@ -99,7 +108,22 @@ impl RefreshCoordinator {
     #[cfg(test)]
     pub fn new(storage: Storage, providers: Vec<Arc<dyn ProviderCollector>>) -> Self {
         let notifications = NotificationManager::new(storage.clone(), false);
-        Self::with_notifications(storage, providers, notifications)
+        Self::with_notifications_and_connectivity(
+            storage,
+            providers,
+            notifications,
+            ConnectivityMonitor::fixed(usage_core::ConnectivityStatus::Online),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn new_with_connectivity(
+        storage: Storage,
+        providers: Vec<Arc<dyn ProviderCollector>>,
+        connectivity: ConnectivityMonitor,
+    ) -> Self {
+        let notifications = NotificationManager::new(storage.clone(), false);
+        Self::with_notifications_and_connectivity(storage, providers, notifications, connectivity)
     }
 
     pub fn with_notifications(
@@ -107,14 +131,33 @@ impl RefreshCoordinator {
         providers: Vec<Arc<dyn ProviderCollector>>,
         notifications: Arc<NotificationManager>,
     ) -> Self {
+        Self::with_notifications_and_connectivity(
+            storage,
+            providers,
+            notifications,
+            ConnectivityMonitor::system(),
+        )
+    }
+
+    pub(crate) fn with_notifications_and_connectivity(
+        storage: Storage,
+        providers: Vec<Arc<dyn ProviderCollector>>,
+        notifications: Arc<NotificationManager>,
+        connectivity: ConnectivityMonitor,
+    ) -> Self {
         Self {
             storage,
+            connectivity,
             notifications,
             providers: Arc::new(RwLock::new(providers)),
             jobs: Arc::new(Mutex::new(RefreshJobs::default())),
             provider_flights: Arc::new(Mutex::new(HashMap::new())),
             local_provider_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn connectivity(&self) -> usage_core::Connectivity {
+        self.connectivity.current()
     }
 
     pub async fn set_providers(&self, providers: Vec<Arc<dyn ProviderCollector>>) {
@@ -340,6 +383,8 @@ impl RefreshCoordinator {
             created_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            skipped_offline: false,
+            discovered_accounts: Vec::new(),
             provider_results: Vec::new(),
             failure_message: None,
         };
@@ -349,7 +394,29 @@ impl RefreshCoordinator {
         });
         jobs.active.insert(key.clone(), entry.clone());
         jobs.by_id.insert(job.id, entry.clone());
+        drop(jobs);
+        self.seed_job_discoveries(&key, &entry).await;
         (key, entry, false)
+    }
+
+    async fn seed_job_discoveries(&self, key: &RefreshKey, entry: &RefreshJobEntry) {
+        let flights = self
+            .provider_flights
+            .lock()
+            .await
+            .iter()
+            .filter(|(provider_id, _)| key.includes_provider(provider_id))
+            .map(|(provider_id, flight)| (provider_id.clone(), flight.clone()))
+            .collect::<Vec<_>>();
+        if flights.is_empty() {
+            return;
+        }
+        let mut job = entry.job.write().await;
+        for (provider_id, flight) in flights {
+            for account_id in flight.discovered_accounts.read().await.iter() {
+                append_discovery(&mut job, &provider_id, account_id);
+            }
+        }
     }
 
     fn spawn_claimed_job(&self, key: RefreshKey, entry: Arc<RefreshJobEntry>) {
@@ -379,6 +446,7 @@ impl RefreshCoordinator {
             job.status = RefreshJobStatus::Completed;
             job.started_at = Some(report.started_at);
             job.finished_at = Some(report.finished_at);
+            job.skipped_offline = report.skipped_offline;
             job.provider_results = report.provider_results;
             job.id.clone()
         };
@@ -436,6 +504,39 @@ impl RefreshCoordinator {
             "refresh started"
         );
 
+        if self.connectivity.current().status == usage_core::ConnectivityStatus::Offline {
+            let provider_ids = providers
+                .into_iter()
+                .filter_map(|provider| {
+                    let provider_id = provider.provider_id();
+                    should_refresh_provider(&provider_id, filter).then_some(provider_id)
+                })
+                .collect::<Vec<_>>();
+            let local_datasets = self.refresh_local(&provider_ids).await;
+            let provider_results = provider_ids
+                .into_iter()
+                .map(|provider_id| ProviderRefreshResult {
+                    provider_id,
+                    account_id: None,
+                    status: ProviderRefreshStatus::Network,
+                    collection_mode: None,
+                    collected_at: None,
+                    message: Some("No internet connection. Showing last known usage.".to_string()),
+                })
+                .collect::<Vec<_>>();
+            let finished_at = Utc::now();
+            info!(
+                results = provider_results.len(),
+                local_datasets, "refresh skipped because the machine is offline"
+            );
+            return RefreshReport {
+                started_at,
+                finished_at,
+                skipped_offline: true,
+                provider_results,
+            };
+        }
+
         let refreshes = providers.into_iter().filter_map(|provider| {
             let provider_id = provider.provider_id();
             if should_refresh_provider(&provider_id, filter) {
@@ -463,6 +564,7 @@ impl RefreshCoordinator {
         RefreshReport {
             started_at,
             finished_at,
+            skipped_offline: false,
             provider_results,
         }
     }
@@ -483,6 +585,7 @@ impl RefreshCoordinator {
             } else {
                 let flight = Arc::new(ProviderRefreshFlight {
                     result: RwLock::new(None),
+                    discovered_accounts: RwLock::new(Vec::new()),
                     finished: Notify::new(),
                 });
                 flights.insert(provider_id.clone(), flight.clone());
@@ -686,6 +789,8 @@ impl RefreshCoordinator {
                 );
             }
         };
+        self.record_account_discovery(&provider_id, &account.id)
+            .await;
 
         if !account.collection_enabled {
             self.clear_rate_limit_backoff(&provider_id, &account.id)
@@ -794,6 +899,29 @@ impl RefreshCoordinator {
                 self.record_failure(provider_id, Some(account.id), err)
                     .await
             }
+        }
+    }
+
+    async fn record_account_discovery(&self, provider_id: &ProviderId, account_id: &AccountId) {
+        if let Some(flight) = self.provider_flights.lock().await.get(provider_id).cloned() {
+            let mut discoveries = flight.discovered_accounts.write().await;
+            if !discoveries.contains(account_id) {
+                discoveries.push(account_id.clone());
+            }
+        }
+
+        let entries = self
+            .jobs
+            .lock()
+            .await
+            .active
+            .iter()
+            .filter(|(key, _)| key.includes_provider(provider_id))
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let mut job = entry.job.write().await;
+            append_discovery(&mut job, provider_id, account_id);
         }
     }
 
@@ -1099,17 +1227,18 @@ impl RefreshCoordinator {
         let store_started = Instant::now();
         if let Err(err) = self
             .storage
-            .record_collection(
-                &snapshot,
-                &result.daily_usage,
-                &state.health,
-                result.account_email.as_deref(),
-                match &state.backoff {
+            .record_collection(CollectionRecord {
+                snapshot: &snapshot,
+                daily_usage: &result.daily_usage,
+                usage_events: result.usage_events.as_ref(),
+                health: &state.health,
+                email: result.account_email.as_deref(),
+                backoff: match &state.backoff {
                     CollectionBackoff::Set(backoff) => Some(backoff),
                     CollectionBackoff::Preserve | CollectionBackoff::Clear => None,
                 },
-                matches!(state.backoff, CollectionBackoff::Clear),
-            )
+                clear_backoff: matches!(state.backoff, CollectionBackoff::Clear),
+            })
             .await
         {
             warn!(
@@ -1181,6 +1310,16 @@ impl RefreshCoordinator {
             error = %error,
             "provider refresh failed"
         );
+        if error.kind() == ProviderErrorKind::Network
+            && self.connectivity.current().status == usage_core::ConnectivityStatus::Offline
+        {
+            info!(
+                provider_id = provider_id.as_str(),
+                account_id = account_id.as_ref().map(AccountId::as_str),
+                "preserving provider health because the machine is offline"
+            );
+            return provider_error_result(provider_id, account_id, error);
+        }
         let provider_health =
             health::from_provider_error(provider_id.clone(), account_id.clone(), &error);
         if let Err(err) = self.storage.upsert_health(&provider_health).await {
@@ -1233,7 +1372,7 @@ fn validate_discovery(
 fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResult> {
     let mut datasets = datasets.into_iter();
     let first = datasets.next()?;
-    let mut provenance = vec![dataset_provenance(&first)];
+    let mut provenance = vec![first.provenance_record()];
     let mut result = first.collection;
     let mut modes = BTreeSet::from([result.collection_mode.clone()]);
     let mut window_ids = result
@@ -1245,7 +1384,6 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
 
     for dataset in datasets {
         let mut contributed_window_ids = Vec::new();
-        let mut contributed_metadata_keys = Vec::new();
         let mut provenance_record = dataset.provenance_record();
         let incoming = dataset.collection;
         result.usage.collected_at = result.usage.collected_at.max(incoming.usage.collected_at);
@@ -1255,23 +1393,18 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
                 result.usage.windows.push(window);
             }
         }
-        if let (Some(target), Some(source)) = (
-            result.usage.metadata.as_object_mut(),
-            incoming.usage.metadata.as_object(),
-        ) {
-            for (key, value) in source {
-                if let serde_json::map::Entry::Vacant(entry) = target.entry(key.clone()) {
-                    contributed_metadata_keys.push(key.clone());
-                    entry.insert(value.clone());
-                }
-            }
-        }
+        // First writer wins for each typed field and diagnostic key.
+        let contributed_metadata_keys = result
+            .usage
+            .detail
+            .fill_missing_from(&incoming.usage.detail);
         provenance_record.window_ids = contributed_window_ids;
         provenance_record.metadata_keys = contributed_metadata_keys;
-        provenance.push(
-            serde_json::to_value(provenance_record).expect("dataset provenance is serializable"),
-        );
+        provenance.push(provenance_record);
         result.daily_usage.extend(incoming.daily_usage);
+        if result.usage_events.is_none() {
+            result.usage_events = incoming.usage_events;
+        }
         result.warnings.extend(incoming.warnings);
         if result.account_email.is_none() {
             result.account_email = incoming.account_email;
@@ -1280,17 +1413,8 @@ fn merge_datasets(datasets: Vec<UsageDataset>) -> Option<ProviderCollectionResul
     }
 
     result.collection_mode = modes.into_iter().collect::<Vec<_>>().join("+");
-    if let Some(metadata) = result.usage.metadata.as_object_mut() {
-        metadata.insert(
-            "dataset_provenance".to_string(),
-            serde_json::Value::Array(provenance),
-        );
-    }
+    result.usage.detail.dataset_provenance = provenance;
     Some(result)
-}
-
-fn dataset_provenance(dataset: &UsageDataset) -> serde_json::Value {
-    serde_json::to_value(dataset.provenance_record()).expect("dataset provenance is serializable")
 }
 
 fn jittered_backoff_seconds(
@@ -1312,6 +1436,7 @@ fn jittered_backoff_seconds(
 pub struct RefreshReport {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    pub skipped_offline: bool,
     pub provider_results: Vec<ProviderRefreshResult>,
 }
 
@@ -1320,6 +1445,7 @@ impl RefreshReport {
         Self {
             started_at: job.started_at.unwrap_or(job.created_at),
             finished_at: job.finished_at.unwrap_or_else(Utc::now),
+            skipped_offline: job.skipped_offline,
             provider_results: job.provider_results,
         }
     }
@@ -1329,6 +1455,16 @@ fn normalized_scope(filter: Option<Vec<ProviderId>>) -> RefreshScope {
     match filter {
         Some(providers) => RefreshScope::providers(providers),
         None => RefreshScope::all(),
+    }
+}
+
+fn append_discovery(job: &mut RefreshJob, provider_id: &ProviderId, account_id: &AccountId) {
+    let discovery = RefreshAccountDiscovery {
+        provider_id: provider_id.clone(),
+        account_id: account_id.clone(),
+    };
+    if !job.discovered_accounts.contains(&discovery) {
+        job.discovered_accounts.push(discovery);
     }
 }
 
@@ -1404,7 +1540,7 @@ mod tests {
         time::timeout,
     };
     use usage_core::{
-        DatasetProvenance, ProviderHealth, ProviderHealthStatus, UsageAmount,
+        CostDetail, ProviderHealth, ProviderHealthStatus, SnapshotDetail, UsageAmount,
         UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource, UsageUnit,
         UsageWindow, UsageWindowKind,
     };
@@ -1468,9 +1604,16 @@ mod tests {
                         provider_id: ProviderId::new("claude"),
                         collected_at: Utc::now(),
                         windows: Vec::new(),
-                        metadata: json!({"claude_cost": {"tokens": 42}}),
+                        detail: SnapshotDetail {
+                            cost: Some(CostDetail {
+                                total_tokens: Some(42),
+                                ..CostDetail::default()
+                            }),
+                            ..SnapshotDetail::default()
+                        },
                     },
                     daily_usage: Vec::new(),
+                    usage_events: None,
                     collection_mode: "claude_local_logs".to_string(),
                     account_email: None,
                     warnings: Vec::new(),
@@ -1531,9 +1674,10 @@ mod tests {
                         percent_remaining: Some(75.0),
                         reset_at: None,
                     }],
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "live".to_string(),
                 account_email: Some("claude@example.com".to_string()),
                 warnings: vec![],
@@ -1570,9 +1714,10 @@ mod tests {
                     provider_id: ProviderId::new("grok"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1621,9 +1766,10 @@ mod tests {
                     provider_id: ProviderId::new("grok"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: account.email.clone(),
                 warnings: vec![],
@@ -1668,11 +1814,13 @@ mod tests {
                     provider_id: ProviderId::new("codex"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({
-                        "credential_profile": account.profile_id.as_deref(),
-                    }),
+                    detail: SnapshotDetail {
+                        credential_profile: account.profile_id.clone(),
+                        ..SnapshotDetail::default()
+                    },
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: account.email.clone(),
                 warnings: vec![],
@@ -1716,9 +1864,10 @@ mod tests {
                     provider_id: ProviderId::new("codex"),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1778,9 +1927,10 @@ mod tests {
                     provider_id: ProviderId::new(self.provider_id),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1862,9 +2012,10 @@ mod tests {
                             percent_remaining: None,
                             reset_at: None,
                         }],
-                        metadata: json!({}),
+                        detail: SnapshotDetail::default(),
                     },
                     daily_usage: Vec::new(),
+                    usage_events: None,
                     collection_mode: "local".to_string(),
                     account_email: None,
                     warnings: Vec::new(),
@@ -1911,9 +2062,10 @@ mod tests {
                     provider_id: ProviderId::new(self.provider_id),
                     collected_at: Utc::now(),
                     windows: Vec::new(),
-                    metadata: json!({}),
+                    detail: SnapshotDetail::default(),
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "test".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -1945,7 +2097,10 @@ mod tests {
                     percent_remaining: Some(90.0),
                     reset_at: None,
                 }],
-                metadata: json!({"remote": true}),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(json!({"remote": true})),
+                    ..SnapshotDetail::default()
+                },
             })
             .await
             .unwrap();
@@ -1966,8 +2121,75 @@ mod tests {
             .windows
             .iter()
             .any(|window| window.window_id == "remote_quota"));
-        assert_eq!(snapshot.metadata["remote"], true);
-        assert_eq!(snapshot.metadata["claude_cost"]["tokens"], 42);
+        assert_eq!(snapshot.detail.extra["remote"], true);
+        assert_eq!(
+            snapshot.detail.cost.as_ref().unwrap().total_tokens,
+            Some(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_refresh_skips_collectors_and_preserves_provider_health() {
+        let storage = test_storage();
+        let provider_id = ProviderId::new("claude");
+        let account = storage
+            .upsert_account(&provider_id, "claude-account", Some("default"), None, None)
+            .await
+            .unwrap();
+        storage
+            .insert_snapshot(&usage_core::UsageSnapshot {
+                provider_id: provider_id.clone(),
+                account_id: account.id,
+                collected_at: Utc::now() - chrono::TimeDelta::minutes(2),
+                windows: Vec::new(),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(json!({"remote": true})),
+                    ..SnapshotDetail::default()
+                },
+            })
+            .await
+            .unwrap();
+        let existing = ProviderHealth {
+            provider_id,
+            account_id: None,
+            status: ProviderHealthStatus::Ok,
+            collection_mode: Some("oauth".to_string()),
+            last_success_at: Some(Utc::now() - chrono::TimeDelta::minutes(2)),
+            last_failure_at: None,
+            last_error_code: None,
+            last_error_message: None,
+            updated_at: Utc::now() - chrono::TimeDelta::minutes(2),
+        };
+        storage.upsert_health(&existing).await.unwrap();
+        let remote_attempts = Arc::new(AtomicUsize::new(0));
+        let coordinator = RefreshCoordinator::new_with_connectivity(
+            storage.clone(),
+            vec![Arc::new(LocalOnlyProvider {
+                remote_attempts: remote_attempts.clone(),
+            })],
+            ConnectivityMonitor::fixed(usage_core::ConnectivityStatus::Offline),
+        );
+
+        let report = coordinator.refresh(None).await;
+
+        assert_eq!(remote_attempts.load(Ordering::SeqCst), 0);
+        assert!(report.skipped_offline);
+        assert_eq!(report.provider_results.len(), 1);
+        assert_eq!(
+            report.provider_results[0].status,
+            ProviderRefreshStatus::Network
+        );
+        let health = storage.provider_health().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+        assert_eq!(health[0].last_success_at, existing.last_success_at);
+        assert!(health[0].last_error_code.is_none());
+        let snapshot = storage.latest_usage().await.unwrap().remove(0);
+        assert_eq!(snapshot.detail.extra["remote"], true);
+        assert_eq!(
+            snapshot.detail.cost.as_ref().unwrap().total_tokens,
+            Some(42)
+        );
     }
 
     #[test]
@@ -1992,12 +2214,14 @@ mod tests {
                 provider_id: provider_id.clone(),
                 collected_at: Utc::now(),
                 windows: vec![window("shared_history", 10.0)],
-                metadata: json!({
-                    "collection_mode": "opencode_go_web_console",
-                    "web_authoritative": true,
-                }),
+                detail: SnapshotDetail {
+                    collection_mode: Some("opencode_go_web_console".to_string()),
+                    web_authoritative: Some(true),
+                    ..SnapshotDetail::default()
+                },
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "web".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -2012,13 +2236,15 @@ mod tests {
                         window("shared_history", 99.0),
                         window("local_history", 25.0),
                     ],
-                    metadata: json!({
-                        "collection_mode": "opencode_go_local_sqlite",
-                        "web_authoritative": false,
-                        "database": "opencode.db",
-                    }),
+                    detail: SnapshotDetail {
+                        collection_mode: Some("opencode_go_local_sqlite".to_string()),
+                        web_authoritative: Some(false),
+                        extra: crate::providers::json_map(json!({ "database": "opencode.db" })),
+                        ..SnapshotDetail::default()
+                    },
                 },
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "local".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -2032,11 +2258,11 @@ mod tests {
         let merged = merge_datasets(vec![authoritative, local]).unwrap();
 
         assert_eq!(
-            merged.usage.metadata["collection_mode"],
-            "opencode_go_web_console"
+            merged.usage.detail.collection_mode.as_deref(),
+            Some("opencode_go_web_console")
         );
-        assert_eq!(merged.usage.metadata["web_authoritative"], true);
-        assert_eq!(merged.usage.metadata["database"], "opencode.db");
+        assert_eq!(merged.usage.detail.web_authoritative, Some(true));
+        assert_eq!(merged.usage.detail.extra["database"], "opencode.db");
         assert_eq!(
             merged
                 .usage
@@ -2059,10 +2285,7 @@ mod tests {
                 .value,
             10.0
         );
-        let provenance = serde_json::from_value::<Vec<DatasetProvenance>>(
-            merged.usage.metadata["dataset_provenance"].clone(),
-        )
-        .unwrap();
+        let provenance = merged.usage.detail.dataset_provenance.clone();
         let local = provenance
             .iter()
             .find(|dataset| dataset.source_id == "opencode_local_database")
@@ -2093,6 +2316,16 @@ mod tests {
         timeout(Duration::from_secs(1), first_started)
             .await
             .expect("background refresh should begin");
+        let collecting = coordinator
+            .get_refresh_job(&first.job.id)
+            .await
+            .expect("running job should remain queryable");
+        assert_eq!(collecting.status, RefreshJobStatus::Running);
+        assert_eq!(collecting.discovered_accounts.len(), 1);
+        assert_eq!(
+            collecting.discovered_accounts[0].provider_id,
+            ProviderId::new("codex")
+        );
 
         let second = coordinator
             .start_refresh(Some(vec![ProviderId::new("codex")]), RefreshTrigger::Manual)
@@ -2191,14 +2424,30 @@ mod tests {
         timeout(Duration::from_secs(1), provider_started)
             .await
             .unwrap();
-        let all = {
+
+        // The overlapping job joins the in-flight provider and is seeded with
+        // the accounts it has already discovered.
+        let all = coordinator
+            .start_refresh(None, RefreshTrigger::Manual)
+            .await;
+        assert!(!all.coalesced);
+        assert!(all
+            .job
+            .discovered_accounts
+            .iter()
+            .any(|discovery| discovery.provider_id == ProviderId::new("codex")));
+
+        let shared_waiter = {
             let coordinator = coordinator.clone();
             tokio::spawn(async move { coordinator.refresh(None).await })
         };
         tokio::task::yield_now().await;
         release.notify_waiters();
 
-        let report = timeout(Duration::from_secs(1), all).await.unwrap().unwrap();
+        let report = timeout(Duration::from_secs(1), shared_waiter)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(report.provider_results.len(), 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }

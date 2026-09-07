@@ -15,7 +15,7 @@ launch_agent_was_registered=0
 update_status_file="${USAGETRACKER_UPDATE_STATUS_FILE:-}"
 daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
 daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
-launch_agent_label="engineering.super.usagetracker.daemon"
+launch_agent_label="app.usagetracker.daemon"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
   style_bold=$'\033[1m'
@@ -300,8 +300,7 @@ daemon_pids() {
 
 unregister_launch_agent() {
   local executable="$app_path/Contents/MacOS/UsageMenuBar"
-  local plist="$app_path/Contents/Library/LaunchAgents/$launch_agent_label.plist"
-  if [[ -x "$executable" && -f "$plist" ]]; then
+  if [[ -x "$executable" ]]; then
     local command_status
     if "$executable" --prepare-daemon-agent-update >/dev/null 2>&1; then
       command_status=0
@@ -360,7 +359,7 @@ wait_for_processes() {
   return 1
 }
 
-expected_app_identifier="engineering.super.usagetracker"
+expected_app_identifier="app.usagetracker"
 expected_daemon_identifier="$expected_app_identifier.daemon"
 expected_cli_identifier="$expected_app_identifier.cli"
 
@@ -430,12 +429,25 @@ fi
 
 if [[ "$install_app" == "1" ]]; then
   app_path="$app_dir/UsageTracker.app"
+  app_receipt="$app_dir/.UsageTracker.app.install-receipt"
   if [[ -e "$app_path" ]]; then
     installed_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
       "$app_path/Contents/Info.plist" 2>/dev/null || true)"
     installed_app_identifier="$(signature_field "$app_path" Identifier || true)"
-    if [[ "$force" != "1" && \
-          ( "$installed_bundle_id" != "$app_identifier" || "$installed_app_identifier" != "$app_identifier" ) ]]; then
+    installed_app_signature="$(signature_field "$app_path" Signature || true)"
+    receipt_bundle_id=""
+    receipt_app_signature=""
+    if [[ -f "$app_receipt" ]]; then
+      receipt_bundle_id="$(sed -n '1p' "$app_receipt")"
+      receipt_app_signature="$(sed -n '2p' "$app_receipt")"
+    fi
+    if [[ "$force" != "1" &&
+          ! ( "$installed_bundle_id" == "$app_identifier" &&
+              "$installed_app_identifier" == "$app_identifier" ) &&
+          ! ( -n "$receipt_bundle_id" &&
+              "$installed_bundle_id" == "$receipt_bundle_id" &&
+              "$installed_app_identifier" == "$receipt_bundle_id" &&
+              "$installed_app_signature" == "$receipt_app_signature" ) ]]; then
       echo "Refusing to replace an unrelated app at $app_path; pass --force to override" >&2
       exit 1
     fi
@@ -444,9 +456,21 @@ fi
 
 if [[ "$install_cli" == "1" ]]; then
   cli_path="$bin_dir/usage"
+  cli_receipt="$bin_dir/.usage.install-receipt"
   if [[ -e "$cli_path" ]]; then
     installed_cli_id="$(signature_field "$cli_path" Identifier || true)"
-    if [[ "$force" != "1" && "$installed_cli_id" != "$cli_identifier" ]]; then
+    installed_cli_signature="$(signature_field "$cli_path" Signature || true)"
+    receipt_cli_id=""
+    receipt_cli_signature=""
+    if [[ -f "$cli_receipt" ]]; then
+      receipt_cli_id="$(sed -n '1p' "$cli_receipt")"
+      receipt_cli_signature="$(sed -n '2p' "$cli_receipt")"
+    fi
+    if [[ "$force" != "1" &&
+          "$installed_cli_id" != "$cli_identifier" &&
+          ! ( -n "$receipt_cli_id" &&
+              "$installed_cli_id" == "$receipt_cli_id" &&
+              "$installed_cli_signature" == "$receipt_cli_signature" ) ]]; then
       echo "Refusing to replace an unrelated command at $cli_path; pass --force to override" >&2
       exit 1
     fi
@@ -458,7 +482,8 @@ if [[ "$install_app" == "1" ]]; then
   if app_is_running; then
     app_was_running=1
     status "Closing the running app..."
-    osascript -e "tell application id \"$app_identifier\" to quit" >/dev/null 2>&1 || true
+    quit_identifier="${installed_bundle_id:-$app_identifier}"
+    osascript -e "tell application id \"$quit_identifier\" to quit" >/dev/null 2>&1 || true
     for _ in {1..20}; do
       if ! app_is_running; then break; fi
       sleep 0.25

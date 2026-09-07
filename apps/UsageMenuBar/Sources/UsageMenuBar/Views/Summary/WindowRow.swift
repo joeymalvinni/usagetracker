@@ -58,7 +58,8 @@ struct WindowRow: View {
                     percent: p,
                     status: window.status,
                     providerId: window.providerId,
-                    forecastPercent: window.forecast?.projectedPercentRemaining
+                    forecastPercent: window.forecast?.projectedPercentRemaining,
+                    isMuted: window.isMuted
                 )
                     .animation(.spring(duration: 0.4), value: p)
                     .animation(

@@ -8,13 +8,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 use usage_core::{
-    Account, ProviderId, UsageDataCompleteness, UsageDataQuality, UsageDataScope, UsageDataSource,
-    UsageSnapshot,
+    Account, ProviderId, SnapshotDetail, UsageDataCompleteness, UsageDataQuality, UsageDataScope,
+    UsageDataSource, UsageSnapshot,
 };
 
 use crate::{
@@ -153,6 +154,8 @@ impl CodexCollector {
         &self,
         profile: &CodexProfile,
     ) -> Result<UsageDataset, ProviderError> {
+        let credentials = self.load_credentials(profile).await?;
+        app_server::validate_profile_home_identity(profile, &credentials.account_id)?;
         let pricing = CodexPricingCatalog::bundled();
         let cost_cache = profile.cost_cache.clone();
         let local_codex_home = self.local_codex_home.clone();
@@ -196,7 +199,7 @@ impl CodexCollector {
             provider_id: ProviderId::new(PROVIDER_ID),
             collected_at: chrono::Utc::now(),
             windows: Vec::new(),
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         };
         usage.merge_cost_report(scan.report, true);
         Ok(UsageDataset::supplemental_named(
@@ -204,6 +207,7 @@ impl CodexCollector {
             ProviderCollectionResult {
                 usage,
                 daily_usage: Vec::new(),
+                usage_events: None,
                 collection_mode: "codex_local_logs".to_string(),
                 account_email: None,
                 warnings: Vec::new(),
@@ -336,12 +340,7 @@ fn codex_profiles(
     let has_direct_default_owner = configured.iter().zip(&decoded).any(|(profile, settings)| {
         profile.enabled
             && !profile.deleted
-            && settings
-                .codex_home
-                .as_ref()
-                .map(|path| expand_home_path(path.clone()))
-                .unwrap_or_else(|| local_codex_home.to_path_buf())
-                == local_codex_home
+            && settings.resolved_home(local_codex_home) == local_codex_home
     });
     let default_activity_owner = (!has_direct_default_owner)
         .then(|| {
@@ -361,10 +360,7 @@ fn codex_profiles(
         .filter(|(_, (profile, _))| profile.enabled && !profile.deleted)
         .map(|(index, (profile, settings))| {
             let id = profile_id(profile.id.as_deref(), index);
-            let codex_home = settings
-                .codex_home
-                .map(expand_home_path)
-                .unwrap_or_else(|| local_codex_home.to_path_buf());
+            let codex_home = settings.resolved_home(local_codex_home);
             let auth_path = settings
                 .auth_path
                 .map(expand_home_path)
@@ -498,8 +494,9 @@ impl ProviderCollector for CodexCollector {
             "codex app-server usage collection started"
         );
         let app_server_profile = profile.clone();
+        let expected_account_id = credentials.account_id.clone();
         let mut collected = match tokio::task::spawn_blocking(move || {
-            collect_usage_from_app_server(&app_server_profile)
+            collect_usage_from_app_server(&app_server_profile, &expected_account_id)
         })
         .await
         {
@@ -508,14 +505,18 @@ impl ProviderCollector for CodexCollector {
                     elapsed_ms = app_server_started.elapsed().as_millis(),
                     windows = collected.usage.windows.len(),
                     reset_credits_available =
-                        reset_credits_available_count(&collected.usage.metadata),
+                        reset_credits_available_count(&collected.usage.detail),
                     reset_credits_next_expires_at =
-                        reset_credits_next_expires_at(&collected.usage.metadata),
+                        reset_credits_next_expires_at(&collected.usage.detail)
+                            .map(|value| value.timestamp()),
                     "codex app-server usage collection completed"
                 );
                 collected
             }
             Ok(Err(app_server_err)) => {
+                if app_server_err.kind() == ProviderErrorKind::RateLimited {
+                    return Err(app_server_err);
+                }
                 warn!(
                     elapsed_ms = app_server_started.elapsed().as_millis(),
                     error = %app_server_err,
@@ -541,9 +542,13 @@ impl ProviderCollector for CodexCollector {
                 fallback
             }
         };
-        collected.usage.metadata["credential_profile"] = json!(profile.id.as_str());
+        collected.usage.detail.credential_profile = Some(profile.id.as_str().to_string());
         if let Some(display_name) = profile.display_name.as_deref() {
-            collected.usage.metadata["profile_display_name"] = json!(display_name);
+            collected
+                .usage
+                .detail
+                .extra
+                .insert("profile_display_name".to_string(), json!(display_name));
         }
 
         let mut supplemental = Vec::new();
@@ -556,6 +561,7 @@ impl ProviderCollector for CodexCollector {
             ProviderCollectionResult {
                 usage: collected.usage,
                 daily_usage: collected.daily_usage,
+                usage_events: None,
                 collection_mode: collected.collection_mode,
                 account_email: collected.account_display_name,
                 warnings: collected.warnings,
@@ -569,23 +575,15 @@ impl ProviderCollector for CodexCollector {
         account: &Account,
         _current: Option<&UsageSnapshot>,
     ) -> Result<Vec<UsageDataset>, ProviderError> {
-        let profile_id = account.profile_id.as_deref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::CredentialsInvalid,
-                "Codex account has no profile identity",
-            )
-        })?;
-        let profile = self
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::CredentialsInvalid,
-                    format!("Codex profile {profile_id} no longer exists"),
-                )
-            })?;
-        Ok(vec![self.collect_local_usage_dataset(profile).await?])
+        let (profile, _) = self
+            .profile_for_account(&DiscoveredAccount {
+                external_account_id: account.external_account_id.clone(),
+                profile_id: account.profile_id.clone(),
+                display_name: account.display_name.clone(),
+                email: account.email.clone(),
+            })
+            .await?;
+        Ok(vec![self.collect_local_usage_dataset(&profile).await?])
     }
 }
 
@@ -598,23 +596,18 @@ struct CodexCollectedUsage {
     warnings: Vec<String>,
 }
 
-fn reset_credits_available_count(metadata: &Value) -> Option<f64> {
-    metadata
-        .get("rate_limit_reset_credits")
-        .and_then(|value| value.get("available_count"))
-        .and_then(number_from_json_value)
-        .or_else(|| {
-            metadata
-                .get("rate_limit_reset_credits_available_count")
-                .and_then(number_from_json_value)
-        })
+fn reset_credits_available_count(detail: &SnapshotDetail) -> Option<u64> {
+    detail
+        .reset_credits
+        .as_ref()
+        .map(|credits| credits.available_count)
 }
 
-fn reset_credits_next_expires_at(metadata: &Value) -> Option<f64> {
-    metadata
-        .get("rate_limit_reset_credits")
-        .and_then(|value| value.get("next_expires_at"))
-        .and_then(number_from_json_value)
+fn reset_credits_next_expires_at(detail: &SnapshotDetail) -> Option<DateTime<Utc>> {
+    detail
+        .reset_credits
+        .as_ref()
+        .and_then(|credits| credits.next_expires_at)
 }
 
 #[derive(Debug, Deserialize)]

@@ -17,6 +17,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "local_usage_overlays",
         sql: include_str!("../../migrations/0002_local_usage_overlays.sql"),
     },
+    Migration {
+        version: 3,
+        name: "provider_usage_events",
+        sql: include_str!("../../migrations/0003_provider_usage_events.sql"),
+    },
 ];
 
 // "USG2". This schema identity cleanly separates the disposable v2 database
@@ -32,6 +37,7 @@ DROP TABLE IF EXISTS notification_window_state;
 DROP TABLE IF EXISTS usage_window_observations;
 DROP TABLE IF EXISTS provider_daily_usage_summary;
 DROP TABLE IF EXISTS provider_daily_usage;
+DROP TABLE IF EXISTS provider_usage_events;
 DROP TABLE IF EXISTS raw_payloads;
 DROP TABLE IF EXISTS local_usage_overlays;
 DROP TABLE IF EXISTS usage_snapshots;
@@ -169,7 +175,7 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         migrate(&mut conn).unwrap();
 
-        assert_eq!(schema_version(&conn).unwrap(), 2);
+        assert_eq!(schema_version(&conn).unwrap(), 3);
         assert_eq!(
             conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -182,7 +188,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(applied, (2, "local_usage_overlays".to_string()));
+        assert_eq!(applied, (3, "provider_usage_events".to_string()));
         assert!(conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'accounts')",
@@ -218,7 +224,7 @@ mod tests {
 
         migrate(&mut conn).unwrap();
 
-        assert_eq!(schema_version(&conn).unwrap(), 2);
+        assert_eq!(schema_version(&conn).unwrap(), 3);
         let columns = conn
             .prepare("PRAGMA table_info(accounts)")
             .unwrap()

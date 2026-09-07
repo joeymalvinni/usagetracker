@@ -169,7 +169,7 @@ impl Storage {
     }
     pub async fn account(&self, account_id: &AccountId) -> anyhow::Result<Option<Account>> {
         let account_id = account_id.clone();
-        self.with_connection(move |conn| {
+        self.with_read_connection(move |conn| {
             conn.query_row(
                 account_select_sql("WHERE id = ?1").as_str(),
                 params![account_id.as_str()],
@@ -269,7 +269,7 @@ impl Storage {
         .await
     }
     pub async fn accounts(&self) -> anyhow::Result<Vec<Account>> {
-        self.with_connection(accounts_from_conn).await
+        self.with_read_connection(accounts_from_conn).await
     }
 }
 

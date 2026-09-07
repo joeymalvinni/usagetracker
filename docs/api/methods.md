@@ -15,6 +15,7 @@ A reminder on trust: read methods can surface account emails, local paths, usage
 | `get_server_info` | `{"method":"get_server_info"}` | `server_info` |
 | `get_state` | `{"method":"get_state"}` | `state` |
 | `get_usage` | `{"method":"get_usage"}` | `usage` |
+| `get_usage_events` | `{"method":"get_usage_events","account_id":"ACCOUNT"}` | `usage_events` |
 | `refresh` | `{"method":"refresh"}` | `refresh_started` |
 | `get_refresh_job` | `{"method":"get_refresh_job","job_id":"JOB"}` | `refresh_job` |
 | `get_provider_health` | `{"method":"get_provider_health"}` | `provider_health` |
@@ -50,8 +51,9 @@ The exact shapes come from the [schemas](index.md) and [models](models.md).
 | Method | What it returns, and in what order | Expected errors | Budget |
 | --- | --- | --- | --- |
 | `get_server_info` | Current capabilities and providers, in fixed provider order. | Protocol errors only. | 3s |
-| `get_state` | The main config/accounts/health/usage/dashboard/forecast view. Storage components come from a single SQLite read transaction; config is read afterward. Lists use the ordering in [models](models.md). | `storage_unavailable` | 3s |
+| `get_state` | The main connectivity/config/accounts/health/usage/dashboard/forecast view. Connectivity is transient macOS reachability; storage components come from a single SQLite read transaction and config is read afterward. Lists use the ordering in [models](models.md). | `storage_unavailable` | 3s |
 | `get_usage` | The latest visible snapshot per account, plus 30 local-calendar days of dashboard activity and forecasts drawn from at most 35 days / 1,024 observations. Hidden accounts are left out. | `storage_unavailable` | 3s |
+| `get_usage_events` | One account's normalized provider events, newest first. `offset` defaults to 0 and `limit` defaults to 100 and must be 1–200. Events are returned separately from state and usage responses so large histories remain paginated. | `unknown_account`, `invalid_argument`, `storage_unavailable` | 3s |
 | `get_refresh_job` | The current retained job. Jobs live in memory, so unknown or expired IDs fail. | `unknown_refresh_job` | 3s |
 | `get_provider_health` | Health for visible supported providers and accounts, ordered by provider then account. | `storage_unavailable` | 3s |
 | `get_accounts` | Every supported account — including hidden, disabled, and removed — ordered by provider, profile, then external ID. | `storage_unavailable` | 3s |
@@ -67,7 +69,7 @@ Read results reflect storage at the moment each method reads it. They aren't sub
 
 | Method | Parameters, effects, retry, persistence | Expected errors |
 | --- | --- | --- |
-| `refresh` | Omitted or `null` `providers` means every enabled collector. A non-empty list is sorted and deduplicated; `[]` is invalid. Starts or joins background work and returns right away. Asking again while overlapping work is active can hand back the same job (`coalesced: true`). Job state isn't persistent, but successful provider data is. | `invalid_argument`, `unknown_provider` |
+| `refresh` | Omitted or `null` `providers` means every enabled collector. A non-empty list is sorted and deduplicated; `[]` is invalid. Starts or joins background work and returns right away. Asking again while overlapping work is active can hand back the same job (`coalesced: true`). When reachability is definitively offline, remote collectors are skipped and existing provider health is preserved. Job state isn't persistent, but successful provider data is. | `invalid_argument`, `unknown_provider` |
 | `acknowledge_notifications` | `ids` is required; `[]` is a valid no-op. Deletes matching queued rows in one transaction and echoes back every ID you sent, including ones already gone. Idempotent and persistent. | `storage_unavailable` |
 
 See [refresh jobs](refresh-jobs.md) for polling and failure details.
@@ -85,7 +87,7 @@ Import jobs follow the same in-memory retention rules as refresh jobs: active jo
 | Method | Validation and side effects | Idempotency / persistence | Expected errors |
 | --- | --- | --- | --- |
 | `update_config` | Omitted or `null` fields stay as they are. `providers` is a partial toggle map. `notifications` replaces the whole notification policy. Polling must be at least 60 seconds; the notification rules are in [configuration](../configuration.md). Rebuilds collectors and polling as needed. | Set-like and persistent. Retrying the same complete update is safe. | `invalid_argument` |
-| `add_provider_account` | The provider must support `add_account` (Codex, Claude, Grok). A blank or whitespace `display_name` is treated as omitted. Creates and persists an isolated profile, then starts login. The response includes `authentication_url` when the provider CLI exposes its one-time browser link. | Not idempotent; the profile survives a restart. | `unknown_provider`, `unsupported_operation`, `internal` |
+| `add_provider_account` | The provider must support `add_account` (Codex, Claude, Grok). A blank or whitespace `display_name` is treated as omitted. Creates and persists an isolated profile, then starts login. `sign_in_action` defaults to `open`; `copy_link` suppresses automatic browser launch and requires the response to include `authentication_url`. | Not idempotent; the profile survives a restart. | `unknown_provider`, `unsupported_operation`, `internal` |
 | `update_account` | The account must exist. Omitted or `null` `display_name`, `hidden`, or `collection_enabled` leaves that field alone. A blank name also leaves the name alone — v3 can't clear a name to null. | Set-like and persistent. | `unknown_account`, `storage_unavailable`, `internal` |
 | `remove_account` | Sets `hidden: true` and `collection_enabled: false` and keeps the history. | Idempotent and persistent. | `unknown_account`, `storage_unavailable`, `internal` |
 | `delete_account` | Deletes the database history and tombstones or removes the profile. Irreversible. | Not response-idempotent: retry after success and you get `unknown_account`. | `unknown_account`, `storage_unavailable`, `internal` |
@@ -95,7 +97,7 @@ Import jobs follow the same in-memory retention rules as refresh jobs: active jo
 
 | Method | Effect | Retry and restart | Expected errors |
 | --- | --- | --- | --- |
-| `repair_provider` | Validates an optional `account_id`, then opens the provider's login/repair flow. The provider must advertise `repair`. The response includes `authentication_url` when a browser link is available. | Not idempotent — it may open several Terminal or login sessions. The configuration itself persists. | `unknown_provider`, `unknown_account`, `storage_unavailable`, `unsupported_operation`, `internal` |
+| `repair_provider` | Validates an optional `account_id`, then starts the provider's login/repair flow. The provider must advertise `repair`. `sign_in_action` defaults to `open`; `copy_link` suppresses automatic browser launch and requires the response to include `authentication_url`. | Not idempotent — it may start several login sessions. The configuration itself persists. | `unknown_provider`, `unknown_account`, `storage_unavailable`, `unsupported_operation`, `internal` |
 | `launch_provider_account` | Opens the provider with the account's isolated profile. Optional `working_directory`, `launch` (structured flags: `model`, `effort`, `dangerously_skip_permissions`), and `remember_dangerously_skip_permissions` override and — on success — persist the account's saved preferences. `launch` replaces the saved flags as a whole rather than merging fields, and a blank `working_directory` clears the saved one. The saved dangerous flag changes only when explicitly remembered, and `remember_dangerously_skip_permissions` has no effect unless `launch` is also sent. Preferences persist only for accounts with managed profile entries; legacy default accounts launch but save nothing. Providers must advertise `launch_options` for overrides; a relative or nonexistent working directory fails with `invalid_argument`. | Not idempotent — it may open several sessions. No job persists. | `unknown_account`, `storage_unavailable`, `unsupported_operation`, `invalid_argument` |
 
 These action methods can expose local profile paths to the launched provider process and cause visible Terminal or app activity. Fixture mode rejects sign-in, repair, and launch operations.

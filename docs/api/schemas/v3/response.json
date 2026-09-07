@@ -199,6 +199,57 @@
       ],
       "type": "object"
     },
+    "ActivityDetail": {
+      "additionalProperties": true,
+      "description": "Normalized token-activity summary for one account.",
+      "properties": {
+        "by_day": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "lifetime_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lookback_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "today_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ActivitySummary": {
       "properties": {
         "days": {
@@ -310,6 +361,7 @@
         "combined_state",
         "typed_errors",
         "usage_provenance",
+        "usage_events",
         "refresh_jobs",
         "refresh_coalescing"
       ],
@@ -365,7 +417,7 @@
           "$ref": "#/$defs/NotificationConfig",
           "default": {
             "cooldown_minutes": 15,
-            "enabled": true,
+            "enabled": false,
             "predictive_alerts": false,
             "reset_alerts": true,
             "thresholds_percent_remaining": [
@@ -401,6 +453,150 @@
       ],
       "type": "object"
     },
+    "Connectivity": {
+      "description": "Transient machine-wide network reachability reported by the daemon.\n\nThis deliberately lives outside provider health: losing the computer's\nnetwork route is not a durable failure of every configured provider.",
+      "properties": {
+        "changed_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ConnectivityStatus"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "ConnectivityStatus": {
+      "enum": [
+        "online",
+        "offline",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "CostDetail": {
+      "additionalProperties": true,
+      "description": "Normalized cost/spend summary for one account. Shared by every provider's\ncost collector and by the dashboard builder.",
+      "properties": {
+        "by_day": {
+          "items": {
+            "$ref": "#/$defs/DailyUsagePoint"
+          },
+          "type": "array"
+        },
+        "by_model": {
+          "items": {
+            "$ref": "#/$defs/ModelCostSummary"
+          },
+          "type": "array"
+        },
+        "complete_lookback": {
+          "description": "Some providers report whether the lookback window was fully scanned.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "estimate": {
+          "default": false,
+          "type": "boolean"
+        },
+        "lookback_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "lookback_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "partial": {
+          "default": false,
+          "type": "boolean"
+        },
+        "pricing_effective_from": {
+          "format": "date",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pricing_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "today_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "today_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "unpriced_models": {
+          "items": {
+            "$ref": "#/$defs/UnpricedModel"
+          },
+          "type": "array"
+        },
+        "unpriced_tokens": {
+          "default": 0,
+          "description": "Unpriced token count for the synthesized \"today\" point when no daily\nbreakdown is present.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "CostSummary": {
       "properties": {
         "days": {
@@ -412,6 +608,12 @@
         "lookback_cost_usd": {
           "format": "double",
           "type": "number"
+        },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ModelCostSummary"
+          },
+          "type": "array"
         },
         "pricing": {
           "$ref": "#/$defs/PricingCoverage"
@@ -494,6 +696,49 @@
         "quality",
         "completeness",
         "confidence"
+      ],
+      "type": "object"
+    },
+    "DatasetProvenance": {
+      "description": "Persisted mapping from normalized data to its typed origin. It lives in the\ndiagnostics object for wire compatibility, but consumers deserialize this\ntype instead of inferring correctness from provider-specific strings.",
+      "properties": {
+        "authoritative": {
+          "type": "boolean"
+        },
+        "daily_sources": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "metadata_keys": {
+          "default": [],
+          "description": "Top-level diagnostic keys contributed by this dataset. This permits a\nnewer source-scoped observation to replace its own metadata without\nknowing provider-specific key names.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "$ref": "#/$defs/DataProvenance"
+        },
+        "source_id": {
+          "default": "",
+          "description": "Stable provider-owned identity for replacing one independently\nrefreshable dataset without conflating sources with the same kind.",
+          "type": "string"
+        },
+        "window_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "authoritative",
+        "provenance"
       ],
       "type": "object"
     },
@@ -693,6 +938,50 @@
       },
       "type": "object"
     },
+
+    "ModelCostSummary": {
+      "properties": {
+        "chargeable_cost_usd": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "event_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "metered_cost_usd": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider_fee_usd": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vendor_cost_usd": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
     "NotificationConfig": {
       "properties": {
         "cooldown_minutes": {
@@ -702,7 +991,7 @@
           "type": "integer"
         },
         "enabled": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         },
         "predictive_alerts": {
@@ -960,6 +1249,17 @@
       "properties": {
         "capabilities": {
           "$ref": "#/$defs/ProviderCapabilities"
+        },
+        "credential_access_notice": {
+          "description": "Provider-owned copy shown before onboarding may access credentials or\nbrowser storage. Omitted when connecting is prompt-free.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detected": {
+          "description": "A prompt-free indication that this provider has an app, CLI, or local\ndata directory on this Mac. This never reads credentials or contacts\nthe provider.",
+          "type": "boolean"
         },
         "display_name": {
           "type": "string"
@@ -1233,11 +1533,33 @@
       ],
       "type": "object"
     },
+    "RefreshAccountDiscovery": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider_id",
+        "account_id"
+      ],
+      "type": "object"
+    },
     "RefreshJob": {
       "properties": {
         "created_at": {
           "format": "date-time",
           "type": "string"
+        },
+        "discovered_accounts": {
+          "description": "Accounts whose identities were discovered and persisted during this\nrefresh. This is populated while collection is still running so clients\ncan react to provider-scoped progress without polling global state.",
+          "items": {
+            "$ref": "#/$defs/RefreshAccountDiscovery"
+          },
+          "type": "array"
         },
         "failure_message": {
           "type": [
@@ -1263,6 +1585,10 @@
         },
         "scope": {
           "$ref": "#/$defs/RefreshScope"
+        },
+        "skipped_offline": {
+          "description": "True when the daemon completed the job without remote collection\nbecause machine-wide reachability was definitively offline.",
+          "type": "boolean"
         },
         "started_at": {
           "format": "date-time",
@@ -1343,6 +1669,37 @@
       ],
       "type": "object"
     },
+    "ResetCreditEntry": {
+      "description": "A single reset credit entry.",
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ResetCreditSummary": {
       "properties": {
         "available_count": {
@@ -1368,6 +1725,31 @@
         "available_count",
         "credits"
       ],
+      "type": "object"
+    },
+    "ResetCreditsDetail": {
+      "description": "Rate-limit reset credits (Codex). Timestamps are normalized to UTC by the\ncollector so consumers never re-parse epoch seconds or ISO strings.",
+      "properties": {
+        "available_count": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "credits": {
+          "items": {
+            "$ref": "#/$defs/ResetCreditEntry"
+          },
+          "type": "array"
+        },
+        "next_expires_at": {
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
       "type": "object"
     },
     "ServerInfo": {
@@ -1396,6 +1778,112 @@
       ],
       "type": "object"
     },
+    "SnapshotDetail": {
+      "additionalProperties": true,
+      "description": "Typed contents of a snapshot's `diagnostics` blob.",
+      "properties": {
+        "account_display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account_email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "activity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActivityDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collection_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CostDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "credential_profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dataset_provenance": {
+          "description": "Typed origin of each contributed dataset. Written by the merge layer.",
+          "items": {
+            "$ref": "#/$defs/DatasetProvenance"
+          },
+          "type": "array"
+        },
+        "email": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "description": "Top-level estimate flag consulted when no dataset provenance matches.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "keychain_account": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reset_credits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResetCreditsDetail"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subscription_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "web_authoritative": {
+          "description": "Set to `false` by collectors that produce a synthetic local estimate\nrather than a web-authoritative reading.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "StateSnapshot": {
       "properties": {
         "accounts": {
@@ -1406,6 +1894,12 @@
         },
         "config": {
           "$ref": "#/$defs/ConfigResponse"
+        },
+        "connectivity": {
+          "$ref": "#/$defs/Connectivity",
+          "default": {
+            "status": "unknown"
+          }
         },
         "dashboard": {
           "$ref": "#/$defs/UsageDashboardSummary"
@@ -1450,6 +1944,23 @@
         "health",
         "snapshots",
         "dashboard"
+      ],
+      "type": "object"
+    },
+    "UnpricedModel": {
+      "description": "A model whose tokens could not be priced. Deserializes from either a bare\nmodel-name string or a `{ \"model\", \"tokens\" }` object.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model"
       ],
       "type": "object"
     },
@@ -1524,6 +2035,7 @@
     "UsageDataScope": {
       "enum": [
         "account_wide",
+        "organization",
         "this_device",
         "selected_local_roots",
         "workspace"
@@ -1538,6 +2050,124 @@
         "synthetic_local_estimate"
       ],
       "type": "string"
+    },
+    "UsageEvent": {
+      "properties": {
+        "cache_read_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_write_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "chargeable": {
+          "type": "boolean"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "headless": {
+          "type": "boolean"
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "metered_cost_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "model": {
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider_fee_usd": {
+          "format": "double",
+          "type": "number"
+        },
+        "request_units": {
+          "format": "double",
+          "type": "number"
+        },
+        "token_based": {
+          "type": "boolean"
+        },
+        "vendor_cost_usd": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "event_id",
+        "occurred_at",
+        "model",
+        "kind",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "request_units",
+        "vendor_cost_usd",
+        "metered_cost_usd",
+        "provider_fee_usd",
+        "chargeable",
+        "token_based",
+        "headless"
+      ],
+      "type": "object"
+    },
+    "UsageEventPage": {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/UsageEvent"
+          },
+          "type": "array"
+        },
+        "next_offset": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account_id",
+        "events",
+        "offset",
+        "total_count"
+      ],
+      "type": "object"
     },
     "UsageForecast": {
       "properties": {
@@ -1641,7 +2271,9 @@
           "format": "date-time",
           "type": "string"
         },
-        "diagnostics": true,
+        "diagnostics": {
+          "$ref": "#/$defs/SnapshotDetail"
+        },
         "provider_id": {
           "type": "string"
         },
@@ -1882,6 +2514,22 @@
         "type",
         "snapshots",
         "dashboard"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "page": {
+          "$ref": "#/$defs/UsageEventPage"
+        },
+        "type": {
+          "const": "usage_events",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "page"
       ],
       "type": "object"
     },

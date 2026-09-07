@@ -12,7 +12,7 @@ use tracing::info;
 use usage_core::{
     Account, AccountId, AccountImportPreview, AccountLaunchSettingsResponse,
     AddProviderAccountResponse, ImportJob, ImportJobId, ImportJobStatus, ImportMode, ImportOptions,
-    ImportToggleSize, ProviderActionResponse, ProviderId,
+    ImportToggleSize, ProviderActionResponse, ProviderId, ProviderSignInAction,
 };
 
 use crate::{
@@ -53,7 +53,6 @@ impl ProviderAdapter for ClaudeAdapter {
             id: PROVIDER_ID,
             display_name: "Claude",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -145,6 +144,19 @@ impl ProviderAdapter for ClaudeAdapter {
         Ok(Arc::new(ClaudeCollector::new(config.clone())?))
     }
 
+    fn detected_locally(&self) -> bool {
+        dirs::home_dir().is_some_and(|home| {
+            home.join(".claude").exists() || home.join(".config/claude").exists()
+        }) || std::path::Path::new("/Applications/Claude.app").exists()
+    }
+
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        Some(
+            "Claude stores its sign-in in macOS Keychain. After you continue, macOS may ask \
+             UsageTracker to access that Claude credential.",
+        )
+    }
+
     fn migrate_config(
         &self,
         config: &mut ProviderConfig,
@@ -211,6 +223,7 @@ impl AddAccountHandler for ClaudeAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         display_name: Option<String>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<AddProviderAccountResponse> {
         let connected_profiles = runtime
             .storage()
@@ -236,7 +249,7 @@ impl AddAccountHandler for ClaudeAdapter {
             .config_dir
             .clone()
             .ok_or_else(|| anyhow::anyhow!("managed Claude profile is missing its config path"))?;
-        let login = launchers::launch_claude_login(Some(&profile_path))?;
+        let login = launchers::launch_claude_login(Some(&profile_path), sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,
@@ -266,9 +279,10 @@ impl RepairHandler for ClaudeAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         let target = prepare_login_profile(runtime, account_id.as_ref()).await?;
-        let login = launchers::launch_claude_login(target.config_dir.as_deref())?;
+        let login = launchers::launch_claude_login(target.config_dir.as_deref(), sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,
@@ -449,14 +463,25 @@ impl LaunchHandler for ClaudeAdapter {
                 .unwrap_or_else(|| config_dir.join(".credentials.json"));
 
             let api = ClaudeApiClient::new(HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT)?;
-            if let Err(err) =
-                credentials::sync_for_launch(service, keychain_account, credentials_file, |creds| {
-                    api.refresh_credentials(creds)
-                })
-                .await
-            {
+            let sync_result = credentials::sync_for_launch(
+                service,
+                keychain_account,
+                credentials_file,
+                |creds| api.refresh_credentials_locked(creds),
+            )
+            .await;
+            // The collector has its own credential cache in addition to the
+            // Keychain broker. Clear it even when synchronization failed.
+            runtime
+                .refresh()
+                .invalidate_cached_credentials(&account.provider_id, Some(profile_id))
+                .await?;
+            if let Err(err) = sync_result {
                 let target = prepare_login_profile(runtime, Some(&account.id)).await?;
-                let login = launchers::launch_claude_login(target.config_dir.as_deref())?;
+                let login = launchers::launch_claude_login(
+                    target.config_dir.as_deref(),
+                    ProviderSignInAction::Open,
+                )?;
                 let authentication_url = login.authentication_url.clone();
                 launchers::monitor_login(
                     login.child,
@@ -534,18 +559,7 @@ impl LaunchHandler for ClaudeAdapter {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?;
         let config = runtime.config().await;
-        let saved = config
-            .providers
-            .get(PROVIDER_ID)
-            .and_then(|provider| {
-                provider
-                    .profiles
-                    .iter()
-                    .find(|profile| is_active_profile(profile, profile_id))
-            })
-            .map(settings::profile)
-            .transpose()?
-            .unwrap_or_default();
+        let saved = configured_profile_settings(&config, profile_id)?.unwrap_or_default();
         Ok(account_launch_settings_response(&account, &saved))
     }
 }
@@ -585,6 +599,25 @@ fn source_paths() -> anyhow::Result<(PathBuf, PathBuf)> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory could not be resolved"))?;
     Ok((home.join(".claude"), home.join(".claude.json")))
+}
+
+/// Read-only sheets can describe an unconfigured/synthetic account, but never
+/// claim that it has a managed destination. Mutating operations still validate it.
+fn configured_profile_settings(
+    config: &crate::config::Config,
+    profile_id: &str,
+) -> anyhow::Result<Option<settings::ClaudeProfileSettings>> {
+    config
+        .providers
+        .get(PROVIDER_ID)
+        .and_then(|provider| {
+            provider
+                .profiles
+                .iter()
+                .find(|profile| is_active_profile(profile, profile_id))
+        })
+        .map(settings::profile)
+        .transpose()
 }
 
 /// Loads the (managed or manual) profile settings for `profile_id`, falling
@@ -676,7 +709,7 @@ impl ImportHandler for ClaudeAdapter {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Claude account is missing its profile identity"))?;
         let config = runtime.config().await;
-        let saved = load_profile_settings(&config, profile_id)?;
+        let saved = configured_profile_settings(&config, profile_id)?.unwrap_or_default();
 
         let destination_path = saved.claude_config_dir.as_deref().map(expand_home_path);
         let has_managed_config_dir = destination_path

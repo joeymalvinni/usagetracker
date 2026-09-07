@@ -6,9 +6,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use usage_core::{
-    Account, DataProvenance, DatasetProvenance, ProviderFailureCode, ProviderId,
+    Account, DataProvenance, DatasetProvenance, ProviderFailureCode, ProviderId, SnapshotDetail,
     UsageDataCompleteness, UsageDataConfidence, UsageDataQuality, UsageDataScope, UsageDataSource,
-    UsageSnapshot, UsageWindow,
+    UsageEvent, UsageSnapshot, UsageWindow,
 };
 
 macro_rules! settings_accessors {
@@ -51,6 +51,7 @@ pub(crate) use settings_accessors;
 pub(crate) mod browser_cookies;
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod grok;
 pub(crate) mod launchers;
 pub(crate) mod local_usage;
@@ -211,9 +212,19 @@ impl FromIterator<DiscoveredAccount> for AccountDiscovery {
 pub struct ProviderCollectionResult {
     pub usage: ProviderUsage,
     pub daily_usage: Vec<DailyUsageBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_events: Option<ProviderUsageEventBatch>,
     pub collection_mode: String,
     pub account_email: Option<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderUsageEventBatch {
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub daily_source: String,
+    pub events: Vec<UsageEvent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -227,12 +238,27 @@ pub struct UsageDataset {
 
 impl UsageDataset {
     pub fn authoritative(collection: ProviderCollectionResult) -> Self {
+        Self::authoritative_scoped(collection, UsageDataScope::AccountWide)
+    }
+
+    pub fn authoritative_scoped(
+        collection: ProviderCollectionResult,
+        scope: UsageDataScope,
+    ) -> Self {
+        Self::authoritative_named_scoped("provider_reported", collection, scope)
+    }
+
+    pub fn authoritative_named_scoped(
+        source_id: impl Into<String>,
+        collection: ProviderCollectionResult,
+        scope: UsageDataScope,
+    ) -> Self {
         Self {
-            source_id: "provider_reported".to_string(),
+            source_id: source_id.into(),
             collection,
             provenance: DataProvenance {
                 source: UsageDataSource::ProviderReported,
-                scope: UsageDataScope::AccountWide,
+                scope,
                 quality: UsageDataQuality::Authoritative,
                 completeness: UsageDataCompleteness::Complete,
                 confidence: UsageDataConfidence::High,
@@ -283,13 +309,7 @@ impl UsageDataset {
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            metadata_keys: self
-                .collection
-                .usage
-                .metadata
-                .as_object()
-                .map(|metadata| metadata.keys().cloned().collect())
-                .unwrap_or_default(),
+            metadata_keys: self.collection.usage.detail.present_keys(),
         }
     }
 
@@ -327,6 +347,19 @@ impl CollectionOutcome {
         }
     }
 
+    pub fn collected_scoped_with_supplemental(
+        collection: ProviderCollectionResult,
+        scope: UsageDataScope,
+        supplemental: Vec<UsageDataset>,
+    ) -> Self {
+        Self {
+            authoritative: AuthoritativeOutcome::Collected(UsageDataset::authoritative_scoped(
+                collection, scope,
+            )),
+            supplemental,
+        }
+    }
+
     pub fn degraded(error: ProviderError, supplemental: Vec<UsageDataset>) -> Self {
         Self {
             authoritative: AuthoritativeOutcome::Failed(error),
@@ -343,12 +376,23 @@ pub struct DailyUsageBucket {
     pub source: String,
 }
 
+/// Converts a `json!` object literal into the `serde_json::Map` used for the
+/// diagnostic-only `extra` fields of [`SnapshotDetail`] and its sub-details.
+/// A non-object value yields an empty map.
+pub(crate) fn json_map(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderUsage {
     pub provider_id: ProviderId,
     pub collected_at: DateTime<Utc>,
     pub windows: Vec<UsageWindow>,
-    pub metadata: serde_json::Value,
+    #[serde(default, alias = "metadata")]
+    pub detail: SnapshotDetail,
 }
 
 impl ProviderUsage {
@@ -358,7 +402,7 @@ impl ProviderUsage {
             account_id,
             collected_at: self.collected_at,
             windows: self.windows,
-            metadata: self.metadata,
+            detail: self.detail,
         }
     }
 }
@@ -450,5 +494,30 @@ mod retry_after_tests {
         let after = Utc::now() + chrono::TimeDelta::seconds(121);
         let deadline = retry_after_deadline(&headers).unwrap();
         assert!(deadline >= before && deadline <= after);
+    }
+
+    #[test]
+    fn provider_usage_accepts_legacy_metadata() {
+        let usage: ProviderUsage = serde_json::from_value(serde_json::json!({
+            "provider_id": "codex",
+            "collected_at": "2026-08-31T00:00:00Z",
+            "windows": [],
+            "metadata": { "collection_mode": "legacy" }
+        }))
+        .unwrap();
+
+        assert_eq!(usage.detail.collection_mode.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn provider_usage_defaults_missing_detail() {
+        let usage: ProviderUsage = serde_json::from_value(serde_json::json!({
+            "provider_id": "codex",
+            "collected_at": "2026-08-31T00:00:00Z",
+            "windows": []
+        }))
+        .unwrap();
+
+        assert_eq!(usage.detail, SnapshotDetail::default());
     }
 }

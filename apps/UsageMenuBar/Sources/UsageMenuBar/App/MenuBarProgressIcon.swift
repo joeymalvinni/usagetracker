@@ -56,6 +56,7 @@ enum MenuBarProgressIcon {
     }
 
     private static func fillColor(for row: MenuBarProviderVM) -> NSColor {
+        if row.isMuted { return .secondaryLabelColor }
         switch row.status {
         case .warning:
             return .systemOrange
@@ -69,12 +70,22 @@ enum MenuBarProgressIcon {
     }
 
     private static func placeholderRow(for status: DisplayStatus) -> MenuBarProviderVM {
-        let percent: Double? = switch status {
-        case .offline, .error, .warning, .critical:
+        MenuBarProviderVM(
+            id: "usage",
+            providerId: "usage",
+            short: "",
+            percent: placeholderFillPercent(for: status),
+            status: status,
+            isMuted: status == .offline
+        )
+    }
+
+    static func placeholderFillPercent(for status: DisplayStatus) -> Double? {
+        switch status {
+        case .offline, .error, .warning, .critical, .stale, .refreshing, .disabled:
             100
-        case .stale, .refreshing, .disabled, .normal:
+        case .normal:
             nil
         }
-        return MenuBarProviderVM(id: "usage", providerId: "usage", short: "", percent: percent, status: status)
     }
 }

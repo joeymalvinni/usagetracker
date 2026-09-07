@@ -47,6 +47,13 @@ struct Header: View {
         switch subtitleStyle {
         case .online: StatusPill(online: true)
         case .offline: StatusPill(online: false, detail: state.message)
+        case .networkOffline:
+            HStack(spacing: 5) {
+                Image(systemName: "wifi.slash")
+                Text("Offline · showing last known usage")
+            }
+            .font(Theme.Typography.micro)
+            .foregroundStyle(.secondary)
         case .custom(let text):
             if !text.isEmpty {
                 Text(text)
@@ -90,7 +97,7 @@ struct HeaderUpdateAction {
 }
 
 enum HeaderSubtitleStyle {
-    case online, offline, custom(String)
+    case online, offline, networkOffline, custom(String)
 }
 
 /// Daemon connection state as plain labeled text. Offline is the exceptional

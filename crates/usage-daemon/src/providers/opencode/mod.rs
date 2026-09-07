@@ -184,6 +184,7 @@ impl OpenCodeCollector {
         Ok(ProviderCollectionResult {
             usage,
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "opencode_go_web_console".to_string(),
             account_email,
             warnings: Vec::new(),

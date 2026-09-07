@@ -40,13 +40,14 @@ pub struct FileConfig {
     /// Accepted only to migrate older config files; raw payload capture was removed.
     #[serde(default, rename = "debug_capture_raw_payloads", skip_serializing)]
     _legacy_debug_capture_raw_payloads: bool,
+    // Missing notification settings stay off until the user grants permission.
     #[serde(default)]
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -58,7 +59,7 @@ pub struct ProviderConfig {
     pub(crate) settings: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProviderProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -510,19 +511,21 @@ mod tests {
     }
 
     #[test]
-    fn default_config_enables_codex_only() {
+    fn default_config_keeps_every_provider_disabled_until_connected() {
         let config = FileConfig::default();
-        assert!(config.providers["codex"].enabled);
+        assert!(!config.providers["codex"].enabled);
         assert!(!config.providers["claude"].enabled);
+        assert!(!config.providers["cursor"].enabled);
+        assert!(!config.providers["opencode_go"].enabled);
         assert!(!config.providers["grok"].enabled);
-        assert!(config.notifications.enabled);
+        assert!(!config.notifications.enabled);
     }
 
     #[test]
-    fn older_config_defaults_notifications_to_enabled() {
+    fn older_config_defaults_notifications_to_disabled() {
         let config: FileConfig =
             serde_json::from_str(r#"{"poll_interval_seconds":300,"providers":{}}"#).unwrap();
-        assert!(config.notifications.enabled);
+        assert!(!config.notifications.enabled);
     }
 
     #[test]
@@ -632,9 +635,10 @@ mod tests {
 
         add_missing_default_providers(&mut config);
 
-        assert_eq!(config.providers.len(), 4);
+        assert_eq!(config.providers.len(), 5);
         assert!(!config.providers["codex"].enabled);
         assert!(config.providers.contains_key("claude"));
+        assert!(config.providers.contains_key("cursor"));
         assert!(config.providers.contains_key("opencode_go"));
         assert!(config.providers.contains_key("grok"));
         assert!(!is_supported_provider("unknown"));
@@ -929,11 +933,11 @@ mod tests {
             crate::runtime::provider_registry::build_collectors(&loaded)
                 .unwrap()
                 .len(),
-            4
+            5
         );
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        for provider in ["codex", "claude", "opencode_go", "grok"] {
+        for provider in ["codex", "claude", "cursor", "opencode_go", "grok"] {
             let provider = &persisted["providers"][provider];
             assert!(provider.get("cookie_header").is_none());
             assert!(provider.get("workspace_id").is_none());
@@ -979,7 +983,7 @@ mod tests {
             crate::runtime::provider_registry::build_collectors(&loaded)
                 .unwrap()
                 .len(),
-            4
+            5
         );
         let persisted: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();

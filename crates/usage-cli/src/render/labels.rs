@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::Value;
 use usage_core::{Account, AccountDisplayNameSource, UsageSnapshot};
 
 use crate::render::style::{format_provider_name, title_case};
@@ -35,7 +34,7 @@ pub(crate) fn identity_labels(
     let provider_id = snapshot
         .map(|snapshot| snapshot.provider_id.as_str())
         .or_else(|| account.map(|account| account.provider_id.as_str()));
-    let metadata = snapshot.map(|snapshot| &snapshot.metadata);
+    let detail = snapshot.map(|snapshot| &snapshot.detail);
 
     let account_label = account
         .and_then(|account| account.email.clone())
@@ -45,23 +44,24 @@ pub(crate) fn identity_labels(
                 .and_then(|account| account.display_name.clone())
         })
         .or_else(|| {
-            metadata
-                .and_then(|metadata| metadata_str(metadata, "email"))
-                .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "account_email")))
-                .or_else(|| {
-                    metadata
-                        .and_then(|metadata| metadata_str(metadata, "account_display_name"))
-                        .filter(|value| is_account_label(provider_id, value))
-                })
-                .map(str::to_string)
+            detail.and_then(|detail| {
+                detail_str(&detail.email)
+                    .or_else(|| detail_str(&detail.account_email))
+                    .or_else(|| {
+                        detail_str(&detail.account_display_name)
+                            .filter(|value| is_account_label(provider_id, value))
+                    })
+                    .map(str::to_string)
+            })
         })
         .or_else(|| {
             account.and_then(|account| account_external_account_label(provider_id, account))
         });
 
-    let profile = metadata
-        .and_then(|metadata| metadata_str(metadata, "credential_profile"))
-        .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "keychain_account")))
+    let profile = detail
+        .and_then(|detail| {
+            detail_str(&detail.credential_profile).or_else(|| detail_str(&detail.keychain_account))
+        })
         .map(str::to_string)
         .or_else(|| {
             account.and_then(|account| match provider_id {
@@ -72,9 +72,10 @@ pub(crate) fn identity_labels(
             })
         });
 
-    let plan = metadata
-        .and_then(|metadata| metadata_str(metadata, "plan_type"))
-        .or_else(|| metadata.and_then(|metadata| metadata_str(metadata, "subscription_type")))
+    let plan = detail
+        .and_then(|detail| {
+            detail_str(&detail.plan_type).or_else(|| detail_str(&detail.subscription_type))
+        })
         .map(plan_label);
 
     let identity = account_label.or_else(|| nonempty(profile));
@@ -96,10 +97,10 @@ pub(crate) fn plan_label(plan: &str) -> String {
     }
 }
 
-pub(crate) fn metadata_str<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
-    metadata
-        .get(key)
-        .and_then(Value::as_str)
+/// Trimmed, non-empty view of an optional typed detail string.
+pub(crate) fn detail_str(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
 }

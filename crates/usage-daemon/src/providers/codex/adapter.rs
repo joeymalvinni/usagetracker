@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tracing::info;
 use usage_core::{
     Account, AccountId, AddProviderAccountResponse, ProviderActionResponse, ProviderId,
+    ProviderSignInAction,
 };
 
 use crate::{
@@ -39,7 +40,6 @@ impl ProviderAdapter for CodexAdapter {
             id: PROVIDER_ID,
             display_name: "Codex",
             minimum_refresh_interval_seconds: 60,
-            default_visible: true,
         }
     }
 
@@ -67,8 +67,12 @@ impl ProviderAdapter for CodexAdapter {
             .iter()
             .filter(|profile| profile.enabled && !profile.deleted)
         {
-            if let Some(home) = settings::profile(profile)?.codex_home {
-                roots.push(expand_home_path(home).join("sessions"));
+            if let Some(default_home) = default_local_home() {
+                roots.push(
+                    settings::profile(profile)?
+                        .resolved_home(&default_home)
+                        .join("sessions"),
+                );
             }
         }
         roots.sort();
@@ -88,6 +92,14 @@ impl ProviderAdapter for CodexAdapter {
         config: &ProviderConfig,
     ) -> anyhow::Result<Arc<dyn ProviderCollector>> {
         Ok(Arc::new(CodexCollector::new(config.clone())?))
+    }
+
+    fn detected_locally(&self) -> bool {
+        let home = std::env::var_os("CODEX_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+        home.is_some_and(|home| home.exists())
+            || std::path::Path::new("/Applications/Codex.app").exists()
     }
 
     fn migrate_config(
@@ -214,6 +226,7 @@ impl AddAccountHandler for CodexAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         display_name: Option<String>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<AddProviderAccountResponse> {
         let (profile_id, profile_path, profile_name) = runtime
             .mutate_config(|config| {
@@ -241,7 +254,7 @@ impl AddAccountHandler for CodexAdapter {
             })
             .await?;
 
-        let login = launchers::launch_codex_login(&profile_path)?;
+        let login = launchers::launch_codex_login(&profile_path, sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,
@@ -271,6 +284,7 @@ impl RepairHandler for CodexAdapter {
         &self,
         runtime: ProviderRuntime<'_>,
         account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         let config = runtime.config().await;
         let account = match account_id.as_ref() {
@@ -302,7 +316,7 @@ impl RepairHandler for CodexAdapter {
         let profile_id = profile
             .and_then(|profile| profile.id.clone())
             .unwrap_or_else(|| "default".to_string());
-        let login = launchers::launch_codex_login(&home)?;
+        let login = launchers::launch_codex_login(&home, sign_in_action)?;
         let authentication_url = login.authentication_url.clone();
         launchers::monitor_login(
             login.child,

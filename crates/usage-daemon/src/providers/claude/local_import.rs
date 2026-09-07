@@ -289,7 +289,39 @@ fn import_trust(source_claude_json: &Path, dest_config_dir: &Path) -> anyhow::Re
         return Ok(false);
     };
     let scrubbed = scrub_claude_json(&raw)?;
-    write_staged_json(&dest_config_dir.join(CLAUDE_JSON_FILE_NAME), &scrubbed)?;
+    let destination = dest_config_dir.join(CLAUDE_JSON_FILE_NAME);
+    // Trust belongs to individual fields, not to the whole account file.
+    // In particular, retain this profile's identity and MCP configuration.
+    let mut merged = read_source_json(&destination)?.unwrap_or_else(|| serde_json::json!({}));
+    let object = merged
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("destination .claude.json is not a JSON object"))?;
+    for key in TRUST_TOP_LEVEL_ALLOWLIST {
+        if let Some(value) = scrubbed.get(*key) {
+            object.insert((*key).to_string(), value.clone());
+        }
+    }
+    let projects = object
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}));
+    let projects = projects
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("destination .claude.json projects is not a JSON object"))?;
+    for (path, trust) in scrubbed["projects"]
+        .as_object()
+        .expect("scrubbed projects object")
+    {
+        let project = projects
+            .entry(path.clone())
+            .or_insert_with(|| serde_json::json!({}));
+        let project = project
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("destination project {path} is not a JSON object"))?;
+        for (key, value) in trust.as_object().expect("scrubbed trust object") {
+            project.insert(key.clone(), value.clone());
+        }
+    }
+    write_staged_json(&destination, &merged)?;
     Ok(true)
 }
 
@@ -671,5 +703,90 @@ mod tests {
         assert!(!dest.join("stale-import-artifact.txt").exists());
         assert!(dest.join("settings.json").exists());
         assert_eq!(fs::read(dest.join(".credentials.json")).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn trust_import_preserves_destination_identity_and_unrelated_settings() {
+        for mode in [ImportMode::PrefsOnly, ImportMode::Replace] {
+            let dir = ScratchDir::new("claude-trust-merge");
+            let source = dir.path.join("source.json");
+            let dest = dir.path.join("dest");
+            fs::create_dir_all(&dest).unwrap();
+            let original = serde_json::json!({
+                "oauthAccount": {"accountUuid":"managed", "emailAddress":"managed@example.test"},
+                "mcpServers": {"global": {"command":"managed-server"}},
+                "hasCompletedOnboarding": false,
+                "projects": {
+                    "/shared": {"hasTrustDialogAccepted": false, "mcpServers":{"local":{}}, "lastSessionId":"keep"},
+                    "/destination-only": {"hasTrustDialogAccepted":true}
+                }
+            });
+            fs::write(dest.join(CLAUDE_JSON_FILE_NAME), original.to_string()).unwrap();
+            fs::write(
+                &source,
+                serde_json::json!({
+                    "oauthAccount":{"accountUuid":"source"},
+                    "hasCompletedOnboarding":true,
+                    "projects": {
+                        "/shared":{"hasTrustDialogAccepted":true,"mcpServers":{"untrusted":{}}},
+                        "/new":{"hasCompletedProjectOnboarding":true}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let options = ImportOptions {
+                prefs: false,
+                prompt_history: false,
+                ..ImportOptions::comfort_defaults()
+            };
+            let plan = plan(&dir.path, &source, &options).unwrap();
+            run(&plan, &dest, mode).unwrap();
+            let actual = read_source_json(&dest.join(CLAUDE_JSON_FILE_NAME))
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual["oauthAccount"], original["oauthAccount"]);
+            assert_eq!(actual["mcpServers"], original["mcpServers"]);
+            assert_eq!(
+                actual["projects"]["/destination-only"],
+                original["projects"]["/destination-only"]
+            );
+            assert_eq!(
+                actual["projects"]["/shared"]["mcpServers"],
+                original["projects"]["/shared"]["mcpServers"]
+            );
+            assert_eq!(actual["projects"]["/shared"]["lastSessionId"], "keep");
+            assert_eq!(
+                actual["projects"]["/shared"]["hasTrustDialogAccepted"],
+                true
+            );
+            assert_eq!(
+                actual["projects"]["/new"]["hasCompletedProjectOnboarding"],
+                true
+            );
+            assert_eq!(actual["hasCompletedOnboarding"], true);
+        }
+    }
+
+    #[test]
+    fn trust_import_rejects_malformed_destination_without_overwriting_it() {
+        let dir = ScratchDir::new("claude-trust-malformed");
+        let source = dir.path.join("source.json");
+        fs::write(
+            &source,
+            r#"{"projects":{"/a":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        let dest = dir.path.join(CLAUDE_JSON_FILE_NAME);
+        for original in [
+            "{broken",
+            "[]",
+            r#"{"projects":[]}"#,
+            r#"{"projects":{"/a":false}}"#,
+        ] {
+            fs::write(&dest, original).unwrap();
+            assert!(import_trust(&source, &dir.path).is_err());
+            assert_eq!(fs::read_to_string(&dest).unwrap(), original);
+        }
     }
 }

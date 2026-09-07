@@ -1,8 +1,8 @@
 //! Claude model normalization and API-equivalent cost estimation.
 
 pub(super) const CLAUDE_PRICING_SOURCE: &str = "bundled_anthropic_api_equivalent";
-pub(super) const CLAUDE_PRICING_VERSION: &str = "anthropic-bundled-2026-07-11";
-pub(super) const CLAUDE_PRICING_EFFECTIVE_FROM: &str = "2026-07-11";
+pub(super) const CLAUDE_PRICING_VERSION: &str = "anthropic-bundled-2026-09-05";
+pub(super) const CLAUDE_PRICING_EFFECTIVE_FROM: &str = "2026-09-05";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ClaudeTokenTotals {
@@ -114,9 +114,8 @@ fn claude_pricing(model: &str) -> Option<ClaudePricing> {
     Some(match model.as_str() {
         "claude-fable-5" => standard(10.00, 50.00),
         "claude-haiku-4-5" => standard(1.00, 5.00),
-        "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" => {
-            standard(5.00, 25.00)
-        }
+        "claude-opus-5" | "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7"
+        | "claude-opus-4-8" => standard(5.00, 25.00),
         "claude-sonnet-4-5" => long_context(3.00, 15.00, 200_000, 6.00, 22.50),
         "claude-sonnet-4-6" => standard(3.00, 15.00),
         "claude-opus-4-1" => standard(15.00, 75.00),
@@ -152,4 +151,23 @@ pub(super) fn normalize_claude_model(model: &str) -> String {
     }
 
     model.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opus_5_prices_both_cache_write_durations() {
+        let tokens = ClaudeTokenTotals {
+            input: 100,
+            cache_creation: 200,
+            cache_creation_1h: 100,
+            cache_read: 300,
+            output: 50,
+        };
+        assert_eq!(tokens.total(), 650);
+        let cost = claude_cost_usd("claude-opus-5", tokens).unwrap();
+        assert!((cost - 0.003525).abs() < 1e-12);
+    }
 }

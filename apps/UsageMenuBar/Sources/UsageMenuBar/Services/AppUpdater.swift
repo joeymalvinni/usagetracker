@@ -230,7 +230,7 @@ private struct GitHubReleaseResponse: Decodable {
     @Published private(set) var installError: String?
 
     private static let repository = "joeymalvinni/usagetracker"
-    private static let bundleIdentifier = "engineering.super.usagetracker"
+    private static let bundleIdentifier = "app.usagetracker"
     private static let maximumMetadataBytes = 1_000_000
     private static let checkInterval: TimeInterval = 60 * 60
     private static let installFailureMessage = "Update failed while installing the new app."

@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Child, Command, Stdio},
@@ -13,9 +14,12 @@ use std::{
 use chrono::{Days, Local, NaiveDate};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
+use usage_core::{ActivityDetail, DailyUsagePoint};
 use wait_timeout::ChildExt;
 
-use crate::providers::{DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsage};
+use crate::providers::{
+    json_map, DailyUsageBucket, ProviderError, ProviderErrorKind, ProviderUsage,
+};
 
 use super::{
     cost::u64_from_json_value, rate_limits::normalize_app_server_usage, CodexCollectedUsage,
@@ -40,13 +44,23 @@ impl Drop for ChildGuard {
 
 pub(super) fn collect_usage_from_app_server(
     profile: &CodexProfile,
+    expected_account_id: &str,
 ) -> Result<CodexCollectedUsage, ProviderError> {
+    // app-server reads its home, not UsageTracker's auth_path override.
+    // Require the home credentials to match before accepting any remote data.
+    validate_profile_home_identity(profile, expected_account_id)?;
     let payload = run_codex_app_server_rate_limits(&profile.codex_home).map_err(|err| {
+        if let Some(provider_error) = err.downcast_ref::<ProviderError>() {
+            return ProviderError::new(provider_error.kind(), provider_error.short_message())
+                .with_retry_at(provider_error.retry_at());
+        }
         ProviderError::new(
             ProviderErrorKind::ProviderUnavailable,
             format!("Codex app-server rate limit request failed: {err}"),
         )
     })?;
+    // A login may change while the process is collecting.
+    validate_profile_home_identity(profile, expected_account_id)?;
     let account_display_name = payload
         .get("account_read")
         .and_then(|value| value.get("account"))
@@ -94,6 +108,26 @@ pub(super) fn collect_usage_from_app_server(
         account_display_name,
         warnings,
     })
+}
+
+pub(super) fn validate_profile_home_identity(
+    profile: &CodexProfile,
+    expected_account_id: &str,
+) -> Result<(), ProviderError> {
+    let contents = std::fs::read_to_string(profile.codex_home.join("auth.json")).map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex profile home credentials are unavailable; cannot attribute its usage",
+        )
+    })?;
+    let credentials = super::codex_credentials_from_auth_json(&contents)?;
+    if credentials.account_id != expected_account_id {
+        return Err(ProviderError::new(
+            ProviderErrorKind::CredentialsInvalid,
+            "Codex profile home belongs to a different account; its usage was not collected",
+        ));
+    }
+    Ok(())
 }
 
 fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> {
@@ -150,6 +184,20 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
             }
         }),
     )?;
+    let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("Codex initialization timed out"))?;
+        let line = line_rx
+            .recv_timeout(remaining)
+            .map_err(|_| anyhow::anyhow!("Codex initialization did not respond"))??;
+        let message: Value = serde_json::from_str(&line)?;
+        if message.get("id").and_then(Value::as_i64) == Some(1) {
+            json_rpc_result(message, "initialize")?;
+            break;
+        }
+    }
     write_json_rpc(
         &mut stdin,
         &json!({ "method": "initialized", "params": {} }),
@@ -171,18 +219,13 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
         &json!({ "method": "account/usage/read", "id": 4 }),
     )?;
 
-    let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
-    let mut account_read: Option<Value> = None;
-    let mut rate_limits_read: Option<Value> = None;
-    let mut account_usage_read: Option<Value> = None;
-    let mut account_usage_error: Option<String> = None;
-    let mut account_usage_complete = false;
+    let mut responses = AppServerResponses::default();
     let mut required_completed_at = None;
 
-    while account_read.is_none() || rate_limits_read.is_none() || !account_usage_complete {
+    while !responses.rate_limits_ready() || !responses.optional_responses_complete() {
         let now = Instant::now();
-        if account_read.is_some() && rate_limits_read.is_some() {
-            if account_usage_complete {
+        if responses.rate_limits_ready() {
+            if responses.optional_responses_complete() {
                 break;
             }
             required_completed_at.get_or_insert(now);
@@ -198,9 +241,11 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
         let line = match line_rx.recv_timeout(remaining) {
             Ok(line) => line?,
             Err(mpsc::RecvTimeoutError::Timeout) => break,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("codex app-server stdout closed before expected responses");
-            }
+            // A Codex release may omit or stop supporting one of the optional
+            // account RPCs and then close stdout. Keep any authoritative rate
+            // limits already received instead of discarding their reset dates
+            // and falling back to WHAM's less complete reset-credit summary.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
         let message: Value = serde_json::from_str(&line)?;
@@ -210,25 +255,7 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
             elapsed_ms = started.elapsed().as_millis(),
             "codex app-server message received"
         );
-        match message.get("id").and_then(Value::as_i64) {
-            Some(2) => account_read = Some(json_rpc_result(message, "account/read")?),
-            Some(3) => {
-                rate_limits_read = Some(json_rpc_result(message, "account/rateLimits/read")?)
-            }
-            Some(4) => {
-                account_usage_complete = true;
-                if let Some(error) = message.get("error") {
-                    account_usage_error = Some(error.to_string());
-                } else {
-                    account_usage_read = message.get("result").cloned();
-                    if account_usage_read.is_none() {
-                        account_usage_error =
-                            Some("account/usage/read response was missing result".to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+        responses.record(message)?;
     }
 
     drop(stdin);
@@ -255,53 +282,96 @@ fn run_codex_app_server_rate_limits(codex_home: &Path) -> anyhow::Result<Value> 
         .recv_timeout(Duration::from_millis(100))
         .unwrap_or_default();
 
-    let account_read = account_read.ok_or_else(|| {
+    let payload = responses.into_payload().map_err(|err| {
         warn!(
             elapsed_ms = started.elapsed().as_millis(),
-            stderr = stderr.trim(),
-            "codex app-server account/read timed out"
-        );
-        anyhow::anyhow!(
-            "codex app-server account/read timed out after {:?}; stderr: {}",
-            CODEX_APP_SERVER_TIMEOUT,
-            stderr.trim()
-        )
-    })?;
-    let rate_limits_read = rate_limits_read.ok_or_else(|| {
-        warn!(
-            elapsed_ms = started.elapsed().as_millis(),
-            stderr = stderr.trim(),
+            stderr_bytes = stderr.len(),
             "codex app-server account/rateLimits/read timed out"
         );
-        anyhow::anyhow!(
-            "codex app-server account/rateLimits/read timed out after {:?}; stderr: {}",
-            CODEX_APP_SERVER_TIMEOUT,
-            stderr.trim()
-        )
+        anyhow::anyhow!("{err}; timed out after {:?}", CODEX_APP_SERVER_TIMEOUT,)
     })?;
-    if !account_usage_complete {
-        account_usage_error = Some(format!(
-            "account/usage/read did not respond within {:?} after rate limits were ready",
-            CODEX_ACCOUNT_USAGE_GRACE_TIMEOUT
-        ));
-    }
 
     debug!(
         elapsed_ms = started.elapsed().as_millis(),
         "codex app-server process completed"
     );
 
-    Ok(json!({
-        "account_read": account_read,
-        "rate_limits_read": rate_limits_read,
-        "account_usage_read": account_usage_read,
-        "account_usage_error": account_usage_error,
-    }))
+    Ok(payload)
+}
+
+#[derive(Default)]
+struct AppServerResponses {
+    account_read: Option<Value>,
+    account_read_complete: bool,
+    account_usage_read: Option<Value>,
+    account_usage_error: Option<String>,
+    account_usage_complete: bool,
+    rate_limits_read: Option<Value>,
+}
+
+impl AppServerResponses {
+    fn rate_limits_ready(&self) -> bool {
+        self.rate_limits_read.is_some()
+    }
+
+    fn optional_responses_complete(&self) -> bool {
+        self.account_read_complete && self.account_usage_complete
+    }
+
+    fn record(&mut self, message: Value) -> anyhow::Result<()> {
+        match message.get("id").and_then(Value::as_i64) {
+            Some(2) => {
+                self.account_read_complete = true;
+                self.account_read = message.get("result").cloned();
+            }
+            Some(3) => {
+                self.rate_limits_read = Some(json_rpc_result(message, "account/rateLimits/read")?);
+            }
+            Some(4) => {
+                self.account_usage_complete = true;
+                if let Some(error) = message.get("error") {
+                    self.account_usage_error = Some(
+                        safe_rpc_error(error, "account/usage/read")
+                            .short_message()
+                            .to_string(),
+                    );
+                } else {
+                    self.account_usage_read = message.get("result").cloned();
+                    if self.account_usage_read.is_none() {
+                        self.account_usage_error =
+                            Some("account/usage/read response was missing result".to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn into_payload(mut self) -> anyhow::Result<Value> {
+        let rate_limits_read = self.rate_limits_read.ok_or_else(|| {
+            anyhow::anyhow!("codex app-server account/rateLimits/read returned no result")
+        })?;
+        if !self.account_usage_complete {
+            self.account_usage_error = Some(format!(
+                "account/usage/read did not respond within {:?} after rate limits were ready",
+                CODEX_ACCOUNT_USAGE_GRACE_TIMEOUT
+            ));
+        }
+
+        Ok(json!({
+            "account_read": self.account_read,
+            "rate_limits_read": rate_limits_read,
+            "account_usage_read": self.account_usage_read,
+            "account_usage_error": self.account_usage_error,
+        }))
+    }
 }
 
 fn spawn_codex_app_server(codex_home: &Path) -> std::io::Result<Child> {
     let configure = |command: &mut Command| {
         command
+            .args(["-c", "cli_auth_credentials_store=\"file\""])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -317,11 +387,16 @@ fn spawn_codex_app_server(codex_home: &Path) -> std::io::Result<Child> {
             // GUI applications normally inherit LaunchServices' minimal PATH,
             // which omits common npm and managed-tool locations. Resolve with a
             // login shell, then launch the absolute binary directly so shell
-            // startup output can never corrupt the JSON-RPC stream.
+            // startup output can never corrupt the JSON-RPC stream. Keep its
+            // directory on PATH as well: npm/NVM entry points commonly use
+            // `#!/usr/bin/env node` and need the sibling Node executable.
             let executable = resolve_codex_executable_with_login_shell()?;
+            let search_path =
+                path_with_executable_dir(&executable, std::env::var_os("PATH").as_deref())?;
             let mut fallback = Command::new(executable);
             fallback.arg("app-server");
             configure(&mut fallback);
+            fallback.env("PATH", search_path);
             fallback.spawn()
         }
         Err(err) => Err(err),
@@ -330,13 +405,37 @@ fn spawn_codex_app_server(codex_home: &Path) -> std::io::Result<Child> {
 
 fn resolve_codex_executable_with_login_shell() -> std::io::Result<std::path::PathBuf> {
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-    let output = Command::new(shell)
-        .args(["-lic", "command -v codex"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    if output.status.success() {
-        if let Some(path) = executable_path_from_shell_output(&output.stdout) {
+    let mut child = ChildGuard(
+        Command::new(shell)
+            .args(["-lic", "command -v codex"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()?,
+    );
+    let stdout = child.0.stdout.take().expect("piped shell stdout");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout
+            .take(MAX_APP_SERVER_STDERR_BYTES)
+            .read_to_end(&mut output);
+        let _ = tx.send(output);
+    });
+    let status = child
+        .0
+        .wait_timeout(Duration::from_secs(5))?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Codex login-shell executable lookup timed out",
+            )
+        })?;
+    if status.success() {
+        let output = rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap_or_default();
+        if let Some(path) = executable_path_from_shell_output(&output) {
             return Ok(path);
         }
     }
@@ -344,6 +443,28 @@ fn resolve_codex_executable_with_login_shell() -> std::io::Result<std::path::Pat
         std::io::ErrorKind::NotFound,
         "codex was not found in the login-shell PATH",
     ))
+}
+
+fn path_with_executable_dir(
+    executable: &Path,
+    current_path: Option<&OsStr>,
+) -> std::io::Result<OsString> {
+    let executable_dir = executable.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "resolved Codex executable has no parent directory",
+        )
+    })?;
+    let mut paths = vec![executable_dir.to_path_buf()];
+    if let Some(current_path) = current_path {
+        paths.extend(std::env::split_paths(current_path).filter(|path| path != executable_dir));
+    }
+    std::env::join_paths(paths).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("failed to construct Codex executable PATH: {err}"),
+        )
+    })
 }
 
 fn executable_path_from_shell_output(output: &[u8]) -> Option<std::path::PathBuf> {
@@ -365,12 +486,36 @@ fn write_json_rpc(stdin: &mut impl Write, message: &Value) -> anyhow::Result<()>
 
 fn json_rpc_result(message: Value, method: &str) -> anyhow::Result<Value> {
     if let Some(error) = message.get("error") {
-        anyhow::bail!("{method} returned error: {error}");
+        return Err(safe_rpc_error(error, method).into());
     }
     message
         .get("result")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{method} response missing result"))
+}
+
+fn safe_rpc_error(error: &Value, method: &str) -> ProviderError {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let code = error.get("code").and_then(Value::as_i64);
+    let kind = if code == Some(429)
+        || message.contains("429")
+        || message.contains("rate limited")
+        || message.contains("rate-limited")
+        || message.contains("rate limit exceeded")
+        || message.contains("too many requests")
+    {
+        ProviderErrorKind::RateLimited
+    } else if matches!(code, Some(401 | 403)) || message.contains("401") || message.contains("403")
+    {
+        ProviderErrorKind::Unauthorized
+    } else {
+        ProviderErrorKind::ProviderUnavailable
+    };
+    ProviderError::new(kind, format!("Codex {method} failed ({})", kind.as_str()))
 }
 
 pub(super) struct CodexAccountActivity {
@@ -497,33 +642,68 @@ impl CodexAccountActivityExt for ProviderUsage {
         let by_day = activity
             .daily_usage
             .iter()
-            .map(|bucket| {
-                json!({
-                    "date": bucket.date.to_string(),
-                    "tokens": bucket.tokens,
-                })
+            .map(|bucket| DailyUsagePoint {
+                date: bucket.date,
+                tokens: bucket.tokens,
+                cost_usd: None,
+                priced_tokens: 0,
+                unpriced_tokens: 0,
             })
             .collect::<Vec<_>>();
-        self.metadata["codex_activity"] = json!({
-            "source": "codex_account_usage",
-            "server_authoritative": true,
-            "daily_bucket_count": activity.daily_usage.len(),
-            "today_tokens": today_tokens,
-            "lookback_days": COST_LOOKBACK_DAYS,
-            "lookback_tokens": lookback_tokens,
-            "lifetime_tokens": lifetime_tokens,
-            "peak_daily_tokens": activity.peak_daily_tokens,
-            "longest_running_turn_sec": activity.longest_running_turn_sec,
-            "current_streak_days": activity.current_streak_days,
-            "longest_streak_days": activity.longest_streak_days,
-            "by_day": by_day,
+        self.detail.activity = Some(ActivityDetail {
+            source: Some("codex_account_usage".to_string()),
+            today_tokens: Some(today_tokens),
+            lookback_tokens: Some(lookback_tokens),
+            lifetime_tokens: Some(lifetime_tokens),
+            by_day,
+            extra: json_map(json!({
+                "server_authoritative": true,
+                "daily_bucket_count": activity.daily_usage.len(),
+                "lookback_days": COST_LOOKBACK_DAYS,
+                "peak_daily_tokens": activity.peak_daily_tokens,
+                "longest_running_turn_sec": activity.longest_running_turn_sec,
+                "current_streak_days": activity.current_streak_days,
+                "longest_streak_days": activity.longest_streak_days,
+            })),
+            ..ActivityDetail::default()
         });
     }
 }
 
 #[cfg(test)]
-mod executable_resolution_tests {
-    use super::executable_path_from_shell_output;
+mod tests {
+    #[test]
+    fn rpc_rate_limits_keep_their_error_kind_without_exposing_payloads() {
+        let error = super::json_rpc_result(
+            serde_json::json!({"error":{
+                "code":429,"message":"rate limited: private provider response"
+            }}),
+            "account/rateLimits/read",
+        )
+        .unwrap_err();
+        let error = error.downcast_ref::<super::ProviderError>().unwrap();
+        assert_eq!(error.kind(), super::ProviderErrorKind::RateLimited);
+        assert!(!error.short_message().contains("private"));
+        let unrelated = super::safe_rpc_error(
+            &json!({
+                "message":"Unable to read rate limits: connection failed"
+            }),
+            "account/rateLimits/read",
+        );
+        assert_eq!(
+            unrelated.kind(),
+            super::ProviderErrorKind::ProviderUnavailable
+        );
+    }
+    use std::{ffi::OsStr, os::unix::fs::PermissionsExt, process::Command};
+
+    use serde_json::json;
+    use usage_core::AccountId;
+
+    use super::{
+        executable_path_from_shell_output, normalize_app_server_usage, path_with_executable_dir,
+        AppServerResponses,
+    };
 
     #[test]
     fn extracts_an_existing_absolute_executable_after_shell_startup_output() {
@@ -532,5 +712,106 @@ mod executable_resolution_tests {
             executable_path_from_shell_output(output).as_deref(),
             Some(std::path::Path::new("/bin/sh"))
         );
+    }
+
+    #[test]
+    fn resolved_npm_entrypoint_can_find_its_sibling_interpreter() {
+        let root = std::env::temp_dir().join(format!(
+            "usagetracker-codex-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let interpreter = root.join("fake-node");
+        let codex = root.join("codex");
+        std::fs::write(&interpreter, "#!/bin/sh\nprintf codex-started\n").unwrap();
+        std::fs::write(&codex, "#!/usr/bin/env fake-node\n").unwrap();
+        for path in [&interpreter, &codex] {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let search_path =
+            path_with_executable_dir(&codex, Some(OsStr::new("/usr/bin:/bin"))).unwrap();
+        let output = Command::new(&codex)
+            .env("PATH", search_path)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"codex-started");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keeps_rate_limit_reset_dates_when_optional_responses_never_arrive() {
+        let mut responses = AppServerResponses::default();
+        responses
+            .record(json!({
+                "id": 3,
+                "result": {
+                    "rateLimits": {
+                        "primary": {
+                            "usedPercent": 27,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1785266625
+                        }
+                    },
+                    "rateLimitResetCredits": {
+                        "availableCount": 1,
+                        "credits": [{
+                            "id": "RateLimitResetCredit_test",
+                            "status": "available",
+                            "expiresAt": 1785430594
+                        }]
+                    }
+                }
+            }))
+            .unwrap();
+
+        let payload = responses.into_payload().unwrap();
+
+        assert_eq!(
+            payload["rate_limits_read"]["rateLimits"]["primary"]["resetsAt"],
+            1785266625
+        );
+        assert_eq!(
+            payload["rate_limits_read"]["rateLimitResetCredits"]["credits"][0]["expiresAt"],
+            1785430594
+        );
+        assert!(payload["account_read"].is_null());
+        assert!(payload["account_usage_error"]
+            .as_str()
+            .unwrap()
+            .contains("did not respond"));
+
+        let snapshot = normalize_app_server_usage(&payload, None)
+            .unwrap()
+            .into_snapshot(AccountId::new("codex-account"));
+        assert_eq!(
+            snapshot.windows[0].reset_at.unwrap().timestamp(),
+            1785266625
+        );
+        assert_eq!(
+            snapshot
+                .detail
+                .reset_credits
+                .as_ref()
+                .unwrap()
+                .next_expires_at
+                .unwrap()
+                .timestamp(),
+            1785430594
+        );
+    }
+
+    #[test]
+    fn still_requires_the_rate_limit_response() {
+        let error = AppServerResponses::default()
+            .into_payload()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("account/rateLimits/read returned no result"));
     }
 }

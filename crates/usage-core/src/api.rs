@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Account, AccountId, ImportJobId, ProviderHealth, ProviderId, RefreshJobId,
-    UsageDashboardSummary, UsageForecast, UsageSnapshot, UsageWindowProvenance,
+    UsageDashboardSummary, UsageEventPage, UsageForecast, UsageSnapshot, UsageWindowProvenance,
 };
 
 pub const API_VERSION: u16 = 3;
@@ -58,6 +58,13 @@ pub enum ApiRequest {
     GetServerInfo,
     GetState,
     GetUsage,
+    GetUsageEvents {
+        account_id: AccountId,
+        #[serde(default)]
+        offset: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
+    },
     Refresh {
         providers: Option<Vec<ProviderId>>,
     },
@@ -83,6 +90,8 @@ pub enum ApiRequest {
         provider_id: ProviderId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "ProviderSignInAction::is_open")]
+        sign_in_action: ProviderSignInAction,
     },
     UpdateAccount {
         account_id: AccountId,
@@ -116,6 +125,8 @@ pub enum ApiRequest {
         provider_id: ProviderId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<AccountId>,
+        #[serde(default, skip_serializing_if = "ProviderSignInAction::is_open")]
+        sign_in_action: ProviderSignInAction,
     },
     LaunchProviderAccount {
         account_id: AccountId,
@@ -144,6 +155,20 @@ pub enum ApiRequest {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSignInAction {
+    #[default]
+    Open,
+    CopyLink,
+}
+
+impl ProviderSignInAction {
+    fn is_open(value: &Self) -> bool {
+        *value == Self::Open
+    }
+}
+
 impl ApiRequest {
     pub fn supports_method(method: &str) -> bool {
         matches!(
@@ -151,6 +176,7 @@ impl ApiRequest {
             "get_server_info"
                 | "get_state"
                 | "get_usage"
+                | "get_usage_events"
                 | "refresh"
                 | "get_refresh_job"
                 | "get_provider_health"
@@ -354,7 +380,7 @@ pub struct AccountLaunchSettingsResponse {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
 pub struct NotificationConfig {
-    #[serde(default = "default_notifications_enabled")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_notification_thresholds")]
     pub thresholds_percent_remaining: Vec<u8>,
@@ -373,7 +399,9 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Notification delivery is a user-facing permission. New installs
+            // remain off until the user opts in from onboarding or Settings.
+            enabled: false,
             thresholds_percent_remaining: default_notification_thresholds(),
             reset_alerts: true,
             predictive_alerts: false,
@@ -466,10 +494,6 @@ fn validate_notification_thresholds(thresholds: &[u8]) -> Result<(), &'static st
     Ok(())
 }
 
-fn default_notifications_enabled() -> bool {
-    true
-}
-
 fn default_true() -> bool {
     true
 }
@@ -498,6 +522,9 @@ pub enum ApiResponse {
         forecasts: Vec<UsageForecast>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         window_provenance: Vec<UsageWindowProvenance>,
+    },
+    UsageEvents {
+        page: UsageEventPage,
     },
     RefreshStarted {
         job: RefreshJob,
@@ -556,6 +583,8 @@ pub enum ApiResponse {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct StateSnapshot {
     pub generated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub connectivity: Connectivity,
     pub server: ServerInfo,
     pub config: ConfigResponse,
     pub accounts: Vec<Account>,
@@ -566,6 +595,26 @@ pub struct StateSnapshot {
     pub forecasts: Vec<UsageForecast>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub window_provenance: Vec<UsageWindowProvenance>,
+}
+
+/// Transient machine-wide network reachability reported by the daemon.
+///
+/// This deliberately lives outside provider health: losing the computer's
+/// network route is not a durable failure of every configured provider.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct Connectivity {
+    pub status: ConnectivityStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectivityStatus {
+    Online,
+    Offline,
+    #[default]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -585,6 +634,7 @@ impl ServerInfo {
                 ApiCapability::RefreshJobs,
                 ApiCapability::RefreshCoalescing,
                 ApiCapability::CombinedState,
+                ApiCapability::UsageEvents,
             ],
             providers,
         }
@@ -599,6 +649,7 @@ pub enum ApiCapability {
     CombinedState,
     TypedErrors,
     UsageProvenance,
+    UsageEvents,
     RefreshJobs,
     RefreshCoalescing,
 }
@@ -608,6 +659,15 @@ pub struct ProviderDescriptor {
     pub id: ProviderId,
     pub display_name: String,
     pub minimum_refresh_interval_seconds: u64,
+    /// A prompt-free indication that this provider has an app, CLI, or local
+    /// data directory on this Mac. This never reads credentials or contacts
+    /// the provider.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub detected: bool,
+    /// Provider-owned copy shown before onboarding may access credentials or
+    /// browser storage. Omitted when connecting is prompt-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_access_notice: Option<String>,
     pub capabilities: ProviderCapabilities,
 }
 
@@ -680,10 +740,25 @@ pub struct RefreshJob {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// True when the daemon completed the job without remote collection
+    /// because machine-wide reachability was definitively offline.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skipped_offline: bool,
+    /// Accounts whose identities were discovered and persisted during this
+    /// refresh. This is populated while collection is still running so clients
+    /// can react to provider-scoped progress without polling global state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_accounts: Vec<RefreshAccountDiscovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_results: Vec<ProviderRefreshResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
+pub struct RefreshAccountDiscovery {
+    pub provider_id: ProviderId,
+    pub account_id: AccountId,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -924,6 +999,53 @@ mod tests {
     }
 
     #[test]
+    fn provider_sign_in_requests_default_to_open_for_existing_clients() {
+        let add: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"add_provider_account","provider_id":"codex"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            add.request,
+            ApiRequest::AddProviderAccount {
+                sign_in_action: ProviderSignInAction::Open,
+                ..
+            }
+        ));
+
+        let repair: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"repair_provider","provider_id":"codex"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            repair.request,
+            ApiRequest::RepairProvider {
+                sign_in_action: ProviderSignInAction::Open,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copy_link_sign_in_action_round_trips_on_the_wire() {
+        let request = RequestEnvelope::new(ApiRequest::RepairProvider {
+            provider_id: ProviderId::new("codex"),
+            account_id: None,
+            sign_in_action: ProviderSignInAction::CopyLink,
+        });
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["sign_in_action"], "copy_link");
+
+        let decoded: RequestEnvelope = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            decoded.request,
+            ApiRequest::RepairProvider {
+                sign_in_action: ProviderSignInAction::CopyLink,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn generic_provider_setup_preserves_explicit_null_values() {
         let request: RequestEnvelope = serde_json::from_str(
             r#"{"api_version":3,"method":"update_provider_setup","provider_id":"future","settings":{"region":null}}"#,
@@ -941,6 +1063,13 @@ mod tests {
         assert_eq!(provider_id.as_str(), "future");
         assert_eq!(settings.get("region"), Some(&None));
         assert_eq!(workspace_id, None);
+    }
+
+    #[test]
+    fn notifications_are_off_when_the_setting_is_new_or_omitted() {
+        assert!(!NotificationConfig::default().enabled);
+        let decoded: NotificationConfig = serde_json::from_str("{}").unwrap();
+        assert!(!decoded.enabled);
     }
 
     #[test]
@@ -974,7 +1103,7 @@ mod tests {
         };
         assert_eq!(server.api_version, API_VERSION);
         assert!(server.capabilities.contains(&ApiCapability::RefreshJobs));
-        assert_eq!(server.providers.len(), 4);
+        assert_eq!(server.providers.len(), 5);
         assert!(server
             .providers
             .iter()
@@ -989,8 +1118,26 @@ mod tests {
             panic!("unexpected fixture response");
         };
         assert_eq!(state.server.api_version, API_VERSION);
+        assert_eq!(state.connectivity.status, ConnectivityStatus::Online);
         assert_eq!(state.config.poll_interval_seconds, 300);
         assert!(state.snapshots.is_empty());
+    }
+
+    #[test]
+    fn state_without_connectivity_defaults_to_unknown() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../wire-fixtures/state_v3.json")).unwrap();
+        value["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("connectivity");
+
+        let response: ResponseEnvelope = serde_json::from_value(value).unwrap();
+        let ApiResponse::State { state } = response.response else {
+            panic!("unexpected fixture response");
+        };
+
+        assert_eq!(state.connectivity, Connectivity::default());
     }
 
     #[test]
@@ -1020,6 +1167,14 @@ mod tests {
             panic!("unexpected fixture response");
         };
         assert_eq!(job.status, RefreshJobStatus::Completed);
+        assert!(!job.skipped_offline);
+        assert_eq!(
+            job.discovered_accounts,
+            vec![RefreshAccountDiscovery {
+                provider_id: ProviderId::new("codex"),
+                account_id: AccountId::new("account-1"),
+            }]
+        );
         assert_eq!(job.provider_results.len(), 1);
     }
 

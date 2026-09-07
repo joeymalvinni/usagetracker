@@ -8,13 +8,13 @@ use crate::{
     config::{Config, ProviderConfig},
     providers::{
         claude::adapter::ADAPTER as CLAUDE, codex::adapter::ADAPTER as CODEX,
-        grok::adapter::ADAPTER as GROK, opencode::adapter::ADAPTER as OPENCODE_GO,
-        ProviderCollector,
+        cursor::adapter::ADAPTER as CURSOR, grok::adapter::ADAPTER as GROK,
+        opencode::adapter::ADAPTER as OPENCODE_GO, ProviderCollector,
     },
     runtime::provider_adapter::{ExecutionPolicy, ProviderAdapter},
 };
 
-const PROVIDERS: &[&dyn ProviderAdapter] = &[&CODEX, &CLAUDE, &OPENCODE_GO, &GROK];
+const PROVIDERS: &[&dyn ProviderAdapter] = &[&CODEX, &CLAUDE, &CURSOR, &OPENCODE_GO, &GROK];
 
 pub(crate) fn adapter(provider_id: &ProviderId) -> anyhow::Result<&'static dyn ProviderAdapter> {
     find(provider_id.as_str()).ok_or_else(|| anyhow::anyhow!("unknown provider: {provider_id}"))
@@ -50,7 +50,10 @@ pub(crate) fn default_provider_configs() -> BTreeMap<String, ProviderConfig> {
             (
                 manifest.id.to_string(),
                 ProviderConfig {
-                    enabled: manifest.default_visible,
+                    // Fresh installations must remain credential-inert until
+                    // the user explicitly connects a provider. In particular,
+                    // a LaunchAgent may start before the onboarding UI appears.
+                    enabled: false,
                     ..ProviderConfig::default()
                 },
             )
@@ -172,7 +175,7 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            ["codex", "claude", "opencode_go", "grok"]
+            ["codex", "claude", "cursor", "opencode_go", "grok"]
         );
     }
 
@@ -180,6 +183,10 @@ mod tests {
     fn capabilities_are_derived_from_registered_handlers() {
         for provider in PROVIDERS {
             let descriptor = provider.descriptor();
+            assert_eq!(
+                descriptor.capabilities.multiple_accounts,
+                provider.supports_multiple_accounts()
+            );
             assert_eq!(
                 descriptor.capabilities.add_account,
                 provider.add_account_handler().is_some()
@@ -199,6 +206,10 @@ mod tests {
             assert_eq!(
                 descriptor.capabilities.setup,
                 provider.setup_handler().is_some()
+            );
+            assert_eq!(
+                descriptor.credential_access_notice.as_deref(),
+                provider.credential_access_notice()
             );
         }
     }

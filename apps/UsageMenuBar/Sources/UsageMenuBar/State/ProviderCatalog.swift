@@ -25,6 +25,7 @@ enum ProviderCatalog {
     static let providers: [ProviderDescriptor] = [
         ProviderDescriptor(id: "codex", name: "Codex", shortName: "Cdx", symbol: "terminal"),
         ProviderDescriptor(id: "claude", name: "Claude", shortName: "Clde", symbol: "sparkles"),
+        ProviderDescriptor(id: "cursor", name: "Cursor", shortName: "Curs", symbol: "cursorarrow"),
         ProviderDescriptor(id: "opencode_go", name: "OpenCode Go", shortName: "Go", symbol: "bolt.horizontal"),
         ProviderDescriptor(id: "grok", name: "Grok", shortName: "Grok", symbol: "sparkle"),
     ]

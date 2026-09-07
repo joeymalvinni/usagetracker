@@ -49,6 +49,75 @@ struct CostSummary: Decodable, Equatable {
     let todayCostUsd: Double
     let lookbackCostUsd: Double
     let pricing: PricingCoverage
+    let models: [ModelCostSummary]
+
+    init(
+        provenance: DataProvenance,
+        days: [DailyUsagePoint],
+        todayCostUsd: Double,
+        lookbackCostUsd: Double,
+        pricing: PricingCoverage,
+        models: [ModelCostSummary] = []
+    ) {
+        self.provenance = provenance
+        self.days = days
+        self.todayCostUsd = todayCostUsd
+        self.lookbackCostUsd = lookbackCostUsd
+        self.pricing = pricing
+        self.models = models
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        provenance = try container.decode(DataProvenance.self, forKey: .provenance)
+        days = try container.decode([DailyUsagePoint].self, forKey: .days)
+        todayCostUsd = try container.decode(Double.self, forKey: .todayCostUsd)
+        lookbackCostUsd = try container.decode(Double.self, forKey: .lookbackCostUsd)
+        pricing = try container.decode(PricingCoverage.self, forKey: .pricing)
+        models = try container.decodeIfPresent([ModelCostSummary].self, forKey: .models) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provenance, days, todayCostUsd, lookbackCostUsd, pricing, models
+    }
+}
+
+struct ModelCostSummary: Decodable, Equatable, Sendable {
+    let model: String
+    let eventCount: UInt64
+    let tokens: UInt64
+    let vendorCostUsd: Double
+    let meteredCostUsd: Double
+    let chargeableCostUsd: Double
+    let providerFeeUsd: Double
+}
+
+struct UsageEventPage: Decodable, Equatable {
+    let accountId: String
+    let events: [UsageEvent]
+    let offset: UInt32
+    let totalCount: UInt64
+    let nextOffset: UInt32?
+}
+
+struct UsageEvent: Decodable, Equatable, Identifiable {
+    let eventId: String
+    let occurredAt: Date
+    let model: String
+    let kind: String
+    let inputTokens: UInt64
+    let outputTokens: UInt64
+    let cacheReadTokens: UInt64
+    let cacheWriteTokens: UInt64
+    let requestUnits: Double
+    let vendorCostUsd: Double
+    let meteredCostUsd: Double
+    let providerFeeUsd: Double
+    let chargeable: Bool
+    let tokenBased: Bool
+    let headless: Bool
+
+    var id: String { eventId }
 }
 
 struct DailyUsagePoint: Decodable, Equatable {
@@ -176,6 +245,7 @@ enum UsageDataSource: String, Decodable {
 }
 enum UsageDataScope: String, Decodable {
     case accountWide = "account_wide"
+    case organization
     case thisDevice = "this_device"
     case selectedLocalRoots = "selected_local_roots"
     case workspace
@@ -183,6 +253,7 @@ enum UsageDataScope: String, Decodable {
     var label: String {
         switch self {
         case .accountWide: "Account-wide"
+        case .organization: "Organization-wide"
         case .thisDevice, .selectedLocalRoots: "This Mac"
         case .workspace: "Workspace"
         }

@@ -285,9 +285,8 @@ fn expected_window_duration(window: &UsageWindow) -> Option<TimeDelta> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use serde_json::json;
     use std::collections::HashMap;
-    use usage_core::{AccountId, ProviderId};
+    use usage_core::{AccountId, ProviderId, SnapshotDetail};
 
     use crate::storage::{StoredForecastHistory, StoredWindowObservation};
 
@@ -431,10 +430,8 @@ mod tests {
         let now = time(2026, 7, 10, 12, 0);
         let mut current = snapshot(now, now + TimeDelta::hours(2), 95.0);
         current.provider_id = ProviderId::new("opencode_go");
-        current.metadata = json!({
-            "estimate": true,
-            "web_authoritative": false,
-        });
+        current.detail.estimate = Some(true);
+        current.detail.web_authoritative = Some(false);
 
         assert!(forecast_from_snapshots(&current, &[], now).is_empty());
     }
@@ -483,7 +480,7 @@ mod tests {
                 percent_remaining: Some(100.0 - percent),
                 reset_at: Some(reset_at),
             }],
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         }
     }
 

@@ -1,6 +1,6 @@
 # Codex
 
-Codex is on by default.
+Codex is available by default but remains off until you explicitly connect it.
 
 ## Accounts
 
@@ -8,7 +8,7 @@ Codex supports as many profiles as you like. Each one uses its own `CODEX_HOME` 
 
 ## Where credentials come from
 
-For each profile, UsageTracker reads `auth_path` if you've set it, otherwise `<codex_home>/auth.json`. The legacy default is `$CODEX_HOME/auth.json` or `~/.codex/auth.json`. Whichever file it lands on has to contain a non-empty access token and account ID.
+For each profile, UsageTracker reads `auth_path` if you've set it, otherwise `<codex_home>/auth.json`. If only `auth_path` is configured, its parent directory is the profile home. The legacy default is `$CODEX_HOME/auth.json` or `~/.codex/auth.json`. Whichever file it lands on has to contain a non-empty access token and account ID. App-server collection explicitly uses file credentials and checks the home account before and after collection. A custom auth file pointing at a different account from the home uses WHAM for quota and does not borrow that home's activity or cost.
 
 ## How usage is collected
 
@@ -16,11 +16,15 @@ For each profile, UsageTracker reads `auth_path` if you've set it, otherwise `<c
 2. If the app-server can't give you rate limits, ask `https://chatgpt.com/backend-api/wham/usage` using the bearer token and account ID you already have.
 3. If account-wide activity isn't available at all, keep the history you already have and lean on local session logs for activity and cost estimates.
 
-Rate-limit trouble can fall through to WHAM, but local logs never stand in for real, provider-reported quota.
+App-server failures can fall through to WHAM, except a rate-limited response, which starts backoff without another remote request. Local logs never stand in for real, provider-reported quota.
 
 ## How the numbers are normalized
 
-Provider windows become percent, credit, or amount windows, each with a stable ID and a UTC reset time. The daily buckets from `account/usage/read` are retained as account diagnostics, but their opaque account-wide totals do not drive the activity graph. Visible Codex tokens come from local logs and count processed input plus output, including cached input once. Cost is estimated from those same logs with cached input charged at its discounted catalog rate; it is never scaled to the account-wide token total. Models that aren't in the bundled, versioned catalog stay clearly marked as unpriced.
+Provider windows become percent, credit, or amount windows, each with a stable ID and a UTC reset time. Additional limits are keyed by the provider's metered feature ID, not their position in a list. Window duration determines daily/weekly labels where supplied, including a weekly primary window.
+
+The account-wide daily buckets and lifetime total from `account/usage/read` drive visible Codex token activity so the dashboard matches the Codex profile. These are provider-reported ChatGPT account activity, not proof that a local Codex session ran on this Mac; the API does not supply conversation-level attribution. Local logs are the fallback activity source when account usage is unavailable, and they continue to provide model-level cost estimates by counting processed input plus output, including cached input once. Repeated notifications with unchanged cumulative token counters do not charge the previous request again. Cost is never scaled to the account-wide token total. Missing local cost data and unknown model pricing are shown as unavailable rather than a zero bill.
+
+The bundled catalog verified September 5, 2026 includes GPT-6 Astra and GPT-5.1 Codex Mini, current GPT-5.6 Sol/Terra/Luna rates, and the `gpt-5.6` alias. Estimates use the installed catalog across the scanned history; they are current API-equivalent estimates, not date-specific invoices. Catalog updates invalidate cached cost calculations. See [the September audit](codex-audit-2026-09-05.md) for sources and validation.
 
 ## Refresh timing and rate limits
 

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use usage_core::{
     Account, AccountId, ProviderActionResponse, ProviderId, ProviderProfileResponse,
-    ProviderSetupField, ProviderSetupFieldKind, ProviderSetupResponse,
+    ProviderSetupField, ProviderSetupFieldKind, ProviderSetupResponse, ProviderSignInAction,
 };
 
 use crate::{
@@ -28,7 +28,6 @@ impl ProviderAdapter for OpenCodeAdapter {
             id: OPENCODE_GO_PROVIDER_ID,
             display_name: "OpenCode Go",
             minimum_refresh_interval_seconds: 60,
-            default_visible: false,
         }
     }
 
@@ -68,6 +67,22 @@ impl ProviderAdapter for OpenCodeAdapter {
         Ok(Arc::new(OpenCodeCollector::new(config.clone())?))
     }
 
+    fn detected_locally(&self) -> bool {
+        std::path::Path::new("/Applications/OpenCode.app").exists()
+            || dirs::home_dir().is_some_and(|home| {
+                home.join("Applications/OpenCode.app").exists()
+                    || home.join(".local/share/opencode").exists()
+                    || home.join(".config/opencode").exists()
+            })
+    }
+
+    fn credential_access_notice(&self) -> Option<&'static str> {
+        Some(
+            "OpenCode Go uses your existing web session. After you continue, macOS may ask for \
+             UsageTracker's cookie cache or your browser's Safe Storage key.",
+        )
+    }
+
     fn repair_handler(&self) -> Option<&dyn RepairHandler> {
         Some(self)
     }
@@ -87,15 +102,22 @@ impl RepairHandler for OpenCodeAdapter {
         &self,
         _runtime: ProviderRuntime<'_>,
         _account_id: Option<AccountId>,
+        sign_in_action: ProviderSignInAction,
     ) -> anyhow::Result<ProviderActionResponse> {
         clear_cached_cookie_cache().await?;
-        launchers::open_url("https://opencode.ai")?;
+        let url = launchers::handle_sign_in_url("https://opencode.ai", sign_in_action)?;
+        let message = match sign_in_action {
+            ProviderSignInAction::Open => {
+                "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
+            }
+            ProviderSignInAction::CopyLink => {
+                "Paste the OpenCode sign-in link into a browser, then discover workspaces and refresh."
+            }
+        };
         Ok(ProviderActionResponse {
             provider_id: ProviderId::new(OPENCODE_GO_PROVIDER_ID),
-            message:
-                "OpenCode opened in your browser. Sign in, then discover workspaces and refresh."
-                    .to_string(),
-            authentication_url: Some("https://opencode.ai".to_string()),
+            message: message.to_string(),
+            authentication_url: Some(url),
         })
     }
 }

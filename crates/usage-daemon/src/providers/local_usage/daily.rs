@@ -1,6 +1,25 @@
 use std::collections::BTreeMap;
 
 use chrono::{Days, NaiveDate};
+use usage_core::DailyUsagePoint;
+
+/// Canonical per-day rows shared by the cost collectors and the dashboard.
+/// Providers own the semantics of `priced`/`unpriced` here so the read side no
+/// longer has to infer them from a partially-populated JSON row.
+pub(crate) fn daily_usage_points(
+    by_day: &BTreeMap<NaiveDate, DailyCostSummary>,
+) -> Vec<DailyUsagePoint> {
+    by_day
+        .iter()
+        .map(|(date, summary)| DailyUsagePoint {
+            date: *date,
+            tokens: summary.tokens,
+            cost_usd: Some(summary.cost_usd),
+            priced_tokens: summary.priced_tokens,
+            unpriced_tokens: summary.unpriced_tokens,
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct DailyCostSummary {
@@ -80,69 +99,31 @@ pub(crate) fn merge_daily_summary(
     }
 }
 
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct DailyCostRow {
-    date: String,
-    cost_usd: f64,
-    tokens: u64,
-    activity_tokens: u64,
-    cached_input_tokens: u64,
-    priced_tokens: u64,
-    unpriced_tokens: u64,
-    unpriced_models: Vec<UnpricedModelRow>,
-    rows: u64,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct UnpricedModelRow {
-    model: String,
-    tokens: u64,
-}
-
-pub(crate) fn daily_cost_rows(by_day: &BTreeMap<NaiveDate, DailyCostSummary>) -> Vec<DailyCostRow> {
-    by_day
-        .iter()
-        .map(|(date, summary)| DailyCostRow {
-            date: date.to_string(),
-            cost_usd: summary.cost_usd,
-            tokens: summary.tokens,
-            activity_tokens: summary.tokens,
-            cached_input_tokens: summary.cached_input_tokens,
-            priced_tokens: summary.priced_tokens,
-            unpriced_tokens: summary.unpriced_tokens,
-            unpriced_models: summary
-                .unpriced_models
-                .iter()
-                .map(|(model, tokens)| UnpricedModelRow {
-                    model: model.clone(),
-                    tokens: *tokens,
-                })
-                .collect(),
-            rows: summary.rows,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn daily_rows_publish_processed_activity_with_cached_input() {
+    fn daily_points_carry_priced_and_unpriced_tokens() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 11).unwrap();
-        let rows = daily_cost_rows(&BTreeMap::from([(
+        let points = daily_usage_points(&BTreeMap::from([(
             date,
             DailyCostSummary {
+                cost_usd: 1.5,
                 tokens: 1_100,
                 cached_input_tokens: 800,
+                priced_tokens: 900,
+                unpriced_tokens: 200,
                 ..Default::default()
             },
         )]));
-        let value = serde_json::to_value(rows).unwrap();
 
-        assert_eq!(value[0]["tokens"], 1_100);
-        assert_eq!(value[0]["cached_input_tokens"], 800);
-        assert_eq!(value[0]["activity_tokens"], 1_100);
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].date, date);
+        assert_eq!(points[0].tokens, 1_100);
+        assert_eq!(points[0].cost_usd, Some(1.5));
+        assert_eq!(points[0].priced_tokens, 900);
+        assert_eq!(points[0].unpriced_tokens, 200);
     }
 
     #[test]

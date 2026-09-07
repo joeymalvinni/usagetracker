@@ -158,20 +158,17 @@ fn summarizes_web_usage_history_payload() {
         "#;
 
     let report = parse_usage_history_report(text).unwrap();
-    let metadata = report.metadata_value();
+    let cost = report.cost_detail();
     let expected_day = Utc
         .with_ymd_and_hms(2026, 7, 9, 3, 7, 31)
         .unwrap()
         .with_timezone(&Local)
-        .date_naive()
-        .to_string();
+        .date_naive();
 
-    assert_eq!(metadata["row_count"], 2);
-    assert_eq!(metadata["total_tokens"], 174083);
-    assert_eq!(metadata["by_day"][0]["date"], expected_day);
-    assert!(
-        (metadata["by_day"][0]["cost_usd"].as_f64().unwrap() - 0.04229685).abs() < f64::EPSILON
-    );
+    assert_eq!(cost.extra["row_count"], 2);
+    assert_eq!(cost.total_tokens, Some(174083));
+    assert_eq!(cost.by_day[0].date, expected_day);
+    assert!((cost.by_day[0].cost_usd.unwrap() - 0.04229685).abs() < f64::EPSILON);
 
     let windows = usage_history_windows(
         OPENCODE_GO_PROVIDER_ID,
@@ -210,13 +207,13 @@ fn summarizes_direct_usage_history_page_payload() {
         true,
     )
     .unwrap();
-    let metadata = report.metadata_value();
+    let cost = report.cost_detail();
 
-    assert_eq!(metadata["row_count"], 1);
-    assert_eq!(metadata["partial"], false);
-    assert_eq!(metadata["complete_lookback"], true);
-    assert_eq!(metadata["total_tokens"], 92047);
-    assert!((metadata["total_cost_usd"].as_f64().unwrap() - 0.03133334).abs() < f64::EPSILON);
+    assert_eq!(cost.extra["row_count"], 1);
+    assert!(!cost.partial);
+    assert_eq!(cost.complete_lookback, Some(true));
+    assert_eq!(cost.total_tokens, Some(92047));
+    assert!((cost.total_cost_usd.unwrap() - 0.03133334).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -246,9 +243,9 @@ fn excludes_future_rows_from_local_history_counts() {
     ];
 
     let report = local_usage_history_report(&rows, now).unwrap();
-    let metadata = report.metadata_value();
-    assert_eq!(metadata["row_count"], 1);
-    assert_eq!(metadata["total_cost_usd"], 1.25);
+    let cost = report.cost_detail();
+    assert_eq!(cost.extra["row_count"], 1);
+    assert_eq!(cost.total_cost_usd, Some(1.25));
 
     assert!(local_usage_history_report(&rows[1..], now).is_none());
 }
@@ -330,10 +327,10 @@ fn reads_local_sqlite_message_and_part_usage() {
 
     let now = rows.iter().map(|row| row.created_at).max().unwrap() + TimeDelta::seconds(1);
     let report = local_usage_history_report(&rows, now).unwrap();
-    let metadata = report.metadata_value();
-    assert_eq!(metadata["source"], "opencode_local_sqlite");
-    assert_eq!(metadata["total_cost_usd"], 3.75);
-    assert!(!metadata["by_day"].as_array().unwrap().is_empty());
+    let cost = report.cost_detail();
+    assert_eq!(cost.source.as_deref(), Some("opencode_local_sqlite"));
+    assert_eq!(cost.total_cost_usd, Some(3.75));
+    assert!(!cost.by_day.is_empty());
 }
 
 #[test]

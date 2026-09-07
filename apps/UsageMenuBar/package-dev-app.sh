@@ -74,7 +74,7 @@ mkdir -p \
   "$app/Contents/Resources" \
   "$app/Contents/Library/LaunchAgents"
 cp "$app_dir/Info.plist" "$app/Contents/Info.plist"
-cp "$app_dir/LaunchAgents/engineering.super.usagetracker.daemon.plist" \
+cp "$app_dir/LaunchAgents/app.usagetracker.daemon.plist" \
   "$app/Contents/Library/LaunchAgents/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_identifier" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $bundle_version" "$app/Contents/Info.plist"

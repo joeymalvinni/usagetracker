@@ -4,18 +4,24 @@ enum DaemonWireProtocol {
     static let currentVersion = 3
 }
 
+enum ProviderSignInAction: String, Encodable {
+    case open
+    case copyLink = "copy_link"
+}
+
 enum DaemonRequest: Encodable {
     case getServerInfo, getState, getUsage, refresh([String]?), getRefreshJob(String)
+    case getUsageEvents(accountId: String, offset: UInt32, limit: UInt16?)
     case getProviderHealth, getAccounts, getConfig, getPendingNotifications
     case acknowledgeNotifications([Int64])
     case updateConfig(pollIntervalSeconds: UInt64?, providers: [String: Bool]?, notifications: NotificationConfig?)
-    case addProviderAccount(providerId: String, displayName: String?)
+    case addProviderAccount(providerId: String, displayName: String?, signInAction: ProviderSignInAction)
     case updateAccount(accountId: String, displayName: String?, hidden: Bool?, collectionEnabled: Bool?)
     case removeAccount(accountId: String)
     case deleteAccount(accountId: String)
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, settings: [String: String?])
-    case repairProvider(providerId: String, accountId: String?)
+    case repairProvider(providerId: String, accountId: String?, signInAction: ProviderSignInAction)
     case launchProviderAccount(
         accountId: String,
         workingDirectory: String?,
@@ -33,6 +39,11 @@ enum DaemonRequest: Encodable {
         case .getServerInfo: try c.encode("get_server_info", forKey: .method)
         case .getState: try c.encode("get_state", forKey: .method)
         case .getUsage: try c.encode("get_usage", forKey: .method)
+        case .getUsageEvents(let accountId, let offset, let limit):
+            try c.encode("get_usage_events", forKey: .method)
+            try c.encode(accountId, forKey: .accountId)
+            try c.encode(offset, forKey: .offset)
+            try c.encodeIfPresent(limit, forKey: .limit)
         case .getProviderHealth: try c.encode("get_provider_health", forKey: .method)
         case .getAccounts: try c.encode("get_accounts", forKey: .method)
         case .getConfig: try c.encode("get_config", forKey: .method)
@@ -49,10 +60,11 @@ enum DaemonRequest: Encodable {
             try c.encodeIfPresent(interval, forKey: .pollIntervalSeconds)
             try c.encodeIfPresent(providers?.mapValues { ProviderToggle(enabled: $0) }, forKey: .providers)
             try c.encodeIfPresent(notifications, forKey: .notifications)
-        case .addProviderAccount(let providerId, let displayName):
+        case .addProviderAccount(let providerId, let displayName, let signInAction):
             try c.encode("add_provider_account", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(displayName, forKey: .displayName)
+            try c.encode(signInAction, forKey: .signInAction)
         case .updateAccount(let accountId, let displayName, let hidden, let collectionEnabled):
             try c.encode("update_account", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
@@ -72,10 +84,11 @@ enum DaemonRequest: Encodable {
             try c.encode("update_provider_setup", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encode(settings, forKey: .settings)
-        case .repairProvider(let providerId, let accountId):
+        case .repairProvider(let providerId, let accountId, let signInAction):
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(accountId, forKey: .accountId)
+            try c.encode(signInAction, forKey: .signInAction)
         case .launchProviderAccount(let accountId, let workingDirectory, let launch, let remember):
             try c.encode("launch_provider_account", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
@@ -100,12 +113,13 @@ enum DaemonRequest: Encodable {
     }
     enum K: String, CodingKey {
         case apiVersion = "api_version"
-        case method, providers, notifications, hidden, ids, settings, launch, options, mode
+        case method, providers, notifications, hidden, ids, settings, launch, options, mode, offset, limit
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
         case jobId = "job_id"
         case displayName = "display_name"
+        case signInAction = "sign_in_action"
         case collectionEnabled = "collection_enabled"
         case workspaceId = "workspace_id"
         case workingDirectory = "working_directory"
@@ -132,6 +146,7 @@ struct UsageResponse: Decodable {
 
 struct StateResponse: Decodable {
     let generatedAt: Date
+    let connectivity: Connectivity
     let server: ServerInfo
     let config: ConfigResponse
     let accounts: [Account]
@@ -144,6 +159,7 @@ struct StateResponse: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = try c.decode(Date.self, forKey: .generatedAt)
+        connectivity = try c.decodeIfPresent(Connectivity.self, forKey: .connectivity) ?? .unknown
         server = try c.decode(ServerInfo.self, forKey: .server)
         config = try c.decode(ConfigResponse.self, forKey: .config)
         accounts = try c.decode([Account].self, forKey: .accounts)
@@ -158,7 +174,7 @@ struct StateResponse: Decodable {
     }
 
     private enum K: String, CodingKey {
-        case generatedAt, server, config, accounts, health, snapshots, forecasts, dashboard
+        case generatedAt, connectivity, server, config, accounts, health, snapshots, forecasts, dashboard
         case windowProvenance
     }
 }
@@ -179,7 +195,46 @@ struct ServerInfo: Decodable, Equatable, Sendable {
 struct ServerProviderDescriptor: Decodable, Equatable, Sendable {
     let id, displayName: String
     let minimumRefreshIntervalSeconds: UInt64
+    let detected: Bool
+    let credentialAccessNotice: String?
     let capabilities: ProviderCapabilities
+
+    init(
+        id: String,
+        displayName: String,
+        minimumRefreshIntervalSeconds: UInt64,
+        detected: Bool = false,
+        credentialAccessNotice: String? = nil,
+        capabilities: ProviderCapabilities
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.minimumRefreshIntervalSeconds = minimumRefreshIntervalSeconds
+        self.detected = detected
+        self.credentialAccessNotice = credentialAccessNotice
+        self.capabilities = capabilities
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        minimumRefreshIntervalSeconds = try c.decode(
+            UInt64.self,
+            forKey: .minimumRefreshIntervalSeconds
+        )
+        detected = try c.decodeIfPresent(Bool.self, forKey: .detected) ?? false
+        credentialAccessNotice = try c.decodeIfPresent(
+            String.self,
+            forKey: .credentialAccessNotice
+        )
+        capabilities = try c.decode(ProviderCapabilities.self, forKey: .capabilities)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, displayName, minimumRefreshIntervalSeconds, detected, credentialAccessNotice
+        case capabilities
+    }
 }
 
 struct ProviderCapabilities: Decodable, Equatable, Sendable {
@@ -240,6 +295,7 @@ func providerSupports(
 
 enum DaemonResponse: Decodable {
     case serverInfo(ServerInfo), state(StateResponse), usage(UsageResponse)
+    case usageEvents(UsageEventPage)
     case refreshStarted(job: RefreshJob, coalesced: Bool), refreshJob(RefreshJob)
     case providerHealth([ProviderHealth]), accounts([Account]), config(ConfigResponse)
     case pendingNotifications([PendingNotification]), notificationsAcknowledged([Int64])
@@ -263,6 +319,7 @@ enum DaemonResponse: Decodable {
         case "server_info": self = .serverInfo(try c.decode(ServerInfo.self, forKey: .server))
         case "state": self = .state(try c.decode(StateResponse.self, forKey: .state))
         case "usage": self = .usage(try UsageResponse(from: decoder))
+        case "usage_events": self = .usageEvents(try c.decode(UsageEventPage.self, forKey: .page))
         case "refresh_started": self = .refreshStarted(
             job: try c.decode(RefreshJob.self, forKey: .job),
             coalesced: try c.decode(Bool.self, forKey: .coalesced)
@@ -294,7 +351,7 @@ enum DaemonResponse: Decodable {
     }
     enum K: String, CodingKey {
         case apiVersion, type, snapshots, health, accounts, config, notifications, ids
-        case server, state, job, coalesced, account, setup, action, error, accountId, settings, preview
+        case server, state, job, coalesced, account, setup, action, error, accountId, settings, preview, page
     }
 }
 

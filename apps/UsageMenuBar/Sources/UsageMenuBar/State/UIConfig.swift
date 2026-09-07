@@ -20,6 +20,18 @@ enum UIPaths {
 struct UIConfig: Codable, Equatable, Sendable {
     static let menuProviderCountRange = 1...2
 
+    enum ActivityChartStyle: String, Codable, CaseIterable, Sendable {
+        case bars
+        case contributions
+
+        var label: String {
+            switch self {
+            case .bars: "Bars"
+            case .contributions: "Activity grid"
+            }
+        }
+    }
+
     enum MenuMetric: String, Codable, CaseIterable, Sendable {
         case remaining, used
         var label: String { self == .remaining ? "% left" : "% used" }
@@ -39,7 +51,13 @@ struct UIConfig: Codable, Equatable, Sendable {
     var maxMenuProviders: Int?
     var colorByStatus = true
     var darkModeEnabled = true
+    var activityChartStyle = ActivityChartStyle.bars
     var onboardingCompleted = false
+    /// Persists the transition past the welcome screen so an interrupted
+    /// provider connection resumes where the user left it.
+    var onboardingWelcomeCompleted = false
+    /// Records the user's response to the contextual notification offer.
+    var notificationPromptCompleted = false
     /// Alert signatures the user has seen (viewed the account). Clears the rail/chip dot.
     var seenAlerts = Set<String>()
     /// Alert signatures whose banner the user has dismissed.
@@ -63,8 +81,20 @@ struct UIConfig: Codable, Equatable, Sendable {
         }
         colorByStatus = try c.decodeIfPresent(Bool.self, forKey: .colorByStatus) ?? true
         darkModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .darkModeEnabled) ?? true
+        activityChartStyle = try c.decodeIfPresent(
+            ActivityChartStyle.self,
+            forKey: .activityChartStyle
+        ) ?? .bars
         // Existing beta users should not be interrupted; newly created configs keep false.
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? true
+        onboardingWelcomeCompleted = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .onboardingWelcomeCompleted
+        ) ?? onboardingCompleted
+        notificationPromptCompleted = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .notificationPromptCompleted
+        ) ?? onboardingCompleted
         seenAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .seenAlerts) ?? []
         dismissedAlerts = try c.decodeIfPresent(Set<String>.self, forKey: .dismissedAlerts) ?? []
         lastSeenReleaseNotesVersion = try c.decodeIfPresent(

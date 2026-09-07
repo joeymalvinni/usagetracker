@@ -83,7 +83,7 @@
           "type": "integer"
         },
         "enabled": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         },
         "predictive_alerts": {
@@ -204,6 +204,13 @@
       },
       "type": "object"
     },
+    "ProviderSignInAction": {
+      "enum": [
+        "open",
+        "copy_link"
+      ],
+      "type": "string"
+    },
     "ProviderToggle": {
       "properties": {
         "enabled": {
@@ -251,6 +258,37 @@
       },
       "required": [
         "method"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "limit": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "method": {
+          "const": "get_usage_events",
+          "type": "string"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "method",
+        "account_id"
       ],
       "type": "object"
     },
@@ -412,6 +450,9 @@
         },
         "provider_id": {
           "type": "string"
+        },
+        "sign_in_action": {
+          "$ref": "#/$defs/ProviderSignInAction"
         }
       },
       "required": [
@@ -549,6 +590,9 @@
         },
         "provider_id": {
           "type": "string"
+        },
+        "sign_in_action": {
+          "$ref": "#/$defs/ProviderSignInAction"
         }
       },
       "required": [

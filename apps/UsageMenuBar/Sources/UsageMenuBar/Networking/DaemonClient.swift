@@ -24,15 +24,59 @@ struct DaemonClient: Sendable {
     func accounts() async throws -> [Account] { guard case let .accounts(v) = try await send(.getAccounts) else { throw DaemonError.badResponse }; return v }
     func health() async throws -> [ProviderHealth] { guard case let .providerHealth(v) = try await send(.getProviderHealth) else { throw DaemonError.badResponse }; return v }
     func usage() async throws -> UsageResponse { guard case let .usage(v) = try await send(.getUsage) else { throw DaemonError.badResponse }; return v }
+    func usageEvents(
+        accountId: String,
+        offset: UInt32 = 0,
+        limit: UInt16? = nil
+    ) async throws -> UsageEventPage {
+        guard case let .usageEvents(page) = try await send(
+            .getUsageEvents(accountId: accountId, offset: offset, limit: limit)
+        ) else { throw DaemonError.badResponse }
+        return page
+    }
     func pendingNotifications() async throws -> [PendingNotification] { guard case let .pendingNotifications(v) = try await send(.getPendingNotifications) else { throw DaemonError.badResponse }; return v }
     func acknowledgeNotifications(_ ids: [Int64]) async throws {
         guard case let .notificationsAcknowledged(acknowledged) = try await send(.acknowledgeNotifications(ids)), acknowledged == ids else { throw DaemonError.badResponse }
     }
     func refresh(_ providers: [String]?) async throws -> RefreshResponse {
+        let job = try await startRefresh(providers)
+        return try await finishRefresh(job)
+    }
+    func startRefresh(_ providers: [String]?) async throws -> RefreshJob {
         guard case let .refreshStarted(job, _) = try await send(.refresh(providers)) else {
             throw DaemonError.badResponse
         }
-        let completed = try await waitForRefresh(job)
+        return job
+    }
+    func waitForRefreshProgress(
+        _ initialJob: RefreshJob,
+        pollInterval: Duration = .milliseconds(100),
+        until shouldStop: (RefreshJob) -> Bool
+    ) async throws -> RefreshJob {
+        var job = initialJob
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: refreshWaitTimeout)
+        while !job.status.isTerminal && !shouldStop(job) {
+            guard clock.now < deadline else { throw DaemonError.timeout }
+            try await Task.sleep(for: pollInterval)
+            job = try await refreshJob(job.id)
+        }
+        return job
+    }
+    func finishRefresh(_ initialJob: RefreshJob) async throws -> RefreshResponse {
+        let completed = try await waitForRefreshProgress(
+            initialJob,
+            pollInterval: refreshPollInterval
+        ) { _ in false }
+        return try completedRefresh(completed)
+    }
+    private func refreshJob(_ id: String) async throws -> RefreshJob {
+        guard case let .refreshJob(job) = try await send(.getRefreshJob(id)) else {
+            throw DaemonError.badResponse
+        }
+        return job
+    }
+    private func completedRefresh(_ completed: RefreshJob) throws -> RefreshResponse {
         guard completed.status != .failed else {
             throw DaemonError.refreshFailed(
                 jobId: completed.id,
@@ -45,8 +89,16 @@ struct DaemonClient: Sendable {
         guard case let .config(v) = try await send(.updateConfig(pollIntervalSeconds: pollIntervalSeconds, providers: providers, notifications: notifications)) else { throw DaemonError.badResponse }
         return v
     }
-    func addProviderAccount(providerId: String, displayName: String?) async throws -> AddProviderAccountResponse {
-        guard case let .addProviderAccount(v) = try await send(.addProviderAccount(providerId: providerId, displayName: displayName)) else { throw DaemonError.badResponse }
+    func addProviderAccount(
+        providerId: String,
+        displayName: String?,
+        signInAction: ProviderSignInAction = .open
+    ) async throws -> AddProviderAccountResponse {
+        guard case let .addProviderAccount(v) = try await send(.addProviderAccount(
+            providerId: providerId,
+            displayName: displayName,
+            signInAction: signInAction
+        )) else { throw DaemonError.badResponse }
         return v
     }
     func updateAccount(accountId: String, displayName: String? = nil, hidden: Bool? = nil, collectionEnabled: Bool? = nil) async throws -> Account {
@@ -68,8 +120,16 @@ struct DaemonClient: Sendable {
         guard case let .providerSetup(v) = try await send(.updateProviderSetup(providerId: providerId, settings: settings)) else { throw DaemonError.badResponse }
         return v
     }
-    func repairProvider(providerId: String, accountId: String?) async throws -> ProviderActionResponse {
-        guard case let .providerAction(v) = try await send(.repairProvider(providerId: providerId, accountId: accountId)) else { throw DaemonError.badResponse }
+    func repairProvider(
+        providerId: String,
+        accountId: String?,
+        signInAction: ProviderSignInAction = .open
+    ) async throws -> ProviderActionResponse {
+        guard case let .providerAction(v) = try await send(.repairProvider(
+            providerId: providerId,
+            accountId: accountId,
+            signInAction: signInAction
+        )) else { throw DaemonError.badResponse }
         return v
     }
     func launchProviderAccount(
@@ -146,27 +206,12 @@ struct DaemonClient: Sendable {
         }
         return decoded
     }
-
-    private func waitForRefresh(_ initialJob: RefreshJob) async throws -> RefreshJob {
-        var job = initialJob
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: refreshWaitTimeout)
-        while !job.status.isTerminal {
-            guard clock.now < deadline else { throw DaemonError.timeout }
-            try await Task.sleep(for: refreshPollInterval)
-            guard case let .refreshJob(latest) = try await send(.getRefreshJob(job.id)) else {
-                throw DaemonError.badResponse
-            }
-            job = latest
-        }
-        return job
-    }
 }
 
 private enum DaemonRequestTimeout {
     static func seconds(for request: DaemonRequest) -> TimeInterval {
         switch request {
-        case .getServerInfo, .getState, .getUsage, .getRefreshJob, .getImportJob, .getProviderHealth,
+        case .getServerInfo, .getState, .getUsage, .getUsageEvents, .getRefreshJob, .getImportJob, .getProviderHealth,
              .getAccounts, .getConfig, .getPendingNotifications,
              .acknowledgeNotifications, .getAccountLaunchSettings, .previewAccountImport:
             3

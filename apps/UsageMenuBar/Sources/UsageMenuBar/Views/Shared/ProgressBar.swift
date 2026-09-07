@@ -9,6 +9,7 @@ struct ProgressBar: View {
     let status: DisplayStatus
     let providerId: String
     var forecastPercent: Double? = nil
+    var isMuted = false
 
     var body: some View {
         GeometryReader { geo in
@@ -42,6 +43,7 @@ struct ProgressBar: View {
     }
 
     private func markerOffset(in width: CGFloat) -> CGFloat? {
+        guard !isMuted else { return nil }
         guard let forecastPercent, forecastPercent.isFinite else { return nil }
         let fraction = CGFloat(max(0, min(1, forecastPercent / 100)))
         return min(max(0, width * fraction - 1.5), max(0, width - 3))
@@ -55,6 +57,7 @@ struct ProgressBar: View {
 
     private var forecastHelp: String {
         let current = "\(Int(percent.rounded()))% remaining"
+        if isMuted { return "\(current) · last known value while offline" }
         guard let forecastPercent, forecastPercent.isFinite else { return current }
         let forecast = Int(max(0, min(100, forecastPercent)).rounded())
         return "Projected remaining at reset: \(forecast)% · Current: \(Int(percent.rounded()))%"
@@ -67,6 +70,9 @@ struct ProgressBar: View {
     }
 
     private var fillStyle: AnyShapeStyle {
+        if isMuted {
+            return AnyShapeStyle(Color.secondary.opacity(0.65))
+        }
         if percent < 10 {
             return AnyShapeStyle(Color.red)
         }

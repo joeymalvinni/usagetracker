@@ -4,13 +4,17 @@ use rusqlite::params;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use usage_core::{
-    AccountDisplayNameSource, DataProvenance, DatasetProvenance, ProviderHealth,
-    ProviderHealthStatus, UsageAmount, UsageDataCompleteness, UsageDataConfidence,
-    UsageDataQuality, UsageDataScope, UsageDataSource, UsageUnit, UsageWindow, UsageWindowKind,
+    AccountDisplayNameSource, CostDetail, DataProvenance, DatasetProvenance, ProviderHealth,
+    ProviderHealthStatus, SnapshotDetail, UsageAmount, UsageDataCompleteness, UsageDataConfidence,
+    UsageDataQuality, UsageDataScope, UsageDataSource, UsageEvent, UsageUnit, UsageWindow,
+    UsageWindowKind,
 };
 use uuid::Uuid;
 
-use crate::providers::{DailyUsageBucket, ProviderCollectionResult, ProviderUsage, UsageDataset};
+use crate::providers::{
+    DailyUsageBucket, ProviderCollectionResult, ProviderUsage, ProviderUsageEventBatch,
+    UsageDataset,
+};
 
 #[tokio::test]
 async fn stores_and_reads_accounts_snapshots_and_health() {
@@ -45,7 +49,10 @@ async fn stores_and_reads_accounts_snapshots_and_health() {
             percent_remaining: Some(75.0),
             reset_at: None,
         }],
-        metadata: json!({"collection_mode": "test"}),
+        detail: SnapshotDetail {
+            collection_mode: Some("test".to_string()),
+            ..SnapshotDetail::default()
+        },
     };
     storage.insert_snapshot(&snapshot).await.unwrap();
 
@@ -101,7 +108,7 @@ async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
         },
         window_ids: vec!["local_tokens".to_string()],
         daily_sources: Vec::new(),
-        metadata_keys: vec!["codex_cost".to_string()],
+        metadata_keys: vec!["cost".to_string()],
     };
     storage
         .insert_snapshot(&UsageSnapshot {
@@ -112,11 +119,15 @@ async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
                 percentage_window("remote_quota", UsageWindowKind::Session, 25.0, None),
                 token_test_window("local_tokens", 10.0),
             ],
-            metadata: json!({
-                "remote": true,
-                "codex_cost": {"tokens": 10},
-                "dataset_provenance": [old_local],
-            }),
+            detail: SnapshotDetail {
+                cost: Some(CostDetail {
+                    total_tokens: Some(10),
+                    ..CostDetail::default()
+                }),
+                dataset_provenance: vec![old_local],
+                extra: crate::providers::json_map(json!({ "remote": true })),
+                ..SnapshotDetail::default()
+            },
         })
         .await
         .unwrap();
@@ -141,9 +152,16 @@ async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
                 provider_id: provider_id.clone(),
                 collected_at: local_at,
                 windows: vec![token_test_window("local_tokens", 25.0)],
-                metadata: json!({"codex_cost": {"tokens": 25}}),
+                detail: SnapshotDetail {
+                    cost: Some(CostDetail {
+                        total_tokens: Some(25),
+                        ..CostDetail::default()
+                    }),
+                    ..SnapshotDetail::default()
+                },
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "codex_local_logs".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -170,7 +188,10 @@ async fn local_overlay_replaces_only_its_source_and_preserves_remote_health() {
         .find(|window| window.window_id == "local_tokens")
         .unwrap();
     assert_eq!(local.used.as_ref().unwrap().value, 25.0);
-    assert_eq!(snapshot.metadata["codex_cost"]["tokens"], 25);
+    assert_eq!(
+        snapshot.detail.cost.as_ref().unwrap().total_tokens,
+        Some(25)
+    );
     assert!(matches!(
         storage.provider_health().await.unwrap()[0].status,
         ProviderHealthStatus::RateLimited
@@ -228,12 +249,13 @@ async fn local_overlay_preserves_colliding_values_owned_by_the_remote_dataset() 
                 token_test_window("shared_history", 10.0),
                 token_test_window("local_history", 10.0),
             ],
-            metadata: json!({
-                "collection_mode": "opencode_go_web_console",
-                "web_authoritative": true,
-                "database": "old.db",
-                "dataset_provenance": provenance,
-            }),
+            detail: SnapshotDetail {
+                collection_mode: Some("opencode_go_web_console".to_string()),
+                web_authoritative: Some(true),
+                dataset_provenance: provenance,
+                extra: crate::providers::json_map(json!({ "database": "old.db" })),
+                ..SnapshotDetail::default()
+            },
         })
         .await
         .unwrap();
@@ -249,13 +271,15 @@ async fn local_overlay_preserves_colliding_values_owned_by_the_remote_dataset() 
                     token_test_window("shared_history", 99.0),
                     token_test_window("local_history", 25.0),
                 ],
-                metadata: json!({
-                    "collection_mode": "opencode_go_local_sqlite",
-                    "web_authoritative": false,
-                    "database": "new.db",
-                }),
+                detail: SnapshotDetail {
+                    collection_mode: Some("opencode_go_local_sqlite".to_string()),
+                    web_authoritative: Some(false),
+                    extra: crate::providers::json_map(json!({ "database": "new.db" })),
+                    ..SnapshotDetail::default()
+                },
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "opencode_go_local_sqlite".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -272,11 +296,11 @@ async fn local_overlay_preserves_colliding_values_owned_by_the_remote_dataset() 
 
     let snapshot = storage.latest_usage().await.unwrap().remove(0);
     assert_eq!(
-        snapshot.metadata["collection_mode"],
-        "opencode_go_web_console"
+        snapshot.detail.collection_mode.as_deref(),
+        Some("opencode_go_web_console")
     );
-    assert_eq!(snapshot.metadata["web_authoritative"], true);
-    assert_eq!(snapshot.metadata["database"], "new.db");
+    assert_eq!(snapshot.detail.web_authoritative, Some(true));
+    assert_eq!(snapshot.detail.extra["database"], "new.db");
     assert_eq!(
         snapshot
             .windows
@@ -309,10 +333,7 @@ async fn local_overlay_preserves_colliding_values_owned_by_the_remote_dataset() 
             .value,
         25.0
     );
-    let provenance = serde_json::from_value::<Vec<DatasetProvenance>>(
-        snapshot.metadata["dataset_provenance"].clone(),
-    )
-    .unwrap();
+    let provenance = snapshot.detail.dataset_provenance.clone();
     let local = provenance
         .iter()
         .find(|dataset| dataset.source_id == "opencode_local_database")
@@ -336,7 +357,10 @@ async fn successful_empty_local_reconciliation_removes_stale_overlays() {
             account_id: account.id.clone(),
             collected_at: remote_at,
             windows: Vec::new(),
-            metadata: json!({"remote": true}),
+            detail: SnapshotDetail {
+                extra: crate::providers::json_map(json!({ "remote": true })),
+                ..SnapshotDetail::default()
+            },
         })
         .await
         .unwrap();
@@ -347,9 +371,16 @@ async fn successful_empty_local_reconciliation_removes_stale_overlays() {
                 provider_id: provider_id.clone(),
                 collected_at: remote_at + chrono::TimeDelta::minutes(1),
                 windows: Vec::new(),
-                metadata: json!({"claude_cost": {"tokens": 42}}),
+                detail: SnapshotDetail {
+                    cost: Some(CostDetail {
+                        total_tokens: Some(42),
+                        ..CostDetail::default()
+                    }),
+                    ..SnapshotDetail::default()
+                },
             },
             daily_usage: Vec::new(),
+            usage_events: None,
             collection_mode: "claude_local_logs".to_string(),
             account_email: None,
             warnings: Vec::new(),
@@ -364,8 +395,8 @@ async fn successful_empty_local_reconciliation_removes_stale_overlays() {
         .await
         .unwrap();
     assert!(storage.latest_usage().await.unwrap()[0]
-        .metadata
-        .get("claude_cost")
+        .detail
+        .cost
         .is_some());
 
     storage
@@ -379,8 +410,8 @@ async fn successful_empty_local_reconciliation_removes_stale_overlays() {
         .unwrap();
 
     let snapshot = storage.latest_usage().await.unwrap().remove(0);
-    assert_eq!(snapshot.metadata["remote"], true);
-    assert!(snapshot.metadata.get("claude_cost").is_none());
+    assert_eq!(snapshot.detail.extra["remote"], true);
+    assert!(snapshot.detail.cost.is_none());
 }
 
 #[tokio::test]
@@ -397,7 +428,7 @@ async fn recent_usage_is_bounded_filtered_and_newest_first() {
         account_id: account.id.clone(),
         collected_at: start,
         windows: Vec::new(),
-        metadata: json!({}),
+        detail: SnapshotDetail::default(),
     };
     for offset in [0, 5, 10] {
         snapshot.collected_at = start + chrono::TimeDelta::minutes(offset);
@@ -456,7 +487,12 @@ async fn usage_dashboard_reads_bounded_compact_forecast_history() {
                     ),
                     percentage_window("codex_tokens", UsageWindowKind::Tokens, percent, None),
                 ],
-                metadata: json!({"large": "metadata is already in normalized_json"}),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(
+                        json!({"large": "metadata is already in normalized_json"}),
+                    ),
+                    ..SnapshotDetail::default()
+                },
             })
             .await
             .unwrap();
@@ -537,6 +573,52 @@ fn creates_private_database_files() {
 }
 
 #[tokio::test]
+async fn dashboard_reads_do_not_queue_behind_the_writer() {
+    let storage = test_storage();
+    let writer_storage = storage.clone();
+    let (writer_started_tx, writer_started_rx) = tokio::sync::oneshot::channel();
+    let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+    let writer = tokio::spawn(async move {
+        writer_storage
+            .with_connection(move |_| {
+                writer_started_tx
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("writer start receiver dropped"))?;
+                release_writer_rx.recv()?;
+                Ok(())
+            })
+            .await
+    });
+    writer_started_rx.await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), storage.latest_usage())
+        .await
+        .expect("a read should use the independent WAL reader pool")
+        .unwrap();
+
+    release_writer_tx.send(()).unwrap();
+    writer.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn pooled_reader_connections_reject_writes() {
+    let storage = test_storage();
+
+    let error = storage
+        .with_read_connection(|conn| {
+            conn.execute("CREATE TABLE reader_must_not_write (id INTEGER)", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("readonly"),
+        "unexpected SQLite error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn upserts_and_retains_daily_usage_by_account_and_date() {
     let storage = test_storage();
     let provider_id = ProviderId::new("codex");
@@ -604,6 +686,146 @@ async fn upserts_and_retains_daily_usage_by_account_and_date() {
 
     storage.delete_account(&account.id).await.unwrap();
     assert!(storage.daily_usage_history().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn atomically_replaces_pages_and_prunes_normalized_usage_events() {
+    let storage = test_storage();
+    let provider_id = ProviderId::new("cursor");
+    let account = storage
+        .upsert_account(&provider_id, "cursor-user", None, None, None)
+        .await
+        .unwrap();
+    let start = Utc::now() - chrono::TimeDelta::days(30);
+    let first = start + chrono::TimeDelta::days(1);
+    let second = start + chrono::TimeDelta::days(2);
+    let end = start + chrono::TimeDelta::days(30);
+    let event = |event_id: &str, occurred_at| UsageEvent {
+        event_id: event_id.to_string(),
+        occurred_at,
+        model: "claude-sonnet".to_string(),
+        kind: "usage_based".to_string(),
+        input_tokens: 1,
+        output_tokens: 2,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        request_units: 1.0,
+        vendor_cost_usd: 0.01,
+        metered_cost_usd: 0.02,
+        provider_fee_usd: 0.01,
+        chargeable: true,
+        token_based: true,
+        headless: false,
+    };
+    let snapshot = UsageSnapshot {
+        provider_id: provider_id.clone(),
+        account_id: account.id.clone(),
+        collected_at: end,
+        windows: Vec::new(),
+        detail: SnapshotDetail::default(),
+    };
+    let health = ProviderHealth {
+        provider_id: provider_id.clone(),
+        account_id: Some(account.id.clone()),
+        status: ProviderHealthStatus::Ok,
+        collection_mode: Some("cursor_web".to_string()),
+        last_success_at: Some(end),
+        last_failure_at: None,
+        last_error_code: None,
+        last_error_message: None,
+        updated_at: end,
+    };
+    storage
+        .record_collection(CollectionRecord {
+            snapshot: &snapshot,
+            daily_usage: &[],
+            usage_events: Some(&ProviderUsageEventBatch {
+                period_start: start,
+                period_end: end,
+                daily_source: "cursor_usage_events".to_string(),
+                events: vec![event("one", first), event("two", second)],
+            }),
+            health: &health,
+            email: None,
+            backoff: None,
+            clear_backoff: true,
+        })
+        .await
+        .unwrap();
+
+    let first_page = storage.usage_events(&account.id, 0, 1).await.unwrap();
+    assert_eq!(first_page.total_count, 2);
+    assert_eq!(first_page.events[0].event_id, "two");
+    assert_eq!(first_page.next_offset, Some(1));
+
+    let plan_account_id = account.id.clone();
+    let (count_plan, page_plan) = storage
+        .with_connection(move |conn| {
+            let count_plan = conn.query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT COUNT(*) FROM provider_usage_events WHERE account_id = ?1",
+                params![plan_account_id.as_str()],
+                |row| row.get::<_, String>(3),
+            )?;
+            let page_plan = conn.query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT normalized_json FROM provider_usage_events
+                 WHERE account_id = ?1
+                 ORDER BY occurred_at DESC, event_id DESC
+                 LIMIT 10 OFFSET 0",
+                params![plan_account_id.as_str()],
+                |row| row.get::<_, String>(3),
+            )?;
+            Ok((count_plan, page_plan))
+        })
+        .await
+        .unwrap();
+    assert!(count_plan.contains("provider_usage_events_account_time"));
+    assert!(page_plan.contains("provider_usage_events_account_time"));
+
+    storage
+        .record_collection(CollectionRecord {
+            snapshot: &snapshot,
+            daily_usage: &[],
+            usage_events: Some(&ProviderUsageEventBatch {
+                period_start: start,
+                period_end: end,
+                daily_source: "cursor_usage_events".to_string(),
+                events: vec![event("replacement", first)],
+            }),
+            health: &health,
+            email: None,
+            backoff: None,
+            clear_backoff: true,
+        })
+        .await
+        .unwrap();
+    let replaced = storage.usage_events(&account.id, 0, 100).await.unwrap();
+    assert_eq!(replaced.total_count, 1);
+    assert_eq!(replaced.events[0].event_id, "replacement");
+
+    let prune_provider_id = provider_id.clone();
+    let prune_account_id = account.id.clone();
+    storage
+        .with_connection(move |conn| {
+            prune_account_history(
+                conn,
+                &prune_provider_id,
+                &prune_account_id,
+                second,
+                MAX_SNAPSHOTS_PER_ACCOUNT,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .usage_events(&account.id, 0, 100)
+            .await
+            .unwrap()
+            .total_count,
+        0
+    );
 }
 
 #[tokio::test]
@@ -739,7 +961,7 @@ async fn permanently_deletes_account_and_related_data() {
                 25.0,
                 None,
             )],
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         })
         .await
         .unwrap();
@@ -806,7 +1028,7 @@ async fn returns_provider_ids_with_account_or_snapshot_data() {
             account_id: account.id,
             collected_at: Utc::now(),
             windows: Vec::new(),
-            metadata: json!({}),
+            detail: SnapshotDetail::default(),
         })
         .await
         .unwrap();
@@ -1071,7 +1293,10 @@ async fn latest_usage_breaks_timestamp_ties_deterministically() {
                 account_id: account.id.clone(),
                 collected_at,
                 windows: Vec::new(),
-                metadata: json!({"version": version}),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(json!({"version": version})),
+                    ..SnapshotDetail::default()
+                },
             })
             .await
             .unwrap();
@@ -1080,7 +1305,7 @@ async fn latest_usage_breaks_timestamp_ties_deterministically() {
     let snapshots = storage.latest_usage().await.unwrap();
 
     assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0].metadata["version"], 2);
+    assert_eq!(snapshots[0].detail.extra["version"], 2);
 }
 
 #[tokio::test]
@@ -1103,7 +1328,10 @@ async fn prunes_bounded_snapshot_history() {
                     f64::from(version),
                     None,
                 )],
-                metadata: json!({"version": version}),
+                detail: SnapshotDetail {
+                    extra: crate::providers::json_map(json!({"version": version})),
+                    ..SnapshotDetail::default()
+                },
             })
             .await
             .unwrap();
@@ -1144,7 +1372,7 @@ async fn prunes_bounded_snapshot_history() {
     assert_eq!(snapshots, 2);
     assert_eq!(observations, 2);
     assert_eq!(
-        storage.latest_usage().await.unwrap()[0].metadata["version"],
+        storage.latest_usage().await.unwrap()[0].detail.extra["version"],
         3
     );
 }

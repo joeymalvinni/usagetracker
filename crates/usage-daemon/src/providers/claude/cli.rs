@@ -13,10 +13,13 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
-use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{
+    ProviderId, SnapshotDetail, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+};
 use wait_timeout::ChildExt;
 
 use crate::providers::{
+    json_map,
     local_usage::{stable_window_fragment, usage_kind_from_name},
     ProviderError, ProviderErrorKind, ProviderUsage,
 };
@@ -325,11 +328,14 @@ fn parse_usage_text(
         provider_id: ProviderId::new(PROVIDER_ID),
         collected_at,
         windows,
-        metadata: json!({
-            "collection_mode": CLAUDE_CLI_COLLECTION_MODE,
-            "command": "claude -p /usage --output-format json --no-session-persistence",
-            "reset_text_by_window": reset_text_by_window,
-        }),
+        detail: SnapshotDetail {
+            collection_mode: Some(CLAUDE_CLI_COLLECTION_MODE.to_string()),
+            extra: json_map(json!({
+                "command": "claude -p /usage --output-format json --no-session-persistence",
+                "reset_text_by_window": reset_text_by_window,
+            })),
+            ..SnapshotDetail::default()
+        },
     })
 }
 

@@ -101,6 +101,7 @@ fn format_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> String {
 fn scope_name(scope: &UsageDataScope) -> String {
     match scope {
         UsageDataScope::AccountWide => "account wide",
+        UsageDataScope::Organization => "organization wide",
         UsageDataScope::ThisDevice => "this Mac",
         UsageDataScope::SelectedLocalRoots => "selected local roots",
         UsageDataScope::Workspace => "workspace",

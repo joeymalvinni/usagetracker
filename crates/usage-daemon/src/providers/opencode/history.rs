@@ -4,11 +4,15 @@ use std::{collections::BTreeMap, sync::LazyLock};
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use regex::Regex;
-use serde_json::{json, Value};
-use usage_core::{UsageWindow, UsageWindowKind};
+use serde_json::json;
+use usage_core::{CostDetail, UsageWindow, UsageWindowKind};
 
-use crate::providers::local_usage::{
-    cost_window, daily_cost_rows, lookback_start, token_window, DailyCostSummary, DailyRollup,
+use crate::providers::{
+    json_map,
+    local_usage::{
+        cost_window, daily_usage_points, lookback_start, token_window, DailyCostSummary,
+        DailyRollup,
+    },
 };
 
 use super::{local::LocalUsageRow, utils::provider_display_name, COST_LOOKBACK_DAYS};
@@ -47,26 +51,29 @@ pub(super) struct UsageHistoryReport {
 }
 
 impl UsageHistoryReport {
-    pub(super) fn metadata_value(&self) -> Value {
+    pub(super) fn cost_detail(&self) -> CostDetail {
         let now = Local::now();
         let rollup =
             DailyRollup::from_days(&self.by_day, now.date_naive(), COST_LOOKBACK_DAYS as u64);
-        json!({
-            "source": self.source,
-            "estimate": self.estimate,
-            "partial": self.partial,
-            "complete_lookback": self.complete_lookback,
-            "row_count": self.row_count,
-            "today_cost_usd": rollup.today.cost_usd,
-            "today_tokens": rollup.today.tokens,
-            "lookback_days": COST_LOOKBACK_DAYS,
-            "lookback_cost_usd": rollup.lookback.cost_usd,
-            "lookback_tokens": rollup.lookback.tokens,
-            "total_tokens": self.total_tokens,
-            "total_cost_usd": self.total_cost_usd,
-            "latest_usage_at": self.latest_at.map(|time| time.to_rfc3339()),
-            "by_day": daily_cost_rows(&self.by_day),
-        })
+        CostDetail {
+            source: Some(self.source.to_string()),
+            estimate: self.estimate,
+            partial: self.partial,
+            complete_lookback: Some(self.complete_lookback),
+            today_cost_usd: Some(rollup.today.cost_usd),
+            today_tokens: Some(rollup.today.tokens),
+            lookback_cost_usd: Some(rollup.lookback.cost_usd),
+            lookback_tokens: Some(rollup.lookback.tokens),
+            total_tokens: Some(self.total_tokens),
+            total_cost_usd: Some(self.total_cost_usd),
+            by_day: daily_usage_points(&self.by_day),
+            extra: json_map(json!({
+                "row_count": self.row_count,
+                "lookback_days": COST_LOOKBACK_DAYS,
+                "latest_usage_at": self.latest_at.map(|time| time.to_rfc3339()),
+            })),
+            ..CostDetail::default()
+        }
     }
 }
 

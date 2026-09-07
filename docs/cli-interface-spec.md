@@ -225,6 +225,7 @@ The suggested action depends on health and configuration:
 | Missing or invalid credentials | `usage providers repair PROVIDER` |
 | Rate limited or backing off | Show the retry/reset information; do not suggest repair. |
 | Provider unavailable | Show the sanitized provider error. |
+| Machine offline | Show one summary-level “Offline — showing last known usage” notice and keep provider rows as cached data. |
 
 If an explicit `--account` does not belong to the selected provider, the command fails instead of displaying an empty dashboard.
 
@@ -326,6 +327,7 @@ JSON is explicit and does not contain the human-formatted range strings:
 {
   "type": "summary",
   "generated_at": "2026-07-13T19:00:00Z",
+  "connectivity": "online",
   "providers": [
     {
       "provider_id": "codex",

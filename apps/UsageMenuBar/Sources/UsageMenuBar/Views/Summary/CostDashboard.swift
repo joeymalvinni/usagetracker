@@ -11,6 +11,7 @@ enum CostMetric: String, CaseIterable, Hashable {
 }
 
 struct CostDashboard: View {
+    @EnvironmentObject var state: AppState
     let dashboard: CostDashboardVM
     var onSelectProvider: ((String) -> Void)?
 
@@ -18,11 +19,17 @@ struct CostDashboard: View {
     @State private var metric: CostMetric = .tokens
     @State private var hover: CostProviderDayVM?
 
-    private var days: [CostDayVM] { Array(dashboard.days.suffix(range.rawValue)) }
+    private var isActivityGrid: Bool {
+        state.ui.activityChartStyle == .contributions
+    }
+
+    private var days: [CostDayVM] {
+        isActivityGrid ? dashboard.days : Array(dashboard.days.suffix(range.rawValue))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            HStack {
+            HStack(alignment: .top, spacing: Theme.Spacing.sm) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Activity").font(Theme.Typography.headline)
                     Text(hover.map(hoverText) ?? activitySubtitle)
@@ -30,7 +37,15 @@ struct CostDashboard: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                Spacer()
+                Spacer(minLength: Theme.Spacing.sm)
+                if !isActivityGrid {
+                    Picker("", selection: $range) {
+                        ForEach(CostRange.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 82)
+                }
                 Picker("", selection: $metric) {
                     ForEach(CostMetric.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
@@ -38,21 +53,32 @@ struct CostDashboard: View {
                 .labelsHidden()
                 .frame(width: 110)
             }
-            CostActivityChart(
-                days: days,
-                metric: metric,
-                hover: $hover,
-                providerColor: nil,
-                onSelectProvider: onSelectProvider
-            )
-                .frame(height: 120)
-            // Single KPI strip driven by the active metric — no longer showing
-            // cost and tokens simultaneously (the old 4-grid duplicated the
-            // chart). Two figures: today + 30d, in the active metric's units.
+            Group {
+                if state.ui.activityChartStyle == .contributions {
+                    ActivityHeatmap(
+                        days: days,
+                        metric: metric,
+                        color: .accentColor,
+                        hover: $hover,
+                        onSelectProvider: onSelectProvider
+                    )
+                } else {
+                    CostActivityChart(
+                        days: days,
+                        metric: metric,
+                        hover: $hover,
+                        providerColor: nil,
+                        onSelectProvider: onSelectProvider
+                    )
+                }
+            }
+            .frame(height: state.ui.activityChartStyle == .contributions ? 110 : 120)
+            // Single KPI strip driven by the active metric. Bars retain the
+            // 30-day rollup; the activity grid uses the lifetime rollup.
             HStack(spacing: Theme.Spacing.sm) {
                 CostKPI(title: "Today", value: todayValue)
                 Divider().frame(height: 24)
-                CostKPI(title: "30d", value: totalValue)
+                CostKPI(title: isActivityGrid ? "All time" : "30d", value: totalValue)
                 Spacer()
             }
         }
@@ -64,12 +90,20 @@ struct CostDashboard: View {
         metric == .cost ? formatUsd(dashboard.todayCost) : formatTokens(dashboard.todayTokens)
     }
     private var totalValue: String {
-        metric == .cost ? formatUsd(dashboard.cost30d) : formatTokens(dashboard.tokens30d)
+        if isActivityGrid {
+            return metric == .cost
+                ? formatUsd(dashboard.allTimeCost)
+                : formatTokens(dashboard.allTimeTokens)
+        }
+        return metric == .cost ? formatUsd(dashboard.cost30d) : formatTokens(dashboard.tokens30d)
     }
 
     private var activitySubtitle: String {
-        if dashboard.hasData { "\(range.label) \(metric == .cost ? "cost" : "tokens")" }
-        else { "No activity yet" }
+        if dashboard.hasData {
+            let period = isActivityGrid ? "All time" : range.label
+            return "\(period) \(metric == .cost ? "cost" : "tokens")"
+        }
+        return "No activity yet"
     }
     private func hoverText(_ value: CostProviderDayVM) -> String {
         if metric == .cost {

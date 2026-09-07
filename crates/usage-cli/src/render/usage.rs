@@ -2,15 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
 use chrono::{DateTime, Days, Local, NaiveDate, TimeDelta, Utc};
-use serde_json::Value;
 use usage_core::{
-    Account, ForecastStatus, UsageAmount, UsageDashboardSummary, UsageForecast, UsageSnapshot,
-    UsageUnit, UsageWindow, UsageWindowKind,
+    Account, DailyUsagePoint, ForecastStatus, UsageAmount, UsageDashboardSummary, UsageForecast,
+    UsageSnapshot, UsageUnit, UsageWindow, UsageWindowKind,
 };
 
 use crate::{
     render::{
-        labels::{identity_labels, metadata_str, plan_label},
+        labels::{detail_str, identity_labels, plan_label},
         style::{
             format_collection_mode, format_provider_name, relative_time, truncate, visible_len,
             Theme,
@@ -267,7 +266,7 @@ impl ProviderPanel {
             .collect::<BTreeSet<_>>();
         Self {
             provider: format_provider_name(snapshot.provider_id.as_str()),
-            mode: metadata_str(&snapshot.metadata, "collection_mode")
+            mode: detail_str(&snapshot.detail.collection_mode)
                 .map(|mode| collection_mode_label(snapshot.provider_id.as_str(), mode)),
             plan: panel_plan(snapshot, labels.plan.as_deref()),
             identity: labels.identity,
@@ -673,32 +672,19 @@ fn credits_line(snapshot: &UsageSnapshot) -> Option<String> {
 }
 
 fn reset_credits_line(snapshot: &UsageSnapshot) -> Option<String> {
-    let metadata = snapshot.metadata.get("rate_limit_reset_credits")?;
-    let available = metadata
-        .get("available_count")
-        .and_then(f64_value)
-        .or_else(|| {
-            snapshot
-                .metadata
-                .get("rate_limit_reset_credits_available_count")
-                .and_then(f64_value)
-        })?;
-    if available <= 0.0 {
+    let credits = snapshot.detail.reset_credits.as_ref()?;
+    if credits.available_count == 0 {
         return None;
     }
 
-    let count = available.round() as u64;
-    let next_expires_at = metadata
-        .get("next_expires_at")
-        .and_then(f64_value)
-        .and_then(|seconds| DateTime::from_timestamp(seconds.round() as i64, 0));
-    let suffix = next_expires_at
+    let suffix = credits
+        .next_expires_at
         .map(reset_credit_expiry_label)
         .unwrap_or_else(|| "expiry unknown".to_string());
 
     Some(format!(
         "{} available  {}",
-        pluralize(count, "reset", "resets"),
+        pluralize(credits.available_count, "reset", "resets"),
         suffix
     ))
 }
@@ -783,8 +769,8 @@ fn role_matches(window: &UsageWindow, role: WindowRole) -> bool {
 /// Plan label for the panel header, preferring snapshot metadata over the
 /// account-derived fallback.
 fn panel_plan(snapshot: &UsageSnapshot, fallback_plan: Option<&str>) -> Option<String> {
-    metadata_str(&snapshot.metadata, "plan_type")
-        .or_else(|| metadata_str(&snapshot.metadata, "subscription_type"))
+    detail_str(&snapshot.detail.plan_type)
+        .or_else(|| detail_str(&snapshot.detail.subscription_type))
         .map(plan_label)
         .or_else(|| fallback_plan.map(str::to_string))
 }
@@ -825,11 +811,16 @@ fn aggregate_daily_tokens(snapshots: &[UsageSnapshot]) -> BTreeMap<NaiveDate, u6
 fn lifetime_tokens(snapshots: &[UsageSnapshot]) -> u64 {
     snapshots
         .iter()
-        .filter_map(activity_metadata)
-        .filter_map(|activity| {
-            u64_field(activity, "lifetime_tokens")
-                .or_else(|| u64_field(activity, "total_tokens"))
-                .or_else(|| u64_field(activity, "lookback_tokens"))
+        .filter_map(|snapshot| {
+            if let Some(activity) = &snapshot.detail.activity {
+                activity
+                    .lifetime_tokens
+                    .or(activity.total_tokens)
+                    .or(activity.lookback_tokens)
+            } else {
+                let cost = snapshot.detail.cost.as_ref()?;
+                cost.total_tokens.or(cost.lookback_tokens)
+            }
         })
         .sum()
 }
@@ -837,54 +828,31 @@ fn lifetime_tokens(snapshots: &[UsageSnapshot]) -> u64 {
 fn total_cost(snapshots: &[UsageSnapshot]) -> f64 {
     snapshots
         .iter()
-        .filter_map(cost_metadata)
-        .filter_map(|cost| {
-            cost.get("total_cost_usd").and_then(f64_value).or_else(|| {
-                cost.get("by_day").and_then(Value::as_array).map(|rows| {
-                    rows.iter()
-                        .filter_map(|row| row.get("cost_usd").and_then(f64_value))
-                        .sum()
-                })
-            })
+        .filter_map(|snapshot| snapshot.detail.cost.as_ref())
+        .map(|cost| {
+            cost.total_cost_usd
+                .unwrap_or_else(|| cost.by_day.iter().filter_map(|point| point.cost_usd).sum())
         })
         .sum()
 }
 
 fn daily_rows(snapshot: &UsageSnapshot) -> Vec<(NaiveDate, u64)> {
-    let Some(cost) = activity_metadata(snapshot) else {
-        return Vec::new();
-    };
-    cost.get("by_day")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            let date = row.get("date").and_then(Value::as_str)?;
-            let tokens = row.get("tokens").and_then(u64_value)?;
-            NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                .ok()
-                .map(|date| (date, tokens))
-        })
+    activity_by_day(snapshot)
+        .iter()
+        .map(|point| (point.date, point.tokens))
         .collect()
 }
 
-fn cost_metadata(snapshot: &UsageSnapshot) -> Option<&Value> {
-    let provider_key = format!("{}_cost", snapshot.provider_id.as_str());
-    snapshot.metadata.get(&provider_key).or_else(|| {
-        snapshot
-            .metadata
-            .as_object()?
-            .values()
-            .find(|value| value.get("by_day").is_some() && value.get("total_tokens").is_some())
-    })
-}
-
-fn activity_metadata(snapshot: &UsageSnapshot) -> Option<&Value> {
-    let provider_key = format!("{}_activity", snapshot.provider_id.as_str());
-    snapshot
-        .metadata
-        .get(&provider_key)
-        .or_else(|| cost_metadata(snapshot))
+/// Daily rows preferred from the activity detail, falling back to the cost
+/// detail's daily breakdown when no activity series is present.
+fn activity_by_day(snapshot: &UsageSnapshot) -> &[DailyUsagePoint] {
+    if let Some(activity) = &snapshot.detail.activity {
+        &activity.by_day
+    } else if let Some(cost) = &snapshot.detail.cost {
+        &cost.by_day
+    } else {
+        &[]
+    }
 }
 
 fn last_seven_days(daily_tokens: &BTreeMap<NaiveDate, u64>) -> Vec<ActivityDay> {
@@ -1102,28 +1070,14 @@ fn format_amount(amount: &UsageAmount) -> String {
     }
 }
 
-fn u64_field(value: &Value, key: &str) -> Option<u64> {
-    value.get(key).and_then(u64_value)
-}
-
-fn u64_value(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_f64().map(|value| value.round() as u64))
-        .or_else(|| value.as_str()?.parse().ok())
-}
-
-fn f64_value(value: &Value) -> Option<f64> {
-    value.as_f64().or_else(|| value.as_str()?.parse().ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::render::style::strip_ansi;
-    use chrono::TimeZone;
-    use serde_json::json;
-    use usage_core::{AccountId, ForecastConfidence, ProviderId};
+    use chrono::{NaiveDate, TimeZone};
+    use usage_core::{
+        AccountId, CostDetail, ForecastConfidence, ProviderId, ResetCreditsDetail, SnapshotDetail,
+    };
 
     const TEST_WIDTH: usize = 80;
 
@@ -1375,23 +1329,37 @@ mod tests {
                     reset_at: Some(Utc::now() + TimeDelta::days(20)),
                 },
             ],
-            metadata: json!({
-                "collection_mode": "wham_usage_api",
-                "plan_type": "prolite",
-                "email": "user@example.com",
-                "rate_limit_reset_credits_available_count": 2,
-                "rate_limit_reset_credits": {
-                    "available_count": 2,
-                    "next_expires_at": (Utc::now() + TimeDelta::days(2)).timestamp()
-                },
-                "codex_cost": {
-                    "total_tokens": 1_250_000_000_u64,
-                    "by_day": [
-                        {"date": "2026-07-05", "tokens": 12_000_000_u64},
-                        {"date": "2026-07-06", "tokens": 44_000_000_u64}
-                    ]
-                }
-            }),
+            detail: SnapshotDetail {
+                collection_mode: Some("wham_usage_api".to_string()),
+                plan_type: Some("prolite".to_string()),
+                email: Some("user@example.com".to_string()),
+                reset_credits: Some(ResetCreditsDetail {
+                    available_count: 2,
+                    next_expires_at: Some(Utc::now() + TimeDelta::days(2)),
+                    credits: Vec::new(),
+                }),
+                cost: Some(CostDetail {
+                    total_tokens: Some(1_250_000_000),
+                    by_day: vec![
+                        DailyUsagePoint {
+                            date: NaiveDate::from_ymd_opt(2026, 7, 5).unwrap(),
+                            tokens: 12_000_000,
+                            cost_usd: None,
+                            priced_tokens: 0,
+                            unpriced_tokens: 0,
+                        },
+                        DailyUsagePoint {
+                            date: NaiveDate::from_ymd_opt(2026, 7, 6).unwrap(),
+                            tokens: 44_000_000,
+                            cost_usd: None,
+                            priced_tokens: 0,
+                            unpriced_tokens: 0,
+                        },
+                    ],
+                    ..CostDetail::default()
+                }),
+                ..SnapshotDetail::default()
+            },
         };
         let account = Account {
             id: account_id,

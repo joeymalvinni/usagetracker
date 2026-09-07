@@ -103,6 +103,19 @@ pub fn spawn_change_log_loop(
 
         let mut pending = BTreeMap::<String, PendingRefresh>::new();
         let mut last_refresh = BTreeMap::<String, tokio::time::Instant>::new();
+        // Reprice existing logs after an upgrade even when no file changes or
+        // remote sign-in succeeds. This schedules local-only work and leaves
+        // provider backoff, quota freshness, and remote health untouched.
+        schedule_providers(
+            tokio::time::Instant::now(),
+            targets
+                .iter()
+                .map(|target| target.provider_id.clone())
+                .collect(),
+            &targets,
+            &last_refresh,
+            &mut pending,
+        );
         loop {
             let deadline = pending.values().map(|pending| pending.deadline).min();
             tokio::select! {

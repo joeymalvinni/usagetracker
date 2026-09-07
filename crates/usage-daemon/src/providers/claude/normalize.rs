@@ -3,9 +3,12 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use usage_core::{ProviderId, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind};
+use usage_core::{
+    ProviderId, SnapshotDetail, UsageAmount, UsageUnit, UsageWindow, UsageWindowKind,
+};
 
 use crate::providers::{
+    json_map,
     local_usage::{stable_window_fragment, usage_kind_from_name},
     ProviderError, ProviderErrorKind, ProviderUsage,
 };
@@ -59,17 +62,20 @@ pub(super) fn normalize_usage(
         provider_id: ProviderId::new(PROVIDER_ID),
         collected_at: Utc::now(),
         windows,
-        metadata: json!({
-            "collection_mode": CLAUDE_COLLECTION_MODE,
-            "keychain_service": credentials.keychain_service,
-            "keychain_account": credentials.keychain_account,
-            "subscription_type": credentials.subscription_type,
-            "rate_limit_tier": credentials.rate_limit_tier,
-            "token_expires_at_ms": credentials.expires_at_ms,
-            "scopes": credentials.scopes,
-            "extra_usage_enabled": response.extra_usage.as_ref().and_then(ClaudeExtraUsage::enabled),
-            "top_level_keys": top_level_keys,
-        }),
+        detail: SnapshotDetail {
+            collection_mode: Some(CLAUDE_COLLECTION_MODE.to_string()),
+            keychain_account: Some(credentials.keychain_account.clone()),
+            subscription_type: credentials.subscription_type.clone(),
+            extra: json_map(json!({
+                "keychain_service": credentials.keychain_service,
+                "rate_limit_tier": credentials.rate_limit_tier,
+                "token_expires_at_ms": credentials.expires_at_ms,
+                "scopes": credentials.scopes,
+                "extra_usage_enabled": response.extra_usage.as_ref().and_then(ClaudeExtraUsage::enabled),
+                "top_level_keys": top_level_keys,
+            })),
+            ..SnapshotDetail::default()
+        },
     })
 }
 
@@ -608,9 +614,12 @@ mod tests {
         assert_eq!(extra.remaining.as_ref().unwrap().value, 87.5);
         assert_eq!(extra.percent_used, Some(12.5));
 
-        assert_eq!(snapshot.metadata["collection_mode"], CLAUDE_COLLECTION_MODE);
-        assert_eq!(snapshot.metadata["subscription_type"], "team");
-        assert_eq!(snapshot.metadata["extra_usage_enabled"], true);
+        assert_eq!(
+            snapshot.detail.collection_mode.as_deref(),
+            Some(CLAUDE_COLLECTION_MODE)
+        );
+        assert_eq!(snapshot.detail.subscription_type.as_deref(), Some("team"));
+        assert_eq!(snapshot.detail.extra["extra_usage_enabled"], true);
     }
 
     #[test]

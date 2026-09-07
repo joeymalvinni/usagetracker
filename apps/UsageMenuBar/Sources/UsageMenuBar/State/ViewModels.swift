@@ -100,6 +100,7 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     let sparkline: [Double]
     let costDashboard: CostDashboardVM
     let subAccounts: [ProviderVM]?
+    var modelCosts: [ModelCostSummary] = []
     /// Non-nil when this provider/account is in an actionable alert state.
     /// Format: "provider|account|statusCode". Acknowledgements key off this exact value.
     var alertSignature: String? = nil
@@ -109,6 +110,9 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     var errorDetail: String? = nil
     var repairRecommended: Bool = false
     var accountEmail: String? = nil
+    var activitySourceLabel: String? = nil
+    var hasCostData: Bool = true
+    var unpricedModelNames: [String] = []
 }
 
 struct MenuBarProviderVM: Identifiable, Equatable, Sendable {
@@ -117,6 +121,7 @@ struct MenuBarProviderVM: Identifiable, Equatable, Sendable {
     let short: String
     let percent: Double?
     let status: DisplayStatus
+    var isMuted: Bool = false
 }
 
 struct WindowVM: Identifiable, Equatable, Sendable {
@@ -129,6 +134,7 @@ struct WindowVM: Identifiable, Equatable, Sendable {
     /// the explicit-date disclosure; `reset` is its pre-rendered short form.
     var resetAt: Date? = nil
     var forecast: WindowForecastVM? = nil
+    var isMuted: Bool = false
 }
 
 struct WindowForecastVM: Equatable, Sendable {
@@ -152,15 +158,24 @@ struct ResetCreditSummaryVM: Equatable, Sendable {
 }
 
 struct CostDashboardVM: Equatable, Sendable {
-    static let empty = CostDashboardVM(days: [], providers: [])
+    static let empty = CostDashboardVM(
+        days: [],
+        providers: [],
+        allTimeCost: 0,
+        allTimeTokens: 0
+    )
     let days: [CostDayVM]
     let providers: [CostProviderVM]
+    let allTimeCost: Double
+    let allTimeTokens: UInt64
 
     var hasData: Bool { days.contains { $0.totalCost > 0 || $0.totalTokens > 0 } }
     var todayCost: Double { days.last?.totalCost ?? 0 }
     var todayTokens: UInt64 { days.last?.totalTokens ?? 0 }
-    var cost30d: Double { days.reduce(0) { $0 + $1.totalCost } }
-    var tokens30d: UInt64 { days.reduce(0) { $0.saturatingAdd($1.totalTokens) } }
+    var cost30d: Double { days.suffix(30).reduce(0) { $0 + $1.totalCost } }
+    var tokens30d: UInt64 {
+        days.suffix(30).reduce(0) { $0.saturatingAdd($1.totalTokens) }
+    }
 }
 
 struct CostProviderVM: Identifiable, Equatable, Sendable { let id, name, symbol: String }

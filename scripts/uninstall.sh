@@ -7,7 +7,7 @@ purge_data=0
 force=0
 daemon_home="${USAGE_TRACKER_HOME:-$HOME/.usagetracker}"
 daemon_socket="${USAGE_TRACKER_SOCKET:-$daemon_home/usage.sock}"
-launch_agent_label="engineering.super.usagetracker.daemon"
+launch_agent_label="app.usagetracker.daemon"
 
 usage() {
   cat <<'EOF'
@@ -82,8 +82,7 @@ wait_for_processes() {
 
 unregister_launch_agent() {
   local executable="$app_path/Contents/MacOS/UsageMenuBar"
-  local plist="$app_path/Contents/Library/LaunchAgents/$launch_agent_label.plist"
-  if [[ -x "$executable" && -f "$plist" ]]; then
+  if [[ -x "$executable" ]]; then
     "$executable" --unregister-daemon-agent >/dev/null 2>&1 || return 1
   fi
   launchctl bootout "gui/$(id -u)/$launch_agent_label" >/dev/null 2>&1 || true

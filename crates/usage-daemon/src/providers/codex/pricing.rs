@@ -7,11 +7,11 @@
 use std::collections::BTreeMap;
 
 const LONG_CONTEXT_THRESHOLD: u64 = 272_000;
-const BUNDLED_CATALOG_EFFECTIVE_FROM: &str = "2026-07-11";
-const BUNDLED_CATALOG_VERSION: &str = "bundled-2026-07-11";
+const BUNDLED_CATALOG_EFFECTIVE_FROM: &str = "2026-09-05";
+const BUNDLED_CATALOG_VERSION: &str = "bundled-2026-09-05";
 // Increment whenever bundled rates or aliases change so cached file reports
 // are repriced without restoring runtime catalog hashing.
-const BUNDLED_CATALOG_REVISION: u64 = 20_260_711;
+const BUNDLED_CATALOG_REVISION: u64 = 20_260_905;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CodexTokenRates {
@@ -45,6 +45,7 @@ impl CodexPricingCatalog {
         insert("gpt-5-nano", 0.05, Some(0.005), 0.4);
         insert("gpt-5-pro", 15.0, None, 120.0);
         insert("gpt-5.1", 1.25, Some(0.125), 10.0);
+        insert("gpt-5.1-codex-mini", 0.25, Some(0.025), 2.0);
         insert("gpt-5.2", 1.75, Some(0.175), 14.0);
         insert("gpt-5.2-pro", 21.0, None, 168.0);
         insert("gpt-5.3-codex", 1.75, Some(0.175), 14.0);
@@ -95,31 +96,41 @@ impl CodexPricingCatalog {
         models.insert(
             "gpt-5.6-sol".to_string(),
             model(
-                5.0,
-                Some(0.5),
-                Some(6.25),
-                30.0,
-                Some(rates(10.0, Some(1.0), Some(12.5), 45.0)),
+                4.0,
+                Some(0.4),
+                Some(5.0),
+                20.0,
+                Some(rates(8.0, Some(0.8), Some(10.0), 30.0)),
             ),
         );
         models.insert(
             "gpt-5.6-terra".to_string(),
             model(
-                2.5,
-                Some(0.25),
-                Some(3.125),
-                15.0,
-                Some(rates(5.0, Some(0.5), Some(6.25), 22.5)),
+                2.0,
+                Some(0.2),
+                Some(2.5),
+                12.0,
+                Some(rates(4.0, Some(0.4), Some(5.0), 18.0)),
             ),
         );
         models.insert(
             "gpt-5.6-luna".to_string(),
             model(
-                1.0,
-                Some(0.1),
-                Some(1.25),
-                6.0,
-                Some(rates(2.0, Some(0.2), Some(2.5), 9.0)),
+                0.2,
+                Some(0.02),
+                Some(0.25),
+                1.2,
+                Some(rates(0.4, Some(0.04), Some(0.5), 1.8)),
+            ),
+        );
+        models.insert(
+            "gpt-6-astra".to_string(),
+            model(
+                10.0,
+                Some(1.0),
+                Some(12.5),
+                50.0,
+                Some(rates(20.0, Some(2.0), Some(25.0), 75.0)),
             ),
         );
 
@@ -182,6 +193,7 @@ fn model_alias(model: &str) -> Option<&'static str> {
         "gpt-5-codex" => "gpt-5",
         "gpt-5.1-codex" | "gpt-5.1-codex-max" => "gpt-5.1",
         "gpt-5.2-codex" => "gpt-5.2",
+        "gpt-5.6" => "gpt-5.6-sol",
         _ => return None,
     })
 }

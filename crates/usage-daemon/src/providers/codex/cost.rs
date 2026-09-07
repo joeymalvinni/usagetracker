@@ -10,11 +10,12 @@ use std::{
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use serde_json::{json, Value};
-use usage_core::UsageWindowKind;
+use usage_core::{CostDetail, ModelCostSummary, UnpricedModel, UsageWindowKind};
 
 use crate::providers::{
+    json_map,
     local_usage::{
-        cost_window, daily_cost_rows, lookback_start, merge_daily_summary, scan_cached_files,
+        cost_window, daily_usage_points, lookback_start, merge_daily_summary, scan_cached_files,
         token_window, CachedFile, DailyRollup, LocalFileCache, LocalFileScan,
     },
     ProviderUsage,
@@ -31,26 +32,29 @@ pub(super) trait CodexUsageCostExt {
 impl CodexUsageCostExt for ProviderUsage {
     fn merge_cost_report(&mut self, report: CodexCostReport, include_token_activity: bool) {
         if report.total_tokens == 0 {
-            self.metadata["codex_cost"] = json!({
-                "source": "local_session_logs",
-                "estimate": true,
-                "partial": true,
-                "complete_lookback": false,
-                "session_roots": report.session_roots,
-                "files_scanned": report.files_scanned,
-                "token_count_events": report.token_count_events,
-                "baseline_seeded_events": report.baseline_seeded_events,
-                "undated_tokens": report.undated_tokens,
-                "undated_cached_input_tokens": report.undated_cached_input_tokens,
-                "undated_cost_usd": report.undated_cost_usd,
-                "total_cached_input_tokens": report.total_cached_input_tokens,
-                "total_activity_tokens": report.total_tokens,
-                "priced_tokens": report.priced_tokens,
-                "unpriced_tokens": report.unpriced_tokens,
-                "unpriced_models": unpriced_model_rows(&report.unpriced_models),
-                "pricing_source": report.pricing_source,
-                "pricing_version": report.pricing_version,
-                "pricing_effective_from": report.pricing_effective_from,
+            self.detail.cost = Some(CostDetail {
+                source: Some("local_session_logs".to_string()),
+                estimate: true,
+                partial: true,
+                complete_lookback: Some(false),
+                unpriced_tokens: report.unpriced_tokens,
+                unpriced_models: unpriced_models(&report.unpriced_models),
+                pricing_source: Some(report.pricing_source.clone()),
+                pricing_version: Some(report.pricing_version.clone()),
+                pricing_effective_from: parse_pricing_date(&report.pricing_effective_from),
+                extra: json_map(json!({
+                    "session_roots": report.session_roots,
+                    "files_scanned": report.files_scanned,
+                    "token_count_events": report.token_count_events,
+                    "baseline_seeded_events": report.baseline_seeded_events,
+                    "undated_tokens": report.undated_tokens,
+                    "undated_cached_input_tokens": report.undated_cached_input_tokens,
+                    "undated_cost_usd": report.undated_cost_usd,
+                    "total_cached_input_tokens": report.total_cached_input_tokens,
+                    "total_activity_tokens": report.total_tokens,
+                    "priced_tokens": report.priced_tokens,
+                })),
+                ..CostDetail::default()
             });
             return;
         }
@@ -87,42 +91,78 @@ impl CodexUsageCostExt for ProviderUsage {
             ));
         }
 
-        self.metadata["codex_cost"] = json!({
-            "source": "local_session_logs",
-            "estimate": true,
-            "partial": true,
-            "complete_lookback": false,
-            "hint": "Estimated from this device's local Codex logs; account-wide token activity is tracked separately.",
-            "session_roots": report.session_roots,
-            "files_scanned": report.files_scanned,
-            "token_count_events": report.token_count_events,
-            "baseline_seeded_events": report.baseline_seeded_events,
-            "today_cost_usd": report.today_cost_usd,
-            "today_tokens": report.today_tokens,
-            "today_cached_input_tokens": report.today_cached_input_tokens,
-            "today_activity_tokens": report.today_tokens,
-            "lookback_days": COST_LOOKBACK_DAYS,
-            "lookback_cost_usd": report.lookback_cost_usd,
-            "lookback_tokens": report.lookback_tokens,
-            "lookback_cached_input_tokens": report.lookback_cached_input_tokens,
-            "lookback_activity_tokens": report.lookback_tokens,
-            "total_cost_usd": report.total_cost_usd,
-            "total_tokens": report.total_tokens,
-            "total_cached_input_tokens": report.total_cached_input_tokens,
-            "total_activity_tokens": report.total_tokens,
-            "undated_cost_usd": report.undated_cost_usd,
-            "undated_tokens": report.undated_tokens,
-            "undated_cached_input_tokens": report.undated_cached_input_tokens,
-            "priced_tokens": report.priced_tokens,
-            "unpriced_tokens": report.unpriced_tokens,
-            "unpriced_models": unpriced_model_rows(&report.unpriced_models),
-            "pricing_source": report.pricing_source,
-            "pricing_version": report.pricing_version,
-            "pricing_effective_from": report.pricing_effective_from,
-            "by_day": daily_cost_rows(&report.by_day),
-            "by_model": report.by_model,
+        self.detail.cost = Some(CostDetail {
+            source: Some("local_session_logs".to_string()),
+            estimate: true,
+            partial: true,
+            complete_lookback: Some(false),
+            today_cost_usd: Some(report.today_cost_usd),
+            today_tokens: Some(report.today_tokens),
+            lookback_cost_usd: Some(report.lookback_cost_usd),
+            lookback_tokens: Some(report.lookback_tokens),
+            total_cost_usd: Some(report.total_cost_usd),
+            total_tokens: Some(report.total_tokens),
+            unpriced_tokens: report.unpriced_tokens,
+            unpriced_models: unpriced_models(&report.unpriced_models),
+            pricing_source: Some(report.pricing_source.clone()),
+            pricing_version: Some(report.pricing_version.clone()),
+            pricing_effective_from: parse_pricing_date(&report.pricing_effective_from),
+            by_day: daily_usage_points(&report.by_day),
+            by_model: codex_model_cost_summaries(&report.by_model),
+            extra: json_map(json!({
+                "hint": "Estimated from this device's local Codex logs; account-wide token activity is tracked separately.",
+                "session_roots": report.session_roots,
+                "files_scanned": report.files_scanned,
+                "token_count_events": report.token_count_events,
+                "baseline_seeded_events": report.baseline_seeded_events,
+                "today_cached_input_tokens": report.today_cached_input_tokens,
+                "today_activity_tokens": report.today_tokens,
+                "lookback_days": COST_LOOKBACK_DAYS,
+                "lookback_cached_input_tokens": report.lookback_cached_input_tokens,
+                "lookback_activity_tokens": report.lookback_tokens,
+                "total_cached_input_tokens": report.total_cached_input_tokens,
+                "total_activity_tokens": report.total_tokens,
+                "undated_cost_usd": report.undated_cost_usd,
+                "undated_tokens": report.undated_tokens,
+                "undated_cached_input_tokens": report.undated_cached_input_tokens,
+                "priced_tokens": report.priced_tokens,
+            })),
         });
     }
+}
+
+fn parse_pricing_date(value: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
+}
+
+/// Maps Codex's per-model rollup into the canonical [`ModelCostSummary`]. Codex
+/// estimates cost locally, so vendor/metered/chargeable collapse to the single
+/// estimate and there is no per-model event count.
+fn codex_model_cost_summaries(
+    by_model: &BTreeMap<String, CodexModelCostSummary>,
+) -> Vec<ModelCostSummary> {
+    by_model
+        .iter()
+        .map(|(model, summary)| ModelCostSummary {
+            model: model.clone(),
+            event_count: 0,
+            tokens: summary.input_tokens.saturating_add(summary.output_tokens),
+            vendor_cost_usd: summary.cost_usd,
+            metered_cost_usd: summary.cost_usd,
+            chargeable_cost_usd: summary.cost_usd,
+            provider_fee_usd: 0.0,
+        })
+        .collect()
+}
+
+fn unpriced_models(models: &BTreeMap<String, u64>) -> Vec<UnpricedModel> {
+    models
+        .iter()
+        .map(|(model, tokens)| UnpricedModel {
+            model: model.clone(),
+            tokens: *tokens,
+        })
+        .collect()
 }
 
 pub(super) type CodexCostCache = LocalFileCache<CodexFileCostReport, CodexCostReport>;
@@ -184,12 +224,6 @@ pub(super) struct CodexFileCostReport {
     unpriced_models: BTreeMap<String, u64>,
     by_day: BTreeMap<NaiveDate, DailyCostSummary>,
     by_model: BTreeMap<String, CodexModelCostSummary>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct UnpricedModelRow {
-    model: String,
-    tokens: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -480,6 +514,11 @@ pub(super) fn codex_token_delta(
         .get("last_token_usage")
         .and_then(codex_totals_from_value);
     let (delta, baseline_seeded) = match (last, total, *previous_totals) {
+        // Rate-limit notifications can repeat the previous request's usage.
+        // An unchanged cumulative counter proves no new tokens were consumed.
+        (_, Some(current), Some(previous)) if current == previous => {
+            (CodexTokenTotals::default(), false)
+        }
         (Some(last), _, _) => (last, false),
         (None, Some(current), Some(previous)) => (current.saturating_delta(previous), false),
         (None, Some(_), None) => {
@@ -501,16 +540,6 @@ pub(super) fn codex_token_delta(
 fn add_unpriced_model(models: &mut BTreeMap<String, u64>, model: &str, tokens: u64) {
     let total = models.entry(model.to_string()).or_default();
     *total = total.saturating_add(tokens);
-}
-
-fn unpriced_model_rows(models: &BTreeMap<String, u64>) -> Vec<UnpricedModelRow> {
-    models
-        .iter()
-        .map(|(model, tokens)| UnpricedModelRow {
-            model: model.clone(),
-            tokens: *tokens,
-        })
-        .collect()
 }
 
 pub(super) trait CodexTotalsAdd {
@@ -639,7 +668,8 @@ fn per_token(per_million: f64) -> f64 {
 }
 
 pub(super) fn normalize_codex_model(model: &str) -> String {
-    let model = model.strip_prefix("openai/").unwrap_or(model).trim();
+    let model = model.trim();
+    let model = model.strip_prefix("openai/").unwrap_or(model);
     if model.len() > 11 && model.as_bytes()[model.len() - 11] == b'-' {
         let suffix = &model[model.len() - 10..];
         if suffix.len() == 10

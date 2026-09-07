@@ -8,9 +8,71 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 - Added per-account Claude launch preferences behind a new confirm-on-open sheet: a saved working directory and structured launch flags (model, effort, dangerously-skip-permissions) applied by the session launcher and persisted on successful open. The dangerous flag is use-once unless explicitly remembered.
 
+### Reliability
+
+- Preserved managed Claude account identity and MCP configuration when importing project trust. Serialized launch credential migration with token refresh and prevented stale credentials from replacing a newer Keychain item.
+
 ### Protocol
 
 - Added v3 import methods (`preview_account_import`, `import_account_data`, `get_import_job`) with wire fixtures, schemas, and provider capability `import_account_data` for Claude managed profiles.
+
+## 0.1.9 — 2026-07-25
+
+### App
+
+- Reworked onboarding around explicit provider consent, with provider-by-provider connection flows, live account-discovery progress, and clearer tracking controls.
+- Added tabs to Settings so general preferences and provider accounts are easier to navigate.
+- Showed complete activity history and all-time totals in the activity grid, and added a hover indicator for the selected chart bar.
+
+### Usage tracking
+
+- Corrected Codex token totals to use the account's recorded activity instead of scaling local activity to an unrelated aggregate.
+
+### Reliability
+
+- Made first-run onboarding anchor to the menu bar item reliably after installation and added a local install test for the packaged app.
+- Prevented temporary Claude backoff health from being presented as low usage.
+
+## 0.1.8 — 2026-07-23
+
+### App
+
+- Made first-launch onboarding wait until the menu bar item is visible before opening, avoiding a startup race where the icon appeared without its popover.
+- Standardized the app, updater, and background service under the `app.usagetracker` identity and restored the full UsageTracker app name.
+
+### Installation
+
+- Preserved installer-managed app and CLI upgrades across the identity migration by validating their install receipts and quitting the previously installed app by its actual bundle identifier.
+
+## 0.1.7 — 2026-07-23
+
+### App
+
+- Added an optional activity grid alongside the existing bar chart, with the preferred chart style saved in Settings.
+- Made Finder launches and app reopens reliably surface the menu bar popover, and refreshed onboarding with the UsageTracker app icon.
+
+### Reliability
+
+- Kept last-known usage visible while offline, skipped unavailable remote collection without overwriting provider health, and clearly marked cached values in the app and CLI.
+- Prevented copy-link provider sign-in from opening a browser, including when a provider invokes the absolute macOS opener.
+
+## 0.1.6 — 2026-07-23
+
+### App
+
+- Added Cursor to onboarding, Settings, dashboard summaries, provider details, and activity views.
+- Made provider sign-in links available to copy when browser-based authentication needs manual follow-up.
+
+### Usage tracking
+
+- Added Cursor usage collection for included plan limits, Auto/API lanes, Enterprise personal caps and team pools, legacy request quotas, and personal or team on-demand budgets.
+- Added complete Cursor billing-cycle usage-event collection with bounded pagination, individual event history, per-day and per-model costs, and vendor-versus-metered comparisons.
+
+### Reliability
+
+- Bound cached Cursor web sessions to validated account identities, re-read Cursor.app authentication during collection, and prevented account fallback after transient or rate-limit failures.
+- Restored Codex rate-limit reset timestamps from app-server responses.
+- Prevented stale menu bar app processes from surviving an update.
 
 ## 0.1.5 — 2026-07-19
 
