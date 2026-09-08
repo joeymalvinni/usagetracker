@@ -334,9 +334,13 @@ pub(super) fn codex_session_roots(
     local_codex_home: &Path,
     owns_default_activity: bool,
 ) -> Vec<PathBuf> {
-    let mut roots = vec![profile_home.join("sessions")];
+    let mut roots = vec![
+        profile_home.join("sessions"),
+        profile_home.join("archived_sessions"),
+    ];
     if profile_home != local_codex_home && owns_default_activity {
         roots.push(local_codex_home.join("sessions"));
+        roots.push(local_codex_home.join("archived_sessions"));
     }
     roots.sort();
     roots.dedup();
@@ -761,6 +765,38 @@ mod cache_tests {
         cache.lock().unwrap().as_mut().unwrap().scanned_at = Instant::now()
             .checked_sub(CODEX_COST_SCAN_MIN_INTERVAL + Duration::from_secs(1))
             .unwrap();
+    }
+
+    #[test]
+    fn archiving_a_codex_session_preserves_usage_after_rescan() {
+        let home = TestDir::new();
+        let roots = codex_session_roots(home.path(), home.path(), false);
+        for root in &roots {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let active = home.path().join("sessions/rollout.jsonl");
+        let archived = home.path().join("archived_sessions/rollout.jsonl");
+        let today = test_date(2026, 9, 7);
+        std::fs::write(
+            &active,
+            format!(
+                "{}\n{}\n",
+                json!({"type": "turn_context", "payload": {"model": "gpt-6-astra"}}),
+                token_event(today, 1000, 100)
+            ),
+        )
+        .unwrap();
+        let cache = Arc::new(Mutex::new(None));
+        let before = scan(cache.clone(), roots.clone(), today).unwrap().report;
+        std::fs::rename(active, archived).unwrap();
+        expire(&cache);
+        let after = scan(cache, roots, today).unwrap().report;
+        assert_eq!(before.total_tokens, 1100);
+        assert_eq!(after.total_tokens, before.total_tokens);
+        assert_eq!(after.today_tokens, before.today_tokens);
+        assert_eq!(after.total_cost_usd, before.total_cost_usd);
+        assert_eq!(after.by_model["gpt-6-astra"].input_tokens, 1000);
+        assert_eq!(after.files_scanned, 1);
     }
 
     #[test]

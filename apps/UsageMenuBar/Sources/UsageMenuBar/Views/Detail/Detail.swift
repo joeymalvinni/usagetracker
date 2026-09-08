@@ -610,12 +610,19 @@ private struct ProviderActivityCard: View {
 
             if !provider.modelCosts.isEmpty {
                 Divider()
+                if provider.providerId == "codex" || provider.providerId == "claude" {
+                    Text("By model · all available local history")
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(.secondary)
+                }
                 ForEach(provider.modelCosts, id: \.model) { model in
                     HStack(spacing: Theme.Spacing.sm) {
                         Text(model.model)
                             .lineLimit(1)
                         Spacer()
-                        Text(provider.unpricedModelNames.contains(model.model)
+                        Text(metric == .tokens
+                            ? "\(formatTokens(model.tokens)) tokens"
+                            : provider.unpricedModelNames.contains(model.model)
                             ? "Price unavailable"
                             : provider.providerId == "codex" || provider.providerId == "claude"
                             ? "\(formatUsd(model.vendorCostUsd)) estimated"
