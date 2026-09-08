@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import CryptoKit
 import Foundation
 import XCTest
@@ -509,6 +510,24 @@ final class DaemonClientTests: XCTestCase {
 
         XCTAssertEqual(object["method"] as? String, "repair_provider")
         XCTAssertEqual(object["sign_in_action"] as? String, "copy_link")
+    }
+
+    func testClaudeAuthenticationCodeIsSubmittedOnTheWire() throws {
+        let request = DaemonRequest.submitProviderSignInCode(
+            providerId: "claude",
+            authenticationCode: "code#with-special-characters"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.usage.encode(request))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(object["method"] as? String, "submit_provider_sign_in_code")
+        XCTAssertEqual(object["provider_id"] as? String, "claude")
+        XCTAssertEqual(
+            object["authentication_code"] as? String,
+            "code#with-special-characters"
+        )
     }
 
     func testDecodesProviderAuthenticationURL() throws {
@@ -1114,6 +1133,22 @@ final class AppStateTests: XCTestCase {
 }
 
 final class ProviderConnectionCoordinatorTests: XCTestCase {
+    @MainActor func testMonitorLifecyclePublishesChangesForSignInControls() async {
+        let coordinator = ProviderConnectionCoordinator()
+        var changes = 0
+        let observation = coordinator.objectWillChange.sink { changes += 1 }
+        coordinator.monitor(providerId: "claude") {}
+        XCTAssertTrue(coordinator.isMonitoring("claude"))
+        XCTAssertGreaterThan(changes, 0)
+        let beforeCompletion = changes
+        for _ in 0..<100 where coordinator.isMonitoring("claude") {
+            await Task.yield()
+        }
+        XCTAssertFalse(coordinator.isMonitoring("claude"))
+        XCTAssertGreaterThan(changes, beforeCompletion)
+        withExtendedLifetime(observation) {}
+    }
+
     @MainActor func testStableConnectionStateAlwaysReflectsCurrentAccounts() {
         let coordinator = ProviderConnectionCoordinator()
         let descriptor = providerDescriptor(detected: true)

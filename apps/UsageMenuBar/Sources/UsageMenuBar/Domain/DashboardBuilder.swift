@@ -690,7 +690,7 @@ struct DashboardBuilder {
 
     private func needsCredentialRepair(_ health: ProviderHealth) -> Bool {
         switch health.status {
-        case .credentialsMissing, .authFailed: true
+        case .credentialsMissing, .authFailed, .keychainAccessFailed: true
         default: false
         }
     }

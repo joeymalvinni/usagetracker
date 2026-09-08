@@ -22,6 +22,8 @@ enum DaemonRequest: Encodable {
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, settings: [String: String?])
     case repairProvider(providerId: String, accountId: String?, signInAction: ProviderSignInAction)
+    case submitProviderSignInCode(providerId: String, authenticationCode: String)
+    case cancelProviderSignIn(providerId: String)
     case launchProviderAccount(
         accountId: String,
         workingDirectory: String?,
@@ -89,6 +91,13 @@ enum DaemonRequest: Encodable {
             try c.encode(providerId, forKey: .providerId)
             try c.encodeIfPresent(accountId, forKey: .accountId)
             try c.encode(signInAction, forKey: .signInAction)
+        case .submitProviderSignInCode(let providerId, let authenticationCode):
+            try c.encode("submit_provider_sign_in_code", forKey: .method)
+            try c.encode(providerId, forKey: .providerId)
+            try c.encode(authenticationCode, forKey: .authenticationCode)
+        case .cancelProviderSignIn(let providerId):
+            try c.encode("cancel_provider_sign_in", forKey: .method)
+            try c.encode(providerId, forKey: .providerId)
         case .launchProviderAccount(let accountId, let workingDirectory, let launch, let remember):
             try c.encode("launch_provider_account", forKey: .method)
             try c.encode(accountId, forKey: .accountId)
@@ -120,6 +129,7 @@ enum DaemonRequest: Encodable {
         case jobId = "job_id"
         case displayName = "display_name"
         case signInAction = "sign_in_action"
+        case authenticationCode = "authentication_code"
         case collectionEnabled = "collection_enabled"
         case workspaceId = "workspace_id"
         case workingDirectory = "working_directory"

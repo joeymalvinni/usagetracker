@@ -292,7 +292,13 @@ private struct OnboardingProviderCard: View {
                 Button("Connect") { requestConnection() }
                     .buttonStyle(.chipProminent)
                     .disabled(state.daemon == .offline)
-            case .needsPermission, .failed:
+            case .needsPermission:
+                Button("Reconnect") {
+                    Task { await state.beginProviderSignIn(providerId, accountId: accounts.first?.id) }
+                }
+                .buttonStyle(.chipProminent)
+                .disabled(state.daemon == .offline)
+            case .failed:
                 Button("Try again") { requestConnection() }
                     .buttonStyle(.chipProminent)
                     .disabled(state.daemon == .offline)
@@ -329,13 +335,18 @@ private struct OnboardingProviderCard: View {
                 }
             }
         case .waitingForSignIn:
-            HStack(spacing: Theme.Spacing.sm) {
-                Button("I’ve signed in — check") {
-                    Task { await state.checkProviderAfterSignIn(providerId) }
+            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                if state.providersAwaitingAuthenticationCode.contains(providerId) {
+                    ProviderAuthenticationCodeEntry(providerId: providerId)
                 }
-                .buttonStyle(.chipProminent)
-                Button("Cancel") { state.cancelProviderSignIn(providerId) }
-                    .buttonStyle(.chip)
+                HStack(spacing: Theme.Spacing.sm) {
+                    Button("I’ve signed in — check") {
+                        Task { await state.checkProviderAfterSignIn(providerId) }
+                    }
+                    .buttonStyle(.chipProminent)
+                    Button("Cancel") { state.cancelProviderSignIn(providerId) }
+                        .buttonStyle(.chip)
+                }
             }
         case .connected:
             HStack(spacing: Theme.Spacing.sm) {

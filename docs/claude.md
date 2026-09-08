@@ -8,6 +8,12 @@ Claude supports as many profiles as you like. Each managed account gets its own 
 
 An account's real identity is its Anthropic `account.uuid`. (For older tokens that don't carry the profile scope, UsageTracker will fall back to a narrowly scoped cached UUID.) Emails, macOS usernames, plan tiers, and labels are just for display — they never decide who an account is. If two profiles share a UUID, the first enabled one wins; if a profile's UUID changes out from under it, that profile is rejected.
 
+## Signing in from the app
+
+Use Open sign-in or Copy sign-in link in onboarding or Settings. If Claude's browser flow displays an authentication code, paste it into the app's secure Authentication code field and submit it. The daemon forwards the code to the waiting Claude CLI, clears cached credentials after the CLI succeeds, and refreshes Claude usage. Repair is confirmed only after healthy usage is observed.
+
+Cancel terminates the waiting login process. A new login replaces the previous attempt for that provider, and unfinished attempts expire after ten minutes. Codes are bounded single-line input and are redacted from daemon request debug output. If the CLI stops accepting input, restart sign-in.
+
 ## Where credentials come from
 
 UsageTracker looks for your Claude credentials in this order:

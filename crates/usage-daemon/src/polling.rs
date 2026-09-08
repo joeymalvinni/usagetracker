@@ -178,6 +178,38 @@ impl RefreshCoordinator {
         Ok(())
     }
 
+    pub(crate) async fn profile_refresh_succeeded(
+        &self,
+        provider_id: &ProviderId,
+        profile_id: Option<&str>,
+        results: &[ProviderRefreshResult],
+    ) -> bool {
+        let Some(profile_id) = profile_id else {
+            return results.iter().any(|result| {
+                result.provider_id == *provider_id && result.status == ProviderRefreshStatus::Ok
+            });
+        };
+        let Ok(accounts) = self.storage.accounts().await else {
+            return false;
+        };
+        let account_ids = accounts
+            .into_iter()
+            .filter(|account| {
+                account.provider_id == *provider_id
+                    && account.profile_id.as_deref() == Some(profile_id)
+            })
+            .map(|account| account.id)
+            .collect::<BTreeSet<_>>();
+        results.iter().any(|result| {
+            result.provider_id == *provider_id
+                && result.status == ProviderRefreshStatus::Ok
+                && result
+                    .account_id
+                    .as_ref()
+                    .is_some_and(|account_id| account_ids.contains(account_id))
+        })
+    }
+
     pub fn notification_manager(&self) -> Arc<NotificationManager> {
         self.notifications.clone()
     }

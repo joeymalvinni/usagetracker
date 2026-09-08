@@ -21,7 +21,7 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
 /// the source of truth.
 @MainActor final class ProviderConnectionCoordinator: ObservableObject {
     @Published private var overrides = [String: ProviderConnectionPresentation]()
-    private var monitors = [String: Monitor]()
+    @Published private var monitors = [String: Monitor]()
 
     private struct Monitor {
         let generation: UUID

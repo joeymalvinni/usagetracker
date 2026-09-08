@@ -31,6 +31,8 @@ A reminder on trust: read methods can surface account emails, local paths, usage
 | `get_provider_setup` | `{"method":"get_provider_setup","provider_id":"opencode_go"}` | `provider_setup` |
 | `update_provider_setup` | `{"method":"update_provider_setup","provider_id":"opencode_go","settings":{"workspace_id":"wrk_123"}}` | `provider_setup` |
 | `repair_provider` | `{"method":"repair_provider","provider_id":"codex"}` | `provider_action` |
+| `submit_provider_sign_in_code` | `{"method":"submit_provider_sign_in_code","provider_id":"claude","authentication_code":"CODE"}` | `provider_action` |
+| `cancel_provider_sign_in` | `{"method":"cancel_provider_sign_in","provider_id":"claude"}` | `provider_action` |
 | `launch_provider_account` | `{"method":"launch_provider_account","account_id":"ACCOUNT"}` | `provider_action` |
 | `get_account_launch_settings` | `{"method":"get_account_launch_settings","account_id":"ACCOUNT"}` | `account_launch_settings` |
 | `preview_account_import` | `{"method":"preview_account_import","account_id":"ACCOUNT"}` | `account_import_preview` |
@@ -101,3 +103,9 @@ Import jobs follow the same in-memory retention rules as refresh jobs: active jo
 | `launch_provider_account` | Opens the provider with the account's isolated profile. Optional `working_directory`, `launch` (structured flags: `model`, `effort`, `dangerously_skip_permissions`), and `remember_dangerously_skip_permissions` override and — on success — persist the account's saved preferences. `launch` replaces the saved flags as a whole rather than merging fields, and a blank `working_directory` clears the saved one. The saved dangerous flag changes only when explicitly remembered, and `remember_dangerously_skip_permissions` has no effect unless `launch` is also sent. Preferences persist only for accounts with managed profile entries; legacy default accounts launch but save nothing. Providers must advertise `launch_options` for overrides; a relative or nonexistent working directory fails with `invalid_argument`. | Not idempotent — it may open several sessions. No job persists. | `unknown_account`, `storage_unavailable`, `unsupported_operation`, `invalid_argument` |
 
 These action methods can expose local profile paths to the launched provider process and cause visible Terminal or app activity. Fixture mode rejects sign-in, repair, and launch operations.
+
+## Completing or cancelling sign-in
+
+`submit_provider_sign_in_code` forwards a trimmed, nonempty, single-line code (at most 4096 UTF-8 bytes) to the provider's active login. Claude currently accepts codes; other login processes do not. Missing logins, unsupported input, invalid codes, or failed delivery return `invalid_argument`. Successful delivery acknowledges input only; it does not confirm authentication. Codes are redacted from request debug output.
+
+`cancel_provider_sign_in` terminates the provider's active login process group and succeeds even if no login remains. There is one active attempt per provider; a new attempt replaces the previous one. Both methods use a five-second first-party client timeout and return `unknown_provider` for an unknown provider ID.

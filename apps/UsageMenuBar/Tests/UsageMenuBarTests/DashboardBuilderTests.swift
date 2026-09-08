@@ -138,7 +138,35 @@ final class DashboardBuilderTests: XCTestCase {
             visible: { _ in true }
         ).build()
 
-        XCTAssertEqual(try XCTUnwrap(authOutput.providers.first).status, .error)
+        let authProvider = try XCTUnwrap(authOutput.providers.first)
+        XCTAssertEqual(authProvider.status, .error)
+        XCTAssertTrue(authProvider.repairRecommended)
+
+        let keychainHealth = ProviderHealth(
+            providerId: "codex",
+            accountId: account.id,
+            status: .keychainAccessFailed,
+            collectionMode: "oauth",
+            lastSuccessAt: snapshot.collectedAt,
+            lastFailureAt: Date(),
+            lastErrorCode: "keychain_access_failed",
+            lastErrorMessage: "macOS denied credential access",
+            updatedAt: Date()
+        )
+        let keychainOutput = DashboardBuilder(
+            config: config(providers: ["codex": true]),
+            accounts: [account],
+            health: [keychainHealth],
+            snapshots: [snapshot],
+            forecasts: [],
+            dashboard: .empty,
+            windowProvenance: [],
+            connectivity: .online,
+            ui: UIConfig(),
+            visible: { _ in true }
+        ).build()
+
+        XCTAssertTrue(try XCTUnwrap(keychainOutput.providers.first).repairRecommended)
     }
 
     func testStaleProviderShowsRefreshingOnlyWhileThatProviderRefreshes() throws {

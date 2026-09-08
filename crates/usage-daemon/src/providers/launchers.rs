@@ -1,14 +1,16 @@
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     fs::OpenOptions,
     io::{Read, Write},
+    os::fd::AsRawFd,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{mpsc, Arc, LazyLock},
+    process::{ChildStdin, Command, Stdio},
+    sync::{mpsc, Arc, LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -16,15 +18,26 @@ use std::{
 use regex::Regex;
 use tracing::{info, warn};
 use usage_core::{default_app_dir, AccountId, ProviderId, ProviderSignInAction};
+use uuid::Uuid;
 
 use crate::polling::RefreshCoordinator;
 
 const AUTH_URL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_AUTH_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_AUTHENTICATION_CODE_BYTES: usize = 4 * 1024;
 const NO_BROWSER_SANDBOX_PROFILE: &str =
     "(version 1) (allow default) (deny process-exec (literal \"/usr/bin/open\"))";
 static HTTPS_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https://[^\s\x1b<>\"']+"#).expect("valid auth URL regex"));
+static ACTIVE_LOGINS: LazyLock<Mutex<HashMap<String, ActiveLogin>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct ActiveLogin {
+    generation: Uuid,
+    process_group: i32,
+    stdin: Option<ChildStdin>,
+}
 
 pub(crate) struct LoginProcess {
     pub(crate) child: std::process::Child,
@@ -60,7 +73,7 @@ fn configure_codex_command(
     action: ProviderSignInAction,
 ) -> anyhow::Result<()> {
     command.env("CODEX_HOME", codex_home);
-    configure_login_stdio(command, action)
+    configure_login_stdio(command, action, false)
 }
 
 pub(crate) fn launch_claude_login(
@@ -70,7 +83,7 @@ pub(crate) fn launch_claude_login(
     let mut direct = login_command("claude", action);
     direct.args(["auth", "login"]);
     configure_claude_environment(&mut direct, config_dir);
-    configure_login_stdio(&mut direct, action)?;
+    configure_login_stdio(&mut direct, action, true)?;
     let child = match direct.spawn() {
         Ok(child) => child,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -78,7 +91,7 @@ pub(crate) fn launch_claude_login(
             let mut fallback = login_command(shell, action);
             fallback.args(["-lic", "exec claude auth login"]);
             configure_claude_environment(&mut fallback, config_dir);
-            configure_login_stdio(&mut fallback, action)?;
+            configure_login_stdio(&mut fallback, action, true)?;
             fallback.spawn().map_err(|fallback_err| {
                 anyhow::anyhow!("failed to start Claude login: {fallback_err}")
             })?
@@ -96,7 +109,7 @@ pub(crate) fn launch_grok_login(
     let mut command = login_command(binary, action);
     command.arg("login");
     command.env("GROK_HOME", grok_home);
-    configure_login_stdio(&mut command, action)?;
+    configure_login_stdio(&mut command, action, false)?;
     let child = command
         .spawn()
         .map_err(|err| anyhow::anyhow!("failed to start Grok login: {err}"))?;
@@ -146,10 +159,15 @@ fn configure_claude_environment(command: &mut Command, config_dir: Option<&Path>
 fn configure_login_stdio(
     command: &mut Command,
     action: ProviderSignInAction,
+    accepts_authentication_code: bool,
 ) -> anyhow::Result<()> {
     command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if accepts_authentication_code {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     match action {
@@ -222,7 +240,7 @@ fn finish_login_launch(
             match capture_authentication_url(&mut child, allowed_domains) {
                 Some(url) => Some(url),
                 None => {
-                    terminate_login_process(&mut child);
+                    let _ = terminate_login_process(&mut child);
                     anyhow::bail!("provider CLI did not produce a sign-in link");
                 }
             }
@@ -234,7 +252,9 @@ fn finish_login_launch(
     })
 }
 
-fn terminate_login_process(child: &mut std::process::Child) {
+fn terminate_login_process(
+    child: &mut std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
     let process_group = i32::try_from(child.id()).ok();
     let killed_group = process_group.is_some_and(|process_group| {
         // Login commands are placed in a dedicated process group before spawn,
@@ -244,7 +264,7 @@ fn terminate_login_process(child: &mut std::process::Child) {
     if !killed_group {
         let _ = child.kill();
     }
-    let _ = child.wait();
+    child.wait()
 }
 
 fn capture_authentication_url(
@@ -330,13 +350,13 @@ pub(crate) fn monitor_login(
     provider_id: &'static str,
     profile_id: Option<String>,
 ) {
+    let generation = register_active_login(provider_id, &mut child);
     let runtime = tokio::runtime::Handle::current();
-    std::thread::spawn(move || match child.wait() {
+    std::thread::spawn(move || match wait_for_login(&mut child) {
         Ok(status) if status.success() => {
-            info!(
-                provider_id,
-                profile_id, "provider login completed; refreshing account"
-            );
+            if !unregister_active_login(provider_id, generation) {
+                return;
+            }
             runtime.spawn(async move {
                 let provider = ProviderId::new(provider_id);
                 if let Err(error) = refresh
@@ -351,21 +371,173 @@ pub(crate) fn monitor_login(
                     );
                 }
                 let report = refresh.refresh(Some(std::slice::from_ref(&provider))).await;
-                info!(
-                    provider_id,
-                    profile_id,
-                    results = report.provider_results.len(),
-                    "post-login provider refresh completed"
-                );
+                let verified = refresh
+                    .profile_refresh_succeeded(
+                        &provider,
+                        profile_id.as_deref(),
+                        &report.provider_results,
+                    )
+                    .await;
+                if verified {
+                    info!(
+                        provider_id,
+                        profile_id,
+                        "provider login credentials verified"
+                    );
+                } else {
+                    warn!(
+                        provider_id,
+                        profile_id,
+                        results = report.provider_results.len(),
+                        "provider login process exited successfully, but no usable credentials were found"
+                    );
+                }
             });
         }
         Ok(status) => {
+            unregister_active_login(provider_id, generation);
             warn!(provider_id, profile_id, %status, "provider login process exited unsuccessfully");
         }
         Err(err) => {
+            unregister_active_login(provider_id, generation);
             warn!(provider_id, profile_id, error = %err, "failed to wait for provider login process");
         }
     });
+}
+
+fn wait_for_login(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            warn!("provider login timed out; terminating it");
+            return terminate_login_process(child);
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn register_active_login(provider_id: &str, child: &mut std::process::Child) -> Uuid {
+    let generation = Uuid::new_v4();
+    // A spawned child always has a valid pid; 0 disables group kills defensively.
+    let process_group = i32::try_from(child.id()).unwrap_or_default();
+    let active = ActiveLogin {
+        generation,
+        process_group,
+        stdin: child.stdin.take(),
+    };
+    let mut logins = ACTIVE_LOGINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(replaced) = logins.insert(provider_id.to_string(), active) {
+        kill_process_group(replaced.process_group);
+        warn!(
+            provider_id,
+            "replaced an unfinished provider login with the new sign-in attempt"
+        );
+    }
+    generation
+}
+
+fn unregister_active_login(provider_id: &str, generation: Uuid) -> bool {
+    let mut active = ACTIVE_LOGINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if active
+        .get(provider_id)
+        .is_some_and(|login| login.generation == generation)
+    {
+        active.remove(provider_id);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn submit_provider_sign_in_code(
+    provider_id: &str,
+    authentication_code: &str,
+) -> anyhow::Result<()> {
+    let authentication_code = authentication_code.trim();
+    anyhow::ensure!(
+        !authentication_code.is_empty(),
+        "authentication code cannot be empty"
+    );
+    anyhow::ensure!(
+        authentication_code.len() <= MAX_AUTHENTICATION_CODE_BYTES,
+        "authentication code is too long"
+    );
+    anyhow::ensure!(
+        !authentication_code.contains(['\r', '\n']),
+        "authentication code must be a single line"
+    );
+
+    let mut active = ACTIVE_LOGINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let login = active
+        .get_mut(provider_id)
+        .ok_or_else(|| anyhow::anyhow!("there is no active sign-in for {provider_id}"))?;
+    let stdin = login
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("{provider_id} does not accept an authentication code"))?;
+    // A CLI may stop reading while it exchanges a code. Never block the socket
+    // worker (or hold the registry lock indefinitely) on a full input pipe.
+    let result = write_authentication_code(stdin, authentication_code);
+    if result.is_err() {
+        // A nonblocking write can be partial. End this attempt so a retry cannot
+        // append a second code to an incomplete first line.
+        let login = active.remove(provider_id).expect("active login exists");
+        kill_process_group(login.process_group);
+    }
+    result.map_err(|_| anyhow::anyhow!("could not deliver authentication code; restart sign-in"))
+}
+
+fn write_authentication_code(stdin: &mut ChildStdin, code: &str) -> std::io::Result<()> {
+    let fd = stdin.as_raw_fd();
+    // The owned ChildStdin keeps the descriptor valid throughout both calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    stdin.write_all(format!("{code}\n").as_bytes())
+}
+
+pub(crate) fn cancel_provider_sign_in(provider_id: &str) -> bool {
+    let active = ACTIVE_LOGINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(provider_id);
+    if let Some(active) = active {
+        kill_process_group(active.process_group);
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn cancel_all_logins() {
+    let active = ACTIVE_LOGINS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .map(|(_, login)| login)
+        .collect::<Vec<_>>();
+    for login in active {
+        kill_process_group(login.process_group);
+    }
+}
+
+fn kill_process_group(process_group: i32) {
+    if process_group > 0 {
+        // Every registered login is spawned in a dedicated process group.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
 }
 
 pub(crate) fn write_claude_profile_launcher(
@@ -482,6 +654,7 @@ pub(crate) fn handle_sign_in_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wait_timeout::ChildExt;
 
     #[test]
     fn launcher_quotes_profile_paths_and_clears_legacy_overrides() {
@@ -491,6 +664,117 @@ mod tests {
 
         let legacy = claude_launcher_contents(None, None, None);
         assert!(legacy.contains("unset CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn submits_authentication_code_to_the_active_login_stdin() {
+        let provider_id = format!("test-{}", Uuid::new_v4());
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "IFS= read -r code; test \"$code\" = 'code#with-special-characters'",
+            ])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let generation = register_active_login(&provider_id, &mut child);
+
+        submit_provider_sign_in_code(&provider_id, "code#with-special-characters").unwrap();
+        assert!(child.wait().unwrap().success());
+        unregister_active_login(&provider_id, generation);
+    }
+
+    #[test]
+    fn full_login_pipe_fails_promptly_and_cancels_the_attempt() {
+        let provider_id = format!("test-{}", Uuid::new_v4());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        let code = "x".repeat(MAX_AUTHENTICATION_CODE_BYTES);
+        // Fill the pipe without relying on the platform's pipe capacity.
+        while write_authentication_code(stdin, &code).is_ok() {}
+        register_active_login(&provider_id, &mut child);
+        let (sender, receiver) = mpsc::channel();
+        let test_provider = provider_id.clone();
+        thread::spawn(move || {
+            sender
+                .send(submit_provider_sign_in_code(&test_provider, &code))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        if result.is_err() {
+            let _ = terminate_login_process(&mut child);
+        }
+        assert!(result.expect("submission must not block").is_err());
+        assert!(!cancel_provider_sign_in(&provider_id));
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn cancellation_terminates_login_and_rejects_late_codes() {
+        let provider_id = format!("test-{}", Uuid::new_v4());
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let generation = register_active_login(&provider_id, &mut child);
+        assert!(cancel_provider_sign_in(&provider_id));
+        assert!(!child
+            .wait_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .success());
+        assert!(!unregister_active_login(&provider_id, generation));
+        assert!(submit_provider_sign_in_code(&provider_id, "late-code").is_err());
+    }
+
+    #[test]
+    fn rejects_multiline_authentication_codes() {
+        let error = submit_provider_sign_in_code("claude", "first\nsecond").unwrap_err();
+        assert!(error.to_string().contains("single line"));
+    }
+
+    #[test]
+    fn replacing_a_login_terminates_the_previous_process() {
+        let provider_id = format!("test-{}", Uuid::new_v4());
+        let mut first = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let first_generation = register_active_login(&provider_id, &mut first);
+
+        let mut replacement = Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r code; test \"$code\" = replacement"])
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let generation = register_active_login(&provider_id, &mut replacement);
+
+        let replaced_status = first
+            .wait_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("replaced login should terminate promptly");
+        assert!(!replaced_status.success());
+        assert!(!unregister_active_login(&provider_id, first_generation));
+        submit_provider_sign_in_code(&provider_id, "replacement").unwrap();
+        assert!(replacement.wait().unwrap().success());
+        unregister_active_login(&provider_id, generation);
     }
 
     #[test]

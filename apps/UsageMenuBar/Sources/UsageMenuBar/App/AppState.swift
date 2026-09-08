@@ -47,6 +47,8 @@ private enum ProviderSignInFollowUp {
     @Published var pendingProviders = Set<String>()
     @Published var pendingAccountProviders = Set<String>()
     @Published var pendingAccounts = Set<String>()
+    @Published private(set) var providersAwaitingAuthenticationCode = Set<String>()
+    @Published private(set) var pendingAuthenticationCodeProviders = Set<String>()
     @Published var pendingInterval = false
     @Published var pendingNotifications = false
     @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
@@ -331,6 +333,7 @@ private enum ProviderSignInFollowUp {
     }
 
     func addProviderAccount(_ providerId: String) async {
+        guard !pendingAccountProviders.contains(providerId) else { return }
         guard supportsAddAccount(providerId) else {
             actionError = "\(providerName(providerId)) does not support adding accounts."
             return
@@ -346,6 +349,7 @@ private enum ProviderSignInFollowUp {
                 .waitingForSignIn,
                 "Waiting for browser sign-in…"
             )
+            markAuthenticationCodeExpected(for: providerId)
             monitorProviderSignIn(
                 providerId: providerId,
                 followUp: .addedAccount(profileId: response.profileId)
@@ -362,6 +366,7 @@ private enum ProviderSignInFollowUp {
         accountId: String? = nil,
         addAccount: Bool = false
     ) async -> String? {
+        guard !pendingAccountProviders.contains(providerId) else { return nil }
         pendingAccountProviders.insert(providerId)
         defer { pendingAccountProviders.remove(providerId) }
         do {
@@ -409,6 +414,7 @@ private enum ProviderSignInFollowUp {
                 .waitingForSignIn,
                 "Waiting for browser sign-in…"
             )
+            markAuthenticationCodeExpected(for: providerId)
             monitorProviderSignIn(providerId: providerId, followUp: followUp)
             return url
         } catch {
@@ -449,12 +455,71 @@ private enum ProviderSignInFollowUp {
     }
 
     func cancelProviderSignIn(_ providerId: String) {
-        providerConnections.cancelMonitor(for: providerId)
-        setOnboardingProviderState(
-            providerId,
-            .needsSignIn,
-            "Sign-in paused. Continue whenever you’re ready."
-        )
+        guard !pendingAccountProviders.contains(providerId) else { return }
+        // Keep retry actions locked until the daemon acknowledges cancellation;
+        // otherwise a delayed cancel request can terminate the next login.
+        pendingAccountProviders.insert(providerId)
+        Task {
+            defer { pendingAccountProviders.remove(providerId) }
+            do {
+                _ = try await client.cancelProviderSignIn(providerId: providerId)
+                providerConnections.cancelMonitor(for: providerId)
+                providersAwaitingAuthenticationCode.remove(providerId)
+                actionError = nil
+                setOnboardingProviderState(
+                    providerId,
+                    .needsSignIn,
+                    "Sign-in cancelled. Continue whenever you’re ready."
+                )
+            } catch {
+                actionError = describe(error)
+            }
+        }
+    }
+
+    func isProviderSignInActive(_ providerId: String) -> Bool {
+        providerConnections.isMonitoring(providerId)
+    }
+
+    @discardableResult
+    func submitProviderAuthenticationCode(_ code: String, providerId: String) async -> Bool {
+        guard !pendingAccountProviders.contains(providerId),
+              isProviderSignInActive(providerId) else { return false }
+        let code = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else {
+            actionError = "Paste the authentication code from your browser."
+            return false
+        }
+        guard !pendingAuthenticationCodeProviders.contains(providerId) else { return false }
+        pendingAuthenticationCodeProviders.insert(providerId)
+        defer { pendingAuthenticationCodeProviders.remove(providerId) }
+        do {
+            let response = try await client.submitProviderSignInCode(
+                providerId: providerId,
+                authenticationCode: code
+            )
+            guard isProviderSignInActive(providerId) else { return false }
+            actionError = nil
+            actionMessage = response.message
+            setOnboardingProviderState(
+                providerId,
+                .waitingForSignIn,
+                "Code submitted. Finishing sign-in…"
+            )
+            return true
+        } catch {
+            actionError = describe(error)
+            return false
+        }
+    }
+
+    private func markAuthenticationCodeExpected(for providerId: String) {
+        // Mirrors the daemon's `accepts_authentication_code` launch flag (only
+        // Claude's login reads a code from stdin). Keep in sync if the daemon
+        // starts piping stdin for another provider's login.
+        if providerId == "claude" {
+            providersAwaitingAuthenticationCode.insert(providerId)
+        }
     }
 
     func setAccountHidden(_ id: String, _ hidden: Bool) async {
@@ -597,6 +662,7 @@ private enum ProviderSignInFollowUp {
     }
 
     func repairProvider(_ providerId: String, accountId: String? = nil) async {
+        guard !pendingAccountProviders.contains(providerId) else { return }
         guard supportsRepair(providerId) else {
             actionError = "\(providerName(providerId)) does not support reconnecting accounts."
             return
@@ -610,6 +676,7 @@ private enum ProviderSignInFollowUp {
                 .waitingForSignIn,
                 "Waiting for browser sign-in…"
             )
+            markAuthenticationCodeExpected(for: providerId)
             monitorProviderSignIn(
                 providerId: providerId,
                 followUp: .repairedAccount(accountId: accountId, startedAt: startedAt)
@@ -884,6 +951,9 @@ private enum ProviderSignInFollowUp {
     func checkProviderAfterSignIn(_ providerId: String) async {
         providerConnections.cancelMonitor(for: providerId)
         await connectProviderForOnboarding(providerId)
+        if onboardingProviderConnection(providerId).state == .connected {
+            providersAwaitingAuthenticationCode.remove(providerId)
+        }
     }
 
     private func pauseProviderAfterFailedOnboardingConnection(_ providerId: String) async throws {
@@ -1266,12 +1336,15 @@ private enum ProviderSignInFollowUp {
             guard !Task.isCancelled else { return }
             do {
                 let discovered = try await client.accounts()
+                guard !Task.isCancelled else { return }
                 if discovered.contains(where: { $0.providerId == providerId && $0.profileId == profileId }) {
                     accounts = discovered
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) account connected."
                     await load()
+                    guard !Task.isCancelled else { return }
                     providerConnections.clearOverride(for: providerId)
+                    providersAwaitingAuthenticationCode.remove(providerId)
                     return
                 }
             } catch {
@@ -1285,24 +1358,27 @@ private enum ProviderSignInFollowUp {
             .needsSignIn,
             "Sign-in was not detected. You can check again or retry."
         )
+        providersAwaitingAuthenticationCode.remove(providerId)
     }
     private func waitForProviderRepair(providerId: String, accountId: String?, startedAt: Date) async {
         for _ in 0..<600 {
             guard !Task.isCancelled else { return }
             do {
                 let latest = try await client.health()
+                guard !Task.isCancelled else { return }
                 let repaired = latest.first {
                     $0.providerId == providerId
                         && (accountId == nil || $0.accountId == accountId)
                         && $0.updatedAt >= startedAt
-                        && $0.status != .credentialsMissing
-                        && $0.status != .authFailed
+                        && $0.status == .ok
                 }
                 if repaired != nil {
                     actionError = nil
                     actionMessage = "\(providerName(providerId)) login connected."
                     await load()
+                    guard !Task.isCancelled else { return }
                     providerConnections.clearOverride(for: providerId)
+                    providersAwaitingAuthenticationCode.remove(providerId)
                     return
                 }
             } catch {
@@ -1316,6 +1392,7 @@ private enum ProviderSignInFollowUp {
             .needsSignIn,
             "Sign-in was not detected. You can check again or retry."
         )
+        providersAwaitingAuthenticationCode.remove(providerId)
     }
 
     private func fail(_ error: Error) {
