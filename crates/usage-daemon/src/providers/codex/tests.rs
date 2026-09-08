@@ -29,12 +29,20 @@ fn adds_standard_codex_sessions_only_for_the_designated_owner() {
     let local_home = Path::new("/home/.codex");
 
     let matching = codex_session_roots(profile_home, local_home, true);
-    assert_eq!(matching.len(), 2);
+    assert_eq!(matching.len(), 4);
     assert!(matching.contains(&profile_home.join("sessions")));
     assert!(matching.contains(&local_home.join("sessions")));
+    assert!(matching.contains(&profile_home.join("archived_sessions")));
+    assert!(matching.contains(&local_home.join("archived_sessions")));
 
     let different = codex_session_roots(Path::new("/profiles/work"), local_home, false);
-    assert_eq!(different, vec![PathBuf::from("/profiles/work/sessions")]);
+    assert_eq!(
+        different,
+        vec![
+            PathBuf::from("/profiles/work/archived_sessions"),
+            PathBuf::from("/profiles/work/sessions")
+        ]
+    );
 }
 
 #[test]
@@ -42,7 +50,13 @@ fn does_not_duplicate_standard_codex_session_root() {
     let local_home = Path::new("/home/.codex");
     let roots = codex_session_roots(local_home, local_home, true);
 
-    assert_eq!(roots, vec![local_home.join("sessions")]);
+    assert_eq!(
+        roots,
+        vec![
+            local_home.join("archived_sessions"),
+            local_home.join("sessions")
+        ]
+    );
 }
 
 #[test]
@@ -892,7 +906,7 @@ fn repeated_cumulative_notifications_do_not_charge_the_last_request_again() {
 
 #[test]
 fn prices_astra_cache_writes_and_long_context_at_the_threshold() {
-    for (input, expected) in [(272_000, 2.095), (272_001, 4.06502)] {
+    for (input, expected) in [(200_001, 1.37501), (272_000, 2.095), (272_001, 4.06502)] {
         let cost = codex_cost_usd(
             " openai/gpt-6-astra-2026-09-01 ",
             CodexTokenTotals {

@@ -60,7 +60,7 @@ impl ProviderAdapter for CodexAdapter {
         config: &ProviderConfig,
     ) -> anyhow::Result<Option<LocalUsageWatch>> {
         let mut roots = default_local_home()
-            .map(|home| vec![home.join("sessions")])
+            .map(|home| super::cost::codex_session_roots(&home, &home, false))
             .unwrap_or_default();
         for profile in config
             .profiles
@@ -68,11 +68,11 @@ impl ProviderAdapter for CodexAdapter {
             .filter(|profile| profile.enabled && !profile.deleted)
         {
             if let Some(default_home) = default_local_home() {
-                roots.push(
-                    settings::profile(profile)?
-                        .resolved_home(&default_home)
-                        .join("sessions"),
-                );
+                roots.extend(super::cost::codex_session_roots(
+                    &settings::profile(profile)?.resolved_home(&default_home),
+                    &default_home,
+                    false,
+                ));
             }
         }
         roots.sort();

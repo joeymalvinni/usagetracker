@@ -26,6 +26,10 @@ The account-wide daily buckets and lifetime total from `account/usage/read` driv
 
 The bundled catalog verified September 5, 2026 includes GPT-6 Astra and GPT-5.1 Codex Mini, current GPT-5.6 Sol/Terra/Luna rates, and the `gpt-5.6` alias. Estimates use the installed catalog across the scanned history; they are current API-equivalent estimates, not date-specific invoices. Catalog updates invalidate cached cost calculations. See [the September audit](codex-audit-2026-09-05.md) for sources and validation.
 
+Astra's bundled standard rates are $10 input, $1 cached input, $12.50 cache writes, and $50 output per million tokens. Requests exceeding 272,000 input tokens use twice the input/cache rates and 1.5 times the output rate for the full request, matching the [official Astra model page](https://developers.openai.com/api/docs/models/gpt-6-astra) checked September 7, 2026. Estimates do not include Fast-mode adjustments. Comparisons with other trackers can differ when their pricing catalogs use different context thresholds or their parsers handle inherited session history differently.
+
+The model breakdown covers all available local history independently of the chart's selected range. It shows token counts in token mode and API-equivalent estimates in cost mode.
+
 ## Refresh timing and rate limits
 
 Refreshes happen at most once a minute. A 429 from the provider starts a shared backoff of 5, 10, 20, 40, then 60 minutes. Local file activity can trigger a (coalesced) refresh, but it can't jump the backoff queue.
@@ -43,11 +47,11 @@ Diagnostics can note the collection mode, plan and email, reset-credit summaries
 
 ## A few security notes
 
-UsageTracker launches the Codex executable you've configured, pointed at the profile's home, and reads its known session roots. Separate homes keep managed accounts isolated. A profile marked `owns_default_codex_activity` may additionally read `~/.codex/sessions` — and only one profile can own that.
+UsageTracker launches the Codex executable you've configured, pointed at the profile's home, and reads both `sessions` and `archived_sessions`. Archiving a conversation preserves its local usage and estimated cost. Both directories are watched for changes. Separate homes keep managed accounts isolated. A profile marked `owns_default_codex_activity` may additionally read both directories in the default Codex home — and only one profile can own that.
 
 ## Tests and fixtures
 
-Inline tests cover credential parsing, duplicate identities, app-server and WHAM normalization, reset credits, activity, local-log attribution, and price coverage. `just fixture` runs normalized Codex data through the real socket and Swift UI.
+Inline tests cover credential parsing, duplicate identities, app-server and WHAM normalization, reset credits, activity, local-log attribution, and price coverage. Regression cases verify that archiving a session preserves its tokens and cost after a cached rescan and that Astra's higher context rates do not apply at 200,001 input tokens. `just fixture` runs normalized Codex data through the real socket and Swift UI.
 
 ## Known limitations
 
