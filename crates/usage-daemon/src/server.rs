@@ -202,6 +202,14 @@ impl SocketServer {
                 self.update_provider_setup_response(provider_id, settings, workspace_id)
                     .await
             }
+            Req::RequestCredentialAccess {
+                provider_id,
+                account_id,
+                profile_id,
+            } => {
+                self.request_credential_access_response(provider_id, account_id, profile_id)
+                    .await
+            }
             Req::RepairProvider {
                 provider_id,
                 account_id,
@@ -520,6 +528,75 @@ impl SocketServer {
                     warn!(error = %err, "provider setup update failed");
                     ApiResponse::error(ApiErrorCode::InvalidArgument, err.to_string())
                 }
+            },
+        )
+    }
+
+    async fn request_credential_access_response(
+        &self,
+        provider_id: usage_core::ProviderId,
+        account_id: Option<AccountId>,
+        profile_id: Option<String>,
+    ) -> Result<ApiResponse, ApiResponse> {
+        require_provider(&provider_id)?;
+        if account_id.is_some() && profile_id.is_some() {
+            return Err(ApiResponse::error(
+                ApiErrorCode::InvalidArgument,
+                "Specify an account_id or a pending profile_id, not both",
+            ));
+        }
+        if let Some(id) = &profile_id {
+            let adapter =
+                crate::runtime::provider_registry::adapter(&provider_id).map_err(|error| {
+                    ApiResponse::error(ApiErrorCode::InvalidArgument, error.to_string())
+                })?;
+            if !adapter.supports_multiple_accounts() || id.trim().is_empty() {
+                return Err(ApiResponse::error(
+                    ApiErrorCode::InvalidArgument,
+                    "The provider does not support this credential profile",
+                ));
+            }
+        }
+        let profile_id =
+            if let Some(account_id) = account_id {
+                let account = self
+                    .runtime
+                    .storage
+                    .account(&account_id)
+                    .await
+                    .map_err(storage_error)?
+                    .ok_or_else(|| {
+                        ApiResponse::error(
+                            ApiErrorCode::UnknownAccount,
+                            format!("unknown account: {account_id}"),
+                        )
+                    })?;
+                if account.provider_id != provider_id {
+                    return Err(ApiResponse::error(
+                        ApiErrorCode::InvalidArgument,
+                        "Account does not belong to the requested provider",
+                    ));
+                }
+                if account.profile_id.is_none()
+                    && crate::runtime::provider_registry::adapter(&provider_id)
+                        .map(|adapter| adapter.supports_multiple_accounts())
+                        .unwrap_or(false)
+                {
+                    return Err(ApiResponse::error(ApiErrorCode::InvalidArgument,
+                    "Account is missing its credential profile. Refresh account discovery first."));
+                }
+                account.profile_id
+            } else {
+                profile_id
+            };
+        Ok(
+            match self
+                .runtime
+                .request_credential_access(provider_id, profile_id)
+                .await
+            {
+                Ok(action) => ApiResponse::ProviderAction { action },
+                Err(error) => ApiResponse::error(ApiErrorCode::Internal, error.to_string()),
             },
         )
     }
@@ -1383,6 +1460,63 @@ mod tests {
 
         server_task.abort();
         let _ = std::fs::remove_file(env.socket_path);
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn credential_access_rejects_conflicting_or_unsupported_profile_scopes() {
+        let env = test_env(BTreeMap::new());
+        let server = SocketServer::new(env.runtime.clone());
+        for (provider, account_id, profile_id) in [
+            ("claude", Some(AccountId::new("saved")), "pending"),
+            ("opencode_go", None, "pending"),
+            ("claude", None, " "),
+        ] {
+            let response = server
+                .handle_request(ApiRequest::RequestCredentialAccess {
+                    provider_id: ProviderId::new(provider),
+                    account_id,
+                    profile_id: Some(profile_id.to_string()),
+                })
+                .await;
+            assert!(matches!(response, ApiResponse::Error { error }
+                if error.code == ApiErrorCode::InvalidArgument));
+        }
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
+    async fn credential_access_rejects_unknown_and_mismatched_accounts_before_prompting() {
+        let env = test_env(BTreeMap::new());
+        let account = env
+            .runtime
+            .storage
+            .upsert_account(
+                &ProviderId::new("codex"),
+                "external-account",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let server = SocketServer::new(env.runtime.clone());
+        for (account_id, expected) in [
+            (AccountId::new("missing"), ApiErrorCode::UnknownAccount),
+            (account.id, ApiErrorCode::InvalidArgument),
+        ] {
+            let response = server
+                .handle_request(ApiRequest::RequestCredentialAccess {
+                    provider_id: ProviderId::new("claude"),
+                    account_id: Some(account_id),
+                    profile_id: None,
+                })
+                .await;
+            let ApiResponse::Error { error } = response else {
+                panic!("expected error");
+            };
+            assert_eq!(error.code, expected);
+        }
         let _ = std::fs::remove_dir_all(env.root);
     }
 

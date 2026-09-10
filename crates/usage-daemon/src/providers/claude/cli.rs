@@ -38,8 +38,332 @@ pub(super) struct ClaudeCliUsage {
 pub(super) fn collect_usage_from_cli(
     config_dir: Option<&Path>,
     profile_id: &str,
+    access_token: Option<&str>,
 ) -> Result<ClaudeCliUsage, ProviderError> {
-    let raw_output = run_claude_usage_cli(config_dir, profile_id).map_err(|err| {
+    match collect_usage_from_tui(config_dir, profile_id, access_token) {
+        Ok(usage) => Ok(ClaudeCliUsage { usage }),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ProviderErrorKind::RateLimited | ProviderErrorKind::Unauthorized
+            ) =>
+        {
+            Err(error)
+        }
+        Err(tui_error) => collect_usage_from_json_cli(config_dir, profile_id, access_token)
+            .map_err(|json_error| {
+                ProviderError::new(
+                    json_error.kind(),
+                    format!(
+                        "{}; JSON fallback: {}",
+                        tui_error.short_message(),
+                        json_error.short_message()
+                    ),
+                )
+            }),
+    }
+}
+
+// A real terminal is required for /usage on Claude versions whose print mode
+// returns help text. Never answer trust/login prompts or send an inference prompt.
+fn collect_usage_from_tui(
+    config_dir: Option<&Path>,
+    profile_id: &str,
+    access_token: Option<&str>,
+) -> Result<ProviderUsage, ProviderError> {
+    let workspace = prepare_usage_workspace(config_dir, profile_id, access_token)?;
+    let mut command = claude_command(config_dir, access_token);
+    command.current_dir(workspace);
+    command
+        .args([
+            "/usage",
+            "--ax-screen-reader",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+        ])
+        .env("TERM", "xterm-256color");
+    read_usage_screen(command, CLAUDE_CLI_TIMEOUT)
+}
+
+// The usage probe has no reason to open a user's project. Prepare only our
+// own empty directory, after Claude confirms this profile already has a login.
+pub(super) fn prepare_usage_workspace(
+    config_dir: Option<&Path>,
+    profile_id: &str,
+    access_token: Option<&str>,
+) -> Result<std::path::PathBuf, ProviderError> {
+    let failure = || {
+        ProviderError::new(
+            ProviderErrorKind::ProviderUnavailable,
+            "Could not prepare Claude's usage screen",
+        )
+    };
+    let home = dirs::home_dir().ok_or_else(failure)?;
+    let profile_file = config_dir
+        .map(|root| root.join(".claude.json"))
+        .unwrap_or_else(|| home.join(".claude.json"));
+    let workspace = crate::runtime::managed_profiles::profile_home(PROVIDER_ID, profile_id)
+        .map_err(|_| failure())?
+        .join("usage-probe");
+    // Reject symlinks before creating or granting trust to a probe directory.
+    let mut ancestor = Some(workspace.as_path());
+    while let Some(path) = ancestor {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(failure());
+        }
+        ancestor = path.parent();
+    }
+    if std::fs::symlink_metadata(&profile_file).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(failure());
+    }
+    let original = std::fs::read(&profile_file).map_err(|_| failure())?;
+    let value: serde_json::Value = serde_json::from_slice(&original).map_err(|_| failure())?;
+    if usage_workspace_ready(&value, &workspace) {
+        return create_probe_directory(&workspace)
+            .map(|()| workspace)
+            .map_err(|_| failure());
+    }
+    create_probe_directory(&workspace).map_err(|_| failure())?;
+    let mut command = claude_command(config_dir, access_token);
+    command
+        .current_dir(&workspace)
+        .args(["auth", "status", "--json"]);
+    let status =
+        run_claude_command(command, profile_id, Duration::from_secs(5)).map_err(|_| failure())?;
+    let status: serde_json::Value = serde_json::from_str(&status).map_err(|_| failure())?;
+    if !has_existing_cli_login(&status, access_token.is_some()) {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Unauthorized,
+            "Claude CLI is not signed in to the selected account",
+        ));
+    }
+    let updated = initialized_usage_workspace(value, &workspace).map_err(|_| failure())?;
+    create_probe_directory(&workspace).map_err(|_| failure())?;
+    write_cli_config_if_unchanged(&profile_file, &original, &updated).map_err(|_| failure())?;
+    Ok(workspace)
+}
+
+fn has_existing_cli_login(status: &serde_json::Value, supplied_token: bool) -> bool {
+    status.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(true)
+        && match status.get("authMethod").and_then(serde_json::Value::as_str) {
+            Some("claude.ai") => true,
+            Some("oauth_token") => supplied_token,
+            _ => false,
+        }
+}
+
+fn create_probe_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
+fn usage_workspace_ready(value: &serde_json::Value, workspace: &Path) -> bool {
+    value
+        .get("hasCompletedOnboarding")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && value
+            .get("projects")
+            .and_then(|v| v.get(workspace.to_string_lossy().as_ref()))
+            .and_then(|v| v.get("hasTrustDialogAccepted"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
+fn initialized_usage_workspace(
+    mut value: serde_json::Value,
+    workspace: &Path,
+) -> anyhow::Result<serde_json::Value> {
+    // A cached identity alone is insufficient: caller must first verify login
+    // using the selected CLI's auth status. This never creates credentials.
+    super::client::parse_cached_profile_identity(&serde_json::to_vec(&value)?)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid Claude config"))?;
+    object.insert("hasCompletedOnboarding".into(), json!(true));
+    let projects = object
+        .entry("projects")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid Claude projects"))?;
+    let project = projects
+        .entry(workspace.to_string_lossy().into_owned())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("invalid probe project"))?;
+    project.insert("hasTrustDialogAccepted".into(), json!(true));
+    Ok(value)
+}
+
+fn write_cli_config_if_unchanged(
+    path: &Path,
+    expected: &[u8],
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let temporary = path.with_file_name(format!(".usage-setup-{}.json", uuid::Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        anyhow::ensure!(
+            std::fs::read(path)? == expected,
+            "Claude config changed during initialization"
+        );
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn read_usage_screen(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<ProviderUsage, ProviderError> {
+    use std::{
+        fs::File,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::process::CommandExt,
+        },
+    };
+    let failure = || {
+        ProviderError::new(
+            ProviderErrorKind::ProviderUnavailable,
+            "Claude usage screen could not be read",
+        )
+    };
+    let mut master = -1;
+    let mut slave = -1;
+    let mut size = libc::winsize {
+        ws_row: 60,
+        ws_col: 160,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    } != 0
+    {
+        return Err(failure());
+    }
+    let mut terminal = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
+    command
+        .stdin(slave.try_clone().map_err(|_| failure())?)
+        .stdout(slave.try_clone().map_err(|_| failure())?)
+        .stderr(slave);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        if libc::fcntl(terminal.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) < 0
+            || libc::fcntl(terminal.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) < 0
+        {
+            return Err(failure());
+        }
+    }
+    let child = command.spawn().map_err(|_| failure())?;
+    drop(command);
+    struct TerminalChild(std::process::Child);
+    impl Drop for TerminalChild {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait_timeout(Duration::from_secs(1));
+        }
+    }
+    let mut child = TerminalChild(child);
+    let started = Instant::now();
+    let mut last_output = Instant::now();
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    while started.elapsed() < timeout {
+        match terminal.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                last_output = Instant::now();
+                if output.len() as u64 > MAX_CLAUDE_CLI_STDOUT_BYTES {
+                    return Err(failure());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        if last_output.elapsed() >= Duration::from_millis(350) {
+            let text = terminal_text(&output);
+            let lower = text.to_ascii_lowercase();
+            if lower.contains("rate limited") || lower.contains("too many requests") {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::RateLimited,
+                    "Claude CLI usage is rate limited",
+                ));
+            }
+            if lower.contains("let's get started") || lower.contains("trust this folder") {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::ProviderUnavailable,
+                    "Claude CLI could not initialize its usage screen for the selected account",
+                ));
+            }
+            if let Ok(mut usage) = parse_usage_text(&text, Utc::now()) {
+                usage
+                    .detail
+                    .extra
+                    .insert("command".into(), json!("claude /usage (TUI)"));
+                return Ok(usage);
+            }
+            if lower.contains("please log in") || lower.contains("not logged in") {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Unauthorized,
+                    "Claude CLI requires sign-in",
+                ));
+            }
+        }
+        if child.0.try_wait().map_err(|_| failure())?.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(failure())
+}
+
+fn terminal_text(bytes: &[u8]) -> String {
+    static ESCAPES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))").unwrap()
+    });
+    ESCAPES
+        .replace_all(&String::from_utf8_lossy(bytes), "")
+        .replace('\r', "\n")
+}
+
+fn collect_usage_from_json_cli(
+    config_dir: Option<&Path>,
+    profile_id: &str,
+    access_token: Option<&str>,
+) -> Result<ClaudeCliUsage, ProviderError> {
+    let raw_output = run_claude_usage_cli(config_dir, profile_id, access_token).map_err(|err| {
         ProviderError::new(
             ProviderErrorKind::ProviderUnavailable,
             format!("Claude CLI usage fallback failed: {err}"),
@@ -57,16 +381,30 @@ pub(super) fn collect_usage_from_cli(
                 failure_stage = "cli_json_decode",
                 stdout_bytes = raw_output.len(),
                 stdout_fingerprint = output_fingerprint(&raw_output),
-                parse_error = %err,
+                parse_error_category = ?err.classify(),
                 "Claude CLI usage returned invalid JSON"
             );
             return Err(ProviderError::new(
                 ProviderErrorKind::Parse,
-                format!("Claude CLI usage fallback returned invalid JSON: {err}"),
+                "Claude CLI usage fallback returned invalid JSON",
             ));
         }
     };
 
+    if response.is_error {
+        let text = response.result.to_ascii_lowercase();
+        let kind = if text.contains("rate limit") || text.contains("too many requests") {
+            ProviderErrorKind::RateLimited
+        } else if text.contains("not logged in") || text.contains("please log in") {
+            ProviderErrorKind::Unauthorized
+        } else {
+            ProviderErrorKind::ProviderUnavailable
+        };
+        return Err(ProviderError::new(
+            kind,
+            "Claude CLI reported a usage command error",
+        ));
+    }
     let usage = match parse_usage_text(&response.result, Utc::now()) {
         Ok(usage) => usage,
         Err(err) => {
@@ -94,15 +432,39 @@ pub(super) fn collect_usage_from_cli(
     Ok(ClaudeCliUsage { usage })
 }
 
-fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::Result<String> {
-    let started = Instant::now();
-    let mut command = Command::new("claude");
+fn usage_command(config_dir: Option<&Path>, access_token: Option<&str>) -> Command {
+    let mut command = claude_command(config_dir, access_token);
     command
         .arg("-p")
         .arg("/usage")
         .arg("--output-format")
         .arg("json")
         .arg("--no-session-persistence")
+        .args([
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+        ]);
+    command
+}
+
+fn claude_command(config_dir: Option<&Path>, access_token: Option<&str>) -> Command {
+    let mut command = Command::new("claude");
+    command.args(["--setting-sources", "user"]);
+    command
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_REFRESH_TOKEN")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("CLAUDE_CODE_USE_BEDROCK")
+        .env_remove("CLAUDE_CODE_USE_VERTEX")
+        .env_remove("CLAUDE_CODE_USE_FOUNDRY")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        .stdin(Stdio::null())
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("ALL_PROXY")
@@ -111,11 +473,35 @@ fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::
         .env_remove("all_proxy")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(access_token) = access_token {
+        command.env("CLAUDE_CODE_OAUTH_TOKEN", access_token);
+    }
     if let Some(config_dir) = config_dir {
         command
             .env("CLAUDE_CONFIG_DIR", config_dir)
             .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
     }
+    command
+}
+
+fn run_claude_usage_cli(
+    config_dir: Option<&Path>,
+    profile_id: &str,
+    access_token: Option<&str>,
+) -> anyhow::Result<String> {
+    run_claude_command(
+        usage_command(config_dir, access_token),
+        profile_id,
+        CLAUDE_CLI_TIMEOUT,
+    )
+}
+
+fn run_claude_command(
+    mut command: Command,
+    profile_id: &str,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let started = Instant::now();
     let mut child = command.spawn()?;
 
     let stdout = child
@@ -141,12 +527,12 @@ fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::
         Ok::<_, std::io::Error>(bytes)
     });
 
-    let status = match child.wait_timeout(CLAUDE_CLI_TIMEOUT)? {
+    let status = match child.wait_timeout(timeout)? {
         Some(status) => status,
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("claude -p /usage timed out after {CLAUDE_CLI_TIMEOUT:?}");
+            anyhow::bail!("Claude command timed out after {timeout:?}");
         }
     };
 
@@ -158,12 +544,12 @@ fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::
         .map_err(|_| anyhow::anyhow!("Claude CLI stderr reader panicked"))??;
     if stdout.len() > MAX_CLAUDE_CLI_STDOUT_BYTES as usize {
         anyhow::bail!(
-            "claude -p /usage exceeded the {MAX_CLAUDE_CLI_STDOUT_BYTES}-byte stdout limit"
+            "Claude command exceeded the {MAX_CLAUDE_CLI_STDOUT_BYTES}-byte stdout limit"
         );
     }
     if stderr.len() > MAX_CLAUDE_CLI_STDERR_BYTES as usize {
         anyhow::bail!(
-            "claude -p /usage exceeded the {MAX_CLAUDE_CLI_STDERR_BYTES}-byte stderr limit"
+            "Claude command exceeded the {MAX_CLAUDE_CLI_STDERR_BYTES}-byte stderr limit"
         );
     }
     let stdout = String::from_utf8(stdout)?;
@@ -183,8 +569,8 @@ fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::
 
     if !status.success() {
         anyhow::bail!(
-            "claude -p /usage exited with status {status}; stderr: {}",
-            stderr.trim()
+            "Claude command exited with status {status} ({} stderr bytes)",
+            stderr.len()
         );
     }
 
@@ -194,6 +580,8 @@ fn run_claude_usage_cli(config_dir: Option<&Path>, profile_id: &str) -> anyhow::
 #[derive(Debug, Deserialize)]
 struct ClaudePrintResponse {
     result: String,
+    #[serde(default)]
+    is_error: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -372,14 +760,25 @@ fn push_pending_window(
         return;
     };
 
-    let window_id = format!(
-        "claude_cli_usage_{}",
-        stable_window_fragment(&pending.heading)
-    );
+    let heading = pending.heading.to_ascii_lowercase();
+    let name = if heading == "current session" {
+        "five_hour".to_string()
+    } else if heading == "current week" || heading == "current week (all models)" {
+        "seven_day".to_string()
+    } else if let Some(scope) = heading
+        .strip_prefix("current week (")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        format!("seven_day_{scope}")
+    } else {
+        heading
+    };
+    let window_id = format!("claude_usage_utilization_{}", stable_window_fragment(&name));
     if let Some(reset_text) = pending.reset_text.as_ref() {
         reset_text_by_window.insert(window_id.clone(), reset_text.clone());
     }
 
+    windows.retain(|window| window.window_id != window_id);
     windows.push(percent_window(
         window_id,
         claude_label(&pending.heading),
@@ -573,6 +972,146 @@ fn claude_label(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "uses the selected local Claude sign-in"]
+    fn live_managed_usage_probe() {
+        let directory =
+            std::env::var("USAGE_TEST_CLAUDE_CONFIG_DIR").expect("set test profile directory");
+        let id = std::env::var("USAGE_TEST_CLAUDE_PROFILE_ID").expect("set test profile id");
+        let usage = collect_usage_from_tui(Some(Path::new(&directory)), &id, None).unwrap();
+        assert!(usage.windows.len() >= 2);
+        for window in usage.windows {
+            println!("{}: {:?}% used", window.label, window.percent_used);
+        }
+    }
+
+    #[test]
+    fn setup_requires_the_selected_subscription_login_or_supplied_oauth_token() {
+        assert!(has_existing_cli_login(
+            &json!({"loggedIn":true,"authMethod":"claude.ai"}),
+            false
+        ));
+        let injected = json!({"loggedIn":true,"authMethod":"oauth_token"});
+        assert!(has_existing_cli_login(&injected, true));
+        assert!(!has_existing_cli_login(&injected, false));
+        assert!(!has_existing_cli_login(
+            &json!({"loggedIn":false,"authMethod":"claude.ai"}),
+            true
+        ));
+        assert!(!has_existing_cli_login(
+            &json!({"loggedIn":true,"authMethod":"api_key"}),
+            true
+        ));
+    }
+
+    #[test]
+    fn initialization_preserves_identity_and_only_trusts_the_probe() {
+        let value = json!({
+            "oauthAccount":{"accountUuid":"986efbc1-2be6-407a-9bcc-2e429b8e358d"},
+            "projects":{"/user/project":{"hasTrustDialogAccepted":false,"custom":"keep"}},
+            "custom":"keep", "mcpServers":{"configured":"keep"}
+        });
+        let probe = Path::new("/tracker/profiles/claude/work/usage-probe");
+        let updated = initialized_usage_workspace(value.clone(), probe).unwrap();
+        assert!(usage_workspace_ready(&updated, probe));
+        assert_eq!(updated["oauthAccount"], value["oauthAccount"]);
+        assert_eq!(
+            updated["projects"]["/user/project"],
+            value["projects"]["/user/project"]
+        );
+        assert_eq!(updated["mcpServers"], value["mcpServers"]);
+        assert_eq!(updated["custom"], "keep");
+        assert!(initialized_usage_workspace(json!({}), probe).is_err());
+    }
+
+    #[test]
+    fn initialization_refuses_to_overwrite_a_concurrent_cli_change() {
+        let directory =
+            std::env::temp_dir().join(format!("usage-cli-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(".claude.json");
+        std::fs::write(&path, br#"{"new":"login"}"#).unwrap();
+        assert!(write_cli_config_if_unchanged(
+            &path,
+            b"{}",
+            &json!({"hasCompletedOnboarding":true})
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"new":"login"}"#);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tui_reader_reads_meters_and_terminates_a_waiting_child() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'Current session\\n12%% used\\nResets 10pm (UTC)\\n'; sleep 5",
+        ]);
+        let started = Instant::now();
+        let usage = read_usage_screen(command, Duration::from_secs(2)).unwrap();
+        assert_eq!(usage.windows[0].percent_used, Some(12.0));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn tui_reader_bounds_a_child_that_never_produces_usage() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5");
+        let started = Instant::now();
+        assert!(read_usage_screen(command, Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn native_cli_auth_is_profile_scoped_and_removes_inherited_tokens() {
+        let command = usage_command(Some(Path::new("/profiles/work")), None);
+        let env: BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(env[std::ffi::OsStr::new("CLAUDE_CODE_OAUTH_TOKEN")], None);
+        assert_eq!(
+            env[std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")],
+            Some(std::ffi::OsStr::new("/profiles/work"))
+        );
+    }
+
+    #[test]
+    fn terminal_redraws_keep_only_the_latest_meter() {
+        let text = terminal_text(
+            b"\x1b[32mCurrent session\x1b[0m\r\n12% used\r\nCurrent session\r\n13% used\r\n",
+        );
+        let usage = parse_usage_text(&text, Utc::now()).unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].percent_used, Some(13.0));
+    }
+
+    #[test]
+    fn fallback_uses_the_selected_token_without_inheriting_another_auth_source() {
+        let command = super::usage_command(
+            Some(std::path::Path::new("/profiles/work")),
+            Some("test-token"),
+        );
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new("CLAUDE_CODE_OAUTH_TOKEN")],
+            Some(std::ffi::OsStr::new("test-token"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")],
+            Some(std::ffi::OsStr::new("/profiles/work"))
+        );
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+        ] {
+            assert_eq!(env[std::ffi::OsStr::new(key)], None);
+        }
+        assert!(!command.get_args().any(|arg| arg == "test-token"));
+    }
+
     use super::*;
 
     #[test]
@@ -608,7 +1147,7 @@ Current week (Fable): 17% used
 
         assert_eq!(usage.windows.len(), 3);
 
-        let session = find_window(&usage.windows, "claude_cli_usage_current_session");
+        let session = find_window(&usage.windows, "claude_usage_utilization_five_hour");
         assert!(matches!(session.kind, UsageWindowKind::Session));
         assert_eq!(session.label, "Claude current session");
         assert_eq!(session.percent_used, Some(20.0));
@@ -618,7 +1157,7 @@ Current week (Fable): 17% used
             Utc.with_ymd_and_hms(2026, 7, 8, 4, 39, 0).unwrap()
         );
 
-        let all_models = find_window(&usage.windows, "claude_cli_usage_current_week__all_models_");
+        let all_models = find_window(&usage.windows, "claude_usage_utilization_seven_day");
         assert!(matches!(all_models.kind, UsageWindowKind::Weekly));
         assert_eq!(all_models.percent_used, Some(25.0));
     }
@@ -636,7 +1175,7 @@ Resets 9:40pm (America/Los_Angeles)
         )
         .unwrap();
 
-        let session = find_window(&usage.windows, "claude_cli_usage_current_session");
+        let session = find_window(&usage.windows, "claude_usage_utilization_five_hour");
         assert_eq!(session.percent_used, Some(20.0));
         assert_eq!(
             session.reset_at.unwrap(),

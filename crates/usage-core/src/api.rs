@@ -121,6 +121,13 @@ pub enum ApiRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_id: Option<String>,
     },
+    RequestCredentialAccess {
+        provider_id: ProviderId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<AccountId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+    },
     RepairProvider {
         provider_id: ProviderId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +230,7 @@ impl ApiRequest {
                 | "delete_account"
                 | "get_provider_setup"
                 | "update_provider_setup"
+                | "request_credential_access"
                 | "repair_provider"
                 | "submit_provider_sign_in_code"
                 | "cancel_provider_sign_in"
@@ -667,6 +675,7 @@ impl ServerInfo {
                 ApiCapability::UsageProvenance,
                 ApiCapability::RefreshJobs,
                 ApiCapability::RefreshCoalescing,
+                ApiCapability::CredentialAccess,
                 ApiCapability::CombinedState,
                 ApiCapability::UsageEvents,
             ],
@@ -686,6 +695,7 @@ pub enum ApiCapability {
     UsageEvents,
     RefreshJobs,
     RefreshCoalescing,
+    CredentialAccess,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq, Serialize)]
@@ -859,6 +869,9 @@ pub struct ProviderActionResponse {
 pub struct ProviderRefreshResult {
     pub provider_id: ProviderId,
     pub account_id: Option<AccountId>,
+    /// Identifies discovery failures before an account has been saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     pub status: ProviderRefreshStatus,
     pub collection_mode: Option<String>,
     pub collected_at: Option<DateTime<Utc>>,
@@ -1092,6 +1105,36 @@ mod tests {
         let debug = format!("{:?}", request.request);
         assert!(!debug.contains("secret-code"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn credential_access_can_target_a_pending_profile_without_an_account() {
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"request_credential_access","provider_id":"claude","profile_id":"pending-work"}"#
+        ).unwrap();
+        assert!(
+            matches!(request.request, ApiRequest::RequestCredentialAccess {
+            account_id: None, profile_id: Some(id), ..
+        } if id == "pending-work")
+        );
+    }
+
+    #[test]
+    fn credential_access_is_explicit_and_scoped_without_changing_refresh() {
+        let request: RequestEnvelope = serde_json::from_str(
+            r#"{"api_version":3,"method":"request_credential_access","provider_id":"claude","account_id":"work"}"#
+        ).unwrap();
+        assert!(
+            matches!(request.request, ApiRequest::RequestCredentialAccess { provider_id, account_id: Some(account_id), profile_id: None }
+            if provider_id.as_str() == "claude" && account_id.as_str() == "work")
+        );
+        assert!(ServerInfo::current(Vec::new())
+            .capabilities
+            .contains(&ApiCapability::CredentialAccess));
+        let request: RequestEnvelope =
+            serde_json::from_str(r#"{"api_version":3,"method":"refresh","providers":["claude"]}"#)
+                .unwrap();
+        assert!(matches!(request.request, ApiRequest::Refresh { .. }));
     }
 
     #[test]

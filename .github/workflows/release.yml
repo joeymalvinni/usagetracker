@@ -64,12 +64,52 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
-      - name: Build and ad-hoc sign artifacts
+      - name: Prepare Developer ID signing
+        if: vars.APPLE_DEVELOPER_ID_RELEASES == 'true'
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${CERTIFICATE_BASE64:?Missing signing certificate}"
+          : "${CERTIFICATE_PASSWORD:?Missing certificate password}"
+          : "${SIGNING_IDENTITY:?Missing signing identity}"
+          : "${APPLE_ID:?Missing Apple ID}"
+          : "${APPLE_TEAM_ID:?Missing Apple team ID}"
+          : "${APPLE_APP_PASSWORD:?Missing notary app password}"
+          signing_keychain="$RUNNER_TEMP/usagetracker-signing.keychain-db"
+          signing_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$signing_password"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/usagetracker-certificate.p12"
+          security create-keychain -p "$signing_password" "$signing_keychain"
+          security set-keychain-settings -lut 21600 "$signing_keychain"
+          security unlock-keychain -p "$signing_password" "$signing_keychain"
+          security import "$RUNNER_TEMP/usagetracker-certificate.p12" \
+            -k "$signing_keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$signing_password" "$signing_keychain" >/dev/null
+          security list-keychains -d user -s "$signing_keychain"
+          xcrun notarytool store-credentials usagetracker-release \
+            --keychain "$signing_keychain" --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          printf 'CODESIGN_IDENTITY=%s\nNOTARYTOOL_PROFILE=usagetracker-release\nNOTARYTOOL_KEYCHAIN=%s\n' \
+            "$SIGNING_IDENTITY" "$signing_keychain" >> "$GITHUB_ENV"
+
+      - name: Build and verify artifacts
         env:
           BUNDLE_VERSION: ${{ github.run_number }}
-          CODESIGN_IDENTITY: "-"
           RELEASE_VERSION: ${{ github.ref_name }}
         run: ./scripts/package-release.sh "${{ matrix.target }}" dist
+
+      - name: Remove signing credentials
+        if: always() && vars.APPLE_DEVELOPER_ID_RELEASES == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/usagetracker-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/usagetracker-certificate.p12"
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4

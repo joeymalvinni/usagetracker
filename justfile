@@ -79,8 +79,12 @@ check-swift:
 audit:
     cargo audit
 
+# Test installer acceptance and release signing with synthetic artifacts.
+check-distribution:
+    python3 scripts/test-distribution.py
+
 # Run the full local verification suite (both CI jobs).
-check: check-rust check-swift audit
+check: check-rust check-swift check-distribution audit
 
 # Explicit alias for callers that distinguish Rust-only and full checks.
 check-all: check

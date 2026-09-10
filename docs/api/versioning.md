@@ -16,6 +16,7 @@ Protocol versioning is exact-match. The daemon accepts `api_version: 3`, and eve
 | `typed_errors` | Errors use stable codes and a `retryable` flag. |
 | `usage_provenance` | Usage responses include normalized source/scope/quality data. |
 | `refresh_jobs` | Refresh work is started and polled as a job. |
+| `credential_access` | Explicit permission requests are separate from silent refreshes. |
 | `refresh_coalescing` | Overlapping in-flight refresh work may be shared. |
 | `combined_state` | `get_state` returns the whole dashboard state in one response. |
 

@@ -1,8 +1,8 @@
 //! Claude model normalization and API-equivalent cost estimation.
 
 pub(super) const CLAUDE_PRICING_SOURCE: &str = "bundled_anthropic_api_equivalent";
-pub(super) const CLAUDE_PRICING_VERSION: &str = "anthropic-bundled-2026-09-05";
-pub(super) const CLAUDE_PRICING_EFFECTIVE_FROM: &str = "2026-09-05";
+pub(super) const CLAUDE_PRICING_VERSION: &str = "anthropic-bundled-2026-09-09";
+pub(super) const CLAUDE_PRICING_EFFECTIVE_FROM: &str = "2026-09-09";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ClaudeTokenTotals {
@@ -112,11 +112,12 @@ fn claude_pricing(model: &str) -> Option<ClaudePricing> {
     };
 
     Some(match model.as_str() {
-        "claude-fable-5" => standard(10.00, 50.00),
+        "claude-fable-5" | "claude-fable-5-1" => standard(10.00, 50.00),
         "claude-haiku-4-5" => standard(1.00, 5.00),
         "claude-opus-5" | "claude-opus-4-5" | "claude-opus-4-6" | "claude-opus-4-7"
         | "claude-opus-4-8" => standard(5.00, 25.00),
         "claude-sonnet-4-5" => long_context(3.00, 15.00, 200_000, 6.00, 22.50),
+        "claude-sonnet-5" => standard(2.00, 10.00),
         "claude-sonnet-4-6" => standard(3.00, 15.00),
         "claude-opus-4-1" => standard(15.00, 75.00),
         _ => return None,
@@ -156,6 +157,22 @@ pub(super) fn normalize_claude_model(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_models_and_dated_aliases_have_verified_prices() {
+        let tokens = ClaudeTokenTotals {
+            input: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(claude_cost_usd("claude-fable-5-1", tokens), Some(60.0));
+        assert_eq!(claude_cost_usd("claude-sonnet-5", tokens), Some(12.0));
+        assert_eq!(
+            claude_cost_usd("claude-fable-5-1-20260901", tokens),
+            Some(60.0)
+        );
+        assert_eq!(claude_cost_usd("nimbus_quill", tokens), None);
+    }
 
     #[test]
     fn opus_5_prices_both_cache_write_durations() {

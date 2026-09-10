@@ -230,11 +230,17 @@ fn limit_windows(limits: Option<&Value>) -> Vec<UsageWindow> {
             let (name, label) = match (limit.kind.as_str(), scope.as_deref()) {
                 // Preserve the established IDs for the two general quotas so
                 // forecasts, alerts, and hidden-window preferences remain stable.
-                ("session", _) => ("five_hour".to_string(), "Claude five hour".to_string()),
-                ("weekly_all", _) => ("seven_day".to_string(), "Claude seven day".to_string()),
+                ("session", _) => (
+                    "five_hour".to_string(),
+                    "Claude current session".to_string(),
+                ),
+                ("weekly_all", _) => (
+                    "seven_day".to_string(),
+                    "Claude current week (all models)".to_string(),
+                ),
                 ("weekly_scoped", Some(scope)) => (
                     format!("seven_day_{scope}"),
-                    format!("Claude current week ({scope})"),
+                    format!("Claude current week ({})", model_scope_display(scope)),
                 ),
                 (kind, Some(scope)) => (
                     format!("{kind}_{scope}"),
@@ -270,6 +276,23 @@ fn limit_scope_label(scope: &Value) -> Option<String> {
         })
 }
 
+fn model_scope_display(scope: &str) -> String {
+    let model = super::pricing::normalize_claude_model(scope);
+    let model = model.strip_prefix("claude-").unwrap_or(&model);
+    for family in ["fable", "opus", "sonnet", "haiku"] {
+        if model == family || model.starts_with(&format!("{family}-")) {
+            let name = format!("{}{}", family[..1].to_uppercase(), &family[1..]);
+            let version = model.strip_prefix(&format!("{family}-")).unwrap_or("");
+            return if version.is_empty() {
+                name
+            } else {
+                format!("{name} {}", version.replace('-', "."))
+            };
+        }
+    }
+    scope.to_string()
+}
+
 fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
@@ -295,6 +318,7 @@ fn utilization_windows(
 
     utilization
         .iter()
+        .filter(|(name, _)| looks_like_usage_window_name(name))
         .filter_map(|(name, entry)| match entry {
             ClaudeUtilizationEntry::Percent(percent) => percent.value().map(|value| {
                 percent_window(PercentWindowSpec {
@@ -376,6 +400,9 @@ fn collect_nested_utilization_windows(
     for (name, entry) in utilization {
         let mut path = parent_path.to_vec();
         path.push(name.clone());
+        if !looks_like_usage_window_name(name) {
+            continue;
+        }
         if let Ok(entry) = serde_json::from_value::<ClaudeUtilizationEntry>(entry.clone()) {
             if let Some(window) = utilization_entry_window(&path, entry) {
                 windows.push(window);
@@ -385,7 +412,10 @@ fn collect_nested_utilization_windows(
 }
 
 fn path_window(path: &[String], value: &Value) -> Option<UsageWindow> {
-    if path.is_empty() {
+    if !looks_like_usage_window_name(path.last()?)
+        || value.get("limit_dollars").is_some()
+        || value.get("used_dollars").is_some()
+    {
         return None;
     }
 
@@ -426,7 +456,8 @@ fn utilization_entry_window(path: &[String], entry: ClaudeUtilizationEntry) -> O
 
 fn looks_like_usage_window_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name.contains("hour")
+    name == "daily"
+        || name.contains("hour")
         || name.contains("day")
         || name.contains("week")
         || name.contains("month")
@@ -453,9 +484,13 @@ fn percent_window(spec: PercentWindowSpec) -> UsageWindow {
         label: spec
             .label
             .unwrap_or_else(|| humanize_window_label(&spec.name)),
-        kind: spec
-            .kind
-            .unwrap_or_else(|| usage_kind_from_name(&spec.name)),
+        kind: spec.kind.unwrap_or_else(|| {
+            if spec.name.starts_with("seven_day") {
+                UsageWindowKind::Weekly
+            } else {
+                usage_kind_from_name(&spec.name)
+            }
+        }),
         used: Some(UsageAmount {
             value: percent_used,
             unit: UsageUnit::Percent,
@@ -544,12 +579,18 @@ fn humanize_words(value: impl AsRef<str>) -> String {
 }
 
 fn humanize_window_label(value: impl AsRef<str>) -> String {
-    let value = humanize_words(value);
-    let value = value.trim();
-    if value.to_ascii_lowercase().starts_with("claude") {
-        value.to_string()
-    } else {
-        format!("Claude {value}")
+    let value = value.as_ref().trim();
+    let raw = value.strip_prefix("Claude ").unwrap_or(value);
+    let words = humanize_words(raw);
+    match words.as_str() {
+        "five hour" => "Claude current session".to_string(),
+        "seven day" | "weekly" => "Claude current week (all models)".to_string(),
+        _ if words.starts_with("seven day ") => format!(
+            "Claude current week ({})",
+            model_scope_display(&words[10..].replace(' ', "-"))
+        ),
+        _ if value.to_ascii_lowercase().starts_with("claude") => value.to_string(),
+        _ => format!("Claude {words}"),
     }
 }
 
@@ -590,7 +631,7 @@ mod tests {
 
         let five_hour = find_window(&snapshot.windows, "claude_usage_utilization_five_hour");
         assert!(matches!(five_hour.kind, UsageWindowKind::Session));
-        assert_eq!(five_hour.label, "Claude five hour");
+        assert_eq!(five_hour.label, "Claude current session");
         assert_eq!(five_hour.used.as_ref().unwrap().value, 42.5);
         assert!(matches!(
             five_hour.used.as_ref().unwrap().unit,
@@ -739,7 +780,7 @@ mod tests {
             &snapshot.windows,
             "claude_usage_utilization_seven_day_claude_fable",
         );
-        assert_eq!(scoped.label, "Claude current week (claude-fable)");
+        assert_eq!(scoped.label, "Claude current week (Fable)");
         assert_eq!(scoped.percent_used, Some(4.0));
     }
 
@@ -811,15 +852,15 @@ mod tests {
 
         let five_hour = find_window(&snapshot.windows, "claude_usage_utilization_five_hour");
         assert!(matches!(five_hour.kind, UsageWindowKind::Session));
-        assert_eq!(five_hour.label, "Claude five hour");
+        assert_eq!(five_hour.label, "Claude current session");
         assert_eq!(five_hour.percent_used, Some(42.5));
 
         let sonnet = find_window(
             &snapshot.windows,
             "claude_usage_utilization_seven_day_sonnet",
         );
-        assert!(matches!(sonnet.kind, UsageWindowKind::Daily));
-        assert_eq!(sonnet.label, "Claude seven day sonnet");
+        assert!(matches!(sonnet.kind, UsageWindowKind::Weekly));
+        assert_eq!(sonnet.label, "Claude current week (Sonnet)");
         assert_eq!(sonnet.percent_used, Some(17.5));
 
         let opus = find_window(&snapshot.windows, "claude_usage_utilization_seven_day_opus");
@@ -848,12 +889,37 @@ mod tests {
             &snapshot.windows,
             "claude_usage_utilization_limits_five_hour",
         );
-        assert_eq!(five_hour.label, "Claude five hour");
+        assert_eq!(five_hour.label, "Claude current session");
         assert_eq!(five_hour.percent_used, Some(25.0));
 
         let weekly = find_window(&snapshot.windows, "claude_usage_utilization_limits_weekly");
-        assert_eq!(weekly.label, "Claude weekly");
+        assert_eq!(weekly.label, "Claude current week (all models)");
         assert_eq!(weekly.percent_used, Some(70.0));
+    }
+
+    #[test]
+    fn ignores_opaque_and_dollar_fields_but_keeps_public_model_limits() {
+        let usage = normalize_usage(
+            &json!({
+                "five_hour": {"utilization": 0},
+                "nimbus_quill": {"utilization": 0, "resets_at": null},
+                "amber_ladder": {"utilization": 30, "limit_dollars": 20},
+                "utilization": {"tangelo": {"utilization": 10}},
+                "limits": [{"kind":"weekly_scoped", "group":"weekly", "percent":12,
+                    "scope":{"model":{"id":"claude-fable-5-1"}}}]
+            }),
+            &test_credentials(),
+        )
+        .unwrap();
+        assert_eq!(usage.windows.len(), 2);
+        assert!(usage
+            .windows
+            .iter()
+            .any(|w| w.label == "Claude current week (Fable 5.1)"));
+        assert!(usage
+            .windows
+            .iter()
+            .all(|w| !w.label.contains("nimbus") && !w.label.contains("tangelo")));
     }
 
     #[test]

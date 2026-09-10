@@ -49,8 +49,8 @@ usage() {
   cat <<'EOF'
 Install UsageTracker from a checksum-verified GitHub release.
 
-Release binaries have ad-hoc code signatures and are not notarized by Apple.
-macOS may require manual approval the first time the app opens.
+Verifies code signatures for both legacy ad-hoc and Developer ID releases.
+Legacy ad-hoc releases may need manual approval the first time the app opens.
 
 Usage: install.sh [options]
 
@@ -258,6 +258,22 @@ signature_field() {
     awk -F= -v field="$field" '$1 == field { print $2; exit }'
 }
 
+verify_release_identity() {
+  local path="$1"
+  local signature="$2"
+  if [[ "$signature" == "adhoc" ]]; then return 0; fi
+  # Retain compatibility with old releases, but do not accept arbitrary local
+  # certificates as Developer ID. Integrity was checked before this call.
+  local team authority
+  team="$(signature_field "$path" TeamIdentifier)"
+  authority="$(signature_field "$path" Authority)"
+  if [[ -z "$team" || "$team" == "not set" || "$authority" != "Developer ID Application: "* ]]; then
+    echo "Release does not have a Developer ID Application signature: $path" >&2
+    exit 1
+  fi
+  codesign --verify --strict -R 'anchor apple generic' "$path"
+}
+
 app_is_running() {
   local pid executable
   while IFS= read -r pid; do
@@ -393,8 +409,18 @@ if [[ "$install_app" == "1" ]]; then
     echo "The app bundle or signing identifier is not UsageTracker" >&2
     exit 1
   fi
+  verify_release_identity "$source_app" "$app_signature"
   if [[ "$app_signature" != "adhoc" ]]; then
-    echo "The app does not have the expected ad-hoc signature" >&2
+    # Let Gatekeeper assess the signed, notarized app before replacing anything.
+    if ! spctl --assess --type execute "$source_app"; then
+      echo "macOS could not verify the notarized app; the installed app was kept." >&2
+      exit 1
+    fi
+  fi
+  source_daemon="$source_app/Contents/MacOS/usage-daemon"
+  if [[ "$(signature_field "$source_daemon" Identifier)" != "$expected_daemon_identifier" ||
+        "$(signature_field "$source_daemon" TeamIdentifier)" != "$(signature_field "$source_app" TeamIdentifier)" ]]; then
+    echo "The background service does not match the app signing identity" >&2
     exit 1
   fi
 fi
@@ -421,8 +447,10 @@ if [[ "$install_cli" == "1" ]]; then
     echo "The command signing identifier is not UsageTracker" >&2
     exit 1
   fi
-  if [[ "$cli_signature" != "adhoc" ]]; then
-    echo "The usage command does not have the expected ad-hoc signature" >&2
+  verify_release_identity "$source_cli" "$cli_signature"
+  if [[ "$install_app" == "1" &&
+        "$(signature_field "$source_cli" TeamIdentifier)" != "$(signature_field "$source_app" TeamIdentifier)" ]]; then
+    echo "The app and command-line tool were signed by different teams" >&2
     exit 1
   fi
 fi
@@ -569,7 +597,7 @@ if [[ "$install_cli" == "1" ]]; then
   printf '  %-5s %s\n' "CLI" "$cli_path"
 fi
 printf '  %-5s %s (preserved)\n' "Data" "$daemon_home"
-if [[ "$install_app" == "1" && "$launch_app" == "1" ]]; then
+if [[ "$install_app" == "1" && "$launch_app" == "1" && "$app_signature" == "adhoc" ]]; then
   printf '\n'
   notice "If macOS blocks the app, open System Settings → Privacy & Security and click Open Anyway."
 fi

@@ -21,6 +21,7 @@ enum DaemonRequest: Encodable {
     case deleteAccount(accountId: String)
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, settings: [String: String?])
+    case requestCredentialAccess(providerId: String, accountId: String?, profileId: String? = nil)
     case repairProvider(providerId: String, accountId: String?, signInAction: ProviderSignInAction)
     case submitProviderSignInCode(providerId: String, authenticationCode: String)
     case cancelProviderSignIn(providerId: String)
@@ -86,6 +87,11 @@ enum DaemonRequest: Encodable {
             try c.encode("update_provider_setup", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encode(settings, forKey: .settings)
+        case .requestCredentialAccess(let providerId, let accountId, let profileId):
+            try c.encode("request_credential_access", forKey: .method)
+            try c.encode(providerId, forKey: .providerId)
+            try c.encodeIfPresent(accountId, forKey: .accountId)
+            try c.encodeIfPresent(profileId, forKey: .profileId)
         case .repairProvider(let providerId, let accountId, let signInAction):
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
@@ -126,6 +132,7 @@ enum DaemonRequest: Encodable {
         case pollIntervalSeconds = "poll_interval_seconds"
         case providerId = "provider_id"
         case accountId = "account_id"
+        case profileId = "profile_id"
         case jobId = "job_id"
         case displayName = "display_name"
         case signInAction = "sign_in_action"

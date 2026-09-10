@@ -14,7 +14,7 @@ Cookie headers are resolved in this order:
 2. A filtered header cached in the Keychain.
 3. `auth` and `__Host-auth` imported from a supported Chrome-family, Dia, or Firefox store for `opencode.ai` / `app.opencode.ai` — then cached for next time.
 
-The Keychain cache is updated only when the filtered header changes. Successful Keychain reads stay in memory for the daemon's lifetime, and an unchanged conditional write uses that in-memory value, so polling does not repeatedly prompt for the same item. Keychain operations share UsageTracker's serialized helper, so overlapping discovery and refresh work can't write the cache concurrently.
+The Keychain cache is updated only when the filtered header changes. Background reads and writes disable macOS interaction. Cached credentials are silently revalidated after sixty seconds; accepted values remain usable while valid if revalidation needs UI. The shared broker serializes access and coalesces repeated reads and permission failures. There is no second permanent cache of browser encryption keys. Allow access authorizes one relevant saved-session or browser credential without starting login.
 
 Workspace selection follows the same idea: a configured `workspace_id` first, then `USAGE_TRACKER_OPENCODE_GO_WORKSPACE_ID`, then automatic discovery.
 
@@ -39,6 +39,7 @@ Diagnostics can note the collection mode, workspace and email, cookie source nam
 ## What failures mean
 
 - No cookie or local auth → `credentials_missing`; a manual cookie it can't use → `credentials_invalid`.
+- A protected cached session or browser encryption key → `keychain_access_failed`; another usable browser or local source can still succeed.
 - Web 401/403 → `unauthorized`; a 429 → `rate_limited`.
 - HTTP, browser, or SQLite access trouble → `network` or `provider_unavailable`; missing usage or workspace shapes → `parse`.
 - When both paths fail, you get the web failure.

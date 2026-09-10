@@ -14,6 +14,7 @@ enum ProviderConnectionState: Equatable, Sendable {
 struct ProviderConnectionPresentation: Equatable, Sendable {
     let state: ProviderConnectionState
     let message: String
+    var pendingProfileId: String? = nil
 }
 
 /// Owns only transient provider-connection state. Stable state is derived from
@@ -39,24 +40,42 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
             return override
         }
 
-        if !accounts.isEmpty {
-            if health.contains(where: { $0.status == .keychainAccessFailed }) {
+        if let override = overrides[providerId], let profileId = override.pendingProfileId,
+           !accounts.contains(where: { $0.profileId == profileId }) {
+            return override
+        }
+
+        // Recovery for multiple accounts is presented on each account row.
+        // A removed or paused account must not make another account ask to sign in.
+        let accountHealth = accounts.filter(\.collectionEnabled).compactMap { account in
+            health.first { $0.accountId == account.id }
+                ?? health.first { $0.accountId == nil }
+        }
+        if accounts.count == 1 {
+            if accountHealth.contains(where: { $0.status == .keychainAccessFailed }) {
                 return ProviderConnectionPresentation(
                     state: .needsPermission,
                     message: "The account is saved, but macOS credential access is needed."
                 )
             }
-            if health.contains(where: {
-                $0.status == .credentialsMissing || $0.status == .authFailed
+            if accountHealth.contains(where: {
+                $0.status == .credentialsMissing ||
+                    ($0.status == .authFailed && $0.lastErrorCode == "unauthorized")
             }) {
                 return ProviderConnectionPresentation(
                     state: .needsSignIn,
-                    message: "The saved account needs to sign in again."
+                    message: "Connect this account to resume usage updates."
+                )
+            }
+            if accountHealth.contains(where: { $0.status == .authFailed }) {
+                return ProviderConnectionPresentation(
+                    state: .failed,
+                    message: "The existing connection could not be read. Check it before signing in again."
                 )
             }
         }
 
-        if let override = overrides[providerId] {
+        if let override = overrides[providerId], override.pendingProfileId == nil {
             return override
         }
 
@@ -79,12 +98,14 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
     func set(
         _ state: ProviderConnectionState,
         message: String,
-        for providerId: String
+        for providerId: String,
+        pendingProfileId: String? = nil
     ) {
         precondition(state != .idle && state != .connected)
         overrides[providerId] = ProviderConnectionPresentation(
             state: state,
-            message: message
+            message: message,
+            pendingProfileId: pendingProfileId
         )
     }
 

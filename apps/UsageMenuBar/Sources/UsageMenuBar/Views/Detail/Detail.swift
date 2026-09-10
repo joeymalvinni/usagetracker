@@ -45,21 +45,12 @@ struct Detail: View {
                 Header(title: group.name, subtitleStyle: subtitleStyle) {
                     Task { await state.refreshProvider(providerId) }
                 }
+                if let issue = activeProvider.collectionIssue {
+                    ProviderCollectionNotice(provider: activeProvider, issue: issue)
+                }
                 if state.showsAlertBanner(activeProvider) {
-                    let canRepair = activeProvider.repairRecommended && state.supportsRepair(providerId)
-                    let signInActive = state.isProviderSignInActive(providerId)
                     AlertBanner(
                         provider: activeProvider,
-                        actionLabel: signInActive ? "Cancel sign-in" : (canRepair ? "Sign in again" : "Refresh"),
-                        onAction: {
-                            if signInActive {
-                                state.cancelProviderSignIn(providerId)
-                            } else if canRepair {
-                                Task { await state.repairProvider(providerId, accountId: activeProvider.accountId) }
-                            } else {
-                                Task { await state.refreshProvider(providerId) }
-                            }
-                        },
                         onDismiss: { state.dismissAlert(activeProvider) }
                     )
                 }
@@ -72,30 +63,6 @@ struct Detail: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Spacing.md) {
                         ProviderActivityCard(provider: activeProvider, dashboard: activeProvider.costDashboard)
-                        if !usageEvents.isEmpty || loadingEvents || eventError != nil {
-                            ProviderSection(title: "Recent usage") {
-                                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                                    ForEach(usageEvents) { event in
-                                        UsageEventRow(event: event)
-                                    }
-                                    if let eventError {
-                                        Text(eventError)
-                                            .font(Theme.Typography.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    if loadingEvents {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                    } else if nextEventOffset != nil {
-                                        Button("Load more") {
-                                            Task { await loadUsageEvents(reset: false) }
-                                        }
-                                        .buttonStyle(.plain)
-                                        .font(Theme.Typography.caption.weight(.medium))
-                                    }
-                                }
-                            }
-                        }
                         if !limitWindows(activeProvider).isEmpty {
                             ProviderSection(title: "Limits") {
                                 ForEach(limitWindows(activeProvider)) { window in
@@ -120,6 +87,30 @@ struct Detail: View {
                             ProviderSection(title: "Credits") {
                                 ForEach(activeProvider.credits) { window in
                                     WindowRow(window: window, onHide: { state.hideWindow(window) })
+                                }
+                            }
+                        }
+                        if !usageEvents.isEmpty || loadingEvents || eventError != nil {
+                            ProviderSection(title: "Recent usage") {
+                                VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+                                    ForEach(usageEvents) { event in
+                                        UsageEventRow(event: event)
+                                    }
+                                    if let eventError {
+                                        Text(eventError)
+                                            .font(Theme.Typography.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if loadingEvents {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else if nextEventOffset != nil {
+                                        Button("Load more") {
+                                            Task { await loadUsageEvents(reset: false) }
+                                        }
+                                        .buttonStyle(.plain)
+                                        .font(Theme.Typography.caption.weight(.medium))
+                                    }
                                 }
                             }
                         }
@@ -186,63 +177,36 @@ struct Detail: View {
     }
 
     private var subtitleStyle: HeaderSubtitleStyle {
-        let success = activeProvider.lastSuccessAt.map { "success \(DateFormats.relative.localizedString(for: $0, relativeTo: Date()))" }
         let subtitleParts: [String?] = [
             selectedAccount?.account,
-            success ?? activeProvider.detail,
-            activeProvider.healthText,
+            activeProvider.detail,
         ]
         let parts = subtitleParts.compactMap { $0 }
         return .custom(parts.joined(separator: " · "))
     }
 
-    @ViewBuilder
     private var accountPicker: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: Theme.Spacing.xs) {
-                ForEach(accounts, id: \.accountId) { account in
-                    Button {
-                        withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) {
-                            selectedAccountId = account.accountId
-                        }
-                    } label: {
-                        HStack(spacing: Theme.Spacing.xs) {
-                            if account.hasUnseenAlert {
-                                Circle()
-                                    .fill(account.status.tint)
-                                    .frame(width: 6, height: 6)
-                            }
-                            Text(accountRowLabel(account))
-                        }
-                            .font(Theme.Typography.caption.weight(.medium))
-                            .lineLimit(1)
-                            .padding(.horizontal, Theme.Spacing.md)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
-                                    .fill(selectedAccountId == account.accountId
-                                        ? Color.primary.opacity(0.10)
-                                        : Color.primary.opacity(0.04))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: Theme.Radius.md, style: .continuous)
-                                    .stroke(selectedAccountId == account.accountId
-                                        ? Theme.chartColor(account.providerId).opacity(0.4)
-                                        : Color.clear, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .help(account.account ?? account.name)
-                }
+        Picker("Account", selection: Binding(
+            get: { activeProvider.accountId },
+            set: { selectedAccountId = $0 }
+        )) {
+            ForEach(accounts) { account in
+                Text(accountRowLabel(account)).tag(account.accountId)
             }
         }
+        .pickerStyle(.menu)
+        .font(Theme.Typography.caption)
+        .lineLimit(1)
+        .accessibilityLabel("Account for \(group?.name ?? providerId)")
     }
 
     private func accountRowLabel(_ account: ProviderVM) -> String {
-        if let displayName = account.account, !displayName.isEmpty {
-            return displayName
+        let name = account.account?.isEmpty == false ? account.account! : account.name
+        if let email = account.accountEmail, !email.isEmpty,
+           email.localizedCaseInsensitiveCompare(name) != .orderedSame {
+            return "\(name) · \(email)"
         }
-        return account.name
+        return name
     }
 
     private func providerAccount(_ id: String) -> ProviderVM? {
@@ -256,8 +220,6 @@ struct Detail: View {
 
 private struct AlertBanner: View {
     let provider: ProviderVM
-    let actionLabel: String
-    let onAction: () -> Void
     let onDismiss: () -> Void
 
     var body: some View {
@@ -277,8 +239,6 @@ private struct AlertBanner: View {
                 }
             }
             Spacer(minLength: Theme.Spacing.sm)
-            Button(actionLabel, action: onAction)
-                .controlSize(.small)
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
                     .font(Theme.Typography.micro.weight(.bold))
@@ -297,9 +257,7 @@ private struct AlertBanner: View {
     }
 
     private var worstWindow: WindowVM? {
-        provider.windows
-            .filter { $0.id != "\(provider.providerId)_rate_limit_resets" && $0.percent != nil }
-            .min { ($0.percent ?? 100) < ($1.percent ?? 100) }
+        provider.headlineWindow
     }
 
     private var title: String {
@@ -310,14 +268,11 @@ private struct AlertBanner: View {
             }
             return "You're almost out of your usage limit"
         case .warning: return "You're running low on your usage limit"
-        default: return provider.healthText == "unknown" ? provider.status.label.capitalized : provider.healthText.capitalized
+        default: return provider.status.label.capitalized
         }
     }
 
     private var subtitle: String? {
-        if provider.status == .error, let error = provider.errorDetail, !error.isEmpty {
-            return error
-        }
         if let window = worstWindow {
             let reset = window.reset.isEmpty ? "" : " · \(window.reset)"
             return "\(window.label): \(window.value)\(reset)"

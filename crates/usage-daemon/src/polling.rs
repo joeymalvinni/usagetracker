@@ -548,6 +548,7 @@ impl RefreshCoordinator {
             let provider_results = provider_ids
                 .into_iter()
                 .map(|provider_id| ProviderRefreshResult {
+                    profile_id: None,
                     provider_id,
                     account_id: None,
                     status: ProviderRefreshStatus::Network,
@@ -771,11 +772,12 @@ impl RefreshCoordinator {
                 account.provider_id == *provider_id
                     && account.profile_id.as_deref() == Some(failure.profile_id.as_str())
             }) else {
-                debug!(
-                    provider_id = provider_id.as_str(),
-                    profile_id = failure.profile_id.as_str(),
-                    "ignoring discovery failure for a pending profile"
-                );
+                // Pending accounts still need actionable onboarding errors.
+                // Return the failure without assigning it to another account
+                // or persisting provider-wide unhealthy state.
+                let mut result = provider_error_result(provider_id.clone(), None, failure.error);
+                result.profile_id = Some(failure.profile_id);
+                results.push(result);
                 continue;
             };
             if !account.collection_enabled {
@@ -846,6 +848,7 @@ impl RefreshCoordinator {
                 );
             }
             return ProviderRefreshResult {
+                profile_id: None,
                 provider_id,
                 account_id: Some(account.id),
                 status: ProviderRefreshStatus::Disabled,
@@ -1219,6 +1222,7 @@ impl RefreshCoordinator {
             warn!(error = %err, "failed to store provider backoff health");
         }
         ProviderRefreshResult {
+            profile_id: None,
             provider_id,
             account_id: Some(account_id),
             status: ProviderRefreshStatus::RateLimited,
@@ -1320,6 +1324,7 @@ impl RefreshCoordinator {
             "provider usage stored"
         );
         ProviderRefreshResult {
+            profile_id: None,
             provider_id,
             account_id: Some(account.id),
             status: state.status,
@@ -1533,6 +1538,7 @@ fn provider_error_result(
     error: ProviderError,
 ) -> ProviderRefreshResult {
     ProviderRefreshResult {
+        profile_id: None,
         provider_id,
         account_id,
         status: error.kind().into(),
@@ -1548,6 +1554,7 @@ fn storage_error_result(
     message: String,
 ) -> ProviderRefreshResult {
     ProviderRefreshResult {
+        profile_id: None,
         provider_id,
         account_id,
         status: ProviderRefreshStatus::StorageError,
@@ -2590,6 +2597,32 @@ mod tests {
         assert_eq!(health[0].provider_id, provider_id);
         assert!(health[0].account_id.is_some());
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn pending_profile_permission_failure_is_returned_without_poisoning_health() {
+        let storage = test_storage();
+        let coordinator = RefreshCoordinator::new(storage.clone(), vec![]);
+        let results = coordinator
+            .record_account_discovery_failures(
+                &ProviderId::new("claude"),
+                vec![AccountDiscoveryFailure {
+                    profile_id: "pending".to_string(),
+                    error: ProviderError::new(
+                        ProviderErrorKind::KeychainAccessFailed,
+                        "Allow access",
+                    ),
+                }],
+            )
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].status,
+            ProviderRefreshStatus::KeychainAccessFailed
+        );
+        assert!(results[0].account_id.is_none());
+        assert_eq!(results[0].profile_id.as_deref(), Some("pending"));
+        assert!(storage.provider_health().await.unwrap().is_empty());
     }
 
     #[tokio::test]

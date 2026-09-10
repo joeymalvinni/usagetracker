@@ -45,7 +45,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 
 The installer verifies the published checksums and installs `UsageTracker.app` in `~/Applications` and `usage` in `~/.local/bin`.
 
-Open the app, choose **Find my accounts**, and UsageTracker will look for accounts already signed in on your Mac. You can add and manage more accounts later in Settings.
+Open the app and choose **Connect** beside a provider found on your Mac. UsageTracker checks your existing sign-in, then **View usage** takes you straight to your limits. Alerts are optional, and you can add or manage accounts later in **Settings → Accounts**.
 
 ```sh
 $ usage

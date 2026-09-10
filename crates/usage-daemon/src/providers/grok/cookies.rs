@@ -50,17 +50,41 @@ fn manual_raw(config: &ProviderConfig) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-pub(super) async fn cached_candidate() -> Option<CookieCandidate> {
-    let raw = tokio::task::spawn_blocking(|| {
-        keychain::get_password(CACHE_SERVICE, super::PROVIDER_ID).ok()
-    })
-    .await
-    .ok()??;
-    normalize(&raw).map(|header| CookieCandidate {
-        header,
-        source: "keychain_cache".to_string(),
-        browser_imported: false,
-    })
+pub(super) async fn cached_candidate() -> Result<Option<CookieCandidate>, ProviderError> {
+    let raw =
+        tokio::task::spawn_blocking(|| keychain::get_password(CACHE_SERVICE, super::PROVIDER_ID))
+            .await
+            .map_err(|_| cookie_access_error())?;
+    match raw {
+        Ok(raw) => Ok(normalize(&raw).map(|header| CookieCandidate {
+            header,
+            source: "keychain_cache".to_string(),
+            browser_imported: false,
+        })),
+        Err(keychain::Error::Missing) => Ok(None),
+        Err(_) => Err(cookie_access_error()),
+    }
+}
+
+fn cookie_access_error() -> ProviderError {
+    ProviderError::new(
+        crate::providers::ProviderErrorKind::KeychainAccessFailed,
+        "Access to the saved Grok session needs macOS permission",
+    )
+}
+
+pub(super) fn request_access() -> Result<(), ProviderError> {
+    if matches!(keychain::get_password(CACHE_SERVICE, super::PROVIDER_ID), Err(error) if error != keychain::Error::Missing)
+    {
+        return keychain::request_access(CACHE_SERVICE, super::PROVIDER_ID)
+            .map_err(|_| cookie_access_error());
+    }
+    browser_cookies::request_browser_access(
+        true,
+        &["grok.com"],
+        &REQUIRED_NAMES,
+        Some(&REQUIRED_NAMES),
+    )
 }
 
 pub(super) fn import_browser_candidates() -> Result<Vec<CookieCandidate>, ProviderError> {

@@ -35,6 +35,8 @@ jobs:
       - name: Test Swift
         working-directory: apps/UsageMenuBar
         run: swift test -Xswiftc -strict-concurrency=complete
+      - name: Test installer and release signing validation
+        run: python3 scripts/test-distribution.py
 
   audit:
     name: Dependency audit

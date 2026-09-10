@@ -53,8 +53,7 @@ struct UIConfig: Codable, Equatable, Sendable {
     var darkModeEnabled = true
     var activityChartStyle = ActivityChartStyle.bars
     var onboardingCompleted = false
-    /// Persists the transition past the welcome screen so an interrupted
-    /// provider connection resumes where the user left it.
+    /// Legacy key retained to resume installations that started the old wizard.
     var onboardingWelcomeCompleted = false
     /// Records the user's response to the contextual notification offer.
     var notificationPromptCompleted = false

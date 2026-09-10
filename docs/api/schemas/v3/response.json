@@ -363,7 +363,8 @@
         "usage_provenance",
         "usage_events",
         "refresh_jobs",
-        "refresh_coalescing"
+        "refresh_coalescing",
+        "credential_access"
       ],
       "type": "string"
     },
@@ -938,7 +939,6 @@
       },
       "type": "object"
     },
-
     "ModelCostSummary": {
       "properties": {
         "chargeable_cost_usd": {
@@ -1396,6 +1396,13 @@
           ]
         },
         "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_id": {
+          "description": "Identifies discovery failures before an account has been saved.",
           "type": [
             "string",
             "null"

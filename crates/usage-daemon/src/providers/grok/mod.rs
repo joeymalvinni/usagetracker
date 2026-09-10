@@ -141,9 +141,9 @@ impl GrokCollector {
         billing::from_rpc(&value)
     }
 
-    async fn initial_cookie_candidates(&self) -> Vec<CookieCandidate> {
+    async fn initial_cookie_candidates(&self) -> Result<Vec<CookieCandidate>, ProviderError> {
         if let Some(manual) = cookies::manual_candidate(&self.config) {
-            return vec![manual];
+            return Ok(vec![manual]);
         }
         let discovered = self
             .discovered_browser_sessions
@@ -157,9 +157,9 @@ impl GrokCollector {
             .map(|cache| cache.candidates.clone())
             .unwrap_or_default();
         if !discovered.is_empty() {
-            return discovered;
+            return Ok(discovered);
         }
-        cookies::cached_candidate().await.into_iter().collect()
+        Ok(cookies::cached_candidate().await?.into_iter().collect())
     }
 
     async fn import_browser_candidates(&self) -> Result<Vec<CookieCandidate>, ProviderError> {
@@ -197,7 +197,10 @@ impl GrokCollector {
                 .await
                 .map(|data| (data, "grok_profile_auth_token".to_string()));
         }
-        let mut candidates = self.initial_cookie_candidates().await;
+        let (mut candidates, mut last_error) = match self.initial_cookie_candidates().await {
+            Ok(candidates) => (candidates, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         if candidates.is_empty() && cookies::manual_is_configured(&self.config) {
             return Err(ProviderError::new(
                 ProviderErrorKind::CredentialsInvalid,
@@ -205,10 +208,16 @@ impl GrokCollector {
             ));
         }
         if candidates.is_empty() && self.config.enabled {
-            candidates = self.import_browser_candidates().await.unwrap_or_default();
+            match self.import_browser_candidates().await {
+                Ok(imported) => candidates = imported,
+                Err(error) => {
+                    if last_error.is_none() || error.kind() != ProviderErrorKind::CredentialsMissing
+                    {
+                        last_error = Some(error);
+                    }
+                }
+            }
         }
-
-        let mut last_error = None;
         let mut seen = BTreeSet::new();
         for candidate in &candidates {
             if !seen.insert(candidate.header.as_str()) {
@@ -244,7 +253,14 @@ impl GrokCollector {
                 .any(|candidate| candidate.source == "keychain_cache")
         {
             cookies::clear_cache().await;
-            for candidate in self.import_browser_candidates().await.unwrap_or_default() {
+            let imported = match self.import_browser_candidates().await {
+                Ok(imported) => imported,
+                Err(error) => {
+                    last_error = Some(error);
+                    Vec::new()
+                }
+            };
+            for candidate in imported {
                 for auth in web_auth_attempts(bearer) {
                     match web::fetch(&self.client, auth, Some(&candidate.header)).await {
                         Ok(data) => {
@@ -372,6 +388,26 @@ fn web_auth_attempts(bearer: Option<&str>) -> impl Iterator<Item = Option<&str>>
 
 #[async_trait]
 impl ProviderCollector for GrokCollector {
+    async fn request_credential_access(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        if profile_id.is_some_and(|id| id != DEFAULT_PROFILE_ID) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsMissing,
+                "Managed Grok profiles use their own CLI sign-in, not global browser cookies",
+            ));
+        }
+        tokio::task::spawn_blocking(cookies::request_access)
+            .await
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::KeychainAccessFailed,
+                    "Browser access request could not complete",
+                )
+            })?
+    }
+
     fn provider_id(&self) -> ProviderId {
         ProviderId::new(PROVIDER_ID)
     }
@@ -414,9 +450,14 @@ impl ProviderCollector for GrokCollector {
                 .iter()
                 .any(|account| account.profile_id.as_deref() == Some(profile.id.as_str()));
             if !already_discovered {
+                let cached = if self.source_mode.uses_web() {
+                    cookies::cached_candidate().await
+                } else {
+                    Ok(None)
+                };
                 let configured_auth = self.source_mode.uses_web()
                     && (cookies::manual_candidate(&self.config).is_some()
-                        || cookies::cached_candidate().await.is_some());
+                        || matches!(cached, Ok(Some(_))));
                 let api_key_auth = self.source_mode.uses_cli()
                     && std::env::var_os("XAI_API_KEY").is_some()
                     && rpc::find_grok_binary().is_some();
@@ -432,10 +473,23 @@ impl ProviderCollector for GrokCollector {
                         ),
                     });
                 } else if self.source_mode.uses_web() && self.config.enabled {
-                    if let Ok(sessions) = self.import_browser_candidates().await {
-                        if !sessions.is_empty() {
-                            accounts.push(Self::discovered_account(profile, None));
+                    match self.import_browser_candidates().await {
+                        Ok(sessions) if !sessions.is_empty() => {
+                            accounts.push(Self::discovered_account(profile, None))
                         }
+                        Err(error) => {
+                            let error = if error.kind() == ProviderErrorKind::CredentialsMissing {
+                                cached.err().unwrap_or(error)
+                            } else {
+                                error
+                            };
+                            failures.retain(|failure| failure.profile_id != profile.id);
+                            failures.push(AccountDiscoveryFailure {
+                                profile_id: profile.id.clone(),
+                                error,
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }

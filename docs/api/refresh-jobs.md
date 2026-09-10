@@ -9,6 +9,8 @@ queued → running → completed
 
 `failed` is only for a job-level failure, like a task panicking. Ordinary provider failures aren't that — they're entries in `provider_results`, and the job still comes back `completed`. So always look through the results.
 
+A discovery failure for an account that has not been saved includes its `profile_id` and a null `account_id`. Preserve that profile ID when offering `request_credential_access`; another account’s successful result does not mean the pending profile recovered. These pending failures do not change the health of existing accounts.
+
 While a job is `running`, `discovered_accounts` grows as provider account
 identities are persisted. Each entry contains the provider and account IDs. This
 lets an interactive client respond to discovery without polling the global
