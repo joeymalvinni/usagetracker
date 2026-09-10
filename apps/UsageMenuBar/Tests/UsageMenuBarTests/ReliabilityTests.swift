@@ -510,6 +510,24 @@ final class DaemonClientTests: XCTestCase {
         }
     }
 
+    func testPendingCredentialRecoveryPreservesProfileOnTheWire() throws {
+        let data = try JSONEncoder.usage.encode(DaemonRequest.requestCredentialAccess(
+            providerId: "claude", accountId: nil, profileId: "pending-work"
+        ))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["profile_id"] as? String, "pending-work")
+        XCTAssertNil(object["account_id"])
+        let failure = try JSONDecoder.usage.decode(ProviderRefreshResult.self, from: Data(
+            #"{"provider_id":"claude","account_id":null,"profile_id":"pending-work","status":"keychain_access_failed"}"#.utf8
+        ))
+        XCTAssertEqual(failure.profileId, "pending-work")
+        XCTAssertNil(failure.accountId)
+        let legacy = try JSONDecoder.usage.decode(ProviderRefreshResult.self, from: Data(
+            #"{"provider_id":"claude","account_id":"saved","status":"ok"}"#.utf8
+        ))
+        XCTAssertNil(legacy.profileId)
+    }
+
     func testCopySignInLinkActionIsExplicitOnTheWire() throws {
         let request = DaemonRequest.repairProvider(
             providerId: "codex",
@@ -1168,6 +1186,28 @@ final class AppStateTests: XCTestCase {
 }
 
 final class ProviderConnectionCoordinatorTests: XCTestCase {
+    @MainActor func testPendingProfilePermissionSurvivesAnExistingAccountAndClearsOnDiscovery() {
+        let coordinator = ProviderConnectionCoordinator()
+        let personal = Account(id: "personal", providerId: "claude", externalAccountId: "personal",
+            profileId: "personal-profile", displayName: nil, email: nil, hidden: false,
+            collectionEnabled: true, createdAt: .now, updatedAt: .now)
+        let personalFailure = ProviderHealth(providerId: "claude", accountId: personal.id, status: .authFailed,
+            collectionMode: nil, lastSuccessAt: nil, lastFailureAt: .now,
+            lastErrorCode: "unauthorized", lastErrorMessage: nil, updatedAt: .now)
+        coordinator.set(.needsPermission, message: "Allow credential access", for: "claude", pendingProfileId: "work-profile")
+        let pending = coordinator.presentation(for: "claude", descriptor: nil,
+            accounts: [personal], health: [personalFailure])
+        XCTAssertEqual(pending.state, .needsPermission)
+        XCTAssertEqual(pending.pendingProfileId, "work-profile")
+        let work = Account(id: "work", providerId: "claude", externalAccountId: "work",
+            profileId: "work-profile", displayName: nil, email: nil, hidden: false,
+            collectionEnabled: true, createdAt: .now, updatedAt: .now)
+        let recovered = coordinator.presentation(for: "claude", descriptor: nil,
+            accounts: [personal, work], health: [])
+        XCTAssertEqual(recovered.state, .connected)
+        XCTAssertNil(recovered.pendingProfileId)
+    }
+
     @MainActor func testRemovedAccountFailureDoesNotChangeConnectedAccount() {
         let coordinator = ProviderConnectionCoordinator()
         let account = Account(id: "current", providerId: "claude", externalAccountId: "external",

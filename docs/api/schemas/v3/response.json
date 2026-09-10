@@ -1401,6 +1401,13 @@
             "null"
           ]
         },
+        "profile_id": {
+          "description": "Identifies discovery failures before an account has been saved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "provider_id": {
           "type": "string"
         },

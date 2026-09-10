@@ -205,8 +205,9 @@ impl SocketServer {
             Req::RequestCredentialAccess {
                 provider_id,
                 account_id,
+                profile_id,
             } => {
-                self.request_credential_access_response(provider_id, account_id)
+                self.request_credential_access_response(provider_id, account_id, profile_id)
                     .await
             }
             Req::RepairProvider {
@@ -535,8 +536,27 @@ impl SocketServer {
         &self,
         provider_id: usage_core::ProviderId,
         account_id: Option<AccountId>,
+        profile_id: Option<String>,
     ) -> Result<ApiResponse, ApiResponse> {
         require_provider(&provider_id)?;
+        if account_id.is_some() && profile_id.is_some() {
+            return Err(ApiResponse::error(
+                ApiErrorCode::InvalidArgument,
+                "Specify an account_id or a pending profile_id, not both",
+            ));
+        }
+        if let Some(id) = &profile_id {
+            let adapter =
+                crate::runtime::provider_registry::adapter(&provider_id).map_err(|error| {
+                    ApiResponse::error(ApiErrorCode::InvalidArgument, error.to_string())
+                })?;
+            if !adapter.supports_multiple_accounts() || id.trim().is_empty() {
+                return Err(ApiResponse::error(
+                    ApiErrorCode::InvalidArgument,
+                    "The provider does not support this credential profile",
+                ));
+            }
+        }
         let profile_id =
             if let Some(account_id) = account_id {
                 let account = self
@@ -567,7 +587,7 @@ impl SocketServer {
                 }
                 account.profile_id
             } else {
-                None
+                profile_id
             };
         Ok(
             match self
@@ -1444,6 +1464,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_access_rejects_conflicting_or_unsupported_profile_scopes() {
+        let env = test_env(BTreeMap::new());
+        let server = SocketServer::new(env.runtime.clone());
+        for (provider, account_id, profile_id) in [
+            ("claude", Some(AccountId::new("saved")), "pending"),
+            ("opencode_go", None, "pending"),
+            ("claude", None, " "),
+        ] {
+            let response = server
+                .handle_request(ApiRequest::RequestCredentialAccess {
+                    provider_id: ProviderId::new(provider),
+                    account_id,
+                    profile_id: Some(profile_id.to_string()),
+                })
+                .await;
+            assert!(matches!(response, ApiResponse::Error { error }
+                if error.code == ApiErrorCode::InvalidArgument));
+        }
+        let _ = std::fs::remove_dir_all(env.root);
+    }
+
+    #[tokio::test]
     async fn credential_access_rejects_unknown_and_mismatched_accounts_before_prompting() {
         let env = test_env(BTreeMap::new());
         let account = env
@@ -1467,6 +1509,7 @@ mod tests {
                 .handle_request(ApiRequest::RequestCredentialAccess {
                     provider_id: ProviderId::new("claude"),
                     account_id: Some(account_id),
+                    profile_id: None,
                 })
                 .await;
             let ApiResponse::Error { error } = response else {

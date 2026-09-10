@@ -146,7 +146,10 @@ struct ProviderConnectionCard: View {
                 Button("Allow access") {
                     Task {
                         await state.allowProviderCredentialAccess(
-                            providerId, accountId: accounts.first?.id, retryConnection: true
+                            providerId,
+                            accountId: connection.pendingProfileId == nil ? accounts.first?.id : nil,
+                            profileId: connection.pendingProfileId,
+                            retryConnection: true
                         )
                     }
                 }

@@ -396,6 +396,25 @@ private struct ProviderAccountCard: View {
                 ProviderSetupFields(providerId: provider.providerId, setup: setup, disabled: busy)
             }
 
+            if !accounts.isEmpty, let profileId = connection.pendingProfileId,
+               connection.state == .needsPermission {
+                HStack {
+                    Text("New account needs credential access")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Allow access") {
+                        Task {
+                            await state.allowProviderCredentialAccess(
+                                provider.providerId, profileId: profileId, retryConnection: true
+                            )
+                        }
+                    }
+                    .buttonStyle(.chip)
+                    .disabled(busy || state.daemon != .online)
+                }
+            }
+
             if state.providersAwaitingAuthenticationCode.contains(provider.providerId) {
                 ProviderAuthenticationCodeEntry(providerId: provider.providerId)
             }
@@ -464,7 +483,8 @@ private struct ProviderAccountCard: View {
 
     private func connectAccount() async {
         if connection.state == .needsPermission {
-            await state.allowProviderCredentialAccess(provider.providerId, retryConnection: true)
+            await state.allowProviderCredentialAccess(provider.providerId,
+                profileId: connection.pendingProfileId, retryConnection: true)
         } else if connection.state == .needsSignIn,
            state.supportsAddAccount(provider.providerId) || state.supportsRepair(provider.providerId) {
             await state.beginProviderSignIn(provider.providerId)

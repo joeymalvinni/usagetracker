@@ -521,6 +521,7 @@ mod tests {
         message: Option<String>,
     ) -> ProviderRefreshResult {
         ProviderRefreshResult {
+            profile_id: None,
             provider_id: ProviderId::new("claude"),
             account_id: Some(AccountId::new("account")),
             status,

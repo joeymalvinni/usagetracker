@@ -56,13 +56,14 @@ pub(super) async fn reload_for_refresh(
     let account = credentials.keychain_account.clone();
     let source = credentials.source.clone();
     tokio::task::spawn_blocking(move || {
-        keychain::revalidate_password(&service, &account).map_err(keychain_save_error)?;
-        match source {
-            CredentialSource::Keychain => load_keychain_credentials(&service, &account),
-            CredentialSource::File(path) => {
-                load_credentials_from_keychain_or_file(&service, &account, path)
-            }
-        }
+        load_revalidated_credentials(
+            &service,
+            &account,
+            match source {
+                CredentialSource::Keychain => None,
+                CredentialSource::File(path) => Some(path),
+            },
+        )
     })
     .await
     .map_err(|_| {
@@ -166,8 +167,7 @@ where
             tokio::task::spawn_blocking(move || {
                 // Check for external rotations while retaining an Allow once
                 // value if macOS refuses a new silent read.
-                keychain::revalidate_password(&service, &account).map_err(keychain_save_error)?;
-                load_credentials_from_keychain_or_file(&service, &account, path)
+                load_revalidated_credentials(&service, &account, Some(path))
             })
             .await
             .map_err(|_| {
@@ -284,6 +284,24 @@ fn load_credentials_from_keychain_or_file(
         load_keychain_credentials(keychain_service, keychain_account),
         || load_file_credentials(&credentials_file_path, keychain_service, keychain_account),
     )
+}
+
+// A fresh Keychain check may fail even while the selected file remains usable.
+// Do not let revalidation bypass the ordinary source-selection policy.
+fn load_revalidated_credentials(
+    service: &str,
+    account: &str,
+    file: Option<PathBuf>,
+) -> Result<ClaudeCredentials, ProviderError> {
+    let primary = keychain::revalidate_password(service, account)
+        .map_err(keychain_load_error)
+        .and_then(|()| load_keychain_credentials(service, account));
+    match file {
+        Some(path) => credentials_with_file_fallback(primary, || {
+            load_file_credentials(&path, service, account)
+        }),
+        None => primary,
+    }
 }
 
 fn credentials_with_file_fallback(
@@ -533,6 +551,13 @@ pub(super) struct ClaudeCredentials {
 }
 
 impl ClaudeCredentials {
+    pub(super) fn uses_native_cli_source(&self, native_file: &Path) -> bool {
+        match &self.source {
+            CredentialSource::Keychain => true,
+            CredentialSource::File(path) => path == native_file,
+        }
+    }
+
     pub(super) fn source_contents(&self) -> &str {
         &self.source_contents
     }
@@ -605,6 +630,49 @@ fn update_oauth_field(raw: &mut Value, field: &str, value: Value) -> Result<(), 
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn file_fallback_survives_refresh_reload() {
+        // The unit-test executable has no --keychain-helper entry point, so its
+        // isolated helper fails without accessing any real Keychain item.
+        let root = std::env::temp_dir().join(format!("usage-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".credentials.json");
+        std::fs::write(&path, r#"{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh","expiresAt":1}}"#).unwrap();
+        let loaded = load_credentials(
+            "usage-test-no-real-service".into(),
+            "synthetic-account".into(),
+            path,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(loaded.source, CredentialSource::File(_)));
+        let reloaded = reload_for_refresh(&loaded).await;
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            reloaded.is_ok(),
+            "a readable file must remain available for refresh: {reloaded:?}"
+        );
+    }
+
+    #[test]
+    fn cached_identity_requires_the_native_credentials_file() {
+        let native = PathBuf::from("/profiles/work/.credentials.json");
+        let raw =
+            r#"{"claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic-refresh"}}"#;
+        for (source, allowed) in [
+            (CredentialSource::Keychain, true),
+            (CredentialSource::File(native.clone()), true),
+            (
+                CredentialSource::File(PathBuf::from("/other-account/credentials.json")),
+                false,
+            ),
+        ] {
+            let credentials =
+                parse_credentials(raw, "native-service", "native-account", source).unwrap();
+            assert_eq!(credentials.uses_native_cli_source(&native), allowed);
+        }
+    }
 
     #[test]
     fn permission_failure_can_use_the_selected_profiles_file() {

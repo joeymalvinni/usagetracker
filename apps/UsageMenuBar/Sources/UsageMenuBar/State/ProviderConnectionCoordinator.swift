@@ -14,6 +14,7 @@ enum ProviderConnectionState: Equatable, Sendable {
 struct ProviderConnectionPresentation: Equatable, Sendable {
     let state: ProviderConnectionState
     let message: String
+    var pendingProfileId: String? = nil
 }
 
 /// Owns only transient provider-connection state. Stable state is derived from
@@ -36,6 +37,11 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
     ) -> ProviderConnectionPresentation {
         if let override = overrides[providerId],
            override.state == .connecting || override.state == .waitingForSignIn {
+            return override
+        }
+
+        if let override = overrides[providerId], let profileId = override.pendingProfileId,
+           !accounts.contains(where: { $0.profileId == profileId }) {
             return override
         }
 
@@ -69,7 +75,7 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
             }
         }
 
-        if let override = overrides[providerId] {
+        if let override = overrides[providerId], override.pendingProfileId == nil {
             return override
         }
 
@@ -92,12 +98,14 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
     func set(
         _ state: ProviderConnectionState,
         message: String,
-        for providerId: String
+        for providerId: String,
+        pendingProfileId: String? = nil
     ) {
         precondition(state != .idle && state != .connected)
         overrides[providerId] = ProviderConnectionPresentation(
             state: state,
-            message: message
+            message: message,
+            pendingProfileId: pendingProfileId
         )
     }
 

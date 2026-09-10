@@ -473,6 +473,7 @@ private enum ProviderSignInFollowUp {
     func allowProviderCredentialAccess(
         _ providerId: String,
         accountId: String? = nil,
+        profileId: String? = nil,
         retryConnection: Bool = false
     ) async {
         guard !providerRecoveryIsBusy(providerId) else { return }
@@ -480,9 +481,9 @@ private enum ProviderSignInFollowUp {
         defer { pendingAccountProviders.remove(providerId) }
         actionError = nil
         do {
-            try await client.requestCredentialAccess(providerId: providerId, accountId: accountId)
+            try await client.requestCredentialAccess(providerId: providerId, accountId: accountId, profileId: profileId)
             if retryConnection {
-                await connectProviderForOnboarding(providerId)
+                await connectProviderForOnboarding(providerId, profileId: profileId)
             } else {
                 await refreshProvider(providerId)
             }
@@ -880,12 +881,12 @@ private enum ProviderSignInFollowUp {
         }
     }
 
-    func connectProviderForOnboarding(_ providerId: String) async {
+    func connectProviderForOnboarding(_ providerId: String, profileId: String? = nil) async {
         guard !onboardingDiscoveryRunning, !onboardingProviderDefaultsPending else { return }
-        await connectOnboardingProvider(providerId)
+        await connectOnboardingProvider(providerId, profileId: profileId)
     }
 
-    private func connectOnboardingProvider(_ providerId: String) async {
+    private func connectOnboardingProvider(_ providerId: String, profileId: String? = nil) async {
         guard onboardingProviderConnection(providerId).state != .connecting else { return }
         setOnboardingProviderState(providerId, .connecting, "Checking for an account…")
         actionError = nil
@@ -898,7 +899,9 @@ private enum ProviderSignInFollowUp {
             build()
             let started = try await client.startRefresh([providerId])
             let discoveredProvider: @Sendable (RefreshJob) -> Bool = { job in
-                job.discoveredAccounts.contains { $0.providerId == providerId }
+                // Pending-profile recovery must finish discovery; an already
+                // connected account is not evidence that the new one recovered.
+                profileId == nil && job.discoveredAccounts.contains { $0.providerId == providerId }
             }
             let progress = try await client.waitForRefreshProgress(
                 started,
@@ -923,9 +926,13 @@ private enum ProviderSignInFollowUp {
             await load()
 
             let providerAccounts = onboardingConnectedAccounts.filter {
-                $0.providerId == providerId
+                $0.providerId == providerId && (profileId == nil || $0.profileId == profileId)
             }
-            let providerResults = report.providerResults.filter { $0.providerId == providerId }
+            let accountIDs = Set(providerAccounts.map(\.id))
+            let providerResults = report.providerResults.filter {
+                $0.providerId == providerId && (profileId == nil || $0.profileId == profileId
+                    || $0.accountId.map { accountIDs.contains($0) } == true)
+            }
             if providerResults.contains(where: { $0.status == .ok }), !providerAccounts.isEmpty {
                 providerConnections.clearOverride(for: providerId)
                 return
@@ -938,7 +945,8 @@ private enum ProviderSignInFollowUp {
                 setOnboardingProviderState(
                     providerId,
                     .needsPermission,
-                    "macOS did not allow credential access. You can try again."
+                    "macOS did not allow credential access. You can try again.",
+                    pendingProfileId: result?.accountId == nil ? result?.profileId : nil
                 )
             case .credentialsMissing:
                 setOnboardingProviderState(
@@ -1042,9 +1050,10 @@ private enum ProviderSignInFollowUp {
     private func setOnboardingProviderState(
         _ providerId: String,
         _ state: ProviderConnectionState,
-        _ message: String
+        _ message: String,
+        pendingProfileId: String? = nil
     ) {
-        providerConnections.set(state, message: message, for: providerId)
+        providerConnections.set(state, message: message, for: providerId, pendingProfileId: pendingProfileId)
     }
 
     func onboardingProviderConnection(
@@ -1409,9 +1418,9 @@ private enum ProviderSignInFollowUp {
                     guard !Task.isCancelled else { return }
                     if report.providerResults.contains(where: {
                         $0.providerId == providerId && $0.accountId == nil
-                            && $0.status == .keychainAccessFailed
+                            && $0.profileId == profileId && $0.status == .keychainAccessFailed
                     }) {
-                        setOnboardingProviderState(providerId, .needsPermission, "Allow credential access")
+                        setOnboardingProviderState(providerId, .needsPermission, "Allow credential access", pendingProfileId: profileId)
                         providersAwaitingAuthenticationCode.remove(providerId)
                         return
                     }

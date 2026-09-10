@@ -120,9 +120,9 @@ struct DaemonClient: Sendable {
         guard case let .providerSetup(v) = try await send(.updateProviderSetup(providerId: providerId, settings: settings)) else { throw DaemonError.badResponse }
         return v
     }
-    func requestCredentialAccess(providerId: String, accountId: String?) async throws {
+    func requestCredentialAccess(providerId: String, accountId: String?, profileId: String? = nil) async throws {
         guard case .providerAction = try await send(.requestCredentialAccess(
-            providerId: providerId, accountId: accountId
+            providerId: providerId, accountId: accountId, profileId: profileId
         )) else { throw DaemonError.badResponse }
     }
     func repairProvider(

@@ -406,6 +406,139 @@ fn map_profile_error(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn identity_fallback_requires_native_service_and_file_even_during_network_failure() {
+        use super::super::{
+            claude_profiles, settings, ClaudeCollector, ProviderConfig, ProviderProfileConfig,
+        };
+        let root =
+            std::env::temp_dir().join(format!("usage-test-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"986efbc1-2be6-407a-9bcc-2e429b8e358d","emailAddress":"personal@example.com"}}"#).unwrap();
+        for (native_service, native_file, profile_scope) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (true, true, false),
+        ] {
+            let credentials_path = root.join(if native_file {
+                ".claude/.credentials.json"
+            } else {
+                "work-credentials.json"
+            });
+            std::fs::write(&credentials_path, serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": { "accessToken":"synthetic-access", "refreshToken":"synthetic-refresh",
+                    "scopes": if profile_scope { vec!["user:profile"] } else { vec![] } }
+            })).unwrap()).unwrap();
+            let mut configured = ProviderProfileConfig {
+                id: Some("default".into()),
+                ..Default::default()
+            };
+            settings::update_profile(&mut configured, |settings| {
+                settings.keychain_service = Some(
+                    if native_service {
+                        "Claude Code-credentials"
+                    } else {
+                        "usage-test-synthetic-work-service"
+                    }
+                    .into(),
+                );
+                settings.keychain_account = Some(std::env::var("USER").unwrap());
+                settings.credentials_file = Some(credentials_path);
+                settings.cli_enabled = Some(true);
+            })
+            .unwrap();
+            let profiles = claude_profiles(
+                ProviderConfig {
+                    profiles: vec![configured],
+                    ..Default::default()
+                },
+                &root,
+            )
+            .unwrap();
+            // The test executable cannot run Keychain helpers. All HTTP requests
+            // go to a closed loopback port; no real credential/provider is used.
+            let client = reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all("http://127.0.0.1:1").unwrap())
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let collector = ClaudeCollector {
+                profiles,
+                api: ClaudeApiClient { client },
+            };
+            let result = collector
+                .fetch_profile_identity(&collector.profiles[0])
+                .await;
+            assert_eq!(result.is_ok(), native_service && native_file,
+                "native_service={native_service}, native_file={native_file}, profile_scope={profile_scope}: {result:?}");
+            if let Ok(identity) = result {
+                assert_eq!(identity.account_id, "986efbc1-2be6-407a-9bcc-2e429b8e358d");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_evict_profile_cache_and_recheck_permission() {
+        use super::super::{
+            claude_profiles, settings, ClaudeCollector, ProviderConfig, ProviderProfileConfig,
+        };
+        let root = std::env::temp_dir().join(format!("usage-rejection-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic-refresh"}}"#,
+        )
+        .unwrap();
+        let mut config = ProviderProfileConfig {
+            id: Some("work".into()),
+            ..Default::default()
+        };
+        settings::update_profile(&mut config, |s| {
+            s.keychain_service = Some(format!("usage-rejection-{}", uuid::Uuid::new_v4()));
+            s.credentials_file = Some(path.clone());
+        })
+        .unwrap();
+        let profiles = claude_profiles(
+            ProviderConfig {
+                profiles: vec![config],
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        let collector = ClaudeCollector {
+            profiles,
+            api: ClaudeApiClient::new(Duration::from_millis(100), Duration::from_millis(100))
+                .unwrap(),
+        };
+        let profile = &collector.profiles[0];
+        collector.load_credentials(profile).await.unwrap();
+        std::fs::remove_file(path).unwrap();
+        // A transport error must not evict an accepted credential.
+        let network = collector
+            .recover_rejected_credentials(
+                profile,
+                ProviderError::new(ProviderErrorKind::Network, "offline"),
+            )
+            .await;
+        assert_eq!(network.kind(), ProviderErrorKind::Network);
+        assert!(profile.credentials_cache.lock().await.is_some());
+        // The unit-test helper is unavailable, so a fresh source read requires
+        // credential recovery instead of reusing the profile's rejected token.
+        let rejected = collector
+            .recover_rejected_credentials(
+                profile,
+                ProviderError::new(ProviderErrorKind::Unauthorized, "rejected"),
+            )
+            .await;
+        assert_eq!(rejected.kind(), ProviderErrorKind::KeychainAccessFailed);
+        assert!(profile.credentials_cache.lock().await.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn parses_oauth_profile_account_identity() {
         let identity = parse_profile_identity(

@@ -646,6 +646,16 @@ impl DaemonRuntime {
         // This also works for a provider paused after failed onboarding. Asking
         // for permission itself never enables polling or starts browser login.
         let collector = adapter.build_collector(&config)?;
+        if let Some(id) = &profile_id {
+            anyhow::ensure!(
+                collector.configured_profile_ids().contains(id),
+                "The selected credential profile is unavailable"
+            );
+        }
+        anyhow::ensure!(
+            profile_id.is_some() || collector.configured_profile_ids().len() <= 1,
+            "Choose an account or pending profile before requesting credential access"
+        );
         self.refresh
             .invalidate_cached_credentials(&provider_id, profile_id.as_deref())
             .await?;

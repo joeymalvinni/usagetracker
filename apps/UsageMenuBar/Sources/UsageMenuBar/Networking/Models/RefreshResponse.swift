@@ -76,6 +76,7 @@ enum RefreshJobStatus: String, Decodable, Equatable, Sendable {
 struct ProviderRefreshResult: Decodable, Equatable, Sendable {
     let providerId: String
     let accountId: String?
+    let profileId: String?
     let status: ProviderRefreshStatus
     let collectionMode: String?
     let collectedAt: Date?

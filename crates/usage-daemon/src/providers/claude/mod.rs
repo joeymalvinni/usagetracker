@@ -123,11 +123,30 @@ impl ClaudeCollector {
             Ok(refreshed) => refreshed,
             Err(err) => {
                 *profile.credentials_cache.lock().await = None;
-                return Err(err);
+                return Err(self.recover_rejected_credentials(profile, err).await);
             }
         };
         *profile.credentials_cache.lock().await = Some((refreshed.clone(), Instant::now()));
         Ok(refreshed)
+    }
+
+    // Only definitive rejection discards an Allow-once value. Re-read after
+    // eviction so a protected replacement is presented as permission recovery.
+    async fn recover_rejected_credentials(
+        &self,
+        profile: &ClaudeProfile,
+        error: ProviderError,
+    ) -> ProviderError {
+        if error.kind() != ProviderErrorKind::Unauthorized {
+            return error;
+        }
+        if let Err(invalidation) = self.invalidate_cached_credentials(Some(&profile.id)).await {
+            return invalidation;
+        }
+        match self.load_credentials(profile).await {
+            Err(access) if access.kind() == ProviderErrorKind::KeychainAccessFailed => access,
+            _ => error,
+        }
     }
 
     async fn load_with_auto_refresh(
@@ -257,7 +276,16 @@ impl ClaudeCollector {
 
         match fetched {
             Ok(identity) => Ok(identity),
+            // A legacy token without user:profile may legitimately be denied
+            // by this endpoint while its usage token remains valid.
+            Err(primary)
+                if primary.kind() == ProviderErrorKind::Unauthorized
+                    && !should_use_cached_identity(&credentials.scopes) =>
+            {
+                Err(self.recover_rejected_credentials(profile, primary).await)
+            }
             Err(primary) if primary.kind() == ProviderErrorKind::RateLimited => Err(primary),
+            Err(primary) if !can_use_cached_identity(profile, &credentials) => Err(primary),
             Err(primary)
                 if !should_use_cached_identity(&credentials.scopes)
                     && !should_use_cli_fallback(profile.cli_enabled, &primary) =>
@@ -306,10 +334,7 @@ impl ClaudeCollector {
                 match self.api.fetch_usage(&credentials).await {
                     Ok(payload) => payload,
                     Err(err) => {
-                        if err.kind() == ProviderErrorKind::Unauthorized {
-                            *profile.credentials_cache.lock().await = None;
-                        }
-                        return Err(err);
+                        return Err(self.recover_rejected_credentials(profile, err).await);
                     }
                 }
             }
@@ -530,6 +555,21 @@ fn supports_native_cli_auth(profile: &ClaudeProfile) -> bool {
     };
     profile.keychain_service == service
         && std::env::var("USER").is_ok_and(|user| profile.keychain_account == user)
+}
+
+fn can_use_cached_identity(profile: &ClaudeProfile, credentials: &ClaudeCredentials) -> bool {
+    if !supports_native_cli_auth(profile) {
+        return false;
+    }
+    let native_file = match &profile.config_dir {
+        Some(root) => root.join(".credentials.json"),
+        None => profile
+            .identity_file_path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join(CLAUDE_CREDENTIALS_FILE),
+    };
+    credentials.uses_native_cli_source(&native_file)
 }
 
 async fn validate_cli_identity(
@@ -753,7 +793,11 @@ impl ProviderCollector for ClaudeCollector {
     ) -> Result<(), ProviderError> {
         let profile = match profile_id {
             Some(id) => self.profiles.iter().find(|profile| profile.id == id),
-            None => self.profiles.first(),
+            None if self.profiles.len() == 1 => self.profiles.first(),
+            None => return Err(ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "Choose a Claude account or pending profile before requesting credential access",
+            )),
         }
         .ok_or_else(|| {
             ProviderError::new(
@@ -913,6 +957,29 @@ mod tests {
                 .is_err()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_access_never_guesses_between_profiles() {
+        let root = std::env::temp_dir();
+        let profiles = claude_profiles(
+            ProviderConfig {
+                profiles: vec![
+                    configured_profile("personal", "/profiles/personal", Some(false), false),
+                    configured_profile("work", "/profiles/work", Some(false), false),
+                ],
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        let collector = ClaudeCollector {
+            profiles,
+            api: ClaudeApiClient::new(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
+        };
+        for profile in [None, Some("missing")] {
+            assert!(collector.request_credential_access(profile).await.is_err());
+        }
     }
 
     #[test]
