@@ -110,6 +110,7 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     var errorDetail: String? = nil
     var collectionIssue: ProviderCollectionIssue? = nil
     var accountEmail: String? = nil
+    var planLabel: String? = nil
     var activitySourceLabel: String? = nil
     var hasCostData: Bool = true
     var unpricedModelNames: [String] = []

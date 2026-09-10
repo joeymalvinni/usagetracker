@@ -266,6 +266,7 @@ struct DashboardBuilder {
             errorDetail: singleAccount?.errorDetail,
             collectionIssue: singleAccount?.collectionIssue,
             accountEmail: singleAccount?.accountEmail,
+            planLabel: singleAccount?.planLabel,
             activitySourceLabel: singleAccount?.activitySourceLabel,
             hasCostData: accountVMs.contains(where: \.hasCostData),
             unpricedModelNames: Array(Set(accountVMs.flatMap(\.unpricedModelNames))).sorted()
@@ -338,6 +339,7 @@ struct DashboardBuilder {
             errorDetail: h?.lastErrorMessage,
             collectionIssue: enabled ? h.flatMap(ProviderCollectionIssue.init) : nil,
             accountEmail: account?.email,
+            planLabel: latest?.diagnostics?.label,
             activitySourceLabel: dashboardByAccount[
                 ProviderAccountKey(providerId: providerId, accountId: accountId)
             ]?.activity.map {

@@ -4,6 +4,7 @@ struct UsageSnapshot: Decodable, Identifiable, Equatable {
     let providerId, accountId: String
     let collectedAt: Date
     let windows: [UsageWindow]
+    var diagnostics: PlanDetails? = nil
 }
 
 struct UsageWindow: Decodable, Identifiable, Equatable {
@@ -83,5 +84,34 @@ extension UsageUnit {
         case .tokens: "tokens"; case .requests: "requests"; case .credits: "credits"
         case .usd: "USD"; case .percent: "%"; case .unknown: "units"; case .other(let s): s
         }
+    }
+}
+
+/// Account-specific subscription metadata supplied by the provider collector.
+struct PlanDetails: Decodable, Equatable {
+    var planType: String? = nil
+    var subscriptionType: String? = nil
+    var membershipType: String? = nil
+
+    var label: String? {
+        for value in [planType, subscriptionType, membershipType] {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { continue }
+            switch value.lowercased() {
+            case "free": return "Free"
+            case "plus": return "Plus"
+            case "pro": return "Pro"
+            case "prolite": return "Pro Lite"
+            case "max": return "Max"
+            case "team": return "Team"
+            case "team_standard": return "Team Standard"
+            case "team_premium": return "Team Premium"
+            case "business": return "Business"
+            case "enterprise": return "Enterprise"
+            case "education", "edu": return "Education"
+            default: return value.replacingOccurrences(of: "_", with: " ")
+            }
+        }
+        return nil
     }
 }

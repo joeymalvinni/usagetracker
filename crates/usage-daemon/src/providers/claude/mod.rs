@@ -572,6 +572,22 @@ fn can_use_cached_identity(profile: &ClaudeProfile, credentials: &ClaudeCredenti
     credentials.uses_native_cli_source(&native_file)
 }
 
+/// Cached seat metadata belongs only to the exact account being collected.
+fn cached_account_plan(body: &[u8], expected_account_id: &str) -> Option<String> {
+    let identity = parse_cached_profile_identity(body).ok()?;
+    if identity.account_id != expected_account_id {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let account = value.get("oauthAccount")?;
+    ["subscriptionType", "seatTier"]
+        .iter()
+        .filter_map(|key| account.get(key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 async fn validate_cli_identity(
     profile: &ClaudeProfile,
     expected: &str,
@@ -764,6 +780,18 @@ impl ProviderCollector for ClaudeCollector {
                     "rate_limit_tier".to_string(),
                     json!(credentials.rate_limit_tier),
                 );
+            }
+        }
+
+        if usage
+            .detail
+            .subscription_type
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            if let Ok(body) = tokio::fs::read(&profile.identity_file_path).await {
+                usage.detail.subscription_type =
+                    cached_account_plan(&body, &account.external_account_id);
             }
         }
 
@@ -980,6 +1008,26 @@ mod tests {
         for profile in [None, Some("missing")] {
             assert!(collector.request_credential_access(profile).await.is_err());
         }
+    }
+
+    #[test]
+    fn cached_plan_uses_matching_account_seat_when_subscription_is_missing() {
+        let id = "986efbc1-2be6-407a-9bcc-2e429b8e358d";
+        let body = serde_json::to_vec(&json!({"oauthAccount": {
+            "accountUuid": id, "subscriptionType": " ", "seatTier": "team_standard"
+        }}))
+        .unwrap();
+        assert_eq!(
+            cached_account_plan(&body, id).as_deref(),
+            Some("team_standard")
+        );
+        assert_eq!(cached_account_plan(&body, "another-account"), None);
+        assert_eq!(cached_account_plan(b"{}", id), None);
+        let body = serde_json::to_vec(&json!({"oauthAccount": {
+            "accountUuid": id, "subscriptionType": "max", "seatTier": "team_standard"
+        }}))
+        .unwrap();
+        assert_eq!(cached_account_plan(&body, id).as_deref(), Some("max"));
     }
 
     #[test]

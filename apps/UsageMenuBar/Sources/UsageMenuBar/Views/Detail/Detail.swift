@@ -180,6 +180,7 @@ struct Detail: View {
         let subtitleParts: [String?] = [
             selectedAccount?.account,
             activeProvider.detail,
+            activeProvider.planLabel.map { "Plan: \($0)" },
         ]
         let parts = subtitleParts.compactMap { $0 }
         return .custom(parts.joined(separator: " · "))
