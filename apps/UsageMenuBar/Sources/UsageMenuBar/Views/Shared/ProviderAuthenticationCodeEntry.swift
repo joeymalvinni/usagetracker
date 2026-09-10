@@ -15,10 +15,7 @@ struct ProviderAuthenticationCodeEntry: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            Text("Paste the authentication code shown in your browser.")
-                .font(Theme.Typography.caption)
-                .foregroundStyle(.secondary)
+        DisclosureGroup("Enter a code (if shown)") {
             HStack(spacing: Theme.Spacing.sm) {
                 SecureField("Authentication code", text: $authenticationCode)
                     .textFieldStyle(.roundedBorder)
@@ -31,7 +28,7 @@ struct ProviderAuthenticationCodeEntry: View {
                 }
             }
         }
-        .surfaceInset()
+        .font(Theme.Typography.caption)
     }
 
     private func submit() {

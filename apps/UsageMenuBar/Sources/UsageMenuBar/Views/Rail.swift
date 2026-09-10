@@ -205,11 +205,10 @@ struct Rail: View {
         return drag.translation - CGFloat(index - drag.startIndex) * rowPitch
     }
 
-    // Actionable alerts (warning/critical/error) only show a dot until the user has viewed
-    // the account; non-actionable states (stale/disabled) always show their gray dot.
+    // Reserve attention dots for unseen quota alerts. Freshness is available
+    // in the provider's update time and collection details.
     private func railShowsDot(_ provider: ProviderVM) -> Bool {
-        if provider.status.isAlert { return provider.hasUnseenAlert }
-        return provider.status.needsAttention
+        provider.status.isAlert && provider.hasUnseenAlert
     }
 
     private func rail(_ selection: Selection, _ label: String, @ViewBuilder icon: () -> some View) -> some View {

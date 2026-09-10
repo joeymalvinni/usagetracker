@@ -22,10 +22,36 @@ pub(super) fn read_cookie_file(provider_id: &str) -> Option<String> {
     .ok()
 }
 
-pub(super) fn load_cached_cookie_header(provider_id: &str) -> Option<String> {
-    keychain::get_password(COOKIE_CACHE_SERVICE, provider_id)
-        .ok()
-        .and_then(|value| normalize_cookie_header(&value))
+pub(super) fn load_cached_cookie_header(
+    provider_id: &str,
+) -> Result<Option<String>, ProviderError> {
+    match keychain::get_password(COOKIE_CACHE_SERVICE, provider_id) {
+        Ok(value) => Ok(normalize_cookie_header(&value)),
+        Err(keychain::Error::Missing) => Ok(None),
+        Err(_) => Err(ProviderError::new(
+            crate::providers::ProviderErrorKind::KeychainAccessFailed,
+            "Access to the saved OpenCode session needs macOS permission",
+        )),
+    }
+}
+
+pub(super) fn request_access() -> Result<(), ProviderError> {
+    if load_cached_cookie_header(OPENCODE_GO_PROVIDER_ID).is_err() {
+        return keychain::request_access(COOKIE_CACHE_SERVICE, OPENCODE_GO_PROVIDER_ID).map_err(
+            |_| {
+                ProviderError::new(
+                    crate::providers::ProviderErrorKind::KeychainAccessFailed,
+                    "macOS did not authorize access to the saved OpenCode session",
+                )
+            },
+        );
+    }
+    browser_cookies::request_browser_access(
+        false,
+        &["opencode.ai", "app.opencode.ai"],
+        &COOKIE_NAMES,
+        Some(&COOKIE_NAMES),
+    )
 }
 
 pub(super) fn store_cached_cookie_header(provider_id: &str, cookie_header: &str) {

@@ -30,6 +30,7 @@ A reminder on trust: read methods can surface account emails, local paths, usage
 | `delete_account` | `{"method":"delete_account","account_id":"ACCOUNT"}` | `account_deleted` |
 | `get_provider_setup` | `{"method":"get_provider_setup","provider_id":"opencode_go"}` | `provider_setup` |
 | `update_provider_setup` | `{"method":"update_provider_setup","provider_id":"opencode_go","settings":{"workspace_id":"wrk_123"}}` | `provider_setup` |
+| `request_credential_access` | `{"method":"request_credential_access","provider_id":"claude","account_id":"account-1"}` | `provider_action` |
 | `repair_provider` | `{"method":"repair_provider","provider_id":"codex"}` | `provider_action` |
 | `submit_provider_sign_in_code` | `{"method":"submit_provider_sign_in_code","provider_id":"claude","authentication_code":"CODE"}` | `provider_action` |
 | `cancel_provider_sign_in` | `{"method":"cancel_provider_sign_in","provider_id":"claude"}` | `provider_action` |
@@ -99,6 +100,7 @@ Import jobs follow the same in-memory retention rules as refresh jobs: active jo
 
 | Method | Effect | Retry and restart | Expected errors |
 | --- | --- | --- | --- |
+| `request_credential_access` | Explicit user action only. Requests macOS permission for an existing credential source. An optional `account_id` must belong to the provider and selects its profile; without one, the initial profile/source is used. Never starts browser login, enables polling, or grants future background interaction. Clients should allow 65 seconds. | May display one system permission prompt per call; cancellation is not retried. | `unknown_provider`, `unknown_account`, `invalid_argument`, `storage_unavailable`, `internal` |
 | `repair_provider` | Validates an optional `account_id`, then starts the provider's login/repair flow. The provider must advertise `repair`. `sign_in_action` defaults to `open`; `copy_link` suppresses automatic browser launch and requires the response to include `authentication_url`. | Not idempotent — it may start several login sessions. The configuration itself persists. | `unknown_provider`, `unknown_account`, `storage_unavailable`, `unsupported_operation`, `internal` |
 | `launch_provider_account` | Opens the provider with the account's isolated profile. Optional `working_directory`, `launch` (structured flags: `model`, `effort`, `dangerously_skip_permissions`), and `remember_dangerously_skip_permissions` override and — on success — persist the account's saved preferences. `launch` replaces the saved flags as a whole rather than merging fields, and a blank `working_directory` clears the saved one. The saved dangerous flag changes only when explicitly remembered, and `remember_dangerously_skip_permissions` has no effect unless `launch` is also sent. Preferences persist only for accounts with managed profile entries; legacy default accounts launch but save nothing. Providers must advertise `launch_options` for overrides; a relative or nonexistent working directory fails with `invalid_argument`. | Not idempotent — it may open several sessions. No job persists. | `unknown_account`, `storage_unavailable`, `unsupported_operation`, `invalid_argument` |
 

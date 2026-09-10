@@ -625,6 +625,40 @@ impl DaemonRuntime {
             .await
     }
 
+    pub async fn request_credential_access(
+        &self,
+        provider_id: ProviderId,
+        profile_id: Option<String>,
+    ) -> anyhow::Result<ProviderActionResponse> {
+        anyhow::ensure!(
+            !self.fixture_mode,
+            "credential access is unavailable in fixture mode"
+        );
+        let adapter = provider_registry::adapter(&provider_id)?;
+        let config = self
+            .config
+            .read()
+            .await
+            .providers
+            .get(provider_id.as_str())
+            .cloned()
+            .unwrap_or_default();
+        // This also works for a provider paused after failed onboarding. Asking
+        // for permission itself never enables polling or starts browser login.
+        let collector = adapter.build_collector(&config)?;
+        self.refresh
+            .invalidate_cached_credentials(&provider_id, profile_id.as_deref())
+            .await?;
+        collector
+            .request_credential_access(profile_id.as_deref())
+            .await?;
+        Ok(ProviderActionResponse {
+            provider_id,
+            message: "Credential access checked.".to_string(),
+            authentication_url: None,
+        })
+    }
+
     pub async fn repair_provider(
         &self,
         provider_id: ProviderId,

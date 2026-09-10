@@ -15,7 +15,7 @@ private enum SettingsTab: String, CaseIterable {
     var label: String {
         switch self {
         case .general: "General"
-        case .providers: "Providers"
+        case .providers: "Accounts"
         }
     }
 }
@@ -26,6 +26,7 @@ struct Settings: View {
     )!
 
     @EnvironmentObject var state: AppState
+    @State private var showsOtherProviders = false
     @State private var showsRemovedAccounts = false
     @State private var showsAdvanced = false
     @State private var showsDeleteAll = false
@@ -135,21 +136,7 @@ struct Settings: View {
                         .disabled(state.daemon == .offline)
                     }
                 }
-                Divider()
-                HStack {
-                    Button("Run setup assistant") {
-                        Task { await state.restartOnboarding() }
-                    }
-                        .buttonStyle(.link)
-                    Spacer()
-                    if !state.accounts.isEmpty {
-                        Button("Delete all accounts…", role: .destructive) {
-                            showsDeleteAll = true
-                        }
-                        .buttonStyle(.link)
-                        .disabled(state.daemon == .offline || !state.pendingAccounts.isEmpty)
-                    }
-                }
+
             }
             .surfaceCard()
 
@@ -177,9 +164,22 @@ struct Settings: View {
 
     private var providerSettings: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-            sectionTitle("Accounts & Providers")
-            ForEach(state.settingsProviders) { provider in
+            ForEach(connectedProviders) { provider in
                 ProviderAccountCard(provider: provider)
+            }
+
+            if !otherProviders.isEmpty {
+                if connectedProviders.isEmpty {
+                    Text("Connect an account to see its usage here.")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                    availableProviders
+                } else {
+                    DisclosureGroup("Add a provider", isExpanded: $showsOtherProviders) {
+                        availableProviders.padding(.top, Theme.Spacing.sm)
+                    }
+                    .font(Theme.Typography.caption.weight(.medium))
+                }
             }
 
             if !removedAccounts.isEmpty {
@@ -217,6 +217,38 @@ struct Settings: View {
                 }
                 .surfaceCard()
             }
+            Menu("Manage accounts") {
+                Button("Connect accounts…") { Task { await state.restartOnboarding() } }
+                if !state.accounts.isEmpty {
+                    Divider()
+                    Button("Delete all accounts…", role: .destructive) { showsDeleteAll = true }
+                        .disabled(state.daemon != .online || !state.pendingAccounts.isEmpty)
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .font(Theme.Typography.caption)
+        }
+    }
+
+    private var connectedProviders: [ProviderVM] {
+        state.settingsProviders.filter { provider in
+            provider.enabled || state.accounts.contains {
+                $0.providerId == provider.providerId && !($0.hidden && !$0.collectionEnabled)
+            }
+        }
+    }
+
+    private var otherProviders: [ProviderVM] {
+        let connected = Set(connectedProviders.map(\.providerId))
+        return state.settingsProviders.filter { !connected.contains($0.providerId) }
+    }
+
+    private var availableProviders: some View {
+        VStack(spacing: Theme.Spacing.sm) {
+            ForEach(otherProviders) { provider in
+                ProviderConnectionCard(providerId: provider.providerId)
+            }
         }
     }
 
@@ -244,7 +276,7 @@ struct Settings: View {
     }
 
     private func accountLabel(_ account: Account) -> String {
-        account.displayName?.isEmpty == false ? account.displayName! : account.externalAccountId
+        account.displayLabel
     }
 
     private var intervalOptions: [UInt64] {
@@ -315,10 +347,9 @@ private struct ProviderAccountCard: View {
     }
 
     private var setup: ProviderSetupResponse? { state.providerSetups[provider.providerId] }
-    private var busy: Bool {
-        state.pendingProviders.contains(provider.providerId)
-            || state.pendingAccountProviders.contains(provider.providerId)
-            || state.isProviderSignInActive(provider.providerId)
+    private var busy: Bool { state.providerRecoveryIsBusy(provider.providerId) }
+    private var connection: ProviderConnectionPresentation {
+        state.onboardingProviderConnection(provider.providerId)
     }
 
     var body: some View {
@@ -328,20 +359,20 @@ private struct ProviderAccountCard: View {
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(provider.name).font(Theme.Typography.headline)
-                    Text(provider.visibleInMenu ? provider.healthText : "Not tracking")
+                    Text(provider.enabled ? "Tracking" : "Not tracking")
                         .font(Theme.Typography.micro)
-                        .foregroundStyle(provider.visibleInMenu ? provider.status.tint : .secondary)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 if state.pendingProviders.contains(provider.providerId) {
                     ProgressView().controlSize(.small)
                 } else {
-                    Toggle("", isOn: visibilityBinding)
+                    Toggle("", isOn: trackingBinding)
                         .labelsHidden()
                         .toggleStyle(.switch)
                         .accessibilityLabel("Track \(provider.name)")
                         .disabled(state.daemon == .offline)
-                        .help(provider.visibleInMenu
+                        .help(provider.enabled
                             ? "Stop tracking \(provider.name)"
                             : "Track \(provider.name)")
                 }
@@ -349,9 +380,10 @@ private struct ProviderAccountCard: View {
 
             Divider()
             if accounts.isEmpty {
-                Text("No account connected")
+                Text(connection.state == .idle ? "No account connected" : connection.message)
                     .font(Theme.Typography.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 VStack(spacing: Theme.Spacing.xs) {
                     ForEach(accounts) { account in
@@ -368,60 +400,76 @@ private struct ProviderAccountCard: View {
                 ProviderAuthenticationCodeEntry(providerId: provider.providerId)
             }
 
-            if hasPrimaryAction {
-                HStack(spacing: Theme.Spacing.sm) {
-                    Button("Open sign-in") { Task { await primaryAction() } }
+            HStack(spacing: Theme.Spacing.sm) {
+                if accounts.isEmpty {
+                    Button(connectionActionLabel) { Task { await connectAccount() } }
                         .buttonStyle(.chipProminent)
                         .disabled(busy || state.daemon == .offline)
-                    Button("Copy sign-in link", systemImage: "doc.on.doc") {
-                        Task { await copySignInLink() }
+                } else if state.supportsAddAccount(provider.providerId) {
+                    Button("Add another account") {
+                        Task { await state.addProviderAccount(provider.providerId) }
                     }
                     .buttonStyle(.chip)
                     .disabled(busy || state.daemon == .offline)
-                    if busy { ProgressView().controlSize(.small) }
-                    if state.isProviderSignInActive(provider.providerId) {
-                        Button("Cancel") { state.cancelProviderSignIn(provider.providerId) }
-                            .buttonStyle(.chip)
-                    }
-                    if state.supportsSetup(provider.providerId) {
-                        Button(setup == nil ? "Find workspaces" : "Refresh workspaces") {
-                            Task { await state.loadProviderSetup(provider.providerId) }
-                        }
-                        .buttonStyle(.chip)
-                        .disabled(busy || state.daemon == .offline)
-                    }
-                    Spacer()
                 }
-            } else if state.supportsSetup(provider.providerId) {
-                HStack {
+                if state.isProviderSignInActive(provider.providerId) {
+                    Button("Cancel sign-in") { state.cancelProviderSignIn(provider.providerId) }
+                        .buttonStyle(.chip)
+                }
+                if state.supportsSetup(provider.providerId) {
                     Button(setup == nil ? "Find workspaces" : "Refresh workspaces") {
                         Task { await state.loadProviderSetup(provider.providerId) }
                     }
                     .buttonStyle(.chip)
                     .disabled(busy || state.daemon == .offline)
-                    Spacer()
+                }
+                Spacer(minLength: 0)
+                if state.supportsAddAccount(provider.providerId)
+                    || (accounts.isEmpty && state.supportsRepair(provider.providerId)) {
+                    Menu {
+                        Button(accounts.isEmpty ? "Copy sign-in link" : "Copy link to add account") {
+                            Task { await copySignInLink() }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis").frame(width: 18, height: 18)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(busy || state.daemon == .offline)
+                    .accessibilityLabel("Account connection options")
                 }
             }
         }
         .surfaceCard()
     }
 
-    private var visibilityBinding: Binding<Bool> {
+    private var trackingBinding: Binding<Bool> {
         Binding(
-            get: { provider.visibleInMenu },
+            get: { provider.enabled },
             set: { enabled in Task { await state.setProviderEnabled(provider.providerId, enabled) } }
         )
     }
 
-    private var hasPrimaryAction: Bool {
-        state.supportsAddAccount(provider.providerId) || state.supportsRepair(provider.providerId)
+    private var connectionActionLabel: String {
+        switch connection.state {
+        case .needsPermission: "Allow access"
+        case .needsSignIn:
+            state.supportsAddAccount(provider.providerId) || state.supportsRepair(provider.providerId)
+                ? "Sign in" : "Check connection"
+        case .failed: "Try again"
+        default: "Connect account"
+        }
     }
 
-    private func primaryAction() async {
-        if state.supportsAddAccount(provider.providerId) {
-            await state.addProviderAccount(provider.providerId)
-        } else if state.supportsRepair(provider.providerId) {
-            await state.repairProvider(provider.providerId, accountId: accounts.first?.id)
+    private func connectAccount() async {
+        if connection.state == .needsPermission {
+            await state.allowProviderCredentialAccess(provider.providerId, retryConnection: true)
+        } else if connection.state == .needsSignIn,
+           state.supportsAddAccount(provider.providerId) || state.supportsRepair(provider.providerId) {
+            await state.beginProviderSignIn(provider.providerId)
+        } else {
+            await state.connectProviderForOnboarding(provider.providerId)
         }
     }
 
@@ -438,7 +486,7 @@ private struct ProviderAccountCard: View {
     }
 
     private func accountLabel(_ account: Account) -> String {
-        account.displayName?.isEmpty == false ? account.displayName! : account.externalAccountId
+        account.displayLabel
     }
 }
 
@@ -455,9 +503,9 @@ private struct AccountSettingsRow: View {
         HStack(spacing: Theme.Spacing.sm) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).font(Theme.Typography.body).lineLimit(1)
-                Text(account.email.map { "\($0) · \(statusText)" } ?? statusText)
+                Text(account.email.flatMap { $0 == title ? nil : "\($0) · \(statusText)" } ?? statusText)
                     .font(Theme.Typography.micro)
-                    .foregroundStyle(needsSignIn ? .orange : .secondary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
@@ -477,18 +525,16 @@ private struct AccountSettingsRow: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
             } else {
-                if needsSignIn, state.supportsRepair(account.providerId) {
-                    Button("Reconnect") {
-                        Task { await state.repairProvider(account.providerId, accountId: account.id) }
+                if let action = collectionIssue?.recoveryAction,
+                   state.canRecoverProvider(account.providerId, action: action) {
+                    Button(action.label) {
+                        Task {
+                            await state.recoverProvider(account.providerId, accountId: account.id, action: action)
+                        }
                     }
                     .buttonStyle(.chip)
+                    .disabled(state.daemon != .online || state.providerRecoveryIsBusy(account.providerId))
                 }
-                Toggle("", isOn: collectionBinding)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .accessibilityLabel("Track \(title)")
-                    .disabled(state.daemon == .offline)
-                    .help(account.collectionEnabled ? "Pause tracking" : "Resume tracking")
                 accountMenu
             }
         }
@@ -566,8 +612,8 @@ private struct AccountSettingsRow: View {
             Button(account.hidden ? "Show in summary" : "Hide from summary") {
                 Task { await state.setAccountHidden(account.id, !account.hidden) }
             }
-            if state.supportsRepair(account.providerId) {
-                Button("Reconnect") {
+            if collectionIssue == .invalidCredentials, state.supportsRepair(account.providerId) {
+                Button("Sign in to this account…") {
                     Task { await state.repairProvider(account.providerId, accountId: account.id) }
                 }
             }
@@ -579,35 +625,29 @@ private struct AccountSettingsRow: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+        .disabled(state.daemon != .online || state.providerRecoveryIsBusy(account.providerId))
+        .accessibilityLabel("Options for \(title)")
     }
 
-    private var collectionBinding: Binding<Bool> {
-        Binding(
-            get: { account.collectionEnabled },
-            set: { enabled in Task { await state.setAccountCollectionEnabled(account.id, enabled) } }
-        )
-    }
-
-    private var title: String {
-        if let displayName = account.displayName, !displayName.isEmpty { return displayName }
-        return account.externalAccountId
-    }
+    private var title: String { account.displayLabel }
 
     private var accountHealth: ProviderHealth? {
-        state.health.first { $0.accountId == account.id }
+        state.health.first { $0.providerId == account.providerId && $0.accountId == account.id }
+            ?? state.health.first { $0.providerId == account.providerId && $0.accountId == nil }
     }
 
-    private var needsSignIn: Bool {
-        switch accountHealth?.status {
-        case .credentialsMissing, .authFailed, .keychainAccessFailed: true
-        default: false
-        }
+    private var collectionIssue: ProviderCollectionIssue? {
+        guard account.collectionEnabled,
+              state.config?.providers[account.providerId]?.enabled == true else { return nil }
+        return accountHealth.flatMap(ProviderCollectionIssue.init)
     }
 
     private var statusText: String {
         if isRemoved { return "Removed · history kept" }
-        if !account.collectionEnabled { return "Paused" }
-        if needsSignIn { return "Needs sign-in" }
+        if !account.collectionEnabled || state.config?.providers[account.providerId]?.enabled != true {
+            return "Paused"
+        }
+        if let issue = collectionIssue { return issue.summary }
         return account.hidden ? "Active · hidden from summary" : "Active"
     }
 }

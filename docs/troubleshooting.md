@@ -6,7 +6,7 @@ When something looks off, start here:
 cargo run -p usage-cli -- status
 ```
 
-The installed app registers the daemon as a per-user macOS LaunchAgent after onboarding. Logs land in `~/.usagetracker/usage-daemon.log` with three bounded, numbered archives. A daemon you run in the foreground logs straight to the terminal — add `RUST_LOG=debug` for more detail.
+The installed app registers the daemon as a per-user macOS LaunchAgent during setup. Logs land in `~/.usagetracker/usage-daemon.log` with three bounded, numbered archives. A daemon you run in the foreground logs straight to the terminal — add `RUST_LOG=debug` for more detail.
 
 Inspect the installed background service with:
 
@@ -56,7 +56,7 @@ See [Apple's official app-opening safety guide](https://support.apple.com/102445
 
 Each provider's sources and fallbacks are spelled out on its own page: [Codex](codex.md), [Claude](claude.md), [Cursor](cursor.md), [OpenCode Go](opencode.md), and [Grok](grok.md).
 
-Keychain work is serialized across providers and daemon instances. After a successful read, the daemon keeps that Keychain credential in memory until it exits, so later polls do not trigger another authorization prompt for the same item. UsageTracker's own writes update or invalidate the cached value; restart the daemon to pick up Keychain changes made externally. If a Keychain call hangs, its isolated helper is killed after 20 seconds; later refreshes can continue without leaving an unkillable Keychain thread inside the daemon. Repeated failures after that usually mean macOS denied Keychain access or the source item is unavailable, so repair the provider login and check `usage-daemon.log`.
+Keychain work is serialized across providers and daemon instances. Background reads never request macOS authorization. When needed, use **Allow access** on the affected account; canceling a prompt does not open sign-in or retry the prompt. Cached credentials revalidate silently after sixty seconds so external sign-in changes can be picked up without restarting. A previously accepted value remains usable if silent revalidation needs permission, until provider authentication rejects it. Background helpers have a five-second deadline; an explicit permission request has sixty seconds. See [Claude credential recovery](claude.md) for the file fallback and account isolation rules.
 
 ## Configuration problems
 

@@ -1,14 +1,27 @@
 # Releasing UsageTracker
 
-Git tags drive releases. A release is accepted only when the tag, Cargo workspace version, and app marketing version all agree. The workflow builds Apple Silicon and Intel artifacts, applies free ad-hoc code signatures, generates SHA-256 checksums, and publishes the artifacts with the installer scripts.
+Git tags drive releases. A release is accepted only when the tag, Cargo workspace version, and app marketing version all agree. The workflow builds Apple Silicon and Intel artifacts, signs and verifies the binaries, generates SHA-256 checksums, and publishes the artifacts with the installer scripts.
 
 ## Signing and Gatekeeper
 
-Releases are not signed with an Apple Developer ID and are not submitted to Apple's notary service. No Apple Developer account, certificate, notarization credentials, or GitHub Actions secrets are required.
+Local builds and the default release workflow use ad-hoc signing. To publish Developer ID releases, set the repository variable `APPLE_DEVELOPER_ID_RELEASES` to `true` and configure these repository secrets:
 
-An ad-hoc signature lets `codesign` detect changes after packaging, but it does not prove the publisher's identity and Gatekeeper does not treat it as an identified-developer signature. Every GitHub Release and the README say this plainly. If macOS blocks the first launch, follow [Opening the unnotarized app](troubleshooting.md#opening-the-unnotarized-app); do not disable Gatekeeper globally.
+| Secret | Value |
+| --- | --- |
+| `APPLE_CERTIFICATE_BASE64` | Base64-encoded Developer ID Application certificate and private key exported as `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | Password protecting that export |
+| `APPLE_SIGNING_IDENTITY` | Full Developer ID Application identity name, or its SHA-1 fingerprint |
+| `APPLE_ID` | Apple ID used for notarization |
+| `APPLE_TEAM_ID` | Developer team ID |
+| `APPLE_APP_PASSWORD` | App-specific password for notarization |
 
-The installer verifies the published checksums, expected archive contents, UsageTracker bundle and signing identifiers, and ad-hoc signature integrity. Checksums and artifacts are hosted by the same GitHub Release, so users still rely on GitHub and the repository account as the distribution trust boundary.
+The enabled workflow imports the identity into a temporary runner Keychain, signs the app, bundled daemon, and CLI with hardened runtime and timestamps, and submits the app and CLI together to Apple. Packaging requires an accepted notarization result, staples and validates the app ticket, and checks Gatekeeper before creating the final archives. Missing credentials or failed notarization stop the build; a signed release never falls back to ad-hoc signing. The runner credentials are removed even when a build fails.
+
+The workflow follows [GitHub's certificate setup guidance](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications) and [Apple's notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow). Keep the same Developer ID team and bundle identifiers across updates. Standalone CLI executables cannot carry stapled tickets; their notarization is available to macOS online.
+
+The installer accepts legacy ad-hoc releases and verified Developer ID Application signatures. It checks published checksums, archive contents, bundle/signing identifiers, app/daemon/CLI team consistency, and signature integrity before replacing files. For signed apps, it also requires Gatekeeper acceptance. It does not remove quarantine attributes or alter macOS security settings. The installer and checksums share the GitHub Release trust boundary with the artifacts.
+
+Until Developer ID releases are configured and published, downloaded ad-hoc releases may still need [first-launch approval](troubleshooting.md#opening-the-unnotarized-app). Packaging support alone does not notarize an existing download.
 
 The dashboard's in-app updater checks GitHub's latest stable release, verifies the release's `install.sh` against `SHA256SUMS`, and runs that installer in app-only mode against the current app directory. Keep both files in every release; they are part of the update path as well as the command-line installation path.
 
@@ -61,4 +74,14 @@ Build an ad-hoc-signed artifact without release credentials:
 ./scripts/package-release.sh aarch64-apple-darwin dist
 ```
 
-Use `x86_64-apple-darwin` to test the Intel artifact. The packaging script intentionally forces ad-hoc signing even when other signing identities are installed on the build Mac.
+Use `x86_64-apple-darwin` to test the Intel artifact. The script defaults to ad-hoc signing without selecting an installed identity automatically.
+
+For a signed local release, first store your notary credentials with `xcrun notarytool store-credentials`, then run:
+
+```sh
+CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+NOTARYTOOL_PROFILE='usagetracker-release' \
+./scripts/package-release.sh aarch64-apple-darwin dist
+```
+
+Set `NOTARYTOOL_KEYCHAIN` if the profile is in a non-default Keychain. Run `python3 scripts/test-distribution.py` to test installer acceptance, rejection, and preservation behavior using synthetic archives. These tests do not contact Apple or replace a real app; a release still needs validation with actual signing credentials.

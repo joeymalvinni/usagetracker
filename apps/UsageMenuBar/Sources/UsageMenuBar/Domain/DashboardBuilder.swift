@@ -154,7 +154,8 @@ struct DashboardBuilder {
                 secondary: "no activity",
                 sparkline: [],
                 costDashboard: .empty,
-                subAccounts: nil
+                subAccounts: nil,
+                collectionIssue: enabled ? h.flatMap(ProviderCollectionIssue.init) : nil
             )
         }
     }
@@ -169,7 +170,7 @@ struct DashboardBuilder {
     private func providerPlaceholderVM(providerId: String) -> ProviderVM {
         let h = selectedHealth(providerId: providerId, accountId: nil)
         let enabled = isEnabledProvider(providerId)
-        let status = statusValue(id: providerId, percent: nil, latest: nil, health: h, enabled: enabled)
+        let status = statusValue(id: providerId, percent: nil, latest: nil, enabled: enabled)
         return ProviderVM(
             id: providerId,
             providerId: providerId,
@@ -192,7 +193,7 @@ struct DashboardBuilder {
             subAccounts: nil,
             lastSuccessAt: h?.lastSuccessAt,
             errorDetail: h?.lastErrorMessage,
-            repairRecommended: h.map(needsCredentialRepair) ?? false
+            collectionIssue: enabled ? h.flatMap(ProviderCollectionIssue.init) : nil
         )
     }
 
@@ -235,7 +236,7 @@ struct DashboardBuilder {
         return ProviderVM(
             id: providerId,
             providerId: providerId,
-            accountId: nil,
+            accountId: singleAccount?.accountId,
             // A provider group always represents the provider, even when it has
             // only one account. Keep the account's editable label in `account`
             // so navigation and headings do not change when that label changes.
@@ -262,8 +263,8 @@ struct DashboardBuilder {
             alertSignature: worstAccount?.alertSignature,
             hasUnseenAlert: accountVMs.contains(where: \.hasUnseenAlert),
             lastSuccessAt: accountVMs.compactMap(\.lastSuccessAt).max(),
-            errorDetail: worstAccount?.errorDetail,
-            repairRecommended: worstAccount?.repairRecommended ?? false,
+            errorDetail: singleAccount?.errorDetail,
+            collectionIssue: singleAccount?.collectionIssue,
             accountEmail: singleAccount?.accountEmail,
             activitySourceLabel: singleAccount?.activitySourceLabel,
             hasCostData: accountVMs.contains(where: \.hasCostData),
@@ -278,6 +279,12 @@ struct DashboardBuilder {
             .max { $0.collectedAt < $1.collectedAt }
         let h = selectedHealth(providerId: providerId, accountId: accountId)
         let snapshotWindows = latest?.windows.filter {
+            // Old snapshots can contain opaque API placeholders from earlier parsers.
+            if providerId == "claude" {
+                let field = $0.windowId.replacingOccurrences(of: "claude_usage_utilization_", with: "")
+                if ["nimbus_quill", "tangelo", "iguana_necktie", "cinder_cove",
+                    "amber_ladder", "omelette_promotional"].contains(field) { return false }
+            }
             let provenance = provenanceByWindow[
                 WindowProvenanceKey(providerId: providerId, accountId: accountId, windowId: $0.windowId)
             ]
@@ -292,12 +299,13 @@ struct DashboardBuilder {
         windows.removeAll { ui.hiddenWindows[AppState.windowKey(providerId, $0.id)] != nil }
         credits.removeAll { ui.hiddenWindows[AppState.windowKey(providerId, $0.id)] != nil }
         let resetCreditSummary = latest.flatMap(self.resetCreditSummary)
-        let primary = windows.compactMap(\.percent).min()
+        let headlineWindow = ProviderVM.headlineWindow(in: windows)
+        let primary = headlineWindow?.percent
         let enabled = isEnabledProvider(providerId) && (account?.collectionEnabled ?? true)
-        let status = statusValue(id: providerId, percent: primary, latest: latest, health: h, enabled: enabled)
+        let status = statusValue(id: providerId, percent: primary, latest: latest, enabled: enabled)
         let (sparkline, sparklineTotal) = dailyTokens(providerId: providerId, accountId: accountId)
         let secondary = secondaryMetric(sparklineTotal: sparklineTotal, windows: windows)
-        let displayName = friendlyAccountName(displayName: account?.displayName, externalId: account?.externalAccountId)
+        let displayName = account?.displayLabel ?? "Account"
         let signature = alertSignature(providerId: providerId, accountId: accountId, status: status)
 
         return ProviderVM(
@@ -307,7 +315,7 @@ struct DashboardBuilder {
             name: displayName,
             short: short(providerId),
             symbol: symbol(providerId),
-            primary: primary.map { "\(Int($0.rounded()))%" } ?? windows.first?.value ?? "No data",
+            primary: primary.map { "\(Int($0.rounded()))%" } ?? headlineWindow?.value ?? "No data",
             detail: latest.map { "updated \(relative($0.collectedAt))" } ?? "waiting for data",
             percent: primary,
             status: status,
@@ -328,7 +336,7 @@ struct DashboardBuilder {
             hasUnseenAlert: signature.map { !ui.seenAlerts.contains($0) } ?? false,
             lastSuccessAt: h?.lastSuccessAt,
             errorDetail: h?.lastErrorMessage,
-            repairRecommended: h.map(needsCredentialRepair) ?? false,
+            collectionIssue: enabled ? h.flatMap(ProviderCollectionIssue.init) : nil,
             accountEmail: account?.email,
             activitySourceLabel: dashboardByAccount[
                 ProviderAccountKey(providerId: providerId, accountId: accountId)
@@ -347,15 +355,6 @@ struct DashboardBuilder {
                 ProviderAccountKey(providerId: providerId, accountId: accountId)
             ]?.cost?.pricing.unpricedModels ?? []
         )
-    }
-
-    private func friendlyAccountName(displayName: String?, externalId: String?) -> String {
-        if let displayName, !displayName.isEmpty { return displayName }
-        guard let externalId, !externalId.isEmpty else { return "Unknown" }
-        if externalId.count <= 12 { return externalId }
-        let prefix = String(externalId.prefix(8))
-        let suffix = String(externalId.suffix(4))
-        return "\(prefix)...\(suffix)"
     }
 
     private func buildCostDashboard(filter: ((UsageSnapshot) -> Bool)?) -> CostDashboardVM {
@@ -661,7 +660,8 @@ struct DashboardBuilder {
         if let accountId, let accountHealth = providerHealth.first(where: { $0.accountId == accountId }) {
             return accountHealth
         }
-        return providerHealth.max { $0.updatedAt < $1.updatedAt }
+        return providerHealth.filter { accountId == nil || $0.accountId == nil }
+            .max { $0.updatedAt < $1.updatedAt }
     }
 
     private func worstHealthText(providerId: String) -> String {
@@ -685,13 +685,6 @@ struct DashboardBuilder {
         case .credentialsMissing: 6
         case .disabled: 7
         case .other: 8
-        }
-    }
-
-    private func needsCredentialRepair(_ health: ProviderHealth) -> Bool {
-        switch health.status {
-        case .credentialsMissing, .authFailed, .keychainAccessFailed: true
-        default: false
         }
     }
 
@@ -773,13 +766,10 @@ struct DashboardBuilder {
         Double(value).formatted(.number.notation(.compactName).precision(.fractionLength(0...1)))
     }
 
-    private func statusValue(id: String, percent: Double?, latest: UsageSnapshot?, health h: ProviderHealth?, enabled: Bool) -> DisplayStatus {
+    private func statusValue(id: String, percent: Double?, latest: UsageSnapshot?, enabled: Bool) -> DisplayStatus {
         guard enabled else { return .disabled }
-        switch h?.status {
-        case .ok, .backingOff, .none: break
-        case .disabled?: return .disabled
-        default: return .error
-        }
+        // Quota presentation is independent of the last collection attempt.
+        // A failed request retains the last value and its existing freshness.
         if connectivity != .offline,
            let latest,
            (latest.hasExpiredWindow(at: Date()) ||
@@ -854,7 +844,7 @@ struct DashboardBuilder {
 
     private func accountLabel(_ key: ProviderAccountKey) -> String {
         guard let accountId = key.accountId else { return "" }
-        return accountsById[accountId].flatMap { $0.displayName ?? $0.externalAccountId } ?? accountId
+        return accountsById[accountId]?.displayLabel ?? accountId
     }
 
     private func symbol(_ id: String) -> String {

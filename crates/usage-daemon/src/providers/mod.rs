@@ -425,6 +425,18 @@ pub trait ProviderCollector: Send + Sync {
         account: &DiscoveredAccount,
     ) -> Result<CollectionOutcome, ProviderError>;
 
+    /// Explicit user action only. Authorize an existing credential source for
+    /// one profile; ordinary discovery and collection must never call this.
+    async fn request_credential_access(
+        &self,
+        _profile_id: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::new(
+            ProviderErrorKind::ProviderUnavailable,
+            "This provider does not require credential access permission",
+        ))
+    }
+
     /// Clears credentials cached by the collector and any shared credential
     /// broker after a successful external login.
     async fn invalidate_cached_credentials(

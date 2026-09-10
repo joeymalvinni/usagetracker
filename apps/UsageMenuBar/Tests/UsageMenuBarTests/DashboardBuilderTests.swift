@@ -3,6 +3,22 @@ import XCTest
 @testable import UsageMenuBar
 
 final class DashboardBuilderTests: XCTestCase {
+    func testCachedClaudePlaceholdersDoNotBecomeQuotaMeters() throws {
+        let account = account(id: "claude-account", providerId: "claude")
+        let snapshot = UsageSnapshot(providerId: "claude", accountId: account.id,
+            collectedAt: Date(), windows: ["nimbus_quill", "five_hour"].map {
+                UsageWindow(windowId: "claude_usage_utilization_\($0)", label: "Claude \($0)",
+                    kind: .session, used: nil, limit: nil, remaining: nil,
+                    percentUsed: 0, percentRemaining: 100, resetAt: nil)
+            })
+        let output = DashboardBuilder(config: config(providers: ["claude": true]),
+            accounts: [account], health: [], snapshots: [snapshot], forecasts: [],
+            dashboard: .empty, windowProvenance: [], ui: UIConfig(), visible: { _ in true }).build()
+        let provider = try XCTUnwrap(output.providers.first)
+        XCTAssertEqual(provider.windows.count, 1)
+        XCTAssertFalse(provider.windows.contains { $0.label.contains("nimbus") })
+    }
+
     func testCodexAccountActivityAndMissingLocalCostStayIsolated() throws {
         let today = DateFormats.dayKey.string(from: Date())
         let accounts = [account(id: "main", providerId: "codex"), account(id: "second", providerId: "codex")]
@@ -112,7 +128,10 @@ final class DashboardBuilderTests: XCTestCase {
             ui: UIConfig(),
             visible: { _ in true }
         ).build()
-        XCTAssertEqual(try XCTUnwrap(onlineOutput.providers.first).status, .error)
+        let onlineProvider = try XCTUnwrap(onlineOutput.providers.first)
+        XCTAssertEqual(onlineProvider.status, .stale)
+        XCTAssertEqual(onlineProvider.collectionIssue, .temporarilyUnavailable)
+        XCTAssertNil(onlineProvider.alertSignature)
 
         let authHealth = ProviderHealth(
             providerId: "codex",
@@ -139,8 +158,9 @@ final class DashboardBuilderTests: XCTestCase {
         ).build()
 
         let authProvider = try XCTUnwrap(authOutput.providers.first)
-        XCTAssertEqual(authProvider.status, .error)
-        XCTAssertTrue(authProvider.repairRecommended)
+        XCTAssertEqual(authProvider.status, .normal)
+        XCTAssertEqual(authProvider.collectionIssue?.recoveryAction, .reconnect)
+        XCTAssertNil(authProvider.alertSignature)
 
         let keychainHealth = ProviderHealth(
             providerId: "codex",
@@ -166,7 +186,120 @@ final class DashboardBuilderTests: XCTestCase {
             visible: { _ in true }
         ).build()
 
-        XCTAssertTrue(try XCTUnwrap(keychainOutput.providers.first).repairRecommended)
+        let keychainProvider = try XCTUnwrap(keychainOutput.providers.first)
+        XCTAssertEqual(keychainProvider.status, .stale)
+        XCTAssertEqual(keychainProvider.collectionIssue?.recoveryAction, .allowAccess)
+        XCTAssertNil(keychainProvider.alertSignature)
+    }
+
+    func testCollectionFailuresPreserveQuotaAndOfferOnlyRelevantRecovery() throws {
+        let account = account(id: "personal", providerId: "codex")
+        let cases: [(ProviderHealthStatus, String, ProviderCollectionIssue, ProviderRecoveryAction?)] = [
+            (.keychainAccessFailed, "keychain_access_failed", .permissionRequired, .allowAccess),
+            (.credentialsMissing, "credentials_missing", .accountUnavailable, .connect),
+            (.authFailed, "credentials_invalid", .invalidCredentials, .checkConnection),
+            (.authFailed, "unauthorized", .signInRequired, .reconnect),
+            (.providerError, "network", .temporarilyUnavailable, nil),
+            (.rateLimited, "rate_limited", .rateLimited, nil),
+            (.backingOff, "rate_limited", .rateLimited, nil),
+            (.parseError, "parse", .responseChanged, nil),
+        ]
+
+        for (status, code, issue, action) in cases {
+            for remaining in [80.0, 5.0] {
+                let output = DashboardBuilder(
+                    config: config(providers: ["codex": true]),
+                    accounts: [account],
+                    health: [health(accountId: account.id, status: status, code: code)],
+                    snapshots: [UsageSnapshot(providerId: "codex", accountId: account.id,
+                        collectedAt: Date(), windows: [limit(id: "weekly", remaining: remaining)])],
+                    forecasts: [], dashboard: .empty, windowProvenance: [],
+                    ui: UIConfig(), visible: { _ in true }
+                ).build()
+
+                let provider = try XCTUnwrap(output.providers.first)
+                XCTAssertEqual(provider.accountId, account.id, code)
+                XCTAssertEqual(provider.percent, remaining, code)
+                XCTAssertEqual(provider.status, remaining == 80 ? .normal : .critical, code)
+                XCTAssertEqual(provider.hasUnseenAlert, remaining == 5, code)
+                XCTAssertEqual(provider.alertSignature != nil, remaining == 5, code)
+                XCTAssertEqual(provider.collectionIssue, issue, code)
+                XCTAssertEqual(provider.collectionIssue?.recoveryAction, action, code)
+            }
+        }
+    }
+
+    func testHeadlineUsesSameVisibleLimitForNumberBarLabelAndReset() throws {
+        let account = account(id: "personal", providerId: "codex")
+        let sessionReset = Date().addingTimeInterval(3_600)
+        let weeklyReset = Date().addingTimeInterval(86_400)
+        let snapshot = UsageSnapshot(providerId: "codex", accountId: account.id,
+            collectedAt: Date(), windows: [
+                limit(id: "session", remaining: 80, resetAt: sessionReset),
+                limit(id: "weekly", remaining: 20, resetAt: weeklyReset),
+            ])
+        func provider(ui: UIConfig) throws -> ProviderVM {
+            let output = DashboardBuilder(config: config(providers: ["codex": true]),
+                accounts: [account], health: [], snapshots: [snapshot], forecasts: [],
+                dashboard: .empty, windowProvenance: [], ui: ui, visible: { _ in true }).build()
+            return try XCTUnwrap(output.providers.first)
+        }
+
+        let bothVisible = try provider(ui: UIConfig())
+        XCTAssertEqual(bothVisible.primary, "20%")
+        XCTAssertEqual(bothVisible.percent, bothVisible.headlineWindow?.percent)
+        XCTAssertEqual(bothVisible.headlineWindow?.label, "weekly")
+        XCTAssertEqual(bothVisible.headlineWindow?.resetAt, weeklyReset)
+
+        var ui = UIConfig()
+        ui.hiddenWindows[AppState.windowKey("codex", "weekly")] = "weekly"
+        let weeklyHidden = try provider(ui: ui)
+        XCTAssertEqual(weeklyHidden.primary, "80%")
+        XCTAssertEqual(weeklyHidden.percent, weeklyHidden.headlineWindow?.percent)
+        XCTAssertEqual(weeklyHidden.headlineWindow?.label, "session")
+        XCTAssertEqual(weeklyHidden.headlineWindow?.resetAt, sessionReset)
+        XCTAssertEqual(weeklyHidden.status, .normal)
+    }
+
+    func testAccountRecoveryDoesNotLeakToAnotherAccountOrProviderGroup() throws {
+        let accounts = [account(id: "personal", providerId: "codex"), account(id: "work", providerId: "codex")]
+        let output = DashboardBuilder(config: config(providers: ["codex": true]), accounts: accounts,
+            health: [health(accountId: "personal", status: .authFailed, code: "unauthorized")],
+            snapshots: accounts.map {
+                UsageSnapshot(providerId: "codex", accountId: $0.id, collectedAt: Date(),
+                    windows: [limit(id: "weekly", remaining: 80)])
+            },
+            forecasts: [], dashboard: .empty, windowProvenance: [],
+            ui: UIConfig(), visible: { _ in true }).build()
+
+        let group = try XCTUnwrap(output.providers.first)
+        let personal = try XCTUnwrap(group.subAccounts?.first { $0.accountId == "personal" })
+        let work = try XCTUnwrap(group.subAccounts?.first { $0.accountId == "work" })
+        XCTAssertEqual(personal.collectionIssue?.recoveryAction, .reconnect)
+        XCTAssertNil(work.collectionIssue)
+        XCTAssertNil(work.errorDetail)
+        XCTAssertNil(group.collectionIssue)
+        XCTAssertNil(group.accountId)
+        XCTAssertNil(group.errorDetail)
+        XCTAssertEqual(group.status, .normal)
+        XCTAssertFalse(group.hasUnseenAlert)
+    }
+
+    func testMissingUsageDoesNotCreateQuotaAlertAndPausedAccountNeedsNoRecovery() throws {
+        for enabled in [true, false] {
+            let output = DashboardBuilder(config: config(providers: ["codex": true]),
+                accounts: [account(id: "personal", providerId: "codex", collectionEnabled: enabled)],
+                health: [health(accountId: "personal", status: .keychainAccessFailed, code: "keychain_access_failed")],
+                snapshots: [], forecasts: [], dashboard: .empty, windowProvenance: [],
+                ui: UIConfig(), visible: { _ in true }).build()
+
+            let provider = try XCTUnwrap(output.providers.first)
+            XCTAssertEqual(provider.primary, "No data")
+            XCTAssertEqual(provider.status, enabled ? .stale : .disabled)
+            XCTAssertEqual(provider.collectionIssue, enabled ? .permissionRequired : nil)
+            XCTAssertNil(provider.alertSignature)
+            XCTAssertFalse(provider.hasUnseenAlert)
+        }
     }
 
     func testStaleProviderShowsRefreshingOnlyWhileThatProviderRefreshes() throws {
@@ -651,6 +784,17 @@ final class DashboardBuilderTests: XCTestCase {
         XCTAssertEqual(output.costDashboard.allTimeTokens, 500)
         XCTAssertEqual(output.costDashboard.cost30d, 2.50, accuracy: 0.001)
         XCTAssertEqual(output.costDashboard.tokens30d, 20)
+    }
+
+    private func limit(id: String, remaining: Double, resetAt: Date? = nil) -> UsageWindow {
+        UsageWindow(windowId: id, label: id, kind: .weekly, used: nil, limit: nil, remaining: nil,
+            percentUsed: 100 - remaining, percentRemaining: remaining, resetAt: resetAt)
+    }
+
+    private func health(accountId: String, status: ProviderHealthStatus, code: String) -> ProviderHealth {
+        ProviderHealth(providerId: "codex", accountId: accountId, status: status, collectionMode: "oauth",
+            lastSuccessAt: nil, lastFailureAt: Date(), lastErrorCode: code,
+            lastErrorMessage: "Collection failed: \(code)", updatedAt: Date())
     }
 
     private func config(providers: [String: Bool]) -> ConfigResponse {

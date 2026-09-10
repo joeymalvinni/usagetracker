@@ -21,6 +21,7 @@ enum DaemonRequest: Encodable {
     case deleteAccount(accountId: String)
     case getProviderSetup(providerId: String)
     case updateProviderSetup(providerId: String, settings: [String: String?])
+    case requestCredentialAccess(providerId: String, accountId: String?)
     case repairProvider(providerId: String, accountId: String?, signInAction: ProviderSignInAction)
     case submitProviderSignInCode(providerId: String, authenticationCode: String)
     case cancelProviderSignIn(providerId: String)
@@ -86,6 +87,10 @@ enum DaemonRequest: Encodable {
             try c.encode("update_provider_setup", forKey: .method)
             try c.encode(providerId, forKey: .providerId)
             try c.encode(settings, forKey: .settings)
+        case .requestCredentialAccess(let providerId, let accountId):
+            try c.encode("request_credential_access", forKey: .method)
+            try c.encode(providerId, forKey: .providerId)
+            try c.encodeIfPresent(accountId, forKey: .accountId)
         case .repairProvider(let providerId, let accountId, let signInAction):
             try c.encode("repair_provider", forKey: .method)
             try c.encode(providerId, forKey: .providerId)

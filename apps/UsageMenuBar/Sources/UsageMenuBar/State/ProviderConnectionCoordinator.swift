@@ -39,19 +39,32 @@ struct ProviderConnectionPresentation: Equatable, Sendable {
             return override
         }
 
-        if !accounts.isEmpty {
-            if health.contains(where: { $0.status == .keychainAccessFailed }) {
+        // Recovery for multiple accounts is presented on each account row.
+        // A removed or paused account must not make another account ask to sign in.
+        let accountHealth = accounts.filter(\.collectionEnabled).compactMap { account in
+            health.first { $0.accountId == account.id }
+                ?? health.first { $0.accountId == nil }
+        }
+        if accounts.count == 1 {
+            if accountHealth.contains(where: { $0.status == .keychainAccessFailed }) {
                 return ProviderConnectionPresentation(
                     state: .needsPermission,
                     message: "The account is saved, but macOS credential access is needed."
                 )
             }
-            if health.contains(where: {
-                $0.status == .credentialsMissing || $0.status == .authFailed
+            if accountHealth.contains(where: {
+                $0.status == .credentialsMissing ||
+                    ($0.status == .authFailed && $0.lastErrorCode == "unauthorized")
             }) {
                 return ProviderConnectionPresentation(
                     state: .needsSignIn,
-                    message: "The saved account needs to sign in again."
+                    message: "Connect this account to resume usage updates."
+                )
+            }
+            if accountHealth.contains(where: { $0.status == .authFailed }) {
+                return ProviderConnectionPresentation(
+                    state: .failed,
+                    message: "The existing connection could not be read. Check it before signing in again."
                 )
             }
         }

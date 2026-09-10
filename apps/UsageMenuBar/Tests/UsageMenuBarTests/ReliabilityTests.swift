@@ -497,6 +497,19 @@ final class DaemonClientTests: XCTestCase {
         XCTAssertNil(object["workspace_id"])
     }
 
+    func testCredentialPermissionUsesItsOwnRequestAndPreservesTheSelectedAccount() throws {
+        for accountId in ["work", nil] as [String?] {
+            let data = try JSONEncoder.usage.encode(DaemonRequest.requestCredentialAccess(
+                providerId: "claude", accountId: accountId
+            ))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(object["method"] as? String, "request_credential_access")
+            XCTAssertEqual(object["provider_id"] as? String, "claude")
+            XCTAssertEqual(object["account_id"] as? String, accountId)
+            XCTAssertNil(object["sign_in_action"])
+        }
+    }
+
     func testCopySignInLinkActionIsExplicitOnTheWire() throws {
         let request = DaemonRequest.repairProvider(
             providerId: "codex",
@@ -1119,6 +1132,28 @@ final class DaemonLogRotatorTests: XCTestCase {
 }
 
 final class AppStateTests: XCTestCase {
+    @MainActor func testOnboardingShowsAllProvidersWithConnectedAccountsFirst() {
+        let state = AppState(socketPath: "/tmp/usagetracker-onboarding-test.sock")
+        state.serverProviderOrder = ["codex", "claude", "opencode_go", "grok"]
+        state.accounts = [Account(
+            id: "grok-account", providerId: "grok", externalAccountId: "external",
+            profileId: nil, displayName: nil, email: nil, hidden: false,
+            collectionEnabled: true, createdAt: .now, updatedAt: .now
+        )]
+        XCTAssertEqual(state.onboardingProviderOrder, ["grok", "codex", "claude", "opencode_go"])
+        state.accounts = []
+        XCTAssertEqual(state.onboardingProviderOrder, state.serverProviderOrder)
+    }
+
+    @MainActor func testSetupPreservesProvidersWithExistingAccounts() {
+        let toggles = AppState.onboardingDefaultProviderToggles(
+            providerIDs: ["codex", "claude", "grok"],
+            existingProviderIDs: ["codex", "claude"]
+        )
+        // Leaving existing settings out preserves both enabled and paused choices.
+        XCTAssertEqual(toggles, ["grok": false])
+    }
+
     @MainActor func testOnboardingStartsWithoutEnablingAnyProvider() {
         let toggles = AppState.onboardingDefaultProviderToggles(
             providerIDs: ["codex", "claude", "cursor", "opencode_go", "grok"]
@@ -1133,6 +1168,64 @@ final class AppStateTests: XCTestCase {
 }
 
 final class ProviderConnectionCoordinatorTests: XCTestCase {
+    @MainActor func testRemovedAccountFailureDoesNotChangeConnectedAccount() {
+        let coordinator = ProviderConnectionCoordinator()
+        let account = Account(id: "current", providerId: "claude", externalAccountId: "external",
+            profileId: nil, displayName: nil, email: nil, hidden: false, collectionEnabled: true,
+            createdAt: .now, updatedAt: .now)
+        let failure = ProviderHealth(providerId: "claude", accountId: "removed", status: .authFailed,
+            collectionMode: nil, lastSuccessAt: nil, lastFailureAt: .now,
+            lastErrorCode: "unauthorized", lastErrorMessage: nil, updatedAt: .now)
+        XCTAssertEqual(coordinator.presentation(for: "claude", descriptor: nil,
+            accounts: [account], health: [failure]).state, .connected)
+    }
+
+    @MainActor func testPausedAccountDoesNotAskForCredentialAccess() {
+        let coordinator = ProviderConnectionCoordinator()
+        let account = Account(id: "paused", providerId: "claude", externalAccountId: "external",
+            profileId: nil, displayName: nil, email: nil, hidden: false, collectionEnabled: false,
+            createdAt: .now, updatedAt: .now)
+        let failure = ProviderHealth(providerId: "claude", accountId: account.id, status: .keychainAccessFailed,
+            collectionMode: nil, lastSuccessAt: nil, lastFailureAt: .now,
+            lastErrorCode: "keychain_access_failed", lastErrorMessage: nil, updatedAt: .now)
+        XCTAssertEqual(coordinator.presentation(for: "claude", descriptor: nil,
+            accounts: [account], health: [failure]).state, .connected)
+    }
+
+    @MainActor func testMultipleAccountsKeepRecoveryOnIndividualRows() {
+        let coordinator = ProviderConnectionCoordinator()
+        let accounts = ["personal", "work"].map { id in
+            Account(id: id, providerId: "claude", externalAccountId: id,
+                profileId: nil, displayName: nil, email: nil, hidden: false, collectionEnabled: true,
+                createdAt: .now, updatedAt: .now)
+        }
+        let failure = ProviderHealth(providerId: "claude", accountId: "work", status: .authFailed,
+            collectionMode: nil, lastSuccessAt: nil, lastFailureAt: .now,
+            lastErrorCode: "unauthorized", lastErrorMessage: nil, updatedAt: .now)
+        XCTAssertEqual(coordinator.presentation(for: "claude", descriptor: nil,
+            accounts: accounts, health: [failure]).state, .connected)
+    }
+
+    @MainActor func testPermissionAndUnreadableCredentialsDoNotAskForSignIn() {
+        let coordinator = ProviderConnectionCoordinator()
+        let account = Account(id: "account", providerId: "future", externalAccountId: "external",
+            profileId: nil, displayName: nil, email: nil, hidden: false, collectionEnabled: true,
+            createdAt: .now, updatedAt: .now)
+        let cases: [(ProviderHealthStatus, String, ProviderConnectionState)] = [
+            (.keychainAccessFailed, "keychain_access_failed", .needsPermission),
+            (.authFailed, "credentials_invalid", .failed),
+            (.authFailed, "unauthorized", .needsSignIn),
+            (.credentialsMissing, "credentials_missing", .needsSignIn),
+        ]
+        for (status, code, expected) in cases {
+            let health = ProviderHealth(providerId: "future", accountId: account.id, status: status,
+                collectionMode: nil, lastSuccessAt: nil, lastFailureAt: .now,
+                lastErrorCode: code, lastErrorMessage: nil, updatedAt: .now)
+            XCTAssertEqual(coordinator.presentation(for: "future", descriptor: providerDescriptor(detected: true),
+                accounts: [account], health: [health]).state, expected, code)
+        }
+    }
+
     @MainActor func testMonitorLifecyclePublishesChangesForSignInControls() async {
         let coordinator = ProviderConnectionCoordinator()
         var changes = 0

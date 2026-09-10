@@ -33,7 +33,7 @@ A few things may prompt macOS: browser cookie import can ask for Safe Storage ke
 
 ## Release integrity
 
-GitHub releases are ad-hoc signed and are not notarized by Apple. The installer checks SHA-256 hashes from the release, verifies expected archive contents and identifiers, and uses `codesign --verify` to detect changes after packaging. An ad-hoc signature does not establish a verified publisher identity, and the checksum file shares GitHub as its trust boundary with the artifacts. Protecting the GitHub repository and release workflow is therefore part of protecting the distribution channel.
+The default release workflow uses ad-hoc signing. An optional [Developer ID release workflow](releasing.md#signing-and-gatekeeper) signs and notarizes the app and CLI; this requires configured Apple credentials. The installer checks SHA-256 hashes from the release, verifies expected archive contents and identifiers, and uses `codesign --verify` to detect changes after packaging. Developer ID releases also require an Apple-rooted signing identity, matching teams for the app and its daemon/CLI, and Gatekeeper acceptance for the app. An ad-hoc signature does not establish a verified publisher identity, and the checksum file shares GitHub as its trust boundary with the artifacts. Protecting the GitHub repository and release workflow is therefore part of protecting the distribution channel.
 
 macOS may require manual approval before opening a downloaded release. Follow the bounded [Open Anyway instructions](troubleshooting.md#opening-the-unnotarized-app) rather than disabling Gatekeeper globally.
 

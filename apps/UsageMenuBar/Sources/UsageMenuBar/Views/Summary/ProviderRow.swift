@@ -13,7 +13,7 @@ struct ProviderRow: View {
                 .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.lg, style: .continuous))
         }
         .buttonStyle(.plain)
-        .help(provider.errorDetail ?? "Open \(provider.name)")
+        .help(provider.collectionIssue?.summary ?? "Open \(provider.name)")
     }
 }
 
@@ -148,7 +148,7 @@ struct AccountCarouselRow: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(account.errorDetail ?? "Open \(account.name)")
+        .help(account.collectionIssue?.summary ?? "Open \(account.name)")
     }
 
     /// Measures the card's content width without constraining it (the strip
@@ -442,18 +442,29 @@ private struct ProviderRowContent: View {
                     .foregroundStyle(.tertiary)
             }
 
-            HStack(spacing: Theme.Spacing.xs) {
-                Text(provider.secondary)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                Spacer()
-                if provider.status.needsAttention {
-                    StatusChip(status: provider.status, healthText: provider.healthText, percent: provider.percent)
+            if provider.status == .stale || provider.status == .refreshing
+                || provider.collectionIssue?.recoveryAction != nil || provider.status.isAlert {
+                HStack(spacing: Theme.Spacing.xs) {
+                    if provider.status == .stale || provider.status == .refreshing {
+                        Text(provider.detail)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Spacer()
+                    if let issue = provider.collectionIssue, issue.recoveryAction != nil {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(.secondary)
+                            .help(issue.summary)
+                            .accessibilityLabel(issue.summary)
+                    }
+                    if provider.status.isAlert {
+                        StatusChip(status: provider.status, percent: provider.percent)
+                    }
                 }
             }
 
-            if let primaryWindow = limitWindows.first {
+            if let primaryWindow = provider.headlineWindow {
                 VStack(spacing: 0) {
                     WindowRow(window: primaryWindow, compact: true)
                     if showsUsageResetSummary {
@@ -480,10 +491,6 @@ private struct ProviderRowContent: View {
         }
     }
 
-    private var limitWindows: [WindowVM] {
-        provider.windows
-    }
-
     private var showsUsageResetSummary: Bool {
         provider.providerId == "codex"
             && (usageResetCountText != nil || nextUsageResetExpiryText != nil)
@@ -506,15 +513,13 @@ private struct ProviderRowContent: View {
 
 struct StatusChip: View {
     let status: DisplayStatus
-    var healthText: String = ""
     var percent: Double? = nil
 
     private var text: String {
         if status == .critical, let percent, percent <= 0 {
             return "limit reached"
         }
-        let generic = ["all good", "unknown", ""]
-        return generic.contains(healthText) ? status.label : healthText
+        return status.label
     }
 
     var body: some View {

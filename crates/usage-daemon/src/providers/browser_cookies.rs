@@ -7,7 +7,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
 };
 
 use aes::Aes128;
@@ -22,10 +21,6 @@ use crate::keychain;
 use super::{ProviderError, ProviderErrorKind};
 
 type ChromiumKey = [u8; 16];
-type ChromiumKeyCache = BTreeMap<(&'static str, &'static str), ChromiumKey>;
-
-static CHROMIUM_KEY_CACHE: OnceLock<Mutex<ChromiumKeyCache>> = OnceLock::new();
-
 #[derive(Clone, Debug)]
 pub(crate) struct ImportedCookieSession {
     pub(crate) header: String,
@@ -87,6 +82,7 @@ fn import_browser_cookie_sessions_from(
     })?;
     let mut sessions = Vec::new();
     let mut failures = Vec::new();
+    let mut access_error = None;
     for &browser in browsers {
         for (index, cookie_path) in browser_cookie_paths(&home, browser).into_iter().enumerate() {
             match import_cookie_db(
@@ -101,17 +97,25 @@ fn import_browser_cookie_sessions_from(
                     source_label: format!("{} profile {}", browser.label, index + 1),
                 }),
                 Ok(None) => {}
-                Err(err) => failures.push(format!(
-                    "{} at {}: {}",
-                    browser.label,
-                    cookie_path.display(),
-                    err.short_message()
-                )),
+                Err(err) => {
+                    failures.push(format!(
+                        "{} at {}: {}",
+                        browser.label,
+                        cookie_path.display(),
+                        err.short_message()
+                    ));
+                    if err.kind() == ProviderErrorKind::KeychainAccessFailed {
+                        access_error = Some(err);
+                    }
+                }
             }
         }
     }
     if !sessions.is_empty() {
         return Ok(sessions);
+    }
+    if let Some(error) = access_error {
+        return Err(error);
     }
     if failures.is_empty() {
         Err(missing_cookie_error())
@@ -218,6 +222,27 @@ fn import_cookie_connection_with_store(
     required_cookie_names: &[&str],
     allowed_cookie_names: Option<&[&str]>,
 ) -> Result<Option<String>, ProviderError> {
+    import_cookie_connection_with_store_using(
+        conn,
+        browser,
+        domains,
+        required_cookie_names,
+        allowed_cookie_names,
+        browser_cookie_value,
+    )
+}
+
+fn import_cookie_connection_with_store_using(
+    conn: &Connection,
+    browser: BrowserCookieStore,
+    domains: &[&str],
+    required_cookie_names: &[&str],
+    allowed_cookie_names: Option<&[&str]>,
+    cookie_value: impl Fn(
+        &BrowserCookieRow,
+        BrowserCookieStore,
+    ) -> Result<Option<String>, ProviderError>,
+) -> Result<Option<String>, ProviderError> {
     if domains.is_empty() {
         return Ok(None);
     }
@@ -273,7 +298,7 @@ fn import_cookie_connection_with_store(
         {
             continue;
         }
-        if let Some(value) = browser_cookie_value(&row, browser) {
+        if let Some(value) = cookie_value(&row, browser)? {
             if plausible_cookie_value(&value) {
                 cookies.insert(row.name, value);
             }
@@ -457,12 +482,15 @@ fn cookie_is_expired(expires_at: i64, kind: BrowserCookieStoreKind, now_unix: i6
     unix_seconds.is_some_and(|expires| expires <= now_unix)
 }
 
-fn browser_cookie_value(row: &BrowserCookieRow, browser: BrowserCookieStore) -> Option<String> {
+fn browser_cookie_value(
+    row: &BrowserCookieRow,
+    browser: BrowserCookieStore,
+) -> Result<Option<String>, ProviderError> {
     if !row.value.trim().is_empty() {
-        return Some(row.value.trim().to_string());
+        return Ok(Some(row.value.trim().to_string()));
     }
     if browser.kind == BrowserCookieStoreKind::Firefox {
-        return None;
+        return Ok(None);
     }
     decrypt_chromium_cookie(&row.encrypted_value, &row.host, browser)
 }
@@ -471,43 +499,87 @@ fn decrypt_chromium_cookie(
     encrypted_value: &[u8],
     _host: &str,
     browser: BrowserCookieStore,
-) -> Option<String> {
+) -> Result<Option<String>, ProviderError> {
     if encrypted_value.is_empty() {
-        return None;
+        return Ok(None);
     }
     if !encrypted_value.starts_with(b"v10") && !encrypted_value.starts_with(b"v11") {
-        return String::from_utf8(encrypted_value.to_vec()).ok();
+        return Ok(String::from_utf8(encrypted_value.to_vec()).ok());
     }
     let key = chromium_decryption_key(browser)?;
     let mut buffer = encrypted_value[3..].to_vec();
-    let plaintext = cbc::Decryptor::<Aes128>::new(&key.into(), &[b' '; 16].into())
+    let Ok(plaintext) = cbc::Decryptor::<Aes128>::new(&key.into(), &[b' '; 16].into())
         .decrypt_padded_mut::<Pkcs7>(&mut buffer)
-        .ok()?;
+    else {
+        return Ok(None);
+    };
     let value = [plaintext, plaintext.get(32..).unwrap_or_default()]
         .into_iter()
         .filter_map(|bytes| String::from_utf8(bytes.to_vec()).ok())
         .find(|value| plausible_cookie_value(value));
-    value
+    Ok(value)
 }
 
-fn chromium_decryption_key(browser: BrowserCookieStore) -> Option<ChromiumKey> {
-    let cache = CHROMIUM_KEY_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let cache_key = (browser.keychain_service, browser.keychain_account);
-    if let Some(key) = cache.get(&cache_key) {
-        return Some(*key);
-    }
-
-    // Keep this lock while reading Keychain so concurrent provider imports cannot
-    // trigger duplicate authorization prompts for the same browser credential.
-    let password =
-        keychain::get_password(browser.keychain_service, browser.keychain_account).ok()?;
+fn chromium_decryption_key(browser: BrowserCookieStore) -> Result<ChromiumKey, ProviderError> {
+    // The broker revalidates passwords and coalesces reads. A second permanent
+    // cache here would keep using an old browser encryption key after rotation.
+    let password = keychain::get_password(browser.keychain_service, browser.keychain_account)
+        .map_err(|error| browser_keychain_error(browser, error))?;
     let mut key = [0_u8; 16];
     pbkdf2_hmac::<Sha1>(password.as_bytes(), b"saltysalt", 1003, &mut key);
-    cache.insert(cache_key, key);
-    Some(key)
+    Ok(key)
+}
+
+fn browser_keychain_error(browser: BrowserCookieStore, error: keychain::Error) -> ProviderError {
+    ProviderError::new(
+        if error == keychain::Error::Missing {
+            ProviderErrorKind::CredentialsMissing
+        } else {
+            ProviderErrorKind::KeychainAccessFailed
+        },
+        format!(
+            "{} cookie access is unavailable. Choose Allow access to read the existing session.",
+            browser.label
+        ),
+    )
+}
+
+/// Explicit action only. Ask once for the first relevant protected browser
+/// source. Unrelated browsers and domains never trigger a permission prompt.
+pub(crate) fn request_browser_access(
+    chrome_only: bool,
+    domains: &[&str],
+    required_cookie_names: &[&str],
+    allowed_cookie_names: Option<&[&str]>,
+) -> Result<(), ProviderError> {
+    let home = dirs::home_dir().ok_or_else(missing_cookie_error)?;
+    let browsers = if chrome_only {
+        vec![chrome_cookie_store()]
+    } else {
+        browser_import_order()
+    };
+    for browser in browsers {
+        for path in browser_cookie_paths(&home, browser) {
+            match import_cookie_db(
+                &path,
+                browser,
+                domains,
+                required_cookie_names,
+                allowed_cookie_names,
+            ) {
+                Ok(Some(_)) => return Ok(()),
+                Err(error) if error.kind() == ProviderErrorKind::KeychainAccessFailed => {
+                    return keychain::request_access(
+                        browser.keychain_service,
+                        browser.keychain_account,
+                    )
+                    .map_err(|error| browser_keychain_error(browser, error));
+                }
+                _ => {}
+            }
+        }
+    }
+    Err(missing_cookie_error())
 }
 
 fn plausible_cookie_name(value: &str) -> bool {
@@ -535,6 +607,47 @@ fn cookie_db_error(err: rusqlite::Error) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_matching_cookie_preserves_permission_error_without_reading_other_domains() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cookies(host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB,
+            expires_utc INTEGER, last_access_utc INTEGER, creation_utc INTEGER);
+            INSERT INTO cookies VALUES('.notgrok.com', 'sso', '', X'763130', 0, 0, 0);",
+        )
+        .unwrap();
+        let browser = chrome_cookie_store();
+        let result = import_cookie_connection_with_store_using(
+            &conn,
+            browser,
+            &["grok.com"],
+            &["sso"],
+            Some(&["sso"]),
+            |_, _| panic!("an unrelated domain must not request credential access"),
+        )
+        .unwrap();
+        assert!(result.is_none());
+        conn.execute_batch(
+            "INSERT INTO cookies VALUES('.grok.com', 'sso', '', X'763130', 0, 0, 0);",
+        )
+        .unwrap();
+        let error = import_cookie_connection_with_store_using(
+            &conn,
+            browser,
+            &["grok.com"],
+            &["sso"],
+            Some(&["sso"]),
+            |_, browser| {
+                Err(browser_keychain_error(
+                    browser,
+                    keychain::Error::InteractionRequired,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::KeychainAccessFailed);
+    }
 
     #[test]
     fn detects_browser_specific_expiry_epochs_and_keeps_session_cookies() {

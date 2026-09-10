@@ -589,6 +589,28 @@
           ]
         },
         "method": {
+          "const": "request_credential_access",
+          "type": "string"
+        },
+        "provider_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "provider_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "account_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
           "const": "repair_provider",
           "type": "string"
         },

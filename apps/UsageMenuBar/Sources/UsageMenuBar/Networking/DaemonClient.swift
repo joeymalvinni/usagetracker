@@ -120,6 +120,11 @@ struct DaemonClient: Sendable {
         guard case let .providerSetup(v) = try await send(.updateProviderSetup(providerId: providerId, settings: settings)) else { throw DaemonError.badResponse }
         return v
     }
+    func requestCredentialAccess(providerId: String, accountId: String?) async throws {
+        guard case .providerAction = try await send(.requestCredentialAccess(
+            providerId: providerId, accountId: accountId
+        )) else { throw DaemonError.badResponse }
+    }
     func repairProvider(
         providerId: String,
         accountId: String?,
@@ -239,6 +244,8 @@ private enum DaemonRequestTimeout {
             10
         case .getProviderSetup, .updateProviderSetup:
             20
+        case .requestCredentialAccess:
+            65
         case .refresh:
             // Starting/coalescing a job is fast; provider work is polled separately.
             10

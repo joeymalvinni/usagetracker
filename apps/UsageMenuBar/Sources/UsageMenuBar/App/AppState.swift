@@ -63,7 +63,6 @@ private enum ProviderSignInFollowUp {
     @Published var importLocalClaude: ImportLocalClaudeModel?
     @Published var onboardingDiscoveryStarted = false
     @Published var onboardingDiscoveryRunning = false
-    @Published var onboardingShowsNotificationChoice = false
     @Published private(set) var derived = DerivedState.empty
     var providers: [ProviderVM] { derived.providers }
     var settingsProviders: [ProviderVM] { derived.settingsProviders }
@@ -101,7 +100,7 @@ private enum ProviderSignInFollowUp {
     }
     private var client: DaemonClient
     private let daemonSupervisor = DaemonSupervisor()
-    private let notificationDelivery = NotificationDelivery()
+    private lazy var notificationDelivery = NotificationDelivery()
     private let uiConfigStore = UIConfigStore()
     private let providerConnections = ProviderConnectionCoordinator()
     private var cancellables = Set<AnyCancellable>()
@@ -148,9 +147,8 @@ private enum ProviderSignInFollowUp {
     }
 
     func bootstrap() async {
-        // First-run onboarding explains Keychain access before any collector can
-        // cause macOS to show its permission prompt. The user starts the daemon
-        // explicitly from the onboarding screen after reading that explanation.
+        // Setup starts the service for local provider discovery. Connections are
+        // enabled explicitly from that screen; background reads never prompt.
         guard ui.onboardingCompleted else { return }
         // A bundled daemon can outlive the app that launched it. Check it
         // before the first API request so replacing the app bundle also
@@ -349,7 +347,7 @@ private enum ProviderSignInFollowUp {
                 .waitingForSignIn,
                 "Waiting for browser sign-in…"
             )
-            markAuthenticationCodeExpected(for: providerId)
+            enableOptionalAuthenticationCode(for: providerId)
             monitorProviderSignIn(
                 providerId: providerId,
                 followUp: .addedAccount(profileId: response.profileId)
@@ -414,7 +412,7 @@ private enum ProviderSignInFollowUp {
                 .waitingForSignIn,
                 "Waiting for browser sign-in…"
             )
-            markAuthenticationCodeExpected(for: providerId)
+            enableOptionalAuthenticationCode(for: providerId)
             monitorProviderSignIn(providerId: providerId, followUp: followUp)
             return url
         } catch {
@@ -432,6 +430,64 @@ private enum ProviderSignInFollowUp {
             await repairProvider(providerId, accountId: accountId)
         } else {
             actionError = "\(providerName(providerId)) does not support sign-in."
+        }
+    }
+
+    func canRecoverProvider(_ providerId: String, action: ProviderRecoveryAction) -> Bool {
+        switch action {
+        case .allowAccess, .checkConnection: true
+        case .connect:
+            supportsRepair(providerId)
+                || (!accounts.contains { $0.providerId == providerId } && supportsAddAccount(providerId))
+        case .reconnect: supportsRepair(providerId)
+        }
+    }
+
+    func providerRecoveryIsBusy(_ providerId: String) -> Bool {
+        refreshingProviderCounts[providerId, default: 0] > 0
+            || pendingProviders.contains(providerId)
+            || pendingAccountProviders.contains(providerId)
+            || isProviderSignInActive(providerId)
+            || onboardingProviderConnection(providerId).state == .connecting
+    }
+
+    func recoverProvider(
+        _ providerId: String,
+        accountId: String?,
+        action: ProviderRecoveryAction
+    ) async {
+        guard canRecoverProvider(providerId, action: action),
+              !providerRecoveryIsBusy(providerId) else { return }
+        switch action {
+        case .allowAccess:
+            await allowProviderCredentialAccess(providerId, accountId: accountId)
+        case .checkConnection:
+            await refreshProvider(providerId)
+        case .connect:
+            await beginProviderSignIn(providerId, accountId: accountId)
+        case .reconnect:
+            await repairProvider(providerId, accountId: accountId)
+        }
+    }
+
+    func allowProviderCredentialAccess(
+        _ providerId: String,
+        accountId: String? = nil,
+        retryConnection: Bool = false
+    ) async {
+        guard !providerRecoveryIsBusy(providerId) else { return }
+        pendingAccountProviders.insert(providerId)
+        defer { pendingAccountProviders.remove(providerId) }
+        actionError = nil
+        do {
+            try await client.requestCredentialAccess(providerId: providerId, accountId: accountId)
+            if retryConnection {
+                await connectProviderForOnboarding(providerId)
+            } else {
+                await refreshProvider(providerId)
+            }
+        } catch {
+            actionError = describe(error)
         }
     }
 
@@ -513,10 +569,9 @@ private enum ProviderSignInFollowUp {
         }
     }
 
-    private func markAuthenticationCodeExpected(for providerId: String) {
-        // Mirrors the daemon's `accepts_authentication_code` launch flag (only
-        // Claude's login reads a code from stdin). Keep in sync if the daemon
-        // starts piping stdin for another provider's login.
+    private func enableOptionalAuthenticationCode(for providerId: String) {
+        // Claude accepts a manual code, but browser callbacks can complete
+        // sign-in without one. The UI offers code entry only as an option.
         if providerId == "claude" {
             providersAwaitingAuthenticationCode.insert(providerId)
         }
@@ -676,7 +731,7 @@ private enum ProviderSignInFollowUp {
                 .waitingForSignIn,
                 "Waiting for browser sign-in…"
             )
-            markAuthenticationCodeExpected(for: providerId)
+            enableOptionalAuthenticationCode(for: providerId)
             monitorProviderSignIn(
                 providerId: providerId,
                 followUp: .repairedAccount(accountId: accountId, startedAt: startedAt)
@@ -782,14 +837,9 @@ private enum ProviderSignInFollowUp {
         }
     }
 
-    func beginOnboarding() async {
-        ui.onboardingWelcomeCompleted = true
-        onboardingDiscoveryStarted = true
-        await prepareOnboarding()
-    }
-
     func prepareOnboarding() async {
         guard !onboardingDiscoveryRunning else { return }
+        ui.onboardingWelcomeCompleted = true
         onboardingDiscoveryStarted = true
         onboardingDiscoveryRunning = true
         actionError = nil
@@ -805,16 +855,25 @@ private enum ProviderSignInFollowUp {
         do {
             if onboardingProviderDefaultsPending {
                 let toggles = Self.onboardingDefaultProviderToggles(
-                    providerIDs: serverProviderOrder
+                    providerIDs: serverProviderOrder,
+                    existingProviderIDs: Set(accounts.map(\.providerId))
                 )
                 config = try await client.updateConfig(
                     pollIntervalSeconds: nil,
                     providers: toggles,
-                    notifications: (config?.notifications ?? NotificationConfig(enabled: false))
-                        .withEnabled(false)
+                    notifications: accounts.isEmpty
+                        ? (config?.notifications ?? NotificationConfig(enabled: false)).withEnabled(false)
+                        : nil
                 )
                 onboardingProviderDefaultsPending = false
                 build()
+            }
+            // Try every provider: browser-only credentials may exist even when
+            // its CLI/app was not detected. Preserve existing paused accounts.
+            let existingProviderIDs = Set(accounts.map(\.providerId))
+            for providerId in onboardingProviderOrder where !existingProviderIDs.contains(providerId) {
+                guard !Task.isCancelled else { return }
+                await connectOnboardingProvider(providerId)
             }
         } catch {
             actionError = "Setup could not be prepared: \(describe(error))"
@@ -822,6 +881,11 @@ private enum ProviderSignInFollowUp {
     }
 
     func connectProviderForOnboarding(_ providerId: String) async {
+        guard !onboardingDiscoveryRunning, !onboardingProviderDefaultsPending else { return }
+        await connectOnboardingProvider(providerId)
+    }
+
+    private func connectOnboardingProvider(_ providerId: String) async {
         guard onboardingProviderConnection(providerId).state != .connecting else { return }
         setOnboardingProviderState(providerId, .connecting, "Checking for an account…")
         actionError = nil
@@ -882,7 +946,13 @@ private enum ProviderSignInFollowUp {
                     .needsSignIn,
                     "No signed-in account was found."
                 )
-            case .credentialsInvalid, .unauthorized:
+            case .credentialsInvalid:
+                setOnboardingProviderState(
+                    providerId,
+                    .failed,
+                    "The existing connection could not be read. Check it before signing in again."
+                )
+            case .unauthorized:
                 setOnboardingProviderState(
                     providerId,
                     .needsSignIn,
@@ -949,7 +1019,12 @@ private enum ProviderSignInFollowUp {
     }
 
     func checkProviderAfterSignIn(_ providerId: String) async {
-        providerConnections.cancelMonitor(for: providerId)
+        // An in-app login is already monitored until its account is saved.
+        // Checking early must not replace that monitor with a failed refresh.
+        if isProviderSignInActive(providerId) {
+            await load()
+            return
+        }
         await connectProviderForOnboarding(providerId)
         if onboardingProviderConnection(providerId).state == .connected {
             providersAwaitingAuthenticationCode.remove(providerId)
@@ -979,7 +1054,8 @@ private enum ProviderSignInFollowUp {
             for: providerId,
             descriptor: serverProviders[providerId],
             accounts: onboardingConnectedAccounts.filter { $0.providerId == providerId },
-            health: health.filter { $0.providerId == providerId }
+            health: config?.providers[providerId]?.enabled == true
+                ? health.filter { $0.providerId == providerId } : []
         )
     }
 
@@ -1021,6 +1097,10 @@ private enum ProviderSignInFollowUp {
         !onboardingConnectedAccounts.isEmpty
     }
 
+    var canConnectProviders: Bool {
+        daemon == .online && !onboardingDiscoveryRunning && !onboardingProviderDefaultsPending
+    }
+
     var onboardingHasSuccessfulUsage: Bool {
         snapshots.contains { snapshot in
             onboardingConnectedAccounts.contains { $0.id == snapshot.accountId }
@@ -1036,42 +1116,9 @@ private enum ProviderSignInFollowUp {
             && notificationAuthorizationAvailable
     }
 
-    func continueFromOnboarding() async {
-        let connectedProviderIDs = Set(onboardingConnectedAccounts.map(\.providerId))
-        if !connectedProviderIDs.isEmpty {
-            do {
-                config = try await client.updateConfig(
-                    pollIntervalSeconds: nil,
-                    providers: Dictionary(
-                        uniqueKeysWithValues: connectedProviderIDs.map { ($0, true) }
-                    )
-                )
-                build()
-            } catch {
-                actionError = "Tracking could not be started: \(describe(error))"
-                return
-            }
-        }
-        if onboardingHasSuccessfulUsage,
-           !ui.notificationPromptCompleted,
-           notificationAuthorization == .notDetermined,
-           notificationAuthorizationAvailable {
-            onboardingShowsNotificationChoice = true
-        } else {
-            completeOnboarding()
-        }
-    }
-
-    func enableNotificationsAndCompleteOnboarding() async {
-        await setNotificationsEnabled(true)
-        ui.notificationPromptCompleted = true
-        onboardingShowsNotificationChoice = false
-        completeOnboarding()
-    }
-
-    func skipNotificationsAndCompleteOnboarding() {
-        ui.notificationPromptCompleted = true
-        onboardingShowsNotificationChoice = false
+    func continueFromOnboarding() {
+        // Connect already enables the chosen provider. Leaving setup must not
+        // resume paused accounts/providers or put a permission step before usage.
         completeOnboarding()
     }
 
@@ -1094,7 +1141,7 @@ private enum ProviderSignInFollowUp {
         ui.onboardingWelcomeCompleted = true
         onboardingProviderDefaultsPending = false
         actionError = nil
-        actionMessage = "Setup complete. Usage will update automatically."
+        actionMessage = nil
     }
 
     func restartOnboarding() async {
@@ -1108,9 +1155,13 @@ private enum ProviderSignInFollowUp {
         await prepareOnboarding()
     }
 
-    static func onboardingDefaultProviderToggles(providerIDs: [String]) -> [String: Bool] {
+    static func onboardingDefaultProviderToggles(
+        providerIDs: [String],
+        existingProviderIDs: Set<String> = []
+    ) -> [String: Bool] {
         Dictionary(
             uniqueKeysWithValues: Set(providerIDs)
+                .subtracting(existingProviderIDs)
                 .map { ($0, false) }
         )
     }
@@ -1249,6 +1300,9 @@ private enum ProviderSignInFollowUp {
     private func requestStaleDataRecovery(
         reloadBeforeChecking: Bool
     ) async {
+        // Local discovery may run while defaults are being prepared. Do not
+        // refresh a default-enabled provider before the user chooses Connect.
+        guard !onboardingProviderDefaultsPending else { return }
         if let automaticRecoveryTask {
             await automaticRecoveryTask.value
             return
@@ -1332,7 +1386,7 @@ private enum ProviderSignInFollowUp {
         }
     }
     private func waitForProviderAccount(providerId: String, profileId: String) async {
-        for _ in 0..<600 {
+        for attempt in 0..<600 {
             guard !Task.isCancelled else { return }
             do {
                 let discovered = try await client.accounts()
@@ -1346,6 +1400,21 @@ private enum ProviderSignInFollowUp {
                     providerConnections.clearOverride(for: providerId)
                     providersAwaitingAuthenticationCode.remove(providerId)
                     return
+                }
+                // A successful browser login may leave a Keychain permission
+                // step before an account can be discovered. Accounts alone
+                // cannot expose that failure, so periodically check discovery.
+                if attempt % 10 == 0 {
+                    let report = try await client.refresh([providerId])
+                    guard !Task.isCancelled else { return }
+                    if report.providerResults.contains(where: {
+                        $0.providerId == providerId && $0.accountId == nil
+                            && $0.status == .keychainAccessFailed
+                    }) {
+                        setOnboardingProviderState(providerId, .needsPermission, "Allow credential access")
+                        providersAwaitingAuthenticationCode.remove(providerId)
+                        return
+                    }
                 }
             } catch {
                 // Login is asynchronous; transient socket failures are retried below.
@@ -1366,6 +1435,16 @@ private enum ProviderSignInFollowUp {
             do {
                 let latest = try await client.health()
                 guard !Task.isCancelled else { return }
+                if latest.contains(where: {
+                    $0.providerId == providerId
+                        && (accountId == nil || $0.accountId == accountId)
+                        && $0.updatedAt >= startedAt
+                        && $0.status == .keychainAccessFailed
+                }) {
+                    setOnboardingProviderState(providerId, .needsPermission, "Allow credential access")
+                    providersAwaitingAuthenticationCode.remove(providerId)
+                    return
+                }
                 let repaired = latest.first {
                     $0.providerId == providerId
                         && (accountId == nil || $0.accountId == accountId)

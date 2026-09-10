@@ -4,6 +4,7 @@ struct Summary: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var updater: AppUpdater
     @Binding var selection: Selection
+    @State private var showsReleaseNotes = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.lg - 2) {
@@ -17,26 +18,21 @@ struct Summary: View {
             }
             ScrollView {
                 LazyVStack(spacing: Theme.Spacing.xs + 2) {
-                    if let notes = updater.installedReleaseNotes,
-                       state.showsReleaseNotes(notes) {
-                        ReleaseNotesCard(notes: notes) {
-                            state.dismissReleaseNotes(notes)
+                    if state.cost.hasData {
+                        CostDashboard(dashboard: state.cost) { providerId in
+                            selection = .provider(providerId, accountId: nil)
                         }
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                    }
-                    if state.shouldOfferNotifications {
-                        NotificationOfferCard()
-                            .transition(.move(edge: .top).combined(with: .opacity))
                     }
                     if state.providers.isEmpty {
                         EmptyState(
-                            text: state.daemon == .offline ? "Daemon unavailable" : "No providers enabled",
+                            text: state.daemon == .offline ? "Usage is unavailable right now" : "Connect an account to see your usage",
                             retry: state.daemon == .offline ? { Task { await state.refreshAll() } } : nil,
                             isError: state.daemon == .offline
                         )
-                    }
-                    CostDashboard(dashboard: state.cost) { providerId in
-                        selection = .provider(providerId, accountId: nil)
+                        Button("Connect an account") {
+                            Task { await state.restartOnboarding() }
+                        }
+                        .buttonStyle(.chipProminent)
                     }
                     ForEach(state.providers) { group in
                         if let subAccounts = group.subAccounts, subAccounts.count > 1 {
@@ -50,6 +46,22 @@ struct Summary: View {
                             }
                                 .transition(.scale(scale: 0.96).combined(with: .opacity))
                         }
+                    }
+                    if state.shouldOfferNotifications {
+                        NotificationOfferCard()
+                    }
+                    if let notes = updater.installedReleaseNotes,
+                       state.showsReleaseNotes(notes) {
+                        DisclosureGroup("What’s new in \(notes.version)", isExpanded: $showsReleaseNotes) {
+                            ReleaseNotesCard(notes: notes) {
+                                showsReleaseNotes = false
+                                state.dismissReleaseNotes(notes)
+                            }
+                            .padding(.top, Theme.Spacing.sm)
+                        }
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, Theme.Spacing.sm)
                     }
                 }
                 .padding(.bottom, Theme.Spacing.sm)
@@ -72,7 +84,9 @@ struct Summary: View {
     private var summarySubtitle: HeaderSubtitleStyle {
         if state.daemon == .offline { return .offline }
         if state.connectivity.status == .offline { return .networkOffline }
-        guard let date = state.lastSuccessfulRefresh else { return .custom("waiting for first successful refresh") }
+        guard let date = state.lastSuccessfulRefresh else {
+            return .custom(state.providers.isEmpty ? "Your AI usage in one place" : "Getting your usage…")
+        }
         return .custom("last refreshed \(DateFormats.relative.localizedString(for: date, relativeTo: Date()))")
     }
 }

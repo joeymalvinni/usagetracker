@@ -363,7 +363,8 @@
         "usage_provenance",
         "usage_events",
         "refresh_jobs",
-        "refresh_coalescing"
+        "refresh_coalescing",
+        "credential_access"
       ],
       "type": "string"
     },
@@ -938,7 +939,6 @@
       },
       "type": "object"
     },
-
     "ModelCostSummary": {
       "properties": {
         "chargeable_cost_usd": {

@@ -499,6 +499,20 @@ impl OpenCodeCollector {
 
 #[async_trait]
 impl ProviderCollector for OpenCodeCollector {
+    async fn request_credential_access(
+        &self,
+        _profile_id: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        tokio::task::spawn_blocking(cookies::request_access)
+            .await
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::KeychainAccessFailed,
+                    "Browser access request could not complete",
+                )
+            })?
+    }
+
     fn provider_id(&self) -> ProviderId {
         ProviderId::new(OPENCODE_GO_PROVIDER_ID)
     }
@@ -524,16 +538,18 @@ impl ProviderCollector for OpenCodeCollector {
             .into());
         }
 
-        if let Ok(cookie_header) = self.resolve_cookie_header(true).await {
-            if let Ok(workspace_id) = self.resolve_workspace_id(&cookie_header.value).await {
-                return Ok(vec![DiscoveredAccount {
-                    external_account_id: workspace_id.clone(),
-                    display_name: None,
-                    email: None,
-                    profile_id: None,
-                }]
-                .into());
-            }
+        let web_discovery = match self.resolve_cookie_header(true).await {
+            Ok(cookie_header) => self.resolve_workspace_id(&cookie_header.value).await,
+            Err(error) => Err(error),
+        };
+        if let Ok(workspace_id) = &web_discovery {
+            return Ok(vec![DiscoveredAccount {
+                external_account_id: workspace_id.clone(),
+                display_name: None,
+                email: None,
+                profile_id: None,
+            }]
+            .into());
         }
 
         if local_go_auth_exists() {
@@ -546,13 +562,7 @@ impl ProviderCollector for OpenCodeCollector {
             .into());
         }
 
-        Err(ProviderError::new(
-            ProviderErrorKind::CredentialsMissing,
-            format!(
-                "{} credentials are missing",
-                provider_display_name(OPENCODE_GO_PROVIDER_ID)
-            ),
-        ))
+        Err(web_discovery.expect_err("successful web discovery returned above"))
     }
 
     async fn collect_usage(
@@ -658,8 +668,7 @@ use http::response_text;
 use local::{collect_go_local_usage, local_go_auth_exists};
 use usage::{account_email_from_text, parse_usage_text, parse_zen_balance, UsageContext};
 use utils::{
-    provider_cookie_env, provider_display_name, provider_workspace_env, url_encode_json_arg,
-    workspace_ids_from_text,
+    provider_cookie_env, provider_workspace_env, url_encode_json_arg, workspace_ids_from_text,
 };
 
 fn resolve_cookie_header_blocking(
@@ -676,16 +685,27 @@ fn resolve_cookie_header_blocking(
         });
     }
 
+    let mut cache_error = None;
     if allow_cached {
-        if let Some(value) = load_cached_cookie_header(OPENCODE_GO_PROVIDER_ID) {
-            return Ok(ResolvedCookieHeader {
-                value,
-                source: CookieHeaderSource::Cache,
-            });
+        match load_cached_cookie_header(OPENCODE_GO_PROVIDER_ID) {
+            Ok(Some(value)) => {
+                return Ok(ResolvedCookieHeader {
+                    value,
+                    source: CookieHeaderSource::Cache,
+                })
+            }
+            Err(error) => cache_error = Some(error),
+            Ok(None) => {}
         }
     }
 
-    let value = import_browser_cookie_header(OPENCODE_GO_PROVIDER_ID)?;
+    let value = import_browser_cookie_header(OPENCODE_GO_PROVIDER_ID).map_err(|error| {
+        if error.kind() == ProviderErrorKind::CredentialsMissing {
+            cache_error.unwrap_or(error)
+        } else {
+            error
+        }
+    })?;
     store_cached_cookie_header(OPENCODE_GO_PROVIDER_ID, &value);
     Ok(ResolvedCookieHeader {
         value,

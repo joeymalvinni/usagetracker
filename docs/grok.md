@@ -12,7 +12,7 @@ The authenticated Grok user ID is the real identity whenever it's available. If 
 
 CLI credentials come from `<grok_home>/auth.json`, preferring complete OIDC entries over legacy ones. Set `GROK_CLI_PATH` to name the executable explicitly; otherwise UsageTracker checks the common install paths, your login shell, and the process `PATH`.
 
-For the default profile's web fallback, cookies are resolved in this order: `USAGE_TRACKER_GROK_COOKIE`, `cookie_header`, `~/.usagetracker/grok.cookie`, the Keychain cache, and finally Chrome's `sso` / `sso-rw` cookies. A Grok bearer token can be used alongside cookies or on its own.
+For the default profile's web fallback, cookies are resolved in this order: `USAGE_TRACKER_GROK_COOKIE`, `cookie_header`, `~/.usagetracker/grok.cookie`, the Keychain cache, and finally Chrome's `sso` / `sso-rw` cookies. A Grok bearer token can be used alongside cookies or on its own. Browser Keychain reads are silent. A protected browser source surfaces `keychain_access_failed` and can be authorized with Allow access. That action reads one relevant browser credential and is unavailable for managed Grok profiles. The shared credential cache revalidates silently after sixty seconds; it does not keep a second permanent browser encryption-key cache.
 
 ## How usage is collected
 

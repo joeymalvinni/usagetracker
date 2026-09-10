@@ -3,73 +3,20 @@ import SwiftUI
 
 struct Onboarding: View {
     @EnvironmentObject var state: AppState
-    @State private var showsOtherProviders = false
 
     var body: some View {
-        Group {
-            if state.onboardingShowsNotificationChoice {
-                notificationContent
-            } else if state.onboardingDiscoveryStarted {
-                providerContent
-            } else {
-                welcomeContent
-            }
-        }
-        .padding(Theme.Spacing.lg)
-        .frame(width: Theme.Popover.width, height: Theme.Popover.height)
-    }
-
-    private var welcomeContent: some View {
-        VStack(spacing: Theme.Spacing.xxl) {
-            Spacer()
-
-            Image(nsImage: NSApplication.shared.applicationIconImage)
-                .resizable()
-                .interpolation(.high)
-                .scaledToFit()
-                .frame(width: 72, height: 72)
-                .accessibilityHidden(true)
-
-            VStack(spacing: Theme.Spacing.sm) {
-                Text("Welcome to UsageTracker")
-                    .font(.title2.bold())
-                Text("Track your AI usage and limits from the menu bar.")
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Label {
-                Text("Your usage history stays on this Mac. Providers are accessed only when you choose to connect them.")
-                    .fixedSize(horizontal: false, vertical: true)
-            } icon: {
-                Image(systemName: "lock.shield")
-                    .foregroundStyle(.tint)
-            }
-            .font(Theme.Typography.body)
-            .surfaceCard()
-
-            Spacer()
-
-            Button("Continue") {
-                Task { await state.beginOnboarding() }
-            }
-            .buttonStyle(.chipPrimary)
-            .frame(maxWidth: .infinity, alignment: .trailing)
-        }
+        providerContent
+            .padding(Theme.Spacing.lg)
+            .frame(width: Theme.Popover.width, height: Theme.Popover.height)
     }
 
     private var providerContent: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-            onboardingHeader(
-                title: "Connect your accounts",
-                subtitle: "We found these tools without opening credentials. Connect only the providers you want to track."
-            )
+            Text("Connect your accounts").font(Theme.Typography.title)
             if let error = state.actionError {
                 SetupNotice(text: error, isError: true)
-                if state.daemon == .offline {
-                    HStack {
+                HStack {
+                    if state.daemon == .offline {
                         Link(
                             "Open Login Items",
                             destination: URL(
@@ -77,47 +24,30 @@ struct Onboarding: View {
                             )!
                         )
                         .buttonStyle(.link)
-                        Spacer()
-                        Button("Retry service") {
-                            Task { await state.prepareOnboarding() }
-                        }
-                        .buttonStyle(.chipProminent)
                     }
+                    Spacer()
+                    Button("Try again") {
+                        Task { await state.prepareOnboarding() }
+                    }
+                    .buttonStyle(.chipProminent)
+                    .disabled(state.onboardingDiscoveryRunning)
                 }
             }
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                     if state.onboardingDiscoveryRunning && state.serverProviderOrder.isEmpty {
                         HStack(spacing: Theme.Spacing.sm) {
                             ProgressView().controlSize(.small)
-                            Text("Looking for providers on this Mac…")
+                            Text("Connecting accounts…")
                                 .font(Theme.Typography.caption)
                                 .foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, Theme.Spacing.xxl)
                     } else {
-                        if !state.onboardingFoundProviderIDs.isEmpty {
-                            sectionTitle("Found on this Mac")
-                            ForEach(state.onboardingFoundProviderIDs, id: \.self) {
-                                OnboardingProviderCard(providerId: $0)
-                            }
-                        }
-
-                        if !state.onboardingOtherProviderIDs.isEmpty {
-                            DisclosureGroup(isExpanded: $showsOtherProviders) {
-                                VStack(spacing: Theme.Spacing.sm) {
-                                    ForEach(state.onboardingOtherProviderIDs, id: \.self) {
-                                        OnboardingProviderCard(providerId: $0)
-                                    }
-                                }
-                                .padding(.top, Theme.Spacing.sm)
-                            } label: {
-                                Text("More providers (\(state.onboardingOtherProviderIDs.count))")
-                                    .font(Theme.Typography.caption.weight(.semibold))
-                            }
-                            .surfaceCard()
+                        ForEach(state.onboardingProviderOrder, id: \.self) {
+                            ProviderConnectionCard(providerId: $0)
                         }
                     }
                 }
@@ -125,92 +55,23 @@ struct Onboarding: View {
             }
 
             HStack {
-                Text(state.onboardingHasConnectedAccounts
-                     ? connectedFooterText
-                     : "You can add providers later from Settings.")
-                    .font(Theme.Typography.micro)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
                 Spacer()
-                Button(state.onboardingHasConnectedAccounts ? "Start tracking" : "Set up later") {
-                    Task { await state.continueFromOnboarding() }
+                Button(state.onboardingHasConnectedAccounts ? "View usage" : "Set up later") {
+                    state.continueFromOnboarding()
                 }
                 .buttonStyle(.chipPrimary)
-                .disabled(state.daemon != .online || state.onboardingDiscoveryRunning)
+                .disabled(state.onboardingDiscoveryRunning)
             }
         }
         .task {
-            if state.serverProviderOrder.isEmpty {
-                await state.prepareOnboarding()
-            }
-        }
-    }
-
-    private var connectedFooterText: String {
-        let count = state.onboardingConnectedAccounts.count
-        return count == 1 ? "1 account is ready." : "\(count) accounts are ready."
-    }
-
-    private var notificationContent: some View {
-        VStack(spacing: Theme.Spacing.xl) {
-            Spacer()
-            Image(systemName: "bell.badge")
-                .font(.system(size: 42, weight: .medium))
-                .foregroundStyle(.tint)
-                .accessibilityHidden(true)
-            VStack(spacing: Theme.Spacing.sm) {
-                Text("Get a heads-up before you run low?")
-                    .font(.title2.bold())
-                    .multilineTextAlignment(.center)
-                Text("UsageTracker can notify you when a limit is nearly reached or resets.")
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Label(
-                "macOS will ask for notification permission after you choose Enable alerts.",
-                systemImage: "hand.raised"
-            )
-            .font(Theme.Typography.caption)
-            .foregroundStyle(.secondary)
-            .surfaceCard()
-            Spacer()
-            HStack {
-                Button("Not now") {
-                    state.skipNotificationsAndCompleteOnboarding()
-                }
-                Spacer()
-                Button("Enable alerts") {
-                    Task { await state.enableNotificationsAndCompleteOnboarding() }
-                }
-                .buttonStyle(.chipPrimary)
-            }
-        }
-    }
-
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text.uppercased())
-            .font(Theme.Typography.micro.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, Theme.Spacing.xs)
-    }
-
-    private func onboardingHeader(title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-            Text(title).font(Theme.Typography.title)
-            Text(subtitle)
-                .font(Theme.Typography.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            await state.prepareOnboarding()
         }
     }
 }
 
-private struct OnboardingProviderCard: View {
+struct ProviderConnectionCard: View {
     @EnvironmentObject var state: AppState
     let providerId: String
-    @State private var showsAccessExplanation = false
 
     private var connection: ProviderConnectionPresentation {
         state.onboardingProviderConnection(providerId)
@@ -239,25 +100,6 @@ private struct OnboardingProviderCard: View {
                 primaryControl
             }
 
-            if showsAccessExplanation {
-                VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                    Text(accessExplanation)
-                        .font(Theme.Typography.caption)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack {
-                        Button("Cancel") { showsAccessExplanation = false }
-                            .buttonStyle(.chip)
-                        Spacer()
-                        Button("Continue") {
-                            showsAccessExplanation = false
-                            Task { await state.connectProviderForOnboarding(providerId) }
-                        }
-                        .buttonStyle(.chipProminent)
-                    }
-                }
-                .surfaceInset()
-            }
-
             if !accounts.isEmpty {
                 VStack(spacing: Theme.Spacing.xs) {
                     ForEach(accounts) { account in
@@ -268,6 +110,14 @@ private struct OnboardingProviderCard: View {
 
             secondaryControls
 
+            if !accounts.isEmpty, state.supportsAddAccount(providerId) {
+                Button("Add another account", systemImage: "person.badge.plus") {
+                    Task { await state.addProviderAccount(providerId) }
+                }
+                .buttonStyle(.chip)
+                .disabled(!state.canConnectProviders || state.providerRecoveryIsBusy(providerId))
+            }
+
             if state.supportsSetup(providerId), let setup = state.providerSetups[providerId] {
                 ProviderSetupFields(providerId: providerId, setup: setup, disabled: isBusy)
             }
@@ -276,38 +126,41 @@ private struct OnboardingProviderCard: View {
     }
 
     @ViewBuilder private var primaryControl: some View {
-        if showsAccessExplanation {
-            EmptyView()
-        } else {
-            switch connectionState {
-            case .connecting:
-                ProgressView().controlSize(.small).accessibilityLabel("Connecting \(providerName)")
-            case .connected:
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                    .accessibilityLabel("\(providerName) connected")
-            case .waitingForSignIn:
-                ProgressView().controlSize(.small).accessibilityLabel("Waiting for \(providerName) sign-in")
-            case .idle:
-                Button("Connect") { requestConnection() }
-                    .buttonStyle(.chipProminent)
-                    .disabled(state.daemon == .offline)
-            case .needsPermission:
-                Button("Reconnect") {
-                    Task { await state.beginProviderSignIn(providerId, accountId: accounts.first?.id) }
+        switch connectionState {
+        case .connecting:
+            ProgressView().controlSize(.small).accessibilityLabel("Connecting \(providerName)")
+        case .connected:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityLabel("\(providerName) connected")
+        case .waitingForSignIn:
+            ProgressView().controlSize(.small).accessibilityLabel("Waiting for \(providerName) sign-in")
+        case .idle:
+            Button("Connect") { requestConnection() }
+                .buttonStyle(.chipProminent)
+                .disabled(!state.canConnectProviders || state.providerRecoveryIsBusy(providerId))
+        case .needsPermission:
+            if state.pendingAccountProviders.contains(providerId) {
+                ProgressView().controlSize(.small).accessibilityLabel("Requesting credential access")
+            } else {
+                Button("Allow access") {
+                    Task {
+                        await state.allowProviderCredentialAccess(
+                            providerId, accountId: accounts.first?.id, retryConnection: true
+                        )
+                    }
                 }
                 .buttonStyle(.chipProminent)
-                .disabled(state.daemon == .offline)
-            case .failed:
-                Button("Try again") { requestConnection() }
-                    .buttonStyle(.chipProminent)
-                    .disabled(state.daemon == .offline)
-            case .needsSignIn:
-                EmptyView()
+                .disabled(state.daemon != .online || state.providerRecoveryIsBusy(providerId))
             }
+        case .failed:
+            Button("Try again") { requestConnection() }
+                .buttonStyle(.chipProminent)
+                .disabled(!state.canConnectProviders || state.providerRecoveryIsBusy(providerId))
+        case .needsSignIn:
+            EmptyView()
         }
     }
-
     @ViewBuilder private var secondaryControls: some View {
         switch connectionState {
         case .needsSignIn:
@@ -319,14 +172,19 @@ private struct OnboardingProviderCard: View {
                 }
                 HStack(spacing: Theme.Spacing.sm) {
                     if canSignIn {
-                        Button("Open sign-in") {
+                        Button("Sign in") {
                             Task { await openSignIn() }
                         }
                         .buttonStyle(.chipProminent)
-                        Button("Copy link", systemImage: "doc.on.doc") {
-                            Task { await copySignInLink() }
+                        Menu {
+                            Button("Copy sign-in link") { Task { await copySignInLink() } }
+                        } label: {
+                            Image(systemName: "ellipsis")
                         }
-                        .buttonStyle(.chip)
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .accessibilityLabel("Sign-in options")
                     }
                     Button("Check again") {
                         Task { await state.checkProviderAfterSignIn(providerId) }
@@ -340,7 +198,7 @@ private struct OnboardingProviderCard: View {
                     ProviderAuthenticationCodeEntry(providerId: providerId)
                 }
                 HStack(spacing: Theme.Spacing.sm) {
-                    Button("I’ve signed in — check") {
+                    Button("Check connection") {
                         Task { await state.checkProviderAfterSignIn(providerId) }
                     }
                     .buttonStyle(.chipProminent)
@@ -350,12 +208,6 @@ private struct OnboardingProviderCard: View {
             }
         case .connected:
             HStack(spacing: Theme.Spacing.sm) {
-                if state.supportsAddAccount(providerId) {
-                    Button("Add account") {
-                        Task { await state.addProviderAccount(providerId) }
-                    }
-                    .buttonStyle(.chip)
-                }
                 if state.supportsSetup(providerId) {
                     Button(state.providerSetups[providerId] == nil ? "Find workspaces" : "Refresh workspaces") {
                         Task { await state.loadProviderSetup(providerId) }
@@ -384,9 +236,21 @@ private struct OnboardingProviderCard: View {
                 }
             }
             Spacer()
-            Text("Connected")
-                .font(Theme.Typography.micro)
-                .foregroundStyle(.secondary)
+            if accounts.count > 1,
+               let issue = collectionIssue(for: account),
+               let action = issue.recoveryAction,
+               state.canRecoverProvider(providerId, action: action) {
+                Button(action.label) {
+                    Task { await state.recoverProvider(providerId, accountId: account.id, action: action) }
+                }
+                .buttonStyle(.chip)
+                .disabled(state.daemon != .online || state.providerRecoveryIsBusy(providerId))
+            } else {
+                Text(accountReading(account))
+                    .font(Theme.Typography.caption.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal, Theme.Spacing.sm)
         .frame(height: 38)
@@ -396,12 +260,24 @@ private struct OnboardingProviderCard: View {
         )
     }
 
+    private func collectionIssue(for account: Account) -> ProviderCollectionIssue? {
+        guard account.collectionEnabled, state.config?.providers[providerId]?.enabled == true else { return nil }
+        let health = state.health.first { $0.providerId == providerId && $0.accountId == account.id }
+            ?? state.health.first { $0.providerId == providerId && $0.accountId == nil }
+        return health.flatMap(ProviderCollectionIssue.init)
+    }
+
+    private func accountReading(_ account: Account) -> String {
+        guard account.collectionEnabled, state.config?.providers[providerId]?.enabled == true else { return "Paused" }
+        let reading = state.settingsProviders
+            .flatMap { $0.subAccounts ?? [$0] }
+            .first { $0.accountId == account.id }
+        if let reading, reading.percent != nil { return reading.primary }
+        return "Added"
+    }
+
     private func requestConnection() {
-        if needsCredentialExplanation {
-            showsAccessExplanation = true
-        } else {
-            Task { await state.connectProviderForOnboarding(providerId) }
-        }
+        Task { await state.connectProviderForOnboarding(providerId) }
     }
 
     private func openSignIn() async {
@@ -418,11 +294,7 @@ private struct OnboardingProviderCard: View {
     }
 
     private func accountTitle(_ account: Account) -> String {
-        if let name = account.displayName, !name.isEmpty { return name }
-        if let email = account.email, !email.isEmpty { return email }
-        let id = account.externalAccountId
-        guard id.count > 16 else { return id }
-        return "\(id.prefix(8))…\(id.suffix(4))"
+        account.displayLabel
     }
 
     private var providerName: String {
@@ -430,16 +302,24 @@ private struct OnboardingProviderCard: View {
     }
 
     private var statusText: String {
-        connection.message
+        switch connectionState {
+        case .idle: "Not connected"
+        case .connecting: "Connecting…"
+        case .connected: accounts.count == 1 ? "1 account connected" : "\(accounts.count) accounts connected"
+        case .waitingForSignIn: "Finish sign-in in your browser"
+        case .needsSignIn: "Sign in to connect"
+        case .needsPermission: "Allow credential access"
+        case .failed: connection.message
+        }
     }
 
     private var statusSymbol: String {
         switch connectionState {
         case .connected: "checkmark.circle.fill"
         case .connecting, .waitingForSignIn: "clock"
-        case .needsPermission: "lock.trianglebadge.exclamationmark"
+        case .needsPermission: "lock"
         case .needsSignIn: "person.badge.key"
-        case .failed: "exclamationmark.triangle"
+        case .failed: "info.circle"
         case .idle: state.serverProviders[providerId]?.detected == true ? "desktopcomputer" : "plus.circle"
         }
     }
@@ -447,9 +327,7 @@ private struct OnboardingProviderCard: View {
     private var statusColor: Color {
         switch connectionState {
         case .connected: .green
-        case .needsPermission, .needsSignIn: .orange
-        case .failed: .red
-        case .idle, .connecting, .waitingForSignIn: .secondary
+        case .idle, .connecting, .waitingForSignIn, .needsPermission, .needsSignIn, .failed: .secondary
         }
     }
 
@@ -461,17 +339,7 @@ private struct OnboardingProviderCard: View {
         state.supportsAddAccount(providerId) || state.supportsRepair(providerId)
     }
 
-    private var credentialAccessNotice: String? {
-        state.serverProviders[providerId]?.credentialAccessNotice
-    }
 
-    private var needsCredentialExplanation: Bool {
-        credentialAccessNotice != nil
-    }
-
-    private var accessExplanation: String {
-        credentialAccessNotice ?? ""
-    }
 }
 
 @MainActor private enum ProviderSignInActions {
@@ -505,7 +373,7 @@ struct ProviderSetupControls: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
             HStack(spacing: Theme.Spacing.sm) {
                 if canConnectOrRepair {
-                    Button("Open sign-in") {
+                    Button("Sign in") {
                         Task { await connectOrRepair() }
                     }
                     .disabled(busy || state.daemon == .offline)

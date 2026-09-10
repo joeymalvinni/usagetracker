@@ -108,11 +108,21 @@ struct ProviderVM: Identifiable, Equatable, Sendable {
     var hasUnseenAlert: Bool = false
     var lastSuccessAt: Date? = nil
     var errorDetail: String? = nil
-    var repairRecommended: Bool = false
+    var collectionIssue: ProviderCollectionIssue? = nil
     var accountEmail: String? = nil
     var activitySourceLabel: String? = nil
     var hasCostData: Bool = true
     var unpricedModelNames: [String] = []
+
+    var headlineWindow: WindowVM? { Self.headlineWindow(in: windows) }
+
+    /// Keep the number, bar, label, and reset tied to one limit. Equal values
+    /// retain provider order so a refresh does not arbitrarily switch windows.
+    static func headlineWindow(in windows: [WindowVM]) -> WindowVM? {
+        windows.filter { $0.percent != nil }.min {
+            ($0.percent ?? 100) < ($1.percent ?? 100)
+        } ?? windows.first
+    }
 }
 
 struct MenuBarProviderVM: Identifiable, Equatable, Sendable {

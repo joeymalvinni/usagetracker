@@ -771,11 +771,14 @@ impl RefreshCoordinator {
                 account.provider_id == *provider_id
                     && account.profile_id.as_deref() == Some(failure.profile_id.as_str())
             }) else {
-                debug!(
-                    provider_id = provider_id.as_str(),
-                    profile_id = failure.profile_id.as_str(),
-                    "ignoring discovery failure for a pending profile"
-                );
+                // Pending accounts still need actionable onboarding errors.
+                // Return the failure without assigning it to another account
+                // or persisting provider-wide unhealthy state.
+                results.push(provider_error_result(
+                    provider_id.clone(),
+                    None,
+                    failure.error,
+                ));
                 continue;
             };
             if !account.collection_enabled {
@@ -2590,6 +2593,31 @@ mod tests {
         assert_eq!(health[0].provider_id, provider_id);
         assert!(health[0].account_id.is_some());
         assert!(matches!(health[0].status, ProviderHealthStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn pending_profile_permission_failure_is_returned_without_poisoning_health() {
+        let storage = test_storage();
+        let coordinator = RefreshCoordinator::new(storage.clone(), vec![]);
+        let results = coordinator
+            .record_account_discovery_failures(
+                &ProviderId::new("claude"),
+                vec![AccountDiscoveryFailure {
+                    profile_id: "pending".to_string(),
+                    error: ProviderError::new(
+                        ProviderErrorKind::KeychainAccessFailed,
+                        "Allow access",
+                    ),
+                }],
+            )
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].status,
+            ProviderRefreshStatus::KeychainAccessFailed
+        );
+        assert!(results[0].account_id.is_none());
+        assert!(storage.provider_health().await.unwrap().is_empty());
     }
 
     #[tokio::test]

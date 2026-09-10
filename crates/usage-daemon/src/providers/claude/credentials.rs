@@ -56,7 +56,7 @@ pub(super) async fn reload_for_refresh(
     let account = credentials.keychain_account.clone();
     let source = credentials.source.clone();
     tokio::task::spawn_blocking(move || {
-        keychain::invalidate_password_cache(&service, &account).map_err(keychain_save_error)?;
+        keychain::revalidate_password(&service, &account).map_err(keychain_save_error)?;
         match source {
             CredentialSource::Keychain => load_keychain_credentials(&service, &account),
             CredentialSource::File(path) => {
@@ -164,10 +164,9 @@ where
         let path = credentials_file_path.clone();
         async move {
             tokio::task::spawn_blocking(move || {
-                // Invalidate before reading: an external Claude process may
-                // have rotated the item since the broker last read it.
-                keychain::invalidate_password_cache(&service, &account)
-                    .map_err(keychain_save_error)?;
+                // Check for external rotations while retaining an Allow once
+                // value if macOS refuses a new silent read.
+                keychain::revalidate_password(&service, &account).map_err(keychain_save_error)?;
                 load_credentials_from_keychain_or_file(&service, &account, path)
             })
             .await
@@ -281,13 +280,50 @@ fn load_credentials_from_keychain_or_file(
     keychain_account: &str,
     credentials_file_path: PathBuf,
 ) -> Result<ClaudeCredentials, ProviderError> {
-    match load_keychain_credentials(keychain_service, keychain_account) {
+    credentials_with_file_fallback(
+        load_keychain_credentials(keychain_service, keychain_account),
+        || load_file_credentials(&credentials_file_path, keychain_service, keychain_account),
+    )
+}
+
+fn credentials_with_file_fallback(
+    primary: Result<ClaudeCredentials, ProviderError>,
+    load_file: impl FnOnce() -> Result<ClaudeCredentials, ProviderError>,
+) -> Result<ClaudeCredentials, ProviderError> {
+    match primary {
         Ok(credentials) => Ok(credentials),
-        Err(err) if err.kind() == ProviderErrorKind::CredentialsMissing => {
-            load_file_credentials(&credentials_file_path, keychain_service, keychain_account)
+        Err(error)
+            if matches!(
+                error.kind(),
+                ProviderErrorKind::CredentialsMissing | ProviderErrorKind::KeychainAccessFailed
+            ) =>
+        {
+            match load_file() {
+                Ok(credentials) => Ok(credentials),
+                Err(file_error) if file_error.kind() == ProviderErrorKind::CredentialsMissing => {
+                    Err(error)
+                }
+                Err(file_error) => Err(file_error),
+            }
         }
-        Err(err) => Err(err),
+        Err(error) => Err(error),
     }
+}
+
+pub(super) async fn request_credential_access(
+    service: String,
+    account: String,
+) -> Result<(), ProviderError> {
+    tokio::task::spawn_blocking(move || {
+        keychain::request_access(&service, &account).map_err(keychain_load_error)
+    })
+    .await
+    .map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::KeychainAccessFailed,
+            "Credential access request could not complete",
+        )
+    })?
 }
 
 fn load_keychain_credentials(
@@ -311,9 +347,13 @@ fn keychain_load_error(error: KeychainError) -> ProviderError {
             ProviderErrorKind::CredentialsMissing,
             "Claude Code credentials are missing from macOS Keychain",
         ),
+        KeychainError::InteractionRequired => ProviderError::new(
+            ProviderErrorKind::KeychainAccessFailed,
+            "macOS credential access needs permission. Choose Allow access to continue.",
+        ),
         KeychainError::AuthenticationFailed => ProviderError::new(
             ProviderErrorKind::KeychainAccessFailed,
-            "macOS Keychain authentication failed after 3 attempts",
+            "macOS did not authorize credential access",
         ),
         _ => ProviderError::new(
             ProviderErrorKind::KeychainAccessFailed,
@@ -347,7 +387,7 @@ fn keychain_save_error(error: KeychainError) -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::KeychainAccessFailed,
         if error == KeychainError::AuthenticationFailed {
-            "macOS Keychain authentication failed after 3 attempts"
+            "macOS did not authorize credential access"
         } else {
             "failed to save Claude Code credentials in macOS Keychain"
         },
@@ -565,6 +605,48 @@ fn update_oauth_field(raw: &mut Value, field: &str, value: Value) -> Result<(), 
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn permission_failure_can_use_the_selected_profiles_file() {
+        let result = credentials_with_file_fallback(
+            Err(keychain_load_error(KeychainError::InteractionRequired)),
+            || {
+                parse_credentials(
+                    r#"{"claudeAiOauth":{"accessToken":"file-access","refreshToken":"refresh"}}"#,
+                    "profile-service",
+                    "profile-account",
+                    CredentialSource::File(PathBuf::from("/profiles/work/.credentials.json")),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(result.access_token, "file-access");
+        assert_eq!(result.source_label(), "file");
+    }
+
+    #[test]
+    fn missing_fallback_preserves_permission_error_and_invalid_keychain_does_not_switch_sources() {
+        let error = credentials_with_file_fallback(
+            Err(keychain_load_error(KeychainError::InteractionRequired)),
+            || {
+                Err(ProviderError::new(
+                    ProviderErrorKind::CredentialsMissing,
+                    "no file",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::KeychainAccessFailed);
+        let error = credentials_with_file_fallback(
+            Err(ProviderError::new(
+                ProviderErrorKind::CredentialsInvalid,
+                "invalid JSON",
+            )),
+            || panic!("malformed credentials must not silently select another account"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::CredentialsInvalid);
+    }
 
     #[test]
     fn parses_keychain_oauth_credentials() {

@@ -25,7 +25,8 @@ use crate::{
             create_managed_claude_profile, ensure_claude_login_profile, pending_claude_profile,
             ClaudeLoginTarget,
         },
-        ProviderCollector, ProviderError, HTTP_CONNECT_TIMEOUT, HTTP_REQUEST_TIMEOUT,
+        ProviderCollector, ProviderError, ProviderErrorKind, HTTP_CONNECT_TIMEOUT,
+        HTTP_REQUEST_TIMEOUT,
     },
     runtime::{
         managed_profiles,
@@ -355,11 +356,16 @@ pub(crate) fn resolve_launch_plan(
     })
 }
 
-fn reconnect_after_sync_failure(err: &ProviderError) -> String {
-    format!(
-        "Claude credentials need reconnect before opening a session ({}). Finish signing in in your browser.",
-        err.kind().as_str()
-    )
+fn session_sync_failure_message(err: &ProviderError) -> String {
+    match err.kind() {
+        ProviderErrorKind::KeychainAccessFailed =>
+            "Claude needs macOS credential access before opening this session. Choose Allow access for this account in Settings.".to_string(),
+        ProviderErrorKind::Unauthorized | ProviderErrorKind::CredentialsMissing =>
+            "Reconnect this Claude account in Settings before opening a session.".to_string(),
+        ProviderErrorKind::CredentialsInvalid =>
+            "Check this Claude account’s connection in Settings before opening a session.".to_string(),
+        _ => "Claude could not prepare this session. Try again after usage updates resume.".to_string(),
+    }
 }
 
 pub(crate) fn account_launch_settings_response(
@@ -477,24 +483,22 @@ impl LaunchHandler for ClaudeAdapter {
                 .invalidate_cached_credentials(&account.provider_id, Some(profile_id))
                 .await?;
             if let Err(err) = sync_result {
-                let target = prepare_login_profile(runtime, Some(&account.id)).await?;
-                let login = launchers::launch_claude_login(
-                    target.config_dir.as_deref(),
-                    ProviderSignInAction::Open,
-                )?;
-                let authentication_url = login.authentication_url.clone();
-                launchers::monitor_login(
-                    login.child,
-                    runtime.refresh(),
-                    PROVIDER_ID,
-                    Some(target.profile_id),
-                );
-                return Ok(ProviderActionResponse {
-                    provider_id: account.provider_id,
-                    message: reconnect_after_sync_failure(&err),
-                    authentication_url,
-                });
+                // Opening a session does not authorize starting a replacement
+                // login. Surface the matching recovery and keep the account.
+                anyhow::bail!(session_sync_failure_message(&err));
             }
+        }
+
+        if let Some(directory) = config_dir
+            .as_ref()
+            .filter(|directory| managed_profiles::is_managed_profile(directory, PROVIDER_ID))
+        {
+            let directory = directory.clone();
+            let profile_id = profile_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                super::cli::prepare_usage_workspace(Some(&directory), &profile_id, None)
+            })
+            .await??;
         }
 
         let launcher = launchers::write_claude_profile_launcher(
@@ -1151,14 +1155,23 @@ mod tests {
     }
 
     #[test]
-    fn launch_credential_sync_failure_message_mentions_reconnect_not_tokens() {
-        let msg = reconnect_after_sync_failure(&ProviderError::new(
-            ProviderErrorKind::CredentialsMissing,
-            "missing",
+    fn launch_sync_failure_only_requests_reconnect_for_missing_or_rejected_sign_in() {
+        for kind in [
+            ProviderErrorKind::KeychainAccessFailed,
+            ProviderErrorKind::CredentialsInvalid,
+            ProviderErrorKind::Network,
+            ProviderErrorKind::RateLimited,
+        ] {
+            let message =
+                session_sync_failure_message(&ProviderError::new(kind, "sensitive detail"));
+            assert!(!message.to_lowercase().contains("reconnect"));
+            assert!(!message.contains("sensitive detail"));
+        }
+        let message = session_sync_failure_message(&ProviderError::new(
+            ProviderErrorKind::Unauthorized,
+            "rejected",
         ));
-        assert!(msg.to_lowercase().contains("reconnect"));
-        assert!(!msg.contains("sk-"));
-        assert!(!msg.contains("accessToken"));
+        assert!(message.contains("Reconnect"));
     }
 
     #[test]

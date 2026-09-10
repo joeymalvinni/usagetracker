@@ -18,11 +18,15 @@ use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt;
 
-const HELPER_TIMEOUT: Duration = Duration::from_secs(20);
-const AUTHENTICATION_ATTEMPTS: usize = 3;
-// Successful Keychain reads stay in the broker until explicitly invalidated.
-// This avoids repeated macOS authorization prompts during polling and discovery.
-// Mutations made through this broker update or invalidate the cached value.
+#[cfg(target_os = "macos")]
+const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308; // Security.framework/SecBase.h
+
+const HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(60);
+const CACHE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60);
+// Periodically revalidate silently so another app's sign-in is discovered.
+// A previously accepted value can still be used if revalidation needs UI;
+// provider rejection explicitly invalidates it before attempting recovery.
 // A small bounded queue prevents a hung Keychain backend from turning caller
 // bursts into unbounded retained secrets while still absorbing normal polling.
 const QUEUE_CAPACITY: usize = 8;
@@ -36,6 +40,7 @@ static BROKER: LazyLock<Broker> =
 pub(crate) enum Error {
     Missing,
     AuthenticationFailed,
+    InteractionRequired,
     QueueFull,
     QueueTimeout,
     HelperTimeout,
@@ -45,8 +50,20 @@ pub(crate) enum Error {
     InvalidResponse,
 }
 
+/// Force a silent source check without discarding a value granted by Allow once.
+pub(crate) fn revalidate_password(service: &str, account: &str) -> Result<(), Error> {
+    invoke_once(Request::Revalidate {
+        service: service.to_string(),
+        account: account.to_string(),
+    })
+    .and_then(|response| match response {
+        Response::Value { .. } => Ok(()),
+        other => expect_ok(other),
+    })
+}
+
 pub(crate) fn get_password(service: &str, account: &str) -> Result<String, Error> {
-    let result = match invoke_with_auth_retry(Request::Get {
+    let result = match invoke_once(Request::Get {
         service: service.to_string(),
         account: account.to_string(),
     }) {
@@ -54,7 +71,8 @@ pub(crate) fn get_password(service: &str, account: &str) -> Result<String, Error
         Ok(Response::Missing) => Err(Error::Missing),
         Ok(Response::Ok) => Err(Error::InvalidResponse),
         Ok(Response::Failed) => Err(Error::BackendRejected),
-        Ok(Response::AuthenticationFailed) => Err(Error::InvalidResponse),
+        Ok(Response::AuthenticationFailed) => Err(Error::AuthenticationFailed),
+        Ok(Response::InteractionRequired) => Err(Error::InteractionRequired),
         Ok(Response::Conflict) => Err(Error::InvalidResponse),
         Err(error) => Err(error),
     };
@@ -67,7 +85,7 @@ pub(crate) fn set_password_if_changed(
     account: &str,
     password: &str,
 ) -> Result<(), Error> {
-    let result = invoke_with_auth_retry(Request::SetIfChanged {
+    let result = invoke_once(Request::SetIfChanged {
         service: service.to_string(),
         account: account.to_string(),
         password: password.to_string(),
@@ -83,7 +101,7 @@ pub(crate) fn create_password_if_missing(
     account: &str,
     password: &str,
 ) -> Result<(), Error> {
-    let result = match invoke_with_auth_retry(Request::CreateIfMissing {
+    let result = match invoke_once(Request::CreateIfMissing {
         service: service.to_string(),
         account: account.to_string(),
         password: password.to_string(),
@@ -104,7 +122,7 @@ pub(crate) fn compare_and_set_password(
     expected: &str,
     password: &str,
 ) -> Result<(), Error> {
-    let result = match invoke_with_auth_retry(Request::CompareAndSet {
+    let result = match invoke_once(Request::CompareAndSet {
         service: service.to_string(),
         account: account.to_string(),
         expected: expected.to_string(),
@@ -114,7 +132,8 @@ pub(crate) fn compare_and_set_password(
         Ok(Response::Conflict) => Err(Error::Conflict),
         Ok(Response::Missing) => Err(Error::Missing),
         Ok(Response::Failed) => Err(Error::BackendRejected),
-        Ok(Response::AuthenticationFailed) => Err(Error::InvalidResponse),
+        Ok(Response::AuthenticationFailed) => Err(Error::AuthenticationFailed),
+        Ok(Response::InteractionRequired) => Err(Error::InteractionRequired),
         Ok(Response::Value { .. }) => Err(Error::InvalidResponse),
         Err(error) => Err(error),
     };
@@ -123,7 +142,7 @@ pub(crate) fn compare_and_set_password(
 }
 
 pub(crate) fn delete_password(service: &str, account: &str) -> Result<(), Error> {
-    let result = invoke_with_auth_retry(Request::Delete {
+    let result = invoke_once(Request::Delete {
         service: service.to_string(),
         account: account.to_string(),
     })
@@ -157,37 +176,50 @@ fn expect_ok(response: Response) -> Result<(), Error> {
         Response::Ok | Response::Missing => Ok(()),
         Response::Value { .. } => Err(Error::InvalidResponse),
         Response::Failed => Err(Error::BackendRejected),
-        Response::AuthenticationFailed => Err(Error::InvalidResponse),
+        Response::AuthenticationFailed => Err(Error::AuthenticationFailed),
+        Response::InteractionRequired => Err(Error::InteractionRequired),
         Response::Conflict => Err(Error::Conflict),
     }
 }
 
-fn invoke(request: Request) -> Result<Response, Error> {
-    BROKER.invoke(request, HELPER_TIMEOUT)
-}
-
-fn invoke_with_auth_retry(request: Request) -> Result<Response, Error> {
-    invoke_with_auth_retry_using(request, invoke)
-}
-
-fn invoke_with_auth_retry_using(
-    request: Request,
-    mut operation: impl FnMut(Request) -> Result<Response, Error>,
-) -> Result<Response, Error> {
-    for attempt in 1..=AUTHENTICATION_ATTEMPTS {
-        match operation(request.clone())? {
-            Response::AuthenticationFailed if attempt < AUTHENTICATION_ATTEMPTS => {
-                tracing::debug!(
-                    attempt,
-                    max_attempts = AUTHENTICATION_ATTEMPTS,
-                    "Keychain authentication failed; prompting again"
-                );
-            }
-            Response::AuthenticationFailed => return Err(Error::AuthenticationFailed),
-            response => return Ok(response),
-        }
+/// Only an explicit credential-access action may use this operation. It reads
+/// an existing item; it never opens login or retries a dismissed system prompt.
+pub(crate) fn request_access(service: &str, account: &str) -> Result<(), Error> {
+    match invoke_once(Request::Authorize {
+        service: service.to_string(),
+        account: account.to_string(),
+    })? {
+        Response::Value { .. } => Ok(()),
+        Response::Missing => Err(Error::Missing),
+        Response::Failed => Err(Error::BackendRejected),
+        Response::AuthenticationFailed => Err(Error::AuthenticationFailed),
+        Response::InteractionRequired => Err(Error::InteractionRequired),
+        Response::Ok | Response::Conflict => Err(Error::InvalidResponse),
     }
-    unreachable!("Keychain authentication retry loop always returns")
+}
+
+fn invoke(request: Request) -> Result<Response, Error> {
+    let timeout = if request.allows_interaction() {
+        AUTHORIZATION_TIMEOUT
+    } else {
+        HELPER_TIMEOUT
+    };
+    BROKER.invoke(request, timeout)
+}
+
+fn invoke_once(request: Request) -> Result<Response, Error> {
+    invoke_once_using(request, invoke)
+}
+
+fn invoke_once_using(
+    request: Request,
+    operation: impl FnOnce(Request) -> Result<Response, Error>,
+) -> Result<Response, Error> {
+    match operation(request)? {
+        Response::AuthenticationFailed => Err(Error::AuthenticationFailed),
+        Response::InteractionRequired => Err(Error::InteractionRequired),
+        response => Ok(response),
+    }
 }
 
 type Executor = Arc<dyn Fn(Request, Instant) -> Result<Response, Error> + Send + Sync>;
@@ -210,10 +242,14 @@ enum BrokerReply {
 
 impl Broker {
     fn new(capacity: usize, executor: Executor) -> Self {
+        Self::with_cache_interval(capacity, executor, CACHE_REVALIDATION_INTERVAL)
+    }
+
+    fn with_cache_interval(capacity: usize, executor: Executor, cache_interval: Duration) -> Self {
         let (requests, receiver) = mpsc::sync_channel(capacity);
         std::thread::Builder::new()
             .name("usage-keychain-broker".to_string())
-            .spawn(move || run_broker(receiver, executor))
+            .spawn(move || run_broker(receiver, executor, cache_interval))
             .expect("failed to start Keychain broker");
         Self { requests }
     }
@@ -260,10 +296,17 @@ impl Broker {
 }
 
 struct CachedPassword {
-    value: String,
+    response: Response,
+    checked_at: Instant,
 }
 
-fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor) {
+impl CachedPassword {
+    fn current(&self, now: Instant, interval: Duration) -> Option<Response> {
+        (now.duration_since(self.checked_at) < interval).then(|| self.response.clone())
+    }
+}
+
+fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor, cache_interval: Duration) {
     let mut pending = VecDeque::new();
     let mut read_cache: HashMap<(String, String), CachedPassword> = HashMap::new();
     loop {
@@ -286,22 +329,23 @@ fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor) {
         let request = queued.request.clone();
         let cached = match &request {
             Request::Get { .. } => request.cache_key().and_then(|key| {
-                read_cache.get(&key).map(|cached| Response::Value {
-                    value: cached.value.clone(),
-                })
+                read_cache.get(&key).and_then(|cached| cached.current(Instant::now(), cache_interval))
             }),
             Request::SetIfChanged { password, .. } => request.cache_key().and_then(|key| {
                 read_cache
                     .get(&key)
-                    .filter(|cached| cached.value == *password)
+                    .filter(|cached| matches!(&cached.response, Response::Value { value } if value == password))
                     .map(|_| Response::Ok)
             }),
             Request::Invalidate { .. } => Some(Response::Ok),
-            Request::CompareAndSet { .. }
+            Request::Authorize { .. }
+            | Request::Revalidate { .. }
+            | Request::CompareAndSet { .. }
             | Request::CreateIfMissing { .. }
             | Request::Delete { .. } => None,
         };
-        let result = if let Some(response) = cached {
+        let cache_hit = cached.is_some();
+        let mut result = if let Some(response) = cached {
             Ok(response)
         } else {
             match catch_unwind(AssertUnwindSafe(|| {
@@ -314,7 +358,24 @@ fn run_broker(receiver: Receiver<BrokerRequest>, executor: Executor) {
                 }
             }
         };
-        update_read_cache(&mut read_cache, &request, &result);
+        if !cache_hit || matches!(&request, Request::Invalidate { .. }) {
+            // "Allow once" can leave usable credentials in memory even when a
+            // later silent read requires permission. Reuse them until provider
+            // authentication rejects them, at which point the caller invalidates.
+            if matches!(&request, Request::Get { .. } | Request::Revalidate { .. })
+                && matches!(
+                    result,
+                    Ok(Response::InteractionRequired | Response::AuthenticationFailed)
+                )
+            {
+                if let Some(cached) = request.cache_key().and_then(|key| read_cache.get(&key)) {
+                    if matches!(&cached.response, Response::Value { .. }) {
+                        result = Ok(cached.response.clone());
+                    }
+                }
+            }
+            update_read_cache(&mut read_cache, &request, &result);
+        }
         let _ = queued.replies.send(BrokerReply::Finished(result.clone()));
         let mut coalescing_allowed = true;
         while let Ok(candidate) = receiver.try_recv() {
@@ -345,14 +406,26 @@ fn update_read_cache(
     let Some(key) = request.cache_key() else {
         return;
     };
-    let value = match (request, result) {
-        (Request::Get { .. }, Ok(Response::Value { value })) => Some(value.clone()),
+    let response = match (request, result) {
+        (
+            Request::Get { .. } | Request::Revalidate { .. } | Request::Authorize { .. },
+            Ok(
+                response @ (Response::Value { .. }
+                | Response::InteractionRequired
+                | Response::AuthenticationFailed),
+            ),
+        ) => Some(response.clone()),
         (Request::SetIfChanged { password, .. }, Ok(Response::Ok))
         | (Request::CreateIfMissing { password, .. }, Ok(Response::Ok))
-        | (Request::CompareAndSet { password, .. }, Ok(Response::Ok)) => Some(password.clone()),
+        | (Request::CompareAndSet { password, .. }, Ok(Response::Ok)) => Some(Response::Value {
+            value: password.clone(),
+        }),
         // A failed mutation leaves the actual Keychain state uncertain. Deletes
         // and missing reads must not preserve an older successful read.
-        (Request::Get { .. }, Ok(Response::Missing))
+        (
+            Request::Get { .. } | Request::Revalidate { .. } | Request::Authorize { .. },
+            Ok(Response::Missing),
+        )
         | (Request::Invalidate { .. }, Ok(Response::Ok))
         | (Request::Delete { .. }, Ok(_)) => None,
         (Request::SetIfChanged { .. }, _)
@@ -362,8 +435,14 @@ fn update_read_cache(
         | (Request::Delete { .. }, _) => None,
         _ => return,
     };
-    if let Some(value) = value {
-        cache.insert(key, CachedPassword { value });
+    if let Some(response) = response {
+        cache.insert(
+            key,
+            CachedPassword {
+                response,
+                checked_at: Instant::now(),
+            },
+        );
     } else {
         cache.remove(&key);
     }
@@ -471,8 +550,21 @@ fn watch_parent() {
 }
 
 fn perform(request: Request) -> Response {
+    // This flag is process-wide, so apply it only inside the isolated helper.
+    // Ordinary reads, writes, deletes, and browser-key reads all fail without UI.
+    #[cfg(target_os = "macos")]
+    if unsafe {
+        security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(u8::from(
+            request.allows_interaction(),
+        ))
+    } != 0
+    {
+        return Response::Failed;
+    }
     match request {
-        Request::Get { service, account } => {
+        Request::Get { service, account }
+        | Request::Revalidate { service, account }
+        | Request::Authorize { service, account } => {
             match entry(&service, &account).and_then(|entry| entry.get_password()) {
                 Ok(value) => Response::Value { value },
                 Err(KeyringError::NoEntry) => Response::Missing,
@@ -563,7 +655,9 @@ fn write_password(service: &str, account: &str, password: &str, only_if_changed:
 }
 
 fn keyring_failure_response(error: &KeyringError) -> Response {
-    if is_authentication_failure(error) {
+    if is_interaction_required(error) {
+        Response::InteractionRequired
+    } else if is_authentication_failure(error) {
         Response::AuthenticationFailed
     } else {
         Response::Failed
@@ -583,6 +677,21 @@ fn is_authentication_failure(error: &KeyringError) -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn is_authentication_failure(_error: &KeyringError) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn is_interaction_required(error: &KeyringError) -> bool {
+    match error {
+        KeyringError::PlatformFailure(error) | KeyringError::NoStorageAccess(error) => error
+            .downcast_ref::<security_framework::base::Error>()
+            .is_some_and(|error| error.code() == ERR_SEC_INTERACTION_NOT_ALLOWED),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_interaction_required(_error: &KeyringError) -> bool {
     false
 }
 
@@ -632,7 +741,15 @@ impl Drop for KeychainLock {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum Request {
+    Authorize {
+        service: String,
+        account: String,
+    },
     Get {
+        service: String,
+        account: String,
+    },
+    Revalidate {
         service: String,
         account: String,
     },
@@ -663,9 +780,15 @@ enum Request {
 }
 
 impl Request {
+    fn allows_interaction(&self) -> bool {
+        matches!(self, Self::Authorize { .. })
+    }
+
     fn cache_key(&self) -> Option<(String, String)> {
         match self {
             Self::Get { service, account }
+            | Self::Revalidate { service, account }
+            | Self::Authorize { service, account }
             | Self::SetIfChanged {
                 service, account, ..
             }
@@ -701,6 +824,7 @@ enum Response {
     Value { value: String },
     Missing,
     AuthenticationFailed,
+    InteractionRequired,
     Failed,
     Conflict,
 }
@@ -761,6 +885,13 @@ mod tests {
             KeyringError::PlatformFailure(Box::new(security_framework::base::Error::from_code(
                 security_framework_sys::base::errSecAuthFailed,
             )));
+        let blocked = KeyringError::PlatformFailure(Box::new(
+            security_framework::base::Error::from_code(ERR_SEC_INTERACTION_NOT_ALLOWED),
+        ));
+        assert!(matches!(
+            keyring_failure_response(&blocked),
+            Response::InteractionRequired
+        ));
         let canceled = KeyringError::PlatformFailure(Box::new(
             security_framework::base::Error::from_code(-128),
         ));
@@ -778,48 +909,175 @@ mod tests {
     }
 
     #[test]
-    fn authentication_failure_reprompts_until_success() {
-        let calls = AtomicUsize::new(0);
-        let response = invoke_with_auth_retry_using(request(), |_| {
-            let call = calls.fetch_add(1, Ordering::SeqCst);
-            if call < 2 {
-                Ok(Response::AuthenticationFailed)
-            } else {
-                Ok(Response::Value {
-                    value: "secret".to_string(),
-                })
-            }
-        })
-        .unwrap();
+    fn denied_or_canceled_access_never_reprompts() {
+        for response in [
+            Response::AuthenticationFailed,
+            Response::InteractionRequired,
+            Response::Failed,
+        ] {
+            let calls = AtomicUsize::new(0);
+            let _ = invoke_once_using(
+                Request::Authorize {
+                    service: "test".into(),
+                    account: "account".into(),
+                },
+                |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(response)
+                },
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
 
-        assert!(matches!(response, Response::Value { value } if value == "secret"));
+    #[test]
+    fn explicit_access_bypasses_cached_denial_and_primes_silent_reads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor_calls = calls.clone();
+        let broker = Broker::new(
+            4,
+            Arc::new(move |request, _| {
+                executor_calls.fetch_add(1, Ordering::SeqCst);
+                if request.allows_interaction() {
+                    Ok(Response::Value {
+                        value: "accepted".into(),
+                    })
+                } else {
+                    Ok(Response::InteractionRequired)
+                }
+            }),
+        );
+        for _ in 0..3 {
+            assert!(matches!(
+                broker.invoke(request(), Duration::from_secs(1)),
+                Ok(Response::InteractionRequired)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let authorize = Request::Authorize {
+            service: "test".into(),
+            account: "account".into(),
+        };
+        assert!(!authorize.coalesces_with(&request()));
+        assert!(!request().coalesces_with(&authorize));
+        assert!(!request().allows_interaction());
+        assert!(matches!(
+            broker.invoke(authorize, Duration::from_secs(1)),
+            Ok(Response::Value { .. })
+        ));
+        assert!(
+            matches!(broker.invoke(request(), Duration::from_secs(1)), Ok(Response::Value { value }) if value == "accepted")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn silent_revalidation_observes_external_rotation_and_removal() {
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            Response::Value {
+                value: "old".into(),
+            },
+            Response::Value {
+                value: "new".into(),
+            },
+            Response::Missing,
+            Response::InteractionRequired,
+        ])));
+        let broker = Broker::with_cache_interval(
+            4,
+            Arc::new(move |request, _| {
+                assert!(!request.allows_interaction());
+                Ok(responses.lock().unwrap().pop_front().unwrap())
+            }),
+            Duration::ZERO,
+        );
+        assert!(
+            matches!(broker.invoke(request(), Duration::from_secs(1)), Ok(Response::Value { value }) if value == "old")
+        );
+        assert!(
+            matches!(broker.invoke(request(), Duration::from_secs(1)), Ok(Response::Value { value }) if value == "new")
+        );
+        assert!(matches!(
+            broker.invoke(request(), Duration::from_secs(1)),
+            Ok(Response::Missing)
+        ));
+        assert!(matches!(
+            broker.invoke(request(), Duration::from_secs(1)),
+            Ok(Response::InteractionRequired)
+        ));
+    }
+
+    #[test]
+    fn accepted_credentials_survive_silent_permission_failure_until_invalidated() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor_calls = calls.clone();
+        let broker = Broker::with_cache_interval(
+            4,
+            Arc::new(move |request, _| {
+                assert!(!request.allows_interaction());
+                Ok(if executor_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Response::Value {
+                        value: "accepted-once".into(),
+                    }
+                } else {
+                    Response::InteractionRequired
+                })
+            }),
+            Duration::ZERO,
+        );
+        for _ in 0..2 {
+            assert!(
+                matches!(broker.invoke(request(), Duration::from_secs(1)), Ok(Response::Value { value }) if value == "accepted-once")
+            );
+        }
+        broker
+            .invoke(
+                Request::Invalidate {
+                    service: "test".into(),
+                    account: "account".into(),
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(matches!(
+            broker.invoke(request(), Duration::from_secs(1)),
+            Ok(Response::InteractionRequired)
+        ));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
-    fn authentication_failure_stops_after_three_attempts() {
-        let calls = AtomicUsize::new(0);
-        let error = invoke_with_auth_retry_using(request(), |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Response::AuthenticationFailed)
-        })
-        .unwrap_err();
-
-        assert_eq!(error, Error::AuthenticationFailed);
-        assert_eq!(calls.load(Ordering::SeqCst), AUTHENTICATION_ATTEMPTS);
-    }
-
-    #[test]
-    fn non_authentication_failure_does_not_retry() {
-        let calls = AtomicUsize::new(0);
-        let response = invoke_with_auth_retry_using(request(), |_| {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Response::Failed)
-        })
-        .unwrap();
-
-        assert!(matches!(response, Response::Failed));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    fn allow_once_survives_refresh_revalidation_and_silent_auth_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let broker = Broker::new(
+            4,
+            Arc::new(move |request, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(match request {
+                    Request::Authorize { .. } => Response::Value {
+                        value: "allowed-token".into(),
+                    },
+                    Request::Revalidate { .. } => Response::AuthenticationFailed,
+                    _ => panic!("subsequent reads should use the accepted value"),
+                })
+            }),
+        );
+        for request in [
+            Request::Authorize {
+                service: "test".into(),
+                account: "account".into(),
+            },
+            Request::Revalidate {
+                service: "test".into(),
+                account: "account".into(),
+            },
+            request(),
+        ] {
+            assert!(matches!(broker.invoke(request, Duration::from_secs(1)),
+                Ok(Response::Value { value }) if value == "allowed-token"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -983,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_caches_successful_reads_for_its_lifetime() {
+    fn broker_coalesces_successful_reads_between_revalidations() {
         let calls = Arc::new(AtomicUsize::new(0));
         let executor_calls = calls.clone();
         let broker = Broker::new(
