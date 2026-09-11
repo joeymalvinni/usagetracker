@@ -102,7 +102,7 @@ private struct NotificationOfferCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Get a heads-up before you run low")
                         .font(Theme.Typography.headline)
-                    Text("Enable alerts for low limits and resets.")
+                    Text("Get notified when your remaining allowance drops or a limit resets.")
                         .font(Theme.Typography.caption)
                         .foregroundStyle(.secondary)
                 }

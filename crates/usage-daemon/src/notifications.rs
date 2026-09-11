@@ -321,8 +321,8 @@ fn reset_notification_content(
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&account.external_account_id);
     DesktopNotification {
-        title: format!("{provider} {window_name} limit reset"),
-        body: format!("{account_name} · Usage is available again"),
+        title: format!("{provider} · {window_name} limit reset"),
+        body: format!("{account_name} · Your {window_name} allowance has reset"),
     }
 }
 
@@ -361,21 +361,16 @@ fn notification_content(
     let provider = provider_name(snapshot.provider_id.as_str());
     let window_name = window.label.trim().to_ascii_lowercase();
     let title = if threshold == 0 {
-        format!("{provider} {window_name} usage exhausted")
+        format!("{provider} · {window_name} limit reached")
     } else {
-        format!("{provider} {window_name} usage is low")
+        format!("{provider} · {percent:.0}% of {window_name} allowance remaining")
     };
     let account_name = account
         .display_name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&account.external_account_id);
-    let remaining = if threshold == 0 {
-        "no usage remaining".to_string()
-    } else {
-        format!("{:.0}% remaining", percent)
-    };
-    let mut parts = vec![account_name.to_string(), remaining];
+    let mut parts = vec![account_name.to_string()];
     if let Some(reset_at) = window.reset_at {
         parts.push(format_reset(reset_at, Utc::now()));
     }
@@ -403,19 +398,28 @@ fn predictive_notification_content(
         .unwrap_or_else(|| "before reset".to_string());
     DesktopNotification {
         title: format!(
-            "{provider} {} may run out",
+            "{provider} · {} allowance may run out before reset",
             window.label.trim().to_ascii_lowercase()
         ),
-        body: format!("{account_name} · Projected to exhaust {exhaustion}"),
+        body: format!(
+            "{account_name} · At your current pace, your allowance may run out {exhaustion}"
+        ),
     }
 }
 
 fn format_exhaustion(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let minutes = ((at - now).num_seconds().max(0) + 59) / 60;
     if minutes < 60 {
-        format!("in {minutes}m")
+        format!(
+            "in about {minutes} {}",
+            if minutes == 1 { "minute" } else { "minutes" }
+        )
     } else {
-        format!("in {}h", minutes / 60)
+        let hours = minutes / 60;
+        format!(
+            "in about {hours} {}",
+            if hours == 1 { "hour" } else { "hours" }
+        )
     }
 }
 
@@ -494,8 +498,11 @@ mod tests {
 
         let notifications = storage.pending_notifications().await.unwrap();
         assert_eq!(notifications.len(), 1);
-        assert!(notifications[0].title.contains("usage is low"));
-        assert!(notifications[0].body.contains("4% remaining"));
+        assert_eq!(
+            notifications[0].title,
+            "Codex · 4% of weekly allowance remaining"
+        );
+        assert!(notifications[0].body.starts_with("Personal · resets in"));
     }
 
     #[tokio::test]
@@ -622,8 +629,11 @@ mod tests {
 
         let notifications = storage.pending_notifications().await.unwrap();
         assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].title, "Codex weekly limit reset");
-        assert_eq!(notifications[0].body, "Personal · Usage is available again");
+        assert_eq!(notifications[0].title, "Codex · weekly limit reset");
+        assert_eq!(
+            notifications[0].body,
+            "Personal · Your weekly allowance has reset"
+        );
     }
 
     #[tokio::test]
@@ -682,7 +692,7 @@ mod tests {
 
         let notifications = storage.pending_notifications().await.unwrap();
         assert_eq!(notifications.len(), 1);
-        assert!(notifications[0].title.contains("usage exhausted"));
+        assert!(notifications[0].title.contains("limit reached"));
     }
 
     #[tokio::test]
@@ -789,7 +799,9 @@ mod tests {
         let notifications = storage.pending_notifications().await.unwrap();
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0].title.contains("may run out"));
-        assert!(notifications[0].body.contains("Projected to exhaust"));
+        assert!(notifications[0]
+            .body
+            .contains("At your current pace, your allowance may run out in about"));
     }
 
     fn test_snapshot(percent: f64, reset_at: DateTime<Utc>) -> UsageSnapshot {

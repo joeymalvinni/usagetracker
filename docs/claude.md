@@ -51,6 +51,8 @@ Refreshes happen at most once a minute. Changes to your local JSONL files are de
 
 ## What's kept in diagnostics
 
+The provider page displays the credential subscription type, falling back to `subscriptionType` or `seatTier` from the selected profile’s cached `oauthAccount` only when its account UUID matches the collected account.
+
 Diagnostics can note things like the collection mode, profile ID, Keychain service and account names, subscription tier, token expiry, scopes, the safe shape of a response, CLI fingerprint counters, and how much of your local cost could be priced. They never include OAuth response bodies, CLI output text, or your access and refresh tokens.
 
 ## What failures mean

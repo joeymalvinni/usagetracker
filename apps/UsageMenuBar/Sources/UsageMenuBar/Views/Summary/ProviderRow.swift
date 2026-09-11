@@ -516,10 +516,7 @@ struct StatusChip: View {
     var percent: Double? = nil
 
     private var text: String {
-        if status == .critical, let percent, percent <= 0 {
-            return "limit reached"
-        }
-        return status.label
+        status.label(percentRemaining: percent)
     }
 
     var body: some View {
