@@ -4,17 +4,34 @@ UsageTracker is pre-1.0. This file records user-visible changes from protocol v3
 
 ## Unreleased
 
+## 0.1.10 — 2026-09-10
+
 ### App
 
-- Added per-account Claude launch preferences behind a new confirm-on-open sheet: a saved working directory and structured launch flags (model, effort, dangerously-skip-permissions) applied by the session launcher and persisted on successful open. The dangerous flag is use-once unless explicitly remembered.
+- Added per-account Claude launch preferences with a confirmation sheet for working directory, model, effort, and permission flags. Permission bypass is use-once unless explicitly remembered.
+- Added import of local Claude preferences, project trust, and prompt history into managed accounts while preserving account identity and MCP configuration.
+- Added Claude authentication-code sign-in and improved sign-in cancellation.
+- Showed account plan labels and clarified remaining allowance, model metrics, and notification wording.
+
+### Usage tracking
+
+- Included archived Codex sessions in local usage history and corrected account attribution, token accounting, and model pricing.
+- Improved Claude usage collection with a profile-isolated terminal fallback and normalized quota meters.
+- Distinguished collection failures and stale data from quota status, and improved automatic refresh and recovery after wake.
 
 ### Reliability
 
-- Preserved managed Claude account identity and MCP configuration when importing project trust. Serialized launch credential migration with token refresh and prevented stale credentials from replacing a newer Keychain item.
+- Kept background Keychain access noninteractive and added explicit account-scoped permission recovery with bounded helpers and cache revalidation.
+- Serialized Claude launch credential migration with token refresh and prevented stale credentials from replacing newer Keychain items.
+- Unified configuration mutations, pooled SQLite reads, and typed usage snapshot details across the daemon and app.
 
 ### Protocol
 
-- Added v3 import methods (`preview_account_import`, `import_account_data`, `get_import_job`) with wire fixtures, schemas, and provider capability `import_account_data` for Claude managed profiles.
+- Added v3 account launch settings, authentication-code submission and cancellation, and Claude import methods with wire fixtures and schemas.
+
+### Distribution
+
+- Strengthened installer signature verification and added optional Developer ID signing and notarization support for release builds. This release remains ad-hoc signed.
 
 ## 0.1.9 — 2026-07-25
 
