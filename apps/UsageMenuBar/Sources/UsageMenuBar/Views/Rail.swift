@@ -107,7 +107,7 @@ struct Rail: View {
                     .frame(width: 7, height: 7)
                     .padding(.top, 2)
                     .padding(.trailing, 12)
-                    .help(provider.status.label)
+                    .help(provider.status.label(percentRemaining: provider.percent))
             }
         }
         .contextMenu {

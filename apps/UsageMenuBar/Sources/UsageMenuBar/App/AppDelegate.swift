@@ -455,7 +455,7 @@ struct StatusItemAnchorSnapshot: Equatable {
         } else {
             value = provider.primary
         }
-        return "\(name ?? provider.name): \(value) · \(provider.status.label)"
+        return "\(name ?? provider.name): \(value) · \(provider.status.label(percentRemaining: provider.percent))"
     }
 
     private func providerMenuItem(_ provider: ProviderVM) -> NSMenuItem {

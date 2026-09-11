@@ -681,7 +681,7 @@ mod tests {
         assert!(notifications.len() >= 6);
         assert!(notifications
             .iter()
-            .any(|item| item.title.contains("exhausted")));
+            .any(|item| item.title.contains("limit reached")));
 
         drop(storage);
         let _ = std::fs::remove_dir_all(root);

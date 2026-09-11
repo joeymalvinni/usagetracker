@@ -53,11 +53,19 @@ enum DisplayStatus: Equatable, Sendable {
         }
     }
 
+    func label(percentRemaining: Double?) -> String {
+        guard let percent = percentRemaining, percent.isFinite else { return label }
+        if self == .normal { return "within limit" }
+        guard self == .warning || self == .critical else { return label }
+        if percent <= 0 { return "limit reached" }
+        return "\(Int(min(100, percent).rounded()))% remaining"
+    }
+
     var label: String {
         switch self {
-        case .normal: "all good"
-        case .warning: "running low"
-        case .critical: "almost out"
+        case .normal: "usage update"
+        case .warning: "usage update"
+        case .critical: "usage update"
         case .stale: "stale data"
         case .refreshing: "refreshing…"
         case .error: "error"
@@ -70,7 +78,7 @@ enum DisplayStatus: Equatable, Sendable {
 extension ProviderHealthStatus {
     var friendly: String {
         switch self {
-        case .ok: "all good"
+        case .ok: "up to date"
         case .credentialsMissing: "needs login"
         case .authFailed: "auth failed"
         case .keychainAccessFailed: "keychain access failed"

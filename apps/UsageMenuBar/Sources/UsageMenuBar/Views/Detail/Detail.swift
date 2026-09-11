@@ -263,12 +263,17 @@ private struct AlertBanner: View {
 
     private var title: String {
         switch provider.status {
-        case .critical:
-            if (worstWindow?.percent ?? provider.percent ?? 100) <= 0 {
-                return "You've reached your usage limit"
+        case .critical, .warning:
+            let windowName = worstWindow?.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let allowance = windowName.map { "\($0) allowance" } ?? "allowance"
+            if let percent = worstWindow?.percent ?? provider.percent, percent.isFinite {
+                if percent <= 0 {
+                    return windowName.map { "Your \($0) limit has been reached" }
+                        ?? "Your usage limit has been reached"
+                }
+                return "\(Int(min(100, percent).rounded()))% of your \(allowance) remains"
             }
-            return "You're almost out of your usage limit"
-        case .warning: return "You're running low on your usage limit"
+            return "Usage update"
         default: return provider.status.label.capitalized
         }
     }
